@@ -1,0 +1,784 @@
+//! Parser — Zig port of libfyaml's fy-parse.
+//!
+//! Folds the scanner's token stream into an event stream using the classic
+//! YAML grammar state machine. The C code uses setjmp/longjmp for error
+//! recovery; the port returns Zig errors and unwinds naturally.
+
+const std = @import("std");
+const diag = @import("diag.zig");
+const event_mod = @import("event.zig");
+const scanner_mod = @import("scanner.zig");
+const token_mod = @import("token.zig");
+
+const Diag = diag.Diag;
+const Mark = diag.Mark;
+const YamlError = diag.YamlError;
+const Event = event_mod.Event;
+const EventType = event_mod.EventType;
+const CollectionStyle = event_mod.CollectionStyle;
+const ScalarStyle = token_mod.ScalarStyle;
+const Scanner = scanner_mod.Scanner;
+const Token = token_mod.Token;
+const TokenType = token_mod.TokenType;
+const TagDirective = token_mod.TagDirective;
+const VersionDirective = token_mod.VersionDirective;
+
+pub const State = enum {
+    stream_start,
+    implicit_document_start,
+    document_start,
+    document_content,
+    document_end,
+    block_node,
+    block_node_or_indentless_sequence,
+    flow_node,
+    block_sequence_first_entry,
+    block_sequence_entry,
+    indentless_sequence_entry,
+    block_mapping_first_key,
+    block_mapping_key,
+    block_mapping_value,
+    flow_sequence_first_entry,
+    flow_sequence_entry,
+    flow_sequence_entry_mapping_key,
+    flow_sequence_entry_mapping_value,
+    flow_sequence_entry_mapping_end,
+    flow_mapping_first_key,
+    flow_mapping_key,
+    flow_mapping_value,
+    flow_mapping_empty_value,
+    end,
+};
+
+pub const Parser = struct {
+    alloc: std.mem.Allocator,
+    d: ?*Diag,
+    scanner: Scanner,
+    state: State = .stream_start,
+    states: std.ArrayList(State) = .empty,
+    marks: std.ArrayList(Mark) = .empty,
+    /// Active %TAG directives of the current document (including the two
+    /// default handles). Used to resolve shorthand tags while parsing nodes.
+    tag_directives: std.ArrayList(TagDirective) = .empty,
+    version_directive: ?VersionDirective = null,
+    /// Transient allocations owned by the parser (resolved tags, directive
+    /// snapshots handed to events). Valid until `deinit`.
+    temp_bytes: std.ArrayList([]u8) = .empty,
+    temp_tags: std.ArrayList([]TagDirective) = .empty,
+
+    pub fn init(alloc: std.mem.Allocator, d: ?*Diag, input: []const u8) !Parser {
+        return .{
+            .alloc = alloc,
+            .d = d,
+            .scanner = try Scanner.init(alloc, d, input),
+        };
+    }
+
+    pub fn deinit(self: *Parser) void {
+        self.scanner.deinit();
+        self.states.deinit(self.alloc);
+        self.marks.deinit(self.alloc);
+        self.tag_directives.deinit(self.alloc);
+        for (self.temp_bytes.items) |buf| self.alloc.free(buf);
+        self.temp_bytes.deinit(self.alloc);
+        for (self.temp_tags.items) |t| self.alloc.free(t);
+        self.temp_tags.deinit(self.alloc);
+    }
+
+    fn trackBytes(self: *Parser, s: []u8) ![]u8 {
+        try self.temp_bytes.append(self.alloc, s);
+        return s;
+    }
+
+    fn trackTags(self: *Parser, s: []TagDirective) ![]TagDirective {
+        try self.temp_tags.append(self.alloc, s);
+        return s;
+    }
+
+    /// Produce the next event. Returns null once the stream end event has
+    /// been delivered. Events stay valid until the parser is deinited.
+    pub fn nextEvent(self: *Parser) !?Event {
+        if (self.state == .end) return null;
+        const ev: Event = switch (self.state) {
+            .stream_start => try self.parseStreamStart(),
+            .implicit_document_start => try self.parseDocumentStart(true),
+            .document_start => try self.parseDocumentStart(false),
+            .document_content => try self.parseDocumentContent(),
+            .document_end => try self.parseDocumentEnd(),
+            .block_node => try self.parseNode(true, false),
+            .block_node_or_indentless_sequence => try self.parseNode(true, true),
+            .flow_node => try self.parseNode(false, false),
+            .block_sequence_first_entry => try self.parseBlockSequenceEntry(true),
+            .block_sequence_entry => try self.parseBlockSequenceEntry(false),
+            .indentless_sequence_entry => try self.parseIndentlessSequenceEntry(),
+            .block_mapping_first_key => try self.parseBlockMappingKey(true),
+            .block_mapping_key => try self.parseBlockMappingKey(false),
+            .block_mapping_value => try self.parseBlockMappingValue(),
+            .flow_sequence_first_entry => try self.parseFlowSequenceEntry(true),
+            .flow_sequence_entry => try self.parseFlowSequenceEntry(false),
+            .flow_sequence_entry_mapping_key => try self.parseFlowSequenceEntryMappingKey(),
+            .flow_sequence_entry_mapping_value => try self.parseFlowSequenceEntryMappingValue(),
+            .flow_sequence_entry_mapping_end => try self.parseFlowSequenceEntryMappingEnd(),
+            .flow_mapping_first_key => try self.parseFlowMappingKey(true),
+            .flow_mapping_key => try self.parseFlowMappingKey(false),
+            .flow_mapping_value => try self.parseFlowMappingValue(false),
+            .flow_mapping_empty_value => try self.parseFlowMappingValue(true),
+            .end => unreachable,
+        };
+        return ev;
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    fn fail(self: *Parser, mark: Mark, comptime fmt: []const u8, args: anytype) YamlError {
+        if (self.d) |d| d.emit(.err, mark, fmt, args) catch {};
+        return error.InvalidSyntax;
+    }
+
+    fn peekToken(self: *Parser) !Token {
+        return (try self.scanner.peekToken()) orelse
+            self.fail(self.scanner.mark, "unexpected end of token stream", .{});
+    }
+
+    fn pushState(self: *Parser, s: State) !void {
+        try self.states.append(self.alloc, s);
+    }
+
+    fn popState(self: *Parser) State {
+        return self.states.pop().?;
+    }
+
+    fn pushMark(self: *Parser, m: Mark) !void {
+        try self.marks.append(self.alloc, m);
+    }
+
+    fn processEmptyScalar(self: *Parser, mark: Mark) Event {
+        _ = self;
+        return .{
+            .type = .scalar,
+            .start = mark,
+            .end = mark,
+            .data = .{ .scalar = .{ .value = "", .style = .plain, .anchor = null, .tag = null } },
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Stream / document level states
+    // ------------------------------------------------------------------
+
+    fn parseStreamStart(self: *Parser) !Event {
+        const tok = try self.peekToken();
+        if (tok.type != .stream_start) {
+            return self.fail(tok.start, "did not find expected <stream-start>", .{});
+        }
+        self.scanner.skipToken();
+        self.state = .implicit_document_start;
+        return .{ .type = .stream_start, .start = tok.start, .end = tok.end };
+    }
+
+    fn parseDocumentStart(self: *Parser, implicit_allowed: bool) !Event {
+        var tok = try self.peekToken();
+        if (!implicit_allowed) {
+            while (tok.type == .document_end) {
+                self.scanner.skipToken();
+                tok = try self.peekToken();
+            }
+        }
+
+        // Implicit document: content without directives or '---'.
+        if (implicit_allowed and tok.type != .directive and
+            tok.type != .document_start and tok.type != .stream_end)
+        {
+            try self.prepareDirectives();
+            try self.pushState(.document_end);
+            self.state = .block_node;
+            return .{
+                .type = .document_start,
+                .start = tok.start,
+                .end = tok.start,
+                .data = .{ .document_start = .{
+                    .version = self.version_directive,
+                    .tags = try self.trackTags(try self.alloc.dupe(TagDirective, self.tag_directives.items)),
+                    .implicit = true,
+                } },
+            };
+        }
+
+        if (tok.type != .stream_end) {
+            // Explicit document, possibly preceded by directives.
+            try self.processDirectives();
+            tok = try self.peekToken();
+            if (tok.type != .document_start) {
+                return self.fail(tok.start, "did not find expected <document start>", .{});
+            }
+            self.scanner.skipToken();
+            try self.pushState(.document_end);
+            self.state = .block_node;
+            return .{
+                .type = .document_start,
+                .start = tok.start,
+                .end = tok.end,
+                .data = .{ .document_start = .{
+                    .version = self.version_directive,
+                    .tags = try self.trackTags(try self.alloc.dupe(TagDirective, self.tag_directives.items)),
+                    .implicit = false,
+                } },
+            };
+        }
+
+        // End of stream.
+        self.scanner.skipToken();
+        self.state = .end;
+        return Event{ .type = .stream_end, .start = tok.start, .end = tok.end };
+    }
+
+    fn parseDocumentContent(self: *Parser) !Event {
+        const tok = try self.peekToken();
+        switch (tok.type) {
+            .directive, .document_start, .document_end, .stream_end => {
+                self.state = self.popState();
+                return self.processEmptyScalar(tok.start);
+            },
+            else => return self.parseNode(true, false),
+        }
+    }
+
+    fn parseDocumentEnd(self: *Parser) !Event {
+        var tok = try self.peekToken();
+        var implicit = true;
+        if (tok.type == .document_end) {
+            implicit = false;
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+        }
+        // Directive state is per-document (fy_parse resets between docs).
+        self.tag_directives.clearRetainingCapacity();
+        self.version_directive = null;
+        self.state = .document_start;
+        return .{
+            .type = .document_end,
+            .start = tok.start,
+            .end = tok.start,
+            .data = .{ .document_end = .{ .implicit = implicit } },
+        };
+    }
+
+    /// Fill `tag_directives` with just the two default handles.
+    fn prepareDirectives(self: *Parser) !void {
+        self.tag_directives.clearRetainingCapacity();
+        self.version_directive = null;
+        try self.tag_directives.appendSlice(self.alloc, &.{
+            .{ .handle = "!", .prefix = "!" },
+            .{ .handle = "!!", .prefix = "tag:yaml.org,2002:" },
+        });
+    }
+
+    /// Consume directive tokens, validating them, then make sure the
+    /// default tag handles are present.
+    fn processDirectives(self: *Parser) !void {
+        self.tag_directives.clearRetainingCapacity();
+        self.version_directive = null;
+
+        while (true) {
+            const tok = try self.peekToken();
+            if (tok.type != .directive) break;
+            const d = tok.data.directive;
+            if (std.mem.eql(u8, d.name, "YAML")) {
+                if (self.version_directive != null) {
+                    return self.fail(tok.start, "found duplicate %YAML directive", .{});
+                }
+                if (d.params.len != 1) {
+                    return self.fail(tok.start, "found malformed %YAML directive", .{});
+                }
+                const p = d.params[0];
+                if (p.len < 3 or p[0] != '1' or p[1] != '.') {
+                    return self.failWith(error.UnsupportedVersion, tok.start, "found incompatible YAML document version '{s}'", .{p});
+                }
+                var minor: u8 = 0;
+                for (p[2..]) |ch| {
+                    if (ch < '0' or ch > '9') {
+                        return self.fail(tok.start, "found malformed %YAML directive", .{});
+                    }
+                    minor = minor * 10 + (ch - '0');
+                }
+                self.version_directive = .{ .major = 1, .minor = minor };
+            } else if (std.mem.eql(u8, d.name, "TAG")) {
+                if (d.params.len != 2) {
+                    return self.fail(tok.start, "found malformed %TAG directive", .{});
+                }
+                for (self.tag_directives.items) |td| {
+                    if (std.mem.eql(u8, td.handle, d.params[0])) {
+                        return self.fail(tok.start, "found duplicate %TAG directive", .{});
+                    }
+                }
+                try self.tag_directives.append(self.alloc, .{
+                    .handle = d.params[0],
+                    .prefix = d.params[1],
+                });
+            } else {
+                return self.fail(tok.start, "found unknown directive name '{s}'", .{d.name});
+            }
+            self.scanner.skipToken();
+        }
+
+        // Ensure the two default handles exist.
+        var have_bang = false;
+        var have_bangbang = false;
+        for (self.tag_directives.items) |td| {
+            if (std.mem.eql(u8, td.handle, "!")) have_bang = true;
+            if (std.mem.eql(u8, td.handle, "!!")) have_bangbang = true;
+        }
+        if (!have_bang) try self.tag_directives.append(self.alloc, .{ .handle = "!", .prefix = "!" });
+        if (!have_bangbang) try self.tag_directives.append(self.alloc, .{ .handle = "!!", .prefix = "tag:yaml.org,2002:" });
+    }
+
+    fn failWith(self: *Parser, err: YamlError, mark: Mark, comptime fmt: []const u8, args: anytype) YamlError {
+        if (self.d) |d| d.emit(.err, mark, fmt, args) catch {};
+        return err;
+    }
+
+    /// Resolve a tag shorthand (handle + suffix) to its full URI.
+    fn resolveTag(self: *Parser, handle: []const u8, suffix: []const u8) ![]const u8 {
+        if (handle.len == 0) {
+            // Verbatim tag.
+            return self.trackBytes(try self.alloc.dupe(u8, suffix));
+        }
+        for (self.tag_directives.items) |td| {
+            if (std.mem.eql(u8, td.handle, handle)) {
+                const out = try self.alloc.alloc(u8, td.prefix.len + suffix.len);
+                @memcpy(out[0..td.prefix.len], td.prefix);
+                @memcpy(out[td.prefix.len..], suffix);
+                return self.trackBytes(out);
+            }
+        }
+        return self.fail(self.scanner.mark, "found undefined tag handle '{s}'", .{handle});
+    }
+
+    // ------------------------------------------------------------------
+    // Node parsing
+    // ------------------------------------------------------------------
+
+    fn parseNode(self: *Parser, block: bool, indentless_sequence: bool) !Event {
+        var tok = try self.peekToken();
+
+        if (tok.type == .alias) {
+            self.scanner.skipToken();
+            self.state = self.popState();
+            return .{
+                .type = .alias,
+                .start = tok.start,
+                .end = tok.end,
+                .data = .{ .alias = tok.data.alias },
+            };
+        }
+
+        const start_mark = tok.start;
+        var anchor: ?[]const u8 = null;
+        var tag_handle: ?[]const u8 = null;
+        var tag_suffix: ?[]const u8 = null;
+
+        if (tok.type == .anchor) {
+            anchor = tok.data.anchor;
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+        }
+        if (tok.type == .tag) {
+            tag_handle = tok.data.tag.handle;
+            tag_suffix = tok.data.tag.suffix;
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+            if (tok.type == .anchor) {
+                if (anchor != null) {
+                    return self.fail(tok.start, "found duplicate anchor", .{});
+                }
+                anchor = tok.data.anchor;
+                self.scanner.skipToken();
+                tok = try self.peekToken();
+            }
+        }
+
+        var tag: ?[]const u8 = null;
+        if (tag_handle) |h| {
+            tag = try self.resolveTag(h, tag_suffix orelse "");
+        }
+
+        switch (tok.type) {
+            .scalar => {
+                self.scanner.skipToken();
+                self.state = self.popState();
+                return .{
+                    .type = .scalar,
+                    .start = start_mark,
+                    .end = tok.end,
+                    .data = .{ .scalar = .{
+                        .value = tok.data.scalar.value,
+                        .style = tok.data.scalar.style,
+                        .anchor = anchor,
+                        .tag = tag,
+                    } },
+                };
+            },
+            .flow_sequence_start => {
+                self.state = .flow_sequence_first_entry;
+                try self.pushMark(tok.start);
+                return .{
+                    .type = .sequence_start,
+                    .start = start_mark,
+                    .end = tok.end,
+                    .data = .{ .collection_start = .{ .style = .flow, .anchor = anchor, .tag = tag } },
+                };
+            },
+            .flow_mapping_start => {
+                self.state = .flow_mapping_first_key;
+                try self.pushMark(tok.start);
+                return .{
+                    .type = .mapping_start,
+                    .start = start_mark,
+                    .end = tok.end,
+                    .data = .{ .collection_start = .{ .style = .flow, .anchor = anchor, .tag = tag } },
+                };
+            },
+            else => {},
+        }
+        if (block and tok.type == .block_sequence_start) {
+            self.state = .block_sequence_first_entry;
+            try self.pushMark(tok.start);
+            return .{
+                .type = .sequence_start,
+                .start = start_mark,
+                .end = tok.end,
+                .data = .{ .collection_start = .{ .style = .block, .anchor = anchor, .tag = tag } },
+            };
+        }
+        if (block and tok.type == .block_mapping_start) {
+            self.state = .block_mapping_first_key;
+            try self.pushMark(tok.start);
+            return .{
+                .type = .mapping_start,
+                .start = start_mark,
+                .end = tok.end,
+                .data = .{ .collection_start = .{ .style = .block, .anchor = anchor, .tag = tag } },
+            };
+        }
+        if (block and indentless_sequence and tok.type == .block_entry) {
+            self.state = .indentless_sequence_entry;
+            try self.pushMark(tok.start);
+            return .{
+                .type = .sequence_start,
+                .start = start_mark,
+                .end = tok.end,
+                .data = .{ .collection_start = .{ .style = .block, .anchor = anchor, .tag = tag } },
+            };
+        }
+
+        // Anchor or tag with no content means an empty plain scalar.
+        if (anchor != null or tag != null) {
+            self.state = self.popState();
+            return .{
+                .type = .scalar,
+                .start = start_mark,
+                .end = tok.start,
+                .data = .{ .scalar = .{ .value = "", .style = .plain, .anchor = anchor, .tag = tag } },
+            };
+        }
+
+        return self.fail(tok.start, "did not find expected node content", .{});
+    }
+
+    // ------------------------------------------------------------------
+    // Block sequences and mappings
+    // ------------------------------------------------------------------
+
+    fn parseBlockSequenceEntry(self: *Parser, first: bool) !Event {
+        var tok = try self.peekToken();
+        if (first and tok.type == .block_sequence_start) {
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+        }
+        if (tok.type == .block_entry) {
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+            if (tok.type != .block_entry and tok.type != .block_end) {
+                try self.pushState(.block_sequence_entry);
+                return self.parseNode(true, false);
+            }
+            self.state = .block_sequence_entry;
+            return self.processEmptyScalar(tok.start);
+        }
+        if (tok.type == .block_end) {
+            self.scanner.skipToken();
+            self.state = self.popState();
+            _ = self.marks.pop();
+            return .{ .type = .sequence_end, .start = tok.start, .end = tok.end };
+        }
+        return self.fail(tok.start, "did not find expected '-' indicator", .{});
+    }
+
+    fn parseIndentlessSequenceEntry(self: *Parser) !Event {
+        var tok = try self.peekToken();
+        if (tok.type == .block_entry) {
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+            if (tok.type != .block_entry and tok.type != .key and
+                tok.type != .value and tok.type != .block_end)
+            {
+                try self.pushState(.indentless_sequence_entry);
+                return self.parseNode(true, false);
+            }
+            self.state = .indentless_sequence_entry;
+            return self.processEmptyScalar(tok.start);
+        }
+        self.state = self.popState();
+        _ = self.marks.pop();
+        return .{ .type = .sequence_end, .start = tok.start, .end = tok.start };
+    }
+
+    fn parseBlockMappingKey(self: *Parser, first: bool) !Event {
+        var tok = try self.peekToken();
+        if (first and tok.type == .block_mapping_start) {
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+        }
+        if (tok.type == .key) {
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+            if (tok.type != .key and tok.type != .value and tok.type != .block_end) {
+                try self.pushState(.block_mapping_value);
+                return self.parseNode(true, false);
+            }
+            self.state = .block_mapping_value;
+            return self.processEmptyScalar(tok.start);
+        }
+        if (tok.type == .value) {
+            // Missing (empty) key.
+            self.state = .block_mapping_value;
+            return self.processEmptyScalar(tok.start);
+        }
+        if (tok.type == .block_end) {
+            self.scanner.skipToken();
+            self.state = self.popState();
+            _ = self.marks.pop();
+            return .{ .type = .mapping_end, .start = tok.start, .end = tok.end };
+        }
+        return self.fail(tok.start, "did not find expected key", .{});
+    }
+
+    fn parseBlockMappingValue(self: *Parser) !Event {
+        var tok = try self.peekToken();
+        if (tok.type == .value) {
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+            if (tok.type != .key and tok.type != .value and tok.type != .block_end) {
+                try self.pushState(.block_mapping_key);
+                return self.parseNode(true, true);
+            }
+            self.state = .block_mapping_key;
+            return self.processEmptyScalar(tok.start);
+        }
+        self.state = .block_mapping_key;
+        return self.processEmptyScalar(tok.start);
+    }
+
+    // ------------------------------------------------------------------
+    // Flow collections
+    // ------------------------------------------------------------------
+
+    fn parseFlowSequenceEntry(self: *Parser, first: bool) !Event {
+        var tok = try self.peekToken();
+        if (first and tok.type == .flow_sequence_start) {
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+        }
+        if (tok.type != .flow_sequence_end) {
+            if (!first) {
+                if (tok.type == .flow_entry) {
+                    self.scanner.skipToken();
+                    tok = try self.peekToken();
+                } else {
+                    return self.fail(tok.start, "did not find expected ',' or ']'", .{});
+                }
+            }
+            if (tok.type != .flow_sequence_end) {
+                if (tok.type == .key) {
+                    // Single-pair mapping inside a flow sequence: [a: b].
+                    self.scanner.skipToken();
+                    self.state = .flow_sequence_entry_mapping_key;
+                    try self.pushMark(tok.start);
+                    return .{
+                        .type = .mapping_start,
+                        .start = tok.start,
+                        .end = tok.start,
+                        .data = .{ .collection_start = .{ .style = .flow, .anchor = null, .tag = null } },
+                    };
+                }
+                try self.pushState(.flow_sequence_entry);
+                return self.parseNode(false, false);
+            }
+        }
+        self.scanner.skipToken();
+        self.state = self.popState();
+        _ = self.marks.pop();
+        return .{ .type = .sequence_end, .start = tok.start, .end = tok.end };
+    }
+
+    fn parseFlowSequenceEntryMappingKey(self: *Parser) !Event {
+        const tok = try self.peekToken();
+        if (tok.type != .value and tok.type != .flow_entry and tok.type != .flow_sequence_end) {
+            try self.pushState(.flow_sequence_entry_mapping_value);
+            return self.parseNode(false, false);
+        }
+        self.state = .flow_sequence_entry_mapping_value;
+        return self.processEmptyScalar(tok.start);
+    }
+
+    fn parseFlowSequenceEntryMappingValue(self: *Parser) !Event {
+        var tok = try self.peekToken();
+        if (tok.type == .value) {
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+            if (tok.type != .flow_entry and tok.type != .flow_sequence_end) {
+                try self.pushState(.flow_sequence_entry_mapping_end);
+                return self.parseNode(false, false);
+            }
+        }
+        self.state = .flow_sequence_entry_mapping_end;
+        return self.processEmptyScalar(tok.start);
+    }
+
+    fn parseFlowSequenceEntryMappingEnd(self: *Parser) !Event {
+        const tok = try self.peekToken();
+        self.state = .flow_sequence_entry;
+        _ = self.marks.pop();
+        return .{ .type = .mapping_end, .start = tok.start, .end = tok.start };
+    }
+
+    fn parseFlowMappingKey(self: *Parser, first: bool) !Event {
+        var tok = try self.peekToken();
+        if (first and tok.type == .flow_mapping_start) {
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+        }
+        if (tok.type != .flow_mapping_end) {
+            if (!first) {
+                if (tok.type == .flow_entry) {
+                    self.scanner.skipToken();
+                    tok = try self.peekToken();
+                } else {
+                    return self.fail(tok.start, "did not find expected ',' or '}}'", .{});
+                }
+            }
+            if (tok.type == .key) {
+                self.scanner.skipToken();
+                tok = try self.peekToken();
+                if (tok.type != .value and tok.type != .flow_entry and tok.type != .flow_mapping_end) {
+                    try self.pushState(.flow_mapping_value);
+                    return self.parseNode(false, false);
+                }
+                self.state = .flow_mapping_value;
+                return self.processEmptyScalar(tok.start);
+            }
+            if (tok.type != .flow_mapping_end) {
+                try self.pushState(.flow_mapping_empty_value);
+                return self.parseNode(false, false);
+            }
+        }
+        self.scanner.skipToken();
+        self.state = self.popState();
+        _ = self.marks.pop();
+        return .{ .type = .mapping_end, .start = tok.start, .end = tok.end };
+    }
+
+    fn parseFlowMappingValue(self: *Parser, empty: bool) !Event {
+        var tok = try self.peekToken();
+        if (!empty and tok.type == .value) {
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+            if (tok.type != .flow_entry and tok.type != .flow_mapping_end) {
+                try self.pushState(.flow_mapping_key);
+                return self.parseNode(false, false);
+            }
+        }
+        self.state = .flow_mapping_key;
+        return self.processEmptyScalar(tok.start);
+    }
+};
+
+// ----------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn eventTypes(alloc: std.mem.Allocator, input: []const u8) !std.ArrayList(EventType) {
+    var p = try Parser.init(alloc, null, input);
+    defer p.deinit();
+    var out: std.ArrayList(EventType) = .empty;
+    errdefer out.deinit(alloc);
+    while (try p.nextEvent()) |ev| try out.append(alloc, ev.type);
+    return out;
+}
+
+test "scalar document events" {
+    var evs = try eventTypes(testing.allocator, "hello\n");
+    defer evs.deinit(testing.allocator);
+    const want: []const EventType = &.{
+        .stream_start, .document_start, .scalar, .document_end, .stream_end,
+    };
+    try testing.expectEqualSlices(EventType, want, evs.items);
+}
+
+test "mapping events" {
+    var evs = try eventTypes(testing.allocator, "a: 1\nb: [2, 3]\n");
+    defer evs.deinit(testing.allocator);
+    const want: []const EventType = &.{
+        .stream_start,    .document_start, .mapping_start,   .scalar,
+        .scalar,          .scalar,         .sequence_start,  .scalar,
+        .scalar,          .sequence_end,   .mapping_end,     .document_end,
+        .stream_end,
+    };
+    try testing.expectEqualSlices(EventType, want, evs.items);
+}
+
+test "indentless sequence events" {
+    var evs = try eventTypes(testing.allocator, "a:\n- 1\n- 2\n");
+    defer evs.deinit(testing.allocator);
+    const want: []const EventType = &.{
+        .stream_start,   .document_start,  .mapping_start,  .scalar,
+        .sequence_start, .scalar,          .scalar,         .sequence_end,
+        .mapping_end,    .document_end,    .stream_end,
+    };
+    try testing.expectEqualSlices(EventType, want, evs.items);
+}
+
+test "alias event" {
+    var evs = try eventTypes(testing.allocator, "- &x 1\n- *x\n");
+    defer evs.deinit(testing.allocator);
+    const want: []const EventType = &.{
+        .stream_start,    .document_start, .sequence_start, .scalar,
+        .alias,           .sequence_end,   .document_end,   .stream_end,
+    };
+    try testing.expectEqualSlices(EventType, want, evs.items);
+}
+
+test "explicit document events" {
+    var evs = try eventTypes(testing.allocator, "%YAML 1.2\n---\nx\n...\n");
+    defer evs.deinit(testing.allocator);
+    const want: []const EventType = &.{
+        .stream_start, .document_start, .scalar, .document_end, .stream_end,
+    };
+    try testing.expectEqualSlices(EventType, want, evs.items);
+}
+
+test "tag resolution" {
+    var p = try Parser.init(testing.allocator, null, "a: !!int 42\nb: !<tag:example.com:t> v\n");
+    defer p.deinit();
+    var tags: std.ArrayList(?[]const u8) = .empty;
+    defer tags.deinit(testing.allocator);
+    while (try p.nextEvent()) |ev| {
+        if (ev.type == .scalar) try tags.append(testing.allocator, ev.data.scalar.tag);
+    }
+    try testing.expectEqualStrings("tag:yaml.org,2002:int", tags.items[1].?);
+    try testing.expectEqualStrings("tag:example.com:t", tags.items[3].?);
+}
