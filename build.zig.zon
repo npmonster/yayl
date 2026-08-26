@@ -3,5 +3,7 @@
     .fingerprint = 0xc49f7ed1a8db0b85,
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
+    .description = "YAYL: Yet Another YAML Library for Zig. Comment-preserving, round-trip safe. By Null Pointer Monster.",
+    .license = "MIT",
     .paths = .{""},
 }

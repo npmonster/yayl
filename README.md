@@ -1,11 +1,16 @@
-# yayl
+# YAYL — Yet Another YAML Library
 
-A YAML parser and emitter for Zig, being converted from the battle-tested C
-library [libfyaml](https://github.com/pantoniou/libfyaml). The goal is a
-native-Zig implementation that supports both **reading** and **writing** YAML
-while following Zig community conventions: clear ownership, tagged unions
-instead of C type tags, `!T` error unions instead of integer error codes, and
-tests living next to the code they cover.
+> *Because the others eat your comments.*
+>
+> By **Null Pointer Monster**
+
+`yayl` is a YAML parser and emitter for Zig with full read and write support.
+**This project was born from a direct conversion of the battle-tested C
+library [libfyaml](https://github.com/pantoniou/libfyaml) to native Zig** —
+module by module, behavior first. The goal is a YAML library that follows Zig
+community conventions — clear ownership, tagged unions instead of C type tags,
+`!T` error unions instead of integer error codes, tests living next to the
+code — while keeping libfyaml's observable semantics.
 
 > **Status:** early. A working scanner, parser, document model and emitter are
 > in place and round-trip a broad, practical subset of YAML (block and flow
@@ -14,9 +19,20 @@ tests living next to the code they cover.
 > comment-preserving round-trip editing via the CST — is the ongoing target.
 > See [AGENTS.md](AGENTS.md) for the conversion roadmap and how to help.
 
+## Credits
+
+yayl stands on the shoulders of **libfyaml**, the feature-complete YAML 1.2
+processing library written in C by **Pantelis Antoniou**
+([pantoniou/libfyaml](https://github.com/pantoniou/libfyaml)), released under
+the MIT license. The architecture, token/event model, and parsing strategy of
+this library are a direct port of that work — every intentional deviation is
+marked with a `PORT NOTE:` in the source. Huge thanks to the libfyaml project
+for producing such a clean, well-structured reference implementation; a
+faithful conversion would not be possible without it.
+
 ## Requirements
 
-- Zig 0.16.x (developed against 0.16.0)
+- Zig 0.16.x (developed against 0.16.0, the latest stable release)
 
 ## Build and test
 
@@ -96,19 +112,19 @@ core schema resolves it (`null`, `bool`, `int`, `float`, or `str`).
 
 ## Module layout
 
-| Module       | libfyaml analogue | Role                                   |
-| ------------ | ----------------- | -------------------------------------- |
-| `pool.zig`   | `fy-pool`         | Arena allocator wrapper                |
-| `diag.zig`   | `fy-diag`         | Marks, diagnostics, error set          |
-| `utf8.zig`   | `fy-utf8`         | UTF-8 decode/encode/validation         |
-| `ctype.zig`  | `fy-ctype`        | Byte-level character classification    |
-| `token.zig`  | (token types)     | Token + scalar style definitions       |
-| `scanner.zig`| `fy-scan`         | Tokenizer (indentation, simple keys)   |
-| `event.zig`  | `fy-event`        | Event definitions                      |
-| `parser.zig` | `fy-parse`        | Token stream -> event stream           |
-| `document.zig`| `fy-doc`/`fy-node`| Event stream -> node tree + mutation  |
-| `emitter.zig`| `fy-emit`         | Node tree -> YAML text                 |
-| `yaml.zig`   | `libfyaml.h`      | Public entry points                    |
+| Module          | libfyaml analogue        | Role                                   |
+| --------------- | ------------------------ | -------------------------------------- |
+| `pool.zig`      | `fy-pool`                | Arena allocator wrapper                |
+| `diag.zig`      | `fy-diag`                | Marks, diagnostics, error set          |
+| `utf8.zig`      | `fy-utf8`                | UTF-8 decode/encode/validation         |
+| `ctype.zig`     | `fy-ctype`               | Byte-level character classification    |
+| `token.zig`     | (token types)            | Token + scalar style definitions       |
+| `scanner.zig`   | `fy-scan`                | Tokenizer (indentation, simple keys)   |
+| `event.zig`     | `fy-event`               | Event definitions                      |
+| `parser.zig`    | `fy-parse`               | Token stream -> event stream           |
+| `document.zig`  | `fy-doc`/`fy-node`       | Event stream -> node tree + mutation   |
+| `emitter.zig`   | `fy-emit`                | Node tree -> YAML text                 |
+| `yaml.zig`      | `libfyaml.h`             | Public entry points                    |
 
 ## Errors
 
@@ -120,5 +136,5 @@ parser to collect human-readable messages with line/column marks.
 
 ## License
 
-To be decided. Note that this is a conversion of libfyaml, which is
-MIT-licensed; the resulting license should remain compatible and give credit.
+MIT — chosen to stay compatible with libfyaml, the C library this project is
+converted from. See [Credits](#credits).
