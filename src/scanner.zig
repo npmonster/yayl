@@ -530,7 +530,7 @@ pub const Scanner = struct {
         self.skipCp(); // '%'
 
         const name_start = self.pos;
-        while (ctype.isAlpha(self.at(0))) self.skipCp();
+        while (ctype.isWordChar(self.at(0))) self.skipCp();
         const name = self.input[name_start..self.pos];
         if (name.len == 0) {
             return self.fail(self.mark, "could not find expected directive name", .{});
@@ -568,7 +568,7 @@ pub const Scanner = struct {
         const start = self.mark;
         self.skipCp(); // '&' or '*'
         const name_start = self.pos;
-        while (ctype.isAlpha(self.at(0))) self.skipCp();
+        while (ctype.isWordChar(self.at(0))) self.skipCp();
         const name = self.input[name_start..self.pos];
         const c = self.at(0);
         const ok_after = ctype.isBlankz(c) or switch (c) {
@@ -612,7 +612,7 @@ pub const Scanner = struct {
             // otherwise the whole thing is a local tag with handle "!".
             const h_start = self.pos;
             var probe = h_start;
-            while (probe < self.input.len and ctype.isAlpha(self.input[probe])) probe += 1;
+            while (probe < self.input.len and ctype.isWordChar(self.input[probe])) probe += 1;
             const trailing_bang = probe < self.input.len and self.input[probe] == '!';
             if (trailing_bang) {
                 while (self.pos < probe) self.skipCp();
@@ -643,7 +643,7 @@ pub const Scanner = struct {
     fn scanTagUri(self: *Scanner) !void {
         while (true) {
             const c = self.at(0);
-            if (ctype.isAlpha(c)) {
+            if (ctype.isWordChar(c)) {
                 self.skipCp();
                 continue;
             }
@@ -677,14 +677,14 @@ pub const Scanner = struct {
         if (self.at(0) == '+' or self.at(0) == '-') {
             chomping = if (self.at(0) == '+') 1 else -1;
             self.skipCp();
-            if (ctype.isDigit(self.at(0))) {
+            if (std.ascii.isDigit(self.at(0))) {
                 increment = self.at(0) - '0';
                 if (increment == 0) {
                     return self.fail(self.mark, "found an indentation indicator equal to 0", .{});
                 }
                 self.skipCp();
             }
-        } else if (ctype.isDigit(self.at(0))) {
+        } else if (std.ascii.isDigit(self.at(0))) {
             increment = self.at(0) - '0';
             if (increment == 0) {
                 return self.fail(self.mark, "found an indentation indicator equal to 0", .{});
