@@ -2,12 +2,15 @@
 id: PLAN-9
 title: Refactor Yayl into an idiomatic, warning-free Zig 0.16 foundation
 created: 2026-08-26T11:26:32Z
-updated: 2026-08-26T11:26:32Z
+updated: 2026-08-26T15:27:16Z
 tags: [yayl, zig, quality, refactor, testing, architecture]
 deps: []
 skills: []
 review_rounds: 0
 priority: 1
+worker: qwen-code qwen3-coder
+reviewer: qwen-code qwen3-coder (self-review per user decision 2026-08-27)
+auto_review: true
 ---
 
 ## Plan
@@ -169,3 +172,4 @@ This card should be completed before PLAN-2. PLAN-3 through PLAN-8 already depen
 
 ## Log
 - 2026-08-26T11:26:32Z created
+- 2026-08-26T15:27:16Z Reproduced current state (Zig 0.16.0, sandbox-safe cache via ZIG_GLOBAL_CACHE_DIR=./.zig-cache-global): zig build + test Debug 47/47 pass; ReleaseSafe 47/47 pass; zig fmt --check clean; ast-check clean. Findings since card creation: #2 fingerprint present (0xc49f7ed1a8db0b85), #3 src/yaml.zig exists, #4 fmt clean, #5 Pool.init shadowing fixed (param renamed gpa), #6 Diag leak fixed (deinit frees messages). Still open: #9 Token/Event dual tag+payload (directive tag now exists), #10 isPrintableAscii 0x80-0xFF true (no external callers), #11 utf8.encode unvalidated + countCodepoints prefix semantics (no external callers), #12 create/createUninit duplicate (zeroes removed), #13 render 4096-byte silent-truncate remains, build.zig.zon .paths = all (needs narrowing), emit() missing errdefer on append failure.
