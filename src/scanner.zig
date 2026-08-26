@@ -1003,8 +1003,8 @@ pub const Scanner = struct {
                     (c == ',' or c == '[' or c == ']' or c == '{' or c == '}')) break;
                 if (c == ':' and
                     (ctype.isBlankz(self.at(1)) or
-                    (self.flow_level > 0 and
-                    (self.at(1) == ',' or self.at(1) == ']' or self.at(1) == '}')))) break;
+                        (self.flow_level > 0 and
+                            (self.at(1) == ',' or self.at(1) == ']' or self.at(1) == '}')))) break;
                 try self.readCp(&value);
             }
             if (!ctype.isBlank(self.at(0)) and !ctype.isBreak(self.at(0))) break;
@@ -1103,8 +1103,8 @@ test "simple key value" {
     const types = try tokenTypes(testing.allocator, toks.items);
     defer testing.allocator.free(types);
     const want: []const TokenType = &.{
-        .stream_start, .block_mapping_start, .key,     .scalar,
-        .value,          .scalar,              .block_end, .stream_end,
+        .stream_start, .block_mapping_start, .key,       .scalar,
+        .value,        .scalar,              .block_end, .stream_end,
     };
     try testing.expectEqualSlices(TokenType, want, types);
     try testing.expectEqualStrings("a", toks.items[3].data.scalar.value);
@@ -1118,8 +1118,8 @@ test "block sequence" {
     const types = try tokenTypes(testing.allocator, toks.items);
     defer testing.allocator.free(types);
     const want: []const TokenType = &.{
-        .stream_start,         .block_sequence_start, .block_entry, .scalar,
-        .block_entry,          .scalar,               .block_end,   .stream_end,
+        .stream_start, .block_sequence_start, .block_entry, .scalar,
+        .block_entry,  .scalar,               .block_end,   .stream_end,
     };
     try testing.expectEqualSlices(TokenType, want, types);
 }
@@ -1137,15 +1137,15 @@ test "nested mapping and sequence" {
     const types = try tokenTypes(testing.allocator, toks.items);
     defer testing.allocator.free(types);
     const want: []const TokenType = &.{
-        .stream_start,         .block_mapping_start, .key,
+        .stream_start, .block_mapping_start, .key,
         .scalar, // a
         .value,
-        .block_sequence_start, .block_entry,         .scalar, // x
-        .block_entry,          .scalar, // y
+        .block_sequence_start, .block_entry, .scalar, // x
+        .block_entry, .scalar, // y
         .block_end,
-        .key,                  .scalar, // b
-        .value,                .scalar, // c
-        .block_end,            .stream_end,
+        .key, .scalar, // b
+        .value,     .scalar, // c
+        .block_end, .stream_end,
     };
     try testing.expectEqualSlices(TokenType, want, types);
 }
@@ -1157,9 +1157,9 @@ test "flow collections" {
     const types = try tokenTypes(testing.allocator, toks.items);
     defer testing.allocator.free(types);
     const want: []const TokenType = &.{
-        .stream_start,        .flow_sequence_start, .scalar,             .flow_entry,
-        .flow_mapping_start,  .key,                 .scalar,             .value,
-        .scalar,              .flow_mapping_end,    .flow_sequence_end,  .stream_end,
+        .stream_start,       .flow_sequence_start, .scalar,            .flow_entry,
+        .flow_mapping_start, .key,                 .scalar,            .value,
+        .scalar,             .flow_mapping_end,    .flow_sequence_end, .stream_end,
     };
     try testing.expectEqualSlices(TokenType, want, types);
 }
@@ -1213,9 +1213,9 @@ test "anchor alias tag" {
     const types = try tokenTypes(testing.allocator, toks.items);
     defer testing.allocator.free(types);
     const want: []const TokenType = &.{
-        .stream_start,         .block_sequence_start, .block_entry, .anchor,
-        .tag,                  .scalar,               .block_entry, .alias,
-        .block_entry,          .tag,                  .scalar,      .block_end,
+        .stream_start, .block_sequence_start, .block_entry, .anchor,
+        .tag,          .scalar,               .block_entry, .alias,
+        .block_entry,  .tag,                  .scalar,      .block_end,
         .stream_end,
     };
     try testing.expectEqualSlices(TokenType, want, types);
@@ -1234,9 +1234,9 @@ test "document markers and directives" {
     const types = try tokenTypes(testing.allocator, toks.items);
     defer testing.allocator.free(types);
     const want: []const TokenType = &.{
-        .stream_start,   .directive,     .document_start, .block_mapping_start,
-        .key,            .scalar,        .value,          .scalar,
-        .block_end,      .document_end,  .stream_end,
+        .stream_start, .directive,    .document_start, .block_mapping_start,
+        .key,          .scalar,       .value,          .scalar,
+        .block_end,    .document_end, .stream_end,
     };
     try testing.expectEqualSlices(TokenType, want, types);
     const d = toks.items[1].data.directive;

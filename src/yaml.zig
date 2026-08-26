@@ -91,7 +91,7 @@ test "build a document programmatically" {
     const root = try doc.createMapping();
     doc.root = root;
     const list = try doc.createSequence();
-    try doc.pathSet(&.{ "items" }, list);
+    try doc.pathSet(&.{"items"}, list);
     try doc.sequenceAppend(list, try doc.createScalar("one", .plain));
     try doc.sequenceAppend(list, try doc.createScalar("two", .plain));
 
@@ -159,4 +159,3 @@ test "deep nesting and empty collections" {
     try std.testing.expect(doc2.pathGet(&.{ "a", "b", "c" }).?.isSequence());
     try std.testing.expect(doc2.pathGet(&.{ "a", "d" }).?.isMapping());
 }
-

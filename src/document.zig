@@ -172,7 +172,8 @@ fn looksLikeFloat(value: []const u8) bool {
     for (value, 0..) |c, i| {
         switch (c) {
             '0'...'9' => has_digit = true,
-            '.', => has_dot = true,
+            '.',
+            => has_dot = true,
             'e', 'E' => {
                 if (i == 0 or !has_digit) return false;
                 has_exp = true;
@@ -617,7 +618,7 @@ test "builder API and path API" {
     doc.root = root;
     try doc.pathSet(&.{ "server", "host" }, try doc.createScalar("localhost", .plain));
     try doc.pathSet(&.{ "server", "port" }, try doc.createScalar("8080", .plain));
-    try doc.pathSet(&.{ "debug" }, try doc.createScalar("true", .plain));
+    try doc.pathSet(&.{"debug"}, try doc.createScalar("true", .plain));
 
     try testing.expectEqualStrings("localhost", doc.pathGet(&.{ "server", "host" }).?.scalarValue().?);
     try testing.expectEqualStrings("8080", doc.pathGet(&.{ "server", "port" }).?.scalarValue().?);
@@ -627,9 +628,9 @@ test "builder API and path API" {
     const server = doc.root.?.lookup("server").?;
     try testing.expectEqualStrings("example.org", server.pairs().?[0].value.scalarValue().?);
 
-    try testing.expect(try doc.pathDelete(&.{ "debug" }));
-    try testing.expect(doc.pathGet(&.{ "debug" }) == null);
-    try testing.expect(!(try doc.pathDelete(&.{ "debug" })));
+    try testing.expect(try doc.pathDelete(&.{"debug"}));
+    try testing.expect(doc.pathGet(&.{"debug"}) == null);
+    try testing.expect(!(try doc.pathDelete(&.{"debug"})));
 }
 
 test "sequence mutation" {

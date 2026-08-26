@@ -111,10 +111,10 @@ test "decode ascii and multibyte" {
 }
 
 test "reject invalid sequences" {
-    try @import("std").testing.expect(!valid(&[_]u8{0xC0, 0x80})); // overlong NUL
-    try @import("std").testing.expect(!valid(&[_]u8{0xED, 0xA0, 0x80})); // surrogate
-    try @import("std").testing.expect(!valid(&[_]u8{0xF4, 0x90, 0x80, 0x80})); // > U+10FFFF
-    try @import("std").testing.expect(!valid(&[_]u8{0xE2, 0x82})); // truncated
+    try @import("std").testing.expect(!valid(&[_]u8{ 0xC0, 0x80 })); // overlong NUL
+    try @import("std").testing.expect(!valid(&[_]u8{ 0xED, 0xA0, 0x80 })); // surrogate
+    try @import("std").testing.expect(!valid(&[_]u8{ 0xF4, 0x90, 0x80, 0x80 })); // > U+10FFFF
+    try @import("std").testing.expect(!valid(&[_]u8{ 0xE2, 0x82 })); // truncated
 }
 
 test "encode roundtrip" {

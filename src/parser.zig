@@ -733,9 +733,9 @@ test "mapping events" {
     var evs = try eventTypes(testing.allocator, "a: 1\nb: [2, 3]\n");
     defer evs.deinit(testing.allocator);
     const want: []const EventType = &.{
-        .stream_start,    .document_start, .mapping_start,   .scalar,
-        .scalar,          .scalar,         .sequence_start,  .scalar,
-        .scalar,          .sequence_end,   .mapping_end,     .document_end,
+        .stream_start, .document_start, .mapping_start,  .scalar,
+        .scalar,       .scalar,         .sequence_start, .scalar,
+        .scalar,       .sequence_end,   .mapping_end,    .document_end,
         .stream_end,
     };
     try testing.expectEqualSlices(EventType, want, evs.items);
@@ -745,9 +745,9 @@ test "indentless sequence events" {
     var evs = try eventTypes(testing.allocator, "a:\n- 1\n- 2\n");
     defer evs.deinit(testing.allocator);
     const want: []const EventType = &.{
-        .stream_start,   .document_start,  .mapping_start,  .scalar,
-        .sequence_start, .scalar,          .scalar,         .sequence_end,
-        .mapping_end,    .document_end,    .stream_end,
+        .stream_start,   .document_start, .mapping_start, .scalar,
+        .sequence_start, .scalar,         .scalar,        .sequence_end,
+        .mapping_end,    .document_end,   .stream_end,
     };
     try testing.expectEqualSlices(EventType, want, evs.items);
 }
@@ -756,8 +756,8 @@ test "alias event" {
     var evs = try eventTypes(testing.allocator, "- &x 1\n- *x\n");
     defer evs.deinit(testing.allocator);
     const want: []const EventType = &.{
-        .stream_start,    .document_start, .sequence_start, .scalar,
-        .alias,           .sequence_end,   .document_end,   .stream_end,
+        .stream_start, .document_start, .sequence_start, .scalar,
+        .alias,        .sequence_end,   .document_end,   .stream_end,
     };
     try testing.expectEqualSlices(EventType, want, evs.items);
 }
