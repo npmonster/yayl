@@ -184,7 +184,9 @@ pub const Scanner = struct {
 
     /// Advance over one codepoint (must not be a line break).
     fn skipCp(self: *Scanner) void {
-        const r = utf8.decode(self.input, self.pos) orelse unreachable;
+        // Input is UTF-8-validated in init and the cursor is on a
+        // character, so neither error nor EOF can occur here.
+        const r = (utf8.decode(self.input, self.pos) catch unreachable) orelse unreachable;
         self.pos += r.len;
         self.mark.offset += r.len;
         self.mark.column += 1;
@@ -205,7 +207,7 @@ pub const Scanner = struct {
 
     /// Append the codepoint at the cursor to `out` and advance.
     fn readCp(self: *Scanner, out: *std.ArrayList(u8)) !void {
-        const r = utf8.decode(self.input, self.pos) orelse unreachable;
+        const r = (utf8.decode(self.input, self.pos) catch unreachable) orelse unreachable;
         try out.appendSlice(self.alloc, self.input[self.pos .. self.pos + r.len]);
         self.skipCp();
     }
@@ -961,7 +963,7 @@ pub const Scanner = struct {
         }
         if (c != 'x' and c != 'u' and c != 'U') self.skipCp();
         var buf: [4]u8 = undefined;
-        const len = utf8.encode(cp, &buf);
+        const len = try utf8.encode(cp, &buf);
         try value.appendSlice(self.alloc, buf[0..len]);
     }
 

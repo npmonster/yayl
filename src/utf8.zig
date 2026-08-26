@@ -1,93 +1,90 @@
-//! UTF-8 codec — Zig port of libfyaml's fy-utf8.
+//! UTF-8 codec for the scanner — strict RFC 3629 UTF-8 built on
+//! `std.unicode`.
 //!
-//! Deliberately small: validate, decode, encode and measure. The scanner
-//! counts columns in codepoints, so every consumed character goes through
-//! `decode` which enforces strict RFC 3629 UTF-8 (no overlong forms, no
-//! surrogates, nothing above U+10FFFF).
+//! libfyaml carries its own fy-utf8; instead of a hand-rolled port, YAYL
+//! reuses `std.unicode` (which already rejects overlong forms, surrogates
+//! and everything above U+10FFFF) and wraps it only where the scanner
+//! needs index-position and EOF semantics the standard functions do not
+//! offer:
+//!
+//!  * `decode` works at an arbitrary index and distinguishes end of input
+//!    (null) from malformed input (`error.InvalidUtf8`); the sized
+//!    `std.unicode.utf8Decode*` functions assume an exactly-sized array.
+//!  * `encode` narrows the two std "cannot encode" errors into one, so
+//!    escape handling reports a single condition.
+//!  * `countCodepoints` fails on invalid input instead of counting a
+//!    valid prefix.
+//!
+//! PORT NOTE: libfyaml's fy_utf8_* helpers collapse into this module.
+
+const std = @import("std");
 
 pub const DecodeResult = struct {
     cp: u21,
     len: usize,
 };
 
-/// Decode one codepoint at `bytes[i]`. Returns null on EOF or invalid input.
-pub fn decode(bytes: []const u8, i: usize) ?DecodeResult {
+pub const DecodeError = error{
+    /// The byte at `i` does not begin a valid UTF-8 sequence: bad lead
+    /// byte, truncated sequence, overlong encoding, encoded surrogate or
+    /// value above U+10FFFF.
+    InvalidUtf8,
+};
+
+/// Decode one codepoint at `bytes[i]`.
+///
+/// Returns null on end of input and `error.InvalidUtf8` on malformed
+/// input — the two are deliberately distinct so callers can position a
+/// diagnostic on malformed bytes while treating EOF as a normal
+/// terminator.
+pub fn decode(bytes: []const u8, i: usize) DecodeError!?DecodeResult {
     if (i >= bytes.len) return null;
-    const b0 = bytes[i];
-    if (b0 < 0x80) return .{ .cp = b0, .len = 1 };
-
-    var len: usize = 0;
-    var cp: u21 = 0;
-    var min: u21 = 0;
-    if (b0 >= 0xC2 and b0 <= 0xDF) {
-        len = 2;
-        cp = @as(u21, b0 & 0x1F);
-        min = 0x80;
-    } else if (b0 >= 0xE0 and b0 <= 0xEF) {
-        len = 3;
-        cp = @as(u21, b0 & 0x0F);
-        min = 0x800;
-    } else if (b0 >= 0xF0 and b0 <= 0xF4) {
-        len = 4;
-        cp = @as(u21, b0 & 0x07);
-        min = 0x10000;
-    } else return null;
-
-    if (i + len > bytes.len) return null;
-    for (1..len) |k| {
-        const b = bytes[i + k];
-        if (b < 0x80 or b > 0xBF) return null;
-        cp = (cp << 6) | @as(u21, b & 0x3F);
-    }
-    // Reject overlong encodings, surrogates and out-of-range values.
-    if (cp < min or (cp >= 0xD800 and cp <= 0xDFFF) or cp > 0x10FFFF) return null;
+    const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch return error.InvalidUtf8;
+    if (i + len > bytes.len) return error.InvalidUtf8;
+    const cp: u21 = switch (len) {
+        1 => bytes[i],
+        2 => std.unicode.utf8Decode2(bytes[i..][0..2].*) catch return error.InvalidUtf8,
+        3 => std.unicode.utf8Decode3(bytes[i..][0..3].*) catch return error.InvalidUtf8,
+        4 => std.unicode.utf8Decode4(bytes[i..][0..4].*) catch return error.InvalidUtf8,
+        else => unreachable, // utf8ByteSequenceLength only returns 1..4
+    };
     return .{ .cp = cp, .len = len };
 }
 
-/// Encode one codepoint into `out`, returning the number of bytes written.
-/// `out` must have room for at least 4 bytes.
-pub fn encode(cp: u21, out: *[4]u8) usize {
-    if (cp < 0x80) {
-        out[0] = @intCast(cp);
-        return 1;
-    } else if (cp < 0x800) {
-        out[0] = @intCast(0xC0 | (cp >> 6));
-        out[1] = @intCast(0x80 | (cp & 0x3F));
-        return 2;
-    } else if (cp < 0x10000) {
-        out[0] = @intCast(0xE0 | (cp >> 12));
-        out[1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
-        out[2] = @intCast(0x80 | (cp & 0x3F));
-        return 3;
-    } else {
-        out[0] = @intCast(0xF0 | (cp >> 18));
-        out[1] = @intCast(0x80 | ((cp >> 12) & 0x3F));
-        out[2] = @intCast(0x80 | ((cp >> 6) & 0x3F));
-        out[3] = @intCast(0x80 | (cp & 0x3F));
-        return 4;
-    }
+pub const EncodeError = error{
+    /// The codepoint is a UTF-16 surrogate half or above U+10FFFF and
+    /// has no UTF-8 representation.
+    InvalidCodepoint,
+};
+
+/// Encode one codepoint into `out`, returning the number of bytes
+/// written. `out` must have room for at least 4 bytes.
+pub fn encode(cp: u21, out: *[4]u8) EncodeError!usize {
+    const len = std.unicode.utf8Encode(cp, out) catch return error.InvalidCodepoint;
+    return len;
 }
 
 /// Strictly validate a whole buffer.
 pub fn valid(bytes: []const u8) bool {
-    var i: usize = 0;
-    while (i < bytes.len) {
-        const r = decode(bytes, i) orelse return false;
-        i += r.len;
-    }
-    return true;
+    return std.unicode.utf8ValidateSlice(bytes);
 }
 
-/// Number of codepoints in a valid UTF-8 buffer.
-pub fn countCodepoints(bytes: []const u8) usize {
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < bytes.len) {
-        const r = decode(bytes, i) orelse break;
-        i += r.len;
-        n += 1;
-    }
-    return n;
+/// Number of codepoints in a buffer; `error.InvalidUtf8` on malformed
+/// input. (Never returns a valid-prefix count — callers that want prefix
+/// semantics must say so.)
+pub fn countCodepoints(bytes: []const u8) DecodeError!usize {
+    return std.unicode.utf8CountCodepoints(bytes) catch error.InvalidUtf8;
+}
+
+/// YAML 1.2 §5.1 printable codepoint: the characters that may appear in
+/// a YAML character stream. Distinct from UTF-8 validity — a codepoint
+/// can be valid UTF-8 yet unprintable (e.g. U+0007 BEL).
+pub fn isPrintableCodepoint(cp: u21) bool {
+    return switch (cp) {
+        0x9, 0xA, 0xD, 0x85 => true,
+        0x20...0x7E, 0xA0...0xD7FF, 0xE000...0xFFFD, 0x10000...0x10FFFF => true,
+        else => false,
+    };
 }
 
 test "decode ascii and multibyte" {
@@ -100,30 +97,125 @@ test "decode ascii and multibyte" {
         .{ .cp = 0x1F600, .len = 4 },
     };
     for (expect) |e| {
-        const r = decode(s, i).?;
-        try @import("std").testing.expectEqual(e.cp, r.cp);
-        try @import("std").testing.expectEqual(e.len, r.len);
+        const r = (try decode(s, i)).?;
+        try std.testing.expectEqual(e.cp, r.cp);
+        try std.testing.expectEqual(e.len, r.len);
         i += r.len;
     }
-    try @import("std").testing.expectEqual(s.len, i);
-    try @import("std").testing.expect(valid(s));
-    try @import("std").testing.expectEqual(@as(usize, 4), countCodepoints(s));
+    try std.testing.expectEqual(s.len, i);
+    try std.testing.expect(valid(s));
+    try std.testing.expectEqual(@as(usize, 4), try countCodepoints(s));
+    // EOF is null, not an error.
+    try std.testing.expectEqual(@as(?DecodeResult, null), try decode(s, i));
+    try std.testing.expectEqual(@as(?DecodeResult, null), try decode("", 0));
 }
 
-test "reject invalid sequences" {
-    try @import("std").testing.expect(!valid(&[_]u8{ 0xC0, 0x80 })); // overlong NUL
-    try @import("std").testing.expect(!valid(&[_]u8{ 0xED, 0xA0, 0x80 })); // surrogate
-    try @import("std").testing.expect(!valid(&[_]u8{ 0xF4, 0x90, 0x80, 0x80 })); // > U+10FFFF
-    try @import("std").testing.expect(!valid(&[_]u8{ 0xE2, 0x82 })); // truncated
+test "malformed input is an error, distinct from EOF" {
+    const cases = [_][]const u8{
+        &.{ 0xC0, 0x80 }, // overlong NUL
+        &.{ 0xC1, 0xBF }, // overlong (lead byte C1 is never valid)
+        &.{ 0xED, 0xA0, 0x80 }, // encoded surrogate U+D800
+        &.{ 0xED, 0xBF, 0xBF }, // encoded surrogate U+DFFF
+        &.{ 0xF4, 0x90, 0x80, 0x80 }, // above U+10FFFF
+        &.{ 0xE2, 0x82 }, // truncated 3-byte sequence
+        &.{0x80}, // lone continuation byte
+        &.{ 0xF5, 0x80, 0x80, 0x80 }, // lead byte beyond F4
+        &.{ 0xE2, 0x28, 0xA1 }, // non-continuation inside sequence
+    };
+    for (cases) |c| {
+        try std.testing.expectError(error.InvalidUtf8, decode(c, 0));
+        try std.testing.expect(!valid(c));
+        try std.testing.expectError(error.InvalidUtf8, countCodepoints(c));
+    }
 }
 
-test "encode roundtrip" {
-    const std = @import("std");
-    for ([_]u21{ 0x41, 0xE9, 0x4E2D, 0x10FFFF }) |cp| {
+test "encode roundtrip at the 1/2/3/4-byte boundaries" {
+    const boundaries = [_]u21{ 0x0, 0x7F, 0x80, 0x7FF, 0x800, 0xFFFF, 0x10000, 0x10FFFF };
+    for (boundaries) |cp| {
         var buf: [4]u8 = undefined;
-        const len = encode(cp, &buf);
-        const r = decode(buf[0..len], 0).?;
+        const len = try encode(cp, &buf);
+        try std.testing.expectEqual(@as(usize, std.unicode.utf8CodepointSequenceLength(cp) catch unreachable), len);
+        const r = (try decode(buf[0..len], 0)).?;
         try std.testing.expectEqual(cp, r.cp);
         try std.testing.expectEqual(len, r.len);
+    }
+}
+
+test "encode rejects surrogates and out-of-range values" {
+    var buf: [4]u8 = undefined;
+    for ([_]u21{ 0xD800, 0xDFFF, 0x110000, 0x1FFFFF }) |cp| {
+        try std.testing.expectError(error.InvalidCodepoint, encode(cp, &buf));
+    }
+}
+
+test "encode agrees with std.unicode.utf8ValidCodepoint" {
+    // Sample every boundary neighbourhood rather than the full u21 range.
+    var cp: u21 = 0;
+    var buf: [4]u8 = undefined;
+    while (cp <= 0x110001) : (cp += 1) {
+        if (cp > 0x1200 and cp < 0xD7F0) {
+            cp = 0xD7F0; // skip the large valid middle
+            continue;
+        }
+        if (cp > 0xE010 and cp < 0xFFE0) {
+            cp = 0xFFE0;
+            continue;
+        }
+        const result = encode(cp, &buf);
+        if (std.unicode.utf8ValidCodepoint(cp)) {
+            const len = try result;
+            try std.testing.expectEqual(@as(usize, std.unicode.utf8CodepointSequenceLength(cp) catch unreachable), len);
+        } else {
+            try std.testing.expectError(error.InvalidCodepoint, result);
+        }
+    }
+}
+
+test "valid agrees with std.unicode on random buffers" {
+    var prng = std.Random.DefaultPrng.init(0x7a6d); // fixed seed: deterministic
+    const random = prng.random();
+    var buf: [64]u8 = undefined;
+    var iteration: usize = 0;
+    while (iteration < 1000) : (iteration += 1) {
+        const len = random.uintAtMost(usize, buf.len);
+        random.bytes(buf[0..len]);
+        try std.testing.expectEqual(std.unicode.utf8ValidateSlice(buf[0..len]), valid(buf[0..len]));
+    }
+    // And on valid strings of every encoding length.
+    for ([_][]const u8{ "a", "é", "中", "😀", "aé中😀" }) |s| {
+        try std.testing.expect(valid(s));
+        try std.testing.expectEqual(std.unicode.utf8ValidateSlice(s), valid(s));
+    }
+}
+
+test "isPrintableCodepoint follows YAML 1.2 section 5.1" {
+    const cases = [_]struct { cp: u21, want: bool }{
+        .{ .cp = 0x8, .want = false },
+        .{ .cp = 0x9, .want = true }, // TAB
+        .{ .cp = 0xA, .want = true }, // LF
+        .{ .cp = 0xB, .want = false },
+        .{ .cp = 0xC, .want = false },
+        .{ .cp = 0xD, .want = true }, // CR
+        .{ .cp = 0x1F, .want = false },
+        .{ .cp = 0x20, .want = true },
+        .{ .cp = 0x7E, .want = true },
+        .{ .cp = 0x7F, .want = false }, // DEL
+        .{ .cp = 0x84, .want = false },
+        .{ .cp = 0x85, .want = true }, // NEL
+        .{ .cp = 0x86, .want = false },
+        .{ .cp = 0x9F, .want = false },
+        .{ .cp = 0xA0, .want = true },
+        .{ .cp = 0xD7FF, .want = true },
+        .{ .cp = 0xD800, .want = false }, // surrogate range excluded
+        .{ .cp = 0xDFFF, .want = false },
+        .{ .cp = 0xE000, .want = true },
+        .{ .cp = 0xFFFD, .want = true },
+        .{ .cp = 0xFFFE, .want = false },
+        .{ .cp = 0xFFFF, .want = false },
+        .{ .cp = 0x10000, .want = true },
+        .{ .cp = 0x10FFFF, .want = true },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(c.want, isPrintableCodepoint(c.cp));
     }
 }
