@@ -5,6 +5,7 @@
 //! recovery; the port returns Zig errors and unwinds naturally.
 
 const std = @import("std");
+const ctype = @import("ctype.zig");
 const diag = @import("diag.zig");
 const event_mod = @import("event.zig");
 const scanner_mod = @import("scanner.zig");
@@ -346,10 +347,27 @@ pub const Parser = struct {
         }
         for (self.tag_directives.items) |td| {
             if (std.mem.eql(u8, td.handle, handle)) {
-                const out = try self.alloc.alloc(u8, td.prefix.len + suffix.len);
-                @memcpy(out[0..td.prefix.len], td.prefix);
-                @memcpy(out[td.prefix.len..], suffix);
-                return self.trackBytes(out);
+                var out: std.ArrayList(u8) = .empty;
+                errdefer out.deinit(self.alloc);
+                try out.appendSlice(self.alloc, td.prefix);
+                // Tag suffixes are RFC 2396: %XX escapes are unescaped
+                // when the tag is resolved.
+                var i: usize = 0;
+                while (i < suffix.len) {
+                    if (suffix[i] == '%' and i + 3 <= suffix.len and
+                        ctype.hexValue(suffix[i + 1]) != null and
+                        ctype.hexValue(suffix[i + 2]) != null)
+                    {
+                        const hi = ctype.hexValue(suffix[i + 1]).?;
+                        const lo = ctype.hexValue(suffix[i + 2]).?;
+                        try out.append(self.alloc, (hi << 4) | lo);
+                        i += 3;
+                    } else {
+                        try out.append(self.alloc, suffix[i]);
+                        i += 1;
+                    }
+                }
+                return self.trackBytes(try out.toOwnedSlice(self.alloc));
             }
         }
         return self.fail(self.scanner.mark, "found undefined tag handle '{s}'", .{handle});
@@ -771,4 +789,18 @@ test "tag resolution" {
     }
     try testing.expectEqualStrings("tag:yaml.org,2002:int", tags.items[1].?);
     try testing.expectEqualStrings("tag:example.com:t", tags.items[3].?);
+}
+
+test "tag shorthand unescapes RFC 2396 escapes" {
+    const alloc = testing.allocator;
+    var p = try Parser.init(alloc, null, "%TAG !e! tag:example.com,2000:app/\n---\n- !e!tag%21 baz\n");
+    defer p.deinit();
+    var found = false;
+    while (try p.nextEvent()) |ev| {
+        if (ev.kind == .scalar) {
+            try testing.expectEqualStrings("tag:example.com,2000:app/tag!", ev.kind.scalar.tag.?);
+            found = true;
+        }
+    }
+    try testing.expect(found);
 }
