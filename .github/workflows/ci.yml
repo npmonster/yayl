@@ -1,0 +1,42 @@
+# yayl CI — pinned to the exact Zig version the library targets.
+# Every compiler, formatter and test-runner diagnostic is a failure:
+# the commands below exit non-zero on any error, and Zig 0.16 promotes
+# most warnings to errors on its own.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: zig version
+        run: zig version
+
+      - name: Format check
+        run: zig fmt --check build.zig build.zig.zon src
+
+      - name: Compile the library (analyse the public root)
+        run: zig build check --summary all
+
+      - name: Unit tests (Debug, leak-checked)
+        run: zig build test --summary all
+
+      - name: Unit tests (ReleaseSafe)
+        run: zig build test -Doptimize=ReleaseSafe --summary all
+
+      - name: Cross-target compile (x86_64-linux)
+        run: zig build check -Dtarget=x86_64-linux
+
+      - name: Cross-target compile (aarch64-linux)
+        run: zig build check -Dtarget=aarch64-linux
