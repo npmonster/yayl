@@ -37,13 +37,39 @@ faithful conversion would not be possible without it.
 ## Build and test
 
 ```sh
-zig build test                  # run all unit tests (Debug)
+zig build                       # compile the library (analyses the public root)
+zig build test                  # run all unit tests (Debug, leak-checked)
 zig build test -Doptimize=ReleaseSafe
+make verify                     # canonical gate: fmt + compile + Debug + ReleaseSafe
 ```
+
+Formatting must be clean: `zig fmt --check build.zig build.zig.zon src`
+(`make fmt` checks, `make fmt-write` fixes).
 
 The library is exposed as a build module named `yayl`. To depend on it from
 another package, add it in your `build.zig.zon` and wire the module in
 `build.zig`, then `@import("yayl")`.
+
+## Allocators and lifetimes
+
+yayl follows the Zig convention of caller-provided allocators with explicit
+lifetimes and no hidden allocation:
+
+- **`Document` owns an arena (`yaml.Pool`)**. Every node, string, anchor and
+  tag inside a parsed or built document lives in that arena and is freed in
+  one shot by `Document.deinit` — nothing inside a document is freed
+  individually.
+- **`Scanner` and `Parser` own transient buffers** (scratch byte buffers and
+  directive parameter lists) and release them in their `deinit`. Token and
+  event payload slices are arena-owned by the producer and stay valid until
+  that producer is reset or deinitialised; anything that must outlive the
+  parser (document nodes) is copied into the document pool during building.
+- **Rendering and diagnostics allocate through a caller-supplied
+  allocator**: `Document.write` and `Diag.render` return slices the caller
+  must free with the same allocator.
+
+No API transfers ownership implicitly; every function documents which
+allocator owns what it returns.
 
 ## Quick start
 
