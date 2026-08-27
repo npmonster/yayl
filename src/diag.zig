@@ -9,12 +9,15 @@ const std = @import("std");
 ///
 /// Corresponds to fy_mark: `line` and `column` are 1-based and count
 /// codepoints (not bytes); `offset` is the 0-based byte offset.
+/// The defaults (line 1, column 1, offset 0) are therefore a *valid*
+/// position — the start of the input — not an "unset" sentinel.
 pub const Mark = struct {
     line: usize = 1,
     column: usize = 1,
     offset: usize = 0,
 
-    pub const zero: Mark = .{};
+    /// The start of an input stream: line 1, column 1, byte offset 0.
+    pub const start: Mark = .{};
 };
 
 pub const Level = enum {
@@ -35,16 +38,23 @@ pub const Level = enum {
     }
 };
 
-/// One diagnostic message, owned by the arena of the parser that created it.
+/// One diagnostic message. `message` is owned by the collector that
+/// emitted it (see `Diag`); `mark` and `level` are plain values.
 pub const Diagnostic = struct {
     level: Level,
     mark: Mark,
     message: []const u8,
 };
 
-/// The complete error surface of the library. Fallible functions return one
-/// of these (plus `error.OutOfMemory`). C-level FYEC_* codes collapse into
-/// this set; the human readable detail lives in the diagnostic list.
+/// The library's public error vocabulary. Fallible functions return one
+/// of these (plus `error.OutOfMemory`); the human readable detail lives
+/// in the diagnostic list.
+///
+/// Kept as one set rather than per-layer sets on purpose: scanner,
+/// parser and builder all feed a single diagnostic channel and callers
+/// (parse/parseAll/emit) surface the union anyway, mirroring how
+/// libfyaml collapses FYEC_* codes into one error surface. C-level
+/// FYEC_* codes map into this set.
 pub const YamlError = error{
     /// Input violates YAML syntax (bad token, bad indentation, ...).
     InvalidSyntax,
@@ -72,8 +82,15 @@ pub const YamlError = error{
     AliasCycle,
 };
 
-/// Diagnostic collector — the fy_diag equivalent. Diagnostics are allocated
-/// from the caller supplied arena so they share the parser's lifetime.
+/// Diagnostic collector — the fy_diag equivalent.
+///
+/// Ownership: the collector owns every message it emits, allocated
+/// through `alloc` (which may itself be arena-backed; freeing into an
+/// arena is then a harmless no-op). `deinit` frees every message and the
+/// list storage; there is no per-message free because diagnostics share
+/// one lifetime in practice. Rendering allocates through a caller
+/// supplied allocator and never touches collector storage, so a `Diag`
+/// can be rendered while other code keeps emitting.
 pub const Diag = struct {
     alloc: std.mem.Allocator,
     list: std.ArrayList(Diagnostic) = .empty,
@@ -85,20 +102,21 @@ pub const Diag = struct {
 
     pub fn emit(self: *Diag, level: Level, mark: Mark, comptime fmt: []const u8, args: anytype) !void {
         const msg = try std.fmt.allocPrint(self.alloc, fmt, args);
+        errdefer self.alloc.free(msg);
         try self.list.append(self.alloc, .{ .level = level, .mark = mark, .message = msg });
     }
 
-    /// Render all diagnostics into a freshly allocated string, one line per
-    /// message in `line:col: level: message` shape.
+    /// Render all diagnostics into a freshly allocated string, one line
+    /// per message in `line:col: level: message` shape. Messages render
+    /// in full regardless of length; the caller owns and must free the
+    /// result with `allocator`.
     pub fn render(self: *const Diag, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
-        var line: [4096]u8 = undefined;
         for (self.list.items) |d| {
-            const text = std.fmt.bufPrint(&line, "{d}:{d}: {s}: {s}\n", .{
+            try buf.print(allocator, "{d}:{d}: {s}: {s}\n", .{
                 d.mark.line, d.mark.column, d.level.name(), d.message,
-            }) catch &line[0..0].*;
-            try buf.appendSlice(allocator, text);
+            });
         }
         return buf.toOwnedSlice(allocator);
     }
@@ -112,4 +130,50 @@ test "diag render" {
     const text = try d.render(alloc);
     defer alloc.free(text);
     try std.testing.expectEqualStrings("2:5: error: expected key, got -\n", text);
+}
+
+test "empty diag renders empty string" {
+    const alloc = std.testing.allocator;
+    var d: Diag = .{ .alloc = alloc };
+    defer d.deinit();
+    const text = try d.render(alloc);
+    defer alloc.free(text);
+    try std.testing.expectEqual(@as(usize, 0), text.len);
+}
+
+test "render preserves long and unicode messages in full" {
+    const alloc = std.testing.allocator;
+    var d: Diag = .{ .alloc = alloc };
+    defer d.deinit();
+
+    // Longer than any historical fixed-size render buffer (was 4096).
+    const long = try alloc.alloc(u8, 10_000);
+    defer alloc.free(long);
+    @memset(long, 'x');
+    try d.emit(.warning, .{ .line = 1, .column = 1 }, "long: {s}", .{long});
+    try d.emit(.notice, .{ .line = 3, .column = 7 }, "unicode: {s}", .{"\u{4E2D}\u{6587}\u{1F600}"});
+
+    const text = try d.render(alloc);
+    defer alloc.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, long) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "unicode: \u{4E2D}\u{6587}\u{1F600}") != null);
+    // Both lines carry their level name; no truncation anywhere.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "1:1: warning: long:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "3:7: notice: unicode:") != null);
+}
+
+fn diagAllocatingOperations(alloc: std.mem.Allocator) !void {
+    var d: Diag = .{ .alloc = alloc };
+    defer d.deinit();
+    try d.emit(.err, Mark.start, "first {d}", .{1});
+    try d.emit(.info, .{ .line = 9, .column = 9, .offset = 42 }, "second {s}", .{"two"});
+    const text = try d.render(alloc);
+    defer alloc.free(text);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "\n"));
+}
+
+test "allocation failures leak nothing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, diagAllocatingOperations, .{});
 }
