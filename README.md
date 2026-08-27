@@ -144,9 +144,9 @@ core schema resolves it (`null`, `bool`, `int`, `float`, or `str`).
 | `diag.zig`      | `fy-diag`                | Marks, diagnostics, error set          |
 | `utf8.zig`      | `fy-utf8`                | UTF-8 decode/encode/validation         |
 | `ctype.zig`     | `fy-ctype`               | Byte-level character classification    |
-| `token.zig`     | (token types)            | Token + scalar style definitions       |
+| `token.zig`     | (token types)            | Token tagged union + scalar styles     |
 | `scanner.zig`   | `fy-scan`                | Tokenizer (indentation, simple keys)   |
-| `event.zig`     | `fy-event`               | Event definitions                      |
+| `event.zig`     | `fy-event`               | Event tagged union                     |
 | `parser.zig`    | `fy-parse`               | Token stream -> event stream           |
 | `document.zig`  | `fy-doc`/`fy-node`       | Event stream -> node tree + mutation   |
 | `emitter.zig`   | `fy-emit`                | Node tree -> YAML text                 |

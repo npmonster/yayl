@@ -20,8 +20,14 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 ## Ground rules for changes
 
 - Run `zig build test` before and after any change; the suite must stay green
-  with **zero leaks** (tests run under `std.testing.allocator`).
-- Also verify `-Doptimize=ReleaseSafe` occasionally; no Debug-only assumptions.
+  with **zero leaks** (tests run under `std.testing.allocator`). The canonical
+  gate is `make verify` (fmt + library compile + Debug and ReleaseSafe tests);
+  CI runs the same on Zig 0.16.0.
+- OOM paths are real code: anything that registers a fresh allocation must
+  `errdefer` it (three real leaks were found this way). Public allocating
+  operations are covered by `std.testing.checkAllAllocationFailures`.
+- Also verify `-Doptimize=ReleaseSafe` (part of `make verify`); no Debug-only
+  assumptions.
 - Memory ownership model:
   - `Document` owns a `Pool` (arena). Nodes and their strings live there and
     are freed in one shot by `Document.deinit`.
@@ -96,7 +102,8 @@ requires a **CST** that keeps comments and original formatting. Path:
 ## Verification strategy
 
 - **Unit tests** (current): token streams, event streams, scalar values,
-  emitter quoting, round trips — `zig build test` (47 tests).
+  emitter quoting, round trips, allocation-failure injection over the public
+  parse/write API — `zig build test` (62 tests).
 - **Next**: port libfyaml's `tests/` data-driven cases (YAML test suite
   inputs with expected token/event/dump outputs) as embedded or generated
   fixtures; compare Zig output to recorded libfyaml output.
