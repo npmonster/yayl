@@ -71,6 +71,13 @@ lifetimes and no hidden allocation:
 No API transfers ownership implicitly; every function documents which
 allocator owns what it returns.
 
+## Resource limits
+
+The scanner caps collection nesting (`Scanner.max_nesting`, default 200)
+and rejects deeper input with `error.NestingTooDeep` instead of
+accumulating unbounded state. Raise the field on a scanner instance if
+a legitimate input needs more.
+
 ## Quick start
 
 ```zig

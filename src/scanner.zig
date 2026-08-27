@@ -37,6 +37,10 @@ pub const Scanner = struct {
 
     flow_level: usize = 0,
     last_node_end: bool = false,
+    /// Hard cap on collection nesting (flow levels plus block indents),
+    /// guarding against nesting bombs. Conservative default; raise per
+    /// scanner instance if a legitimate input needs more.
+    max_nesting: usize = 200,
     indent: isize = -1,
     indents: std.ArrayList(isize) = .empty,
     simple_key_allowed: bool = true,
@@ -282,6 +286,9 @@ pub const Scanner = struct {
         if (self.flow_level > 0) return;
         const col: isize = @intCast(column);
         if (self.indent < col) {
+            if (self.indents.items.len >= self.max_nesting) {
+                return self.failWith(error.NestingTooDeep, mark, "block nesting is too deep", .{});
+            }
             try self.indents.append(self.alloc, self.indent);
             self.indent = col;
             const tok = Token{ .kind = kind, .start = mark, .end = mark };
@@ -486,6 +493,9 @@ pub const Scanner = struct {
     }
 
     fn fetchFlowCollectionStart(self: *Scanner, kind: Token.Kind) !void {
+        if (self.flow_level >= self.max_nesting) {
+            return self.failWith(error.NestingTooDeep, self.mark, "flow nesting is too deep", .{});
+        }
         try self.saveSimpleKey();
         self.flow_level += 1;
         try self.simple_keys.append(self.alloc, .{});
@@ -1505,6 +1515,48 @@ test "quoted scalar fold before closing quote is content" {
     try testing.expectEqualStrings(" ", scalars2.items[1]);
     try testing.expectEqualStrings("y", scalars2.items[2]);
     try testing.expectEqualStrings(" ", scalars2.items[3]);
+}
+
+test "nesting depth is capped" {
+    // The limit is per-scanner and enforced lazily during scanning.
+    var s = try Scanner.init(testing.allocator, null, "[[[[[[1]]]]]]");
+    defer s.deinit();
+    s.max_nesting = 3;
+    var outcome: ?anyerror = null;
+    while (true) {
+        const tok = s.peekToken() catch |err| {
+            outcome = err;
+            break;
+        };
+        if (tok == null) break;
+        s.skipToken();
+    }
+    try testing.expectEqual(@as(?anyerror, error.NestingTooDeep), outcome);
+}
+
+test "nesting bomb is rejected with NestingTooDeep" {
+    // A flow nesting bomb far past the default limit must error cleanly.
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(testing.allocator);
+    var i: usize = 0;
+    while (i < 400) : (i += 1) try input.append(testing.allocator, '[');
+    i = 0;
+    while (i < 400) : (i += 1) try input.append(testing.allocator, ']');
+    const r = scanAll(testing.allocator, input.items);
+    try testing.expectError(error.NestingTooDeep, r);
+}
+
+test "block nesting bomb is rejected" {
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(testing.allocator);
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        var j: usize = 0;
+        while (j < i) : (j += 1) try input.append(testing.allocator, ' ');
+        try input.appendSlice(testing.allocator, "a:\n");
+    }
+    const r = scanAll(testing.allocator, input.items);
+    try testing.expectError(error.NestingTooDeep, r);
 }
 
 test "anchor alias tag" {

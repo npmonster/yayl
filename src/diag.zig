@@ -79,6 +79,8 @@ pub const YamlError = error{
     Unterminated,
     /// A simple key would exceed the maximum allowed length.
     KeyTooLong,
+    /// Collection nesting exceeds the scanner's `max_nesting` limit.
+    NestingTooDeep,
     /// Alias would create a reference cycle during expansion.
     AliasCycle,
 };
