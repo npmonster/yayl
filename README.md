@@ -1,82 +1,38 @@
-# YAYL — Yet Another YAML Library
+# yayl
 
-> *Because the others eat your comments.*
->
-> By **Null Pointer Monster**
+A native Zig YAML parser, document model, and emitter. yayl follows the architecture and observable behavior of [libfyaml](https://github.com/pantoniou/libfyaml), using Zig allocators, error unions, and tagged unions.
 
-`yayl` is a YAML parser and emitter for Zig with full read and write support.
-**This project was born from a direct conversion of the battle-tested C
-library [libfyaml](https://github.com/pantoniou/libfyaml) to native Zig** —
-module by module, behavior first. The goal is a YAML library that follows Zig
-community conventions — clear ownership, tagged unions instead of C type tags,
-`!T` error unions instead of integer error codes, tests living next to the
-code — while keeping libfyaml's observable semantics.
+> **Status: early release.** The scanner, parser, document API, and emitter support practical YAML 1.2 inputs. Output is semantic, not byte-preserving: comments, whitespace, and original formatting are normalized.
 
-> **Status:** early. A working scanner, parser, document model and emitter are
-> in place and round-trip a broad, practical subset of YAML (block and flow
-> collections, all scalar styles, anchors/aliases, tags, directives,
-> multi-document streams). Full libfyaml feature parity — most notably
-> comment-preserving round-trip editing via the CST — is the ongoing target.
-> See [AGENTS.md](AGENTS.md) for the conversion roadmap and how to help.
-
-## Credits
-
-yayl stands on the shoulders of **libfyaml**, the feature-complete YAML 1.2
-processing library written in C by **Pantelis Antoniou**
-([pantoniou/libfyaml](https://github.com/pantoniou/libfyaml)), released under
-the MIT license. The architecture, token/event model, and parsing strategy of
-this library are a direct port of that work — every intentional deviation is
-marked with a `PORT NOTE:` in the source. Huge thanks to the libfyaml project
-for producing such a clean, well-structured reference implementation; a
-faithful conversion would not be possible without it.
+See the [usage guide](docs/USAGE.md) for library examples and API patterns.
 
 ## Requirements
 
-- Zig 0.16.x (developed against 0.16.0, the latest stable release)
+- Zig 0.16.0 or later in the 0.16 series
 
-## Build and test
+## Install
+
+Add the package:
 
 ```sh
-zig build                       # compile the library (analyses the public root)
-zig build test                  # run all unit tests (Debug, leak-checked)
-zig build test -Doptimize=ReleaseSafe
-make verify                     # canonical gate: fmt + compile + Debug + ReleaseSafe
+zig fetch --save git+https://github.com/npmonster/yayl
 ```
 
-Formatting must be clean: `zig fmt --check build.zig build.zig.zon src`
-(`make fmt` checks, `make fmt-write` fixes).
+Import its module in your `build.zig`:
 
-The library is exposed as a build module named `yayl`. To depend on it from
-another package, add it in your `build.zig.zon` and wire the module in
-`build.zig`, then `@import("yayl")`.
+```zig
+const yayl_dep = b.dependency("yayl", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("yayl", yayl_dep.module("yayl"));
+```
 
-## Allocators and lifetimes
+Then import it in Zig source:
 
-yayl follows the Zig convention of caller-provided allocators with explicit
-lifetimes and no hidden allocation:
-
-- **`Document` owns an arena (`yaml.Pool`)**. Every node, string, anchor and
-  tag inside a parsed or built document lives in that arena and is freed in
-  one shot by `Document.deinit` — nothing inside a document is freed
-  individually.
-- **`Scanner` and `Parser` own transient buffers** (scratch byte buffers and
-  directive parameter lists) and release them in their `deinit`. Token and
-  event payload slices are arena-owned by the producer and stay valid until
-  that producer is reset or deinitialised; anything that must outlive the
-  parser (document nodes) is copied into the document pool during building.
-- **Rendering and diagnostics allocate through a caller-supplied
-  allocator**: `Document.write` and `Diag.render` return slices the caller
-  must free with the same allocator.
-
-No API transfers ownership implicitly; every function documents which
-allocator owns what it returns.
-
-## Resource limits
-
-The scanner caps collection nesting (`Scanner.max_nesting`, default 200)
-and rejects deeper input with `error.NestingTooDeep` instead of
-accumulating unbounded state. Raise the field on a scanner instance if
-a legitimate input needs more.
+```zig
+const yaml = @import("yayl");
+```
 
 ## Quick start
 
@@ -89,40 +45,51 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    // Parse the first document in a stream.
     var doc = try yaml.parse(alloc, "name: yayl\nlang: zig\n");
     defer doc.deinit();
 
-    // Read by mapping-key path.
     const name = doc.pathGet(&.{"name"}).?.scalarValue().?;
     std.debug.print("name = {s}\n", .{name});
 
-    // Serialize back to YAML text.
-    const text = try doc.write(alloc);
-    defer alloc.free(text);
-    std.debug.print("{s}", .{text});
+    const output = try doc.write(alloc);
+    defer alloc.free(output);
+    std.debug.print("{s}", .{output});
 }
 ```
 
-### Parse
+## Parse
 
-- `yaml.parse(alloc, input) !Document` — first document in the stream.
-- `yaml.parseAll(alloc, input) !std.ArrayList(Document)` — every document.
-  The caller owns the list and must `deinit()` each document and the list.
+`yaml.parse(allocator, input) !Document` reads the first document in a YAML stream.
 
-`Document.parse` returns a tree of `yaml.Node` values. A node is a tagged
-union of `scalar`, `mapping`, or `sequence`, so you can `switch` on
-`node.data` or use the accessors (`isScalar`, `scalarValue`, `pairs`,
-`items`, `lookup`, `byPath`).
+`yaml.parseAll(allocator, input) !std.ArrayList(Document)` reads every document. Deinitialize each document, then the list:
 
-### Write
+```zig
+var docs = try yaml.parseAll(alloc, input);
+defer {
+    for (docs.items) |*doc| doc.deinit();
+    docs.deinit(alloc);
+}
+```
 
-`doc.write(alloc) ![]u8` renders the document back to YAML. The emitter picks
-a safe presentation for each scalar (plain, single-quoted, double-quoted, or
-literal block) and preserves anchors/aliases and flow vs. block collection
-style.
+The root node is `doc.root`. Nodes are scalars, mappings, or sequences; use accessors to inspect them safely:
 
-### Build a document programmatically
+```zig
+const root = doc.root orelse return error.EmptyDocument;
+const enabled = root.lookup("enabled").?.scalarValue().?;
+const items = root.lookup("items").?.items().?;
+_ = enabled;
+_ = items;
+```
+
+Useful node APIs:
+
+- `scalarValue()`, `pairs()`, `items()`
+- `lookup(key)` and `byPath(path)`
+- `yaml.scalarKind(value, style)` for YAML core-schema classification
+
+## Build and modify documents
+
+A `Document` owns its nodes and strings. Create nodes through the document, then attach them with its mutation APIs:
 
 ```zig
 var doc = yaml.Document.init(alloc);
@@ -130,44 +97,50 @@ defer doc.deinit();
 
 const root = try doc.createMapping();
 doc.root = root;
-try doc.pathSet(&.{ "server", "host" }, try doc.createScalar("localhost", .plain));
-try doc.pathSet(&.{ "server", "port" }, try doc.createScalar("8080", .plain));
+
+try doc.pathSet(
+    &.{ "server", "host" },
+    try doc.createScalar("localhost", .plain),
+);
+try doc.pathSet(
+    &.{ "server", "port" },
+    try doc.createScalar("8080", .plain),
+);
 ```
 
-Mutation helpers on `Document`: `createScalar`, `createMapping`,
-`createSequence`, `mappingAppend`, `sequenceAppend`, `sequenceInsert`,
-`mappingRemove`, `sequenceRemove`, `pathSet`, `pathDelete`, `pathGet`.
+Available mutation APIs: `createScalar`, `createMapping`, `createSequence`, `mappingAppend`, `mappingRemove`, `sequenceAppend`, `sequenceInsert`, `sequenceRemove`, `pathSet`, and `pathDelete`.
 
-### Typed scalar inspection
+## Write
 
-`yaml.scalarKind(value, style)` classifies a plain scalar the way the YAML 1.2
-core schema resolves it (`null`, `bool`, `int`, `float`, or `str`).
+`doc.write(allocator) ![]u8` serializes a document. The returned buffer belongs to the allocator and must be freed by the caller.
 
-## Module layout
+The emitter preserves document markers, tags, anchors, aliases, and flow versus block collection style. It chooses a safe scalar presentation when needed.
 
-| Module          | libfyaml analogue        | Role                                   |
-| --------------- | ------------------------ | -------------------------------------- |
-| `pool.zig`      | `fy-pool`                | Arena allocator wrapper                |
-| `diag.zig`      | `fy-diag`                | Marks, diagnostics, error set          |
-| `utf8.zig`      | `fy-utf8`                | UTF-8 decode/encode/validation         |
-| `ctype.zig`     | `fy-ctype`               | Byte-level character classification    |
-| `token.zig`     | (token types)            | Token tagged union + scalar styles     |
-| `scanner.zig`   | `fy-scan`                | Tokenizer (indentation, simple keys)   |
-| `event.zig`     | `fy-event`               | Event tagged union                     |
-| `parser.zig`    | `fy-parse`               | Token stream -> event stream           |
-| `document.zig`  | `fy-doc`/`fy-node`       | Event stream -> node tree + mutation   |
-| `emitter.zig`   | `fy-emit`                | Node tree -> YAML text                 |
-| `yaml.zig`      | `libfyaml.h`             | Public entry points                    |
+## Ownership
 
-## Errors
+- Pass an allocator to all allocating operations.
+- `Document.deinit()` releases every node, string, anchor, and tag owned by the document.
+- Values returned by `doc.write()` and `Diag.render()` must be freed with the allocator supplied to those calls.
+- `Scanner` and `Parser` own transient token/event data; copy data that must outlive them into a document.
 
-Fallible functions return Zig error unions. The shared YAML error surface is
-`yaml.YamlError` (`InvalidSyntax`, `InvalidUtf8`, `InvalidEscape`,
-`UnknownAlias`, `DuplicateAnchor`, `Unterminated`, and friends) merged with
-`std.mem.Allocator.Error` for out-of-memory. Attach a `yaml.Diag` to the
-parser to collect human-readable messages with line/column marks.
+## Current limitations
+
+- Input must fit in memory; streaming input is not implemented.
+- Formatting is normalized. Comments, blank lines, indentation width, and other source layout are not preserved.
+- Round-trip editing is semantic: `write(parse(input))` can differ textually from `input`.
+- Full libfyaml parity is still in progress.
+
+## Development
+
+```sh
+zig build
+zig build test
+zig build test -Doptimize=ReleaseSafe
+make verify
+```
+
+`make verify` is the project quality gate: formatting, library compilation, and Debug and ReleaseSafe tests.
 
 ## License
 
-MIT — chosen to stay compatible with libfyaml, the C library this project is
-converted from. See [Credits](#credits).
+MIT. See [LICENSE](LICENSE).
