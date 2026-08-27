@@ -345,7 +345,9 @@ pub const Scanner = struct {
             ',' => return self.fetchFlowEntry(),
             '-' => if (ctype.isBlankz(self.at(1))) return self.fetchBlockEntry(),
             '?' => if (self.flow_level > 0 or ctype.isBlankz(self.at(1))) return self.fetchKey(),
-            ':' => if (self.flow_level > 0 or ctype.isBlankz(self.at(1))) return self.fetchValue(),
+            ':' => if (ctype.isBlankz(self.at(1)) or
+                (self.flow_level > 0 and
+                    (self.at(1) == ',' or self.at(1) == ']' or self.at(1) == '}'))) return self.fetchValue(),
             '*' => return self.fetchAnchor(.alias),
             '&' => return self.fetchAnchor(.anchor),
             '!' => return self.fetchTag(),
@@ -1246,6 +1248,34 @@ test "block scalar keeps '#' lines and leading empty lines" {
         if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
     }
     try testing.expectEqualStrings("\n\n# detected\n", scalars.items[0]);
+}
+
+test "flow mapping value may start with ':'" {
+    // In flow context ':' is a value indicator only before blanks or
+    // flow indicators; ':x' is a plain scalar (corpus 58MP).
+    var r = try scanAll(testing.allocator, "{x: :x}\n");
+    defer r.deinit(testing.allocator);
+    var scalars: std.ArrayList([]const u8) = .empty;
+    defer scalars.deinit(testing.allocator);
+    for (r.toks.items) |t| {
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+    }
+    try testing.expectEqualStrings("x", scalars.items[0]);
+    try testing.expectEqualStrings(":x", scalars.items[1]);
+}
+
+test "trailing blanks after top-level flow collection" {
+    // Trailing spaces before EOF are not an error (corpus 4RWC).
+    var r = try scanAll(testing.allocator, "[1, 2, 3]  ");
+    defer r.deinit(testing.allocator);
+    const types = try tokenTypes(testing.allocator, r.toks.items);
+    defer testing.allocator.free(types);
+    const want: []const TokenType = &.{
+        .stream_start, .flow_sequence_start, .scalar, .flow_entry,
+        .scalar,       .flow_entry,          .scalar, .flow_sequence_end,
+        .stream_end,
+    };
+    try testing.expectEqualSlices(TokenType, want, types);
 }
 
 test "anchor alias tag" {

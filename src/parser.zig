@@ -318,7 +318,9 @@ pub const Parser = struct {
                     .prefix = d.params[1],
                 });
             } else {
-                return self.fail(tok.start, "found unknown directive name '{s}'", .{d.name});
+                // Unknown directives are ignored; the spec asks for a
+                // warning only (YAML 1.2 6.1).
+                if (self.d) |dd| dd.emit(.warning, tok.start, "found unknown directive name '{s}'", .{d.name}) catch {};
             }
             self.scanner.skipToken();
         }
@@ -803,4 +805,31 @@ test "tag shorthand unescapes RFC 2396 escapes" {
         }
     }
     try testing.expect(found);
+}
+
+test "unknown directives are ignored with a warning" {
+    // YAML 1.2 6.1: unknown directives are skipped, not an error
+    // (corpus 2LFX).
+    const alloc = testing.allocator;
+    var p = try Parser.init(alloc, null, "%FOO bar baz\n---\nfoo\n");
+    defer p.deinit();
+    var found = false;
+    while (try p.nextEvent()) |ev| {
+        if (ev.kind == .scalar) {
+            try testing.expectEqualStrings("foo", ev.kind.scalar.value);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "trailing blanks after top-level flow collection parse" {
+    const alloc = testing.allocator;
+    var p = try Parser.init(alloc, null, "[1, 2, 3]  ");
+    defer p.deinit();
+    var scalars: usize = 0;
+    while (try p.nextEvent()) |ev| {
+        if (ev.kind == .scalar) scalars += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), scalars);
 }
