@@ -158,6 +158,47 @@ test "allocation failures in parse alone leak nothing" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, parseOnly, .{});
 }
 
+test "seeded fuzz: random ASCII input never panics or leaks" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed); // fixed seed: deterministic
+    const random = prng.random();
+    var buf: [256]u8 = undefined;
+    var i: usize = 0;
+    while (i < 400) : (i += 1) {
+        const len = random.uintAtMost(usize, buf.len + 1);
+        random.bytes(buf[0..len]);
+        // ASCII keeps the input valid UTF-8; InvalidUtf8 is covered by
+        // dedicated tests.
+        for (buf[0..len]) |*b| b.* &= 0x7F;
+        var docs = parseAll(alloc, buf[0..len]) catch continue;
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(alloc);
+        }
+    }
+}
+
+test "property: write(parse(write(parse(x)))) is a fixpoint" {
+    const alloc = std.testing.allocator;
+    const samples = [_][]const u8{
+        "a: 1\nb:\n  - x\n  - y: z\n",
+        "top:\n  nested:\n    deep: value\n  list:\n    - 1\n    - two\n",
+        "plain: text\nquoted: \"with: colon\"\nsingle: 'it''s'\n",
+        "---\nfirst: doc\n---\nsecond: doc\n",
+    };
+    for (samples) |src| {
+        var d1 = try parse(alloc, src);
+        defer d1.deinit();
+        const out1 = try d1.write(alloc);
+        defer alloc.free(out1);
+        var d2 = try parse(alloc, out1);
+        defer d2.deinit();
+        const out2 = try d2.write(alloc);
+        defer alloc.free(out2);
+        try std.testing.expectEqualStrings(out1, out2);
+    }
+}
+
 fn parseOnly(alloc: std.mem.Allocator) !void {
     var doc = try parse(alloc, "name: yayl\nitems:\n  - one\n  - two\n");
     defer doc.deinit();
