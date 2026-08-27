@@ -32,4 +32,19 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // Conformance: the pinned YAML Test Suite corpus (fetch with
+    // `make corpus`). Kept separate from the unit suite so it can run
+    // against a vendored checkout without blocking quick test cycles.
+    const conformance_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/conformance.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "yayl", .module = module }},
+        }),
+    });
+    const run_conformance = b.addRunArtifact(conformance_tests);
+    const conformance_step = b.step("conformance", "Run the pinned YAML Test Suite corpus");
+    conformance_step.dependOn(&run_conformance.step);
 }

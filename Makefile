@@ -8,7 +8,7 @@ ZIG ?= zig
 .DEFAULT_GOAL := help
 .MAIN: help
 
-.PHONY: help all build check test test-release fmt fmt-write docs verify clean
+.PHONY: help all build check test test-release fmt fmt-write docs corpus conformance verify clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' Makefile
@@ -27,16 +27,22 @@ test: ## Run unit tests in Debug (leak-checked via std.testing.allocator)
 test-release: ## Run unit tests under ReleaseSafe (no Debug-only assumptions)
 	$(ZIG) build test -Doptimize=ReleaseSafe
 
-fmt: ## Check formatting of build.zig, build.zig.zon and src/ without modifying anything
-	$(ZIG) fmt --check build.zig build.zig.zon src
+fmt: ## Check formatting of build.zig, build.zig.zon, src/ and tests/ without modifying anything
+	$(ZIG) fmt --check build.zig build.zig.zon src tests
 
-fmt-write: ## Apply zig fmt to build.zig, build.zig.zon and src/
-	$(ZIG) fmt build.zig build.zig.zon src
+fmt-write: ## Apply zig fmt to build.zig, build.zig.zon, src/ and tests/
+	$(ZIG) fmt build.zig build.zig.zon src tests
 
 docs: ## Generate HTML documentation into zig-out/docs/
 	@mkdir -p zig-out
 	$(ZIG) build-lib src/yaml.zig -fno-emit-bin -femit-docs=zig-out/docs
 	@echo "docs: zig-out/docs/index.html"
+
+corpus: ## Fetch the pinned YAML Test Suite corpus (gitignored vendor/)
+	sh scripts/fetch-corpus.sh
+
+conformance: corpus ## Run the pinned YAML Test Suite corpus through yayl
+	$(ZIG) build conformance
 
 verify: fmt check test test-release ## Full quality gate: fmt, compile, Debug and ReleaseSafe tests
 

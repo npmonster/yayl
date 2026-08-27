@@ -24,7 +24,7 @@ jobs:
         run: zig version
 
       - name: Format check
-        run: zig fmt --check build.zig build.zig.zon src
+        run: zig fmt --check build.zig build.zig.zon src tests
 
       - name: Compile the library (analyse the public root)
         run: zig build check --summary all
@@ -40,3 +40,20 @@ jobs:
 
       - name: Cross-target compile (aarch64-linux)
         run: zig build check -Dtarget=aarch64-linux
+
+      - name: Fetch pinned YAML Test Suite corpus
+        run: make corpus
+
+      - name: Conformance corpus
+        # Baseline is recorded in the PLAN-2 card log; this step flips
+        # to a hard gate once the failure triage (skips with reasons)
+        # is complete.
+        continue-on-error: true
+        run: zig build conformance --summary all
+
+      - name: Upload conformance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-report
+          path: zig-out/conformance-report.json
