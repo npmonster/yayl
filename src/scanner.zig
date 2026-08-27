@@ -653,7 +653,10 @@ pub const Scanner = struct {
         self.skipCp(); // '%'
 
         const name_start = self.pos;
-        while (ctype.isWordChar(self.at(0))) self.skipCp();
+        // A directive name is ns-char+: any non-blank, non-comment char.
+        // Allow '.' so `%YAML1.1` is a reserved directive rather than an
+        // error (corpus ZYU8).
+        while (ctype.isWordChar(self.at(0)) or self.at(0) == '.') self.skipCp();
         const name = self.input[name_start..self.pos];
         if (name.len == 0) {
             return self.fail(self.mark, "could not find expected directive name", .{});

@@ -36,8 +36,6 @@ const skips: []const Skip = &.{
     .{ .id = "Y79Y-1", .reason = "tabs in various contexts accepted", .target = "PLAN-3" },
     .{ .id = "9C9N", .reason = "wrong-indented flow continuation accepted", .target = "PLAN-3" },
     .{ .id = "QB6E", .reason = "wrong-indented multiline quoted scalar accepted", .target = "PLAN-3" },
-    // Quoted scalar line handling.
-    .{ .id = "ZYU8-1", .reason = "directive variants", .target = "PLAN-3" },
 };
 
 fn findSkip(id: []const u8) ?Skip {
