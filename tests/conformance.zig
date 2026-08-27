@@ -55,8 +55,6 @@ const skips: []const Skip = &.{
     .{ .id = "QB6E", .reason = "wrong-indented multiline quoted scalar accepted", .target = "PLAN-3" },
     // Quoted scalar line handling.
     .{ .id = "G4RS", .reason = "quoted scalar folding details (spec 2.17)", .target = "PLAN-3" },
-    .{ .id = "NP9H", .reason = "double-quoted escaped line breaks (spec 7.5)", .target = "PLAN-3" },
-    .{ .id = "Q8AD", .reason = "double-quoted escaped line breaks (spec 7.5, 1.3)", .target = "PLAN-3" },
     .{ .id = "JEF9-1", .reason = "keep-chomping empty scalar via marker", .target = "PLAN-3" },
     .{ .id = "ZYU8-1", .reason = "directive variants", .target = "PLAN-3" },
 };
@@ -246,9 +244,11 @@ fn replaceMarker(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
             i += bom_marker.len;
         } else if (starts(rest, em_dash) or starts(rest, guillemet)) {
             // Tab marker: drop up to 3 already-written spaces (the tab
-            // stop padding) and emit one tab.
+            // stop padding) and emit one tab. Only spaces preceded by
+            // whitespace or line start are padding; spaces after content
+            // are part of the content.
             var pop: usize = 0;
-            while (pop < 3 and out.items.len > pop and out.items[out.items.len - 1 - pop] == ' ') pop += 1;
+            while (pop < 3 and out.items.len > pop + 1 and out.items[out.items.len - 1 - pop] == ' ' and (out.items[out.items.len - 2 - pop] == ' ' or out.items[out.items.len - 2 - pop] == '\t' or out.items[out.items.len - 2 - pop] == '\n')) pop += 1;
             out.shrinkRetainingCapacity(out.items.len - pop);
             while (starts(input[i..], em_dash)) i += em_dash.len;
             if (starts(input[i..], guillemet)) i += guillemet.len;
