@@ -36,6 +36,7 @@ pub const Scanner = struct {
     stream_end_produced: bool = false,
 
     flow_level: usize = 0,
+    last_node_end: bool = false,
     indent: isize = -1,
     indents: std.ArrayList(isize) = .empty,
     simple_key_allowed: bool = true,
@@ -221,11 +222,22 @@ pub const Scanner = struct {
 
     fn appendToken(self: *Scanner, tok: Token) !void {
         try self.tokens.append(self.alloc, tok);
+        self.noteNodeEnd(tok.kind);
     }
 
     fn insertToken(self: *Scanner, number: usize, tok: Token) !void {
         const index = number - self.token_base;
         try self.tokens.insert(self.alloc, index, tok);
+        self.noteNodeEnd(tok.kind);
+    }
+
+    /// True when the most recently emitted token can end a key node:
+    /// the basis for flow adjacent values ("key":value, spec 7.18).
+    fn noteNodeEnd(self: *Scanner, kind: Token.Kind) void {
+        self.last_node_end = switch (kind) {
+            .scalar, .alias, .flow_sequence_end, .flow_mapping_end => true,
+            else => false,
+        };
     }
 
     // ------------------------------------------------------------------
@@ -364,7 +376,7 @@ pub const Scanner = struct {
 
         const c = self.at(0);
         if (c == 0) return self.fetchStreamEnd();
-        if (c == '%' and self.mark.column == 1) return self.fetchDirective();
+        if (c == '%' and self.mark.column == 1 and self.flow_level == 0) return self.fetchDirective();
         if (self.mark.column == 1 and self.matchAt("---", 0) and ctype.isBlankz(self.at(3))) {
             return self.fetchDocumentIndicator(.document_start);
         }
@@ -387,7 +399,7 @@ pub const Scanner = struct {
             '?' => if (self.flow_level > 0 or ctype.isBlankz(self.at(1))) return self.fetchKey(),
             ':' => if (ctype.isBlankz(self.at(1)) or
                 (self.flow_level > 0 and
-                    (self.at(1) == ',' or self.at(1) == ']' or self.at(1) == '}'))) return self.fetchValue(),
+                    (self.last_node_end or self.at(1) == ',' or self.at(1) == ']' or self.at(1) == '}'))) return self.fetchValue(),
             '*' => return self.fetchAnchor(.alias),
             '&' => return self.fetchAnchor(.anchor),
             '!' => return self.fetchTag(),
@@ -407,7 +419,7 @@ pub const Scanner = struct {
     fn canStartPlain(self: *const Scanner) bool {
         const c = self.at(0);
         return switch (c) {
-            0, ' ', '\t', '\n', '\r', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`' => false,
+            0, ' ', '\t', '\n', '\r', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '\'', '"', '@', '`' => false,
             '-', '?', ':' => blk: {
                 if (ctype.isBlankz(self.at(1))) break :blk false;
                 if (self.flow_level > 0) {
@@ -1391,6 +1403,35 @@ test "rejections required by the corpus" {
     {
         var r = try scanAll(testing.allocator, "- [-a, b-c]\n");
         defer r.deinit(testing.allocator);
+    }
+}
+
+test "flow adjacent values and '%' as a scalar in flow" {
+    // Spec 7.18 adjacent value: ':' directly after a closing quote is a
+    // value indicator (corpus C2DT); '%' inside flow is a plain scalar,
+    // never a directive (corpus UT92).
+    {
+        var r = try scanAll(testing.allocator, "{\"adjacent\":value, \"empty\":}\n");
+        defer r.deinit(testing.allocator);
+        var scalars: std.ArrayList([]const u8) = .empty;
+        defer scalars.deinit(testing.allocator);
+        for (r.toks.items) |t| {
+            if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        }
+        try testing.expectEqualStrings("adjacent", scalars.items[0]);
+        try testing.expectEqualStrings("value", scalars.items[1]);
+        try testing.expectEqualStrings("empty", scalars.items[2]);
+    }
+    {
+        var r = try scanAll(testing.allocator, "{% : 1}\n");
+        defer r.deinit(testing.allocator);
+        var scalars: std.ArrayList([]const u8) = .empty;
+        defer scalars.deinit(testing.allocator);
+        for (r.toks.items) |t| {
+            if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        }
+        try testing.expectEqualStrings("%", scalars.items[0]);
+        try testing.expectEqualStrings("1", scalars.items[1]);
     }
 }
 
