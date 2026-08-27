@@ -965,13 +965,16 @@ pub const Scanner = struct {
                 while (ctype.isBlank(self.at(0))) self.skipCp();
                 continue;
             }
-            // Commit any pending separator before real content.
-            try self.flushQuotedSeparators(&value, &breaks, &join_direct, &pending_ws);
+            // Whitespace stays pending until real content decides whether
+            // it is interior (kept) or trailing (dropped by a following
+            // break or the closing quote).
             if (ctype.isBlank(c)) {
                 try pending_ws.append(self.alloc, c);
                 self.skipCp();
                 continue;
             }
+            // Commit any pending separator before real content.
+            try self.flushQuotedSeparators(&value, &breaks, &join_direct, &pending_ws);
             if (style == .double_quoted and c == '\\') {
                 try self.scanEscape(&value, &join_direct, &breaks);
                 continue;
@@ -1489,6 +1492,19 @@ test "quoted scalar fold before closing quote is content" {
     try testing.expectEqualStrings(" ", scalars.items[1]);
     try testing.expectEqualStrings("b", scalars.items[2]);
     try testing.expectEqualStrings("\n", scalars.items[3]);
+    // Trailing whitespace before a folded break is dropped; the fold
+    // itself supplies the single separator space (NAT4 b/d).
+    var r2 = try scanAll(testing.allocator, "x: '  \n  '\ny: \"  \n  \"\n");
+    defer r2.deinit(testing.allocator);
+    var scalars2: std.ArrayList([]const u8) = .empty;
+    defer scalars2.deinit(testing.allocator);
+    for (r2.toks.items) |t| {
+        if (t.kind == .scalar) try scalars2.append(testing.allocator, t.kind.scalar.value);
+    }
+    try testing.expectEqualStrings("x", scalars2.items[0]);
+    try testing.expectEqualStrings(" ", scalars2.items[1]);
+    try testing.expectEqualStrings("y", scalars2.items[2]);
+    try testing.expectEqualStrings(" ", scalars2.items[3]);
 }
 
 test "anchor alias tag" {
