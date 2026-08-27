@@ -26,11 +26,7 @@ const Skip = struct {
 /// starts passing fails the gate ("stale skip") so this table cannot
 /// outlive a fix.
 const skips: []const Skip = &.{
-    // Anchor and alias character sets / rendering.
-    .{ .id = "2SXE", .reason = "anchor names containing ':'", .target = "PLAN-3" },
-    .{ .id = "8XYN", .reason = "non-ASCII anchor characters", .target = "PLAN-3" },
-    .{ .id = "W5VH", .reason = "extended alias character set", .target = "PLAN-3" },
-    .{ .id = "Y2GN", .reason = "anchor with ':' mid-name", .target = "PLAN-3" },
+    // Anchor and alias rendering on flow nodes.
     .{ .id = "6BFJ", .reason = "anchor rendering on flow sequence items", .target = "PLAN-3" },
     .{ .id = "CN3R", .reason = "anchor positions in flow sequences", .target = "PLAN-3" },
     .{ .id = "X38W", .reason = "alias rendering in flow objects", .target = "PLAN-3" },
@@ -38,7 +34,6 @@ const skips: []const Skip = &.{
     .{ .id = "7FWL", .reason = "verbatim tags !<...>", .target = "PLAN-3" },
     .{ .id = "C4HZ", .reason = "global tag rendering", .target = "PLAN-3" },
     .{ .id = "EHF6", .reason = "tag rendering for flow objects", .target = "PLAN-3" },
-    .{ .id = "U99R", .reason = "comma in tag accepted", .target = "PLAN-3" },
     // Flow grammar: empty nodes, keys, multiline constructs.
     .{ .id = "4MUZ-1", .reason = "flow mapping colon on line after key", .target = "PLAN-3" },
     .{ .id = "5MUD", .reason = "flow colon with adjacent value on next line", .target = "PLAN-3" },
@@ -49,7 +44,6 @@ const skips: []const Skip = &.{
     .{ .id = "CFD4", .reason = "empty implicit key in single-pair flow sequence", .target = "PLAN-3" },
     .{ .id = "FRK4", .reason = "completely empty flow nodes (spec 7.3)", .target = "PLAN-3" },
     .{ .id = "NKF9", .reason = "empty keys in block and flow mappings", .target = "PLAN-3" },
-    .{ .id = "WZ62", .reason = "empty content with tags (spec 7.2)", .target = "PLAN-3" },
     .{ .id = "6PBE", .reason = "zero-indented sequence in explicit mapping key", .target = "PLAN-3" },
     // Block scalars, tabs and indentation interplay.
     .{ .id = "4ZYM", .reason = "tab in block indentation region (spec 6.4)", .target = "PLAN-3" },

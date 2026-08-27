@@ -655,14 +655,18 @@ pub const Scanner = struct {
         const start = self.mark;
         self.skipCp(); // '&' or '*'
         const name_start = self.pos;
-        while (ctype.isWordChar(self.at(0))) self.skipCp();
+        // Greedy name: everything up to blanks, flow indicators or
+        // control characters (libfyaml fy_fetch_anchor_or_alias); this
+        // allows ':', '@', '"', unicode etc. inside names.
+        while (true) {
+            const c = self.at(0);
+            if (ctype.isBlankz(c)) break;
+            if (c == ',' or c == '[' or c == ']' or c == '{' or c == '}') break;
+            if (c < 0x20 or c == 0x7F) break;
+            self.skipCp();
+        }
         const name = self.input[name_start..self.pos];
-        const c = self.at(0);
-        const ok_after = ctype.isBlankz(c) or switch (c) {
-            '?', ':', ',', ']', '}', '%', '@', '`' => true,
-            else => false,
-        };
-        if (name.len == 0 or !ok_after) {
+        if (name.len == 0) {
             return self.fail(start, "did not find expected alphabetic or numeric character in {s}", .{@tagName(tag)});
         }
         const k: Token.Kind = if (tag == .anchor) .{ .anchor = name } else .{ .alias = name };
@@ -715,7 +719,8 @@ pub const Scanner = struct {
                 suffix = self.input[s_start..self.pos];
             }
         }
-        if (!ctype.isBlankz(self.at(0))) {
+        const tc = self.at(0);
+        if (!ctype.isBlankz(tc) and tc != ',' and tc != ']' and tc != '}') {
             return self.fail(self.mark, "did not find expected whitespace or line break after tag", .{});
         }
         return .{
@@ -734,7 +739,14 @@ pub const Scanner = struct {
                 continue;
             }
             switch (c) {
-                ';', '/', '?', ':', '@', '&', '=', '+', '$', ',', '.', '_', '~', '*', '\'', '(', ')', '[', ']', '-' => self.skipCp(),
+                ';', '/', '?', ':', '@', '&', '=', '+', '$', '.', '_', '~', '*', '\'', '(', ')', '[', '-' => self.skipCp(),
+                ',', ']' => {
+                    // A trailing ',' or ']' before blanks terminates the
+                    // tag; elsewhere it is part of the URI (libfyaml
+                    // fy_scan_tag_uri_length).
+                    if (ctype.isBlankz(self.at(1))) break;
+                    self.skipCp();
+                },
                 '%' => {
                     if (ctype.hexValue(self.at(1)) == null or ctype.hexValue(self.at(2)) == null) {
                         return self.fail(self.mark, "did not find URI escaped octet", .{});
@@ -1557,6 +1569,38 @@ test "block nesting bomb is rejected" {
     }
     const r = scanAll(testing.allocator, input.items);
     try testing.expectError(error.NestingTooDeep, r);
+}
+
+test "anchor and alias names are greedy" {
+    // libfyaml rule: the name runs until blanks, flow indicators or
+    // control characters — ':', '@', '"', '<', '>' and unicode are all
+    // valid inside a name (corpus 2SXE, W5VH, 8XYN, Y2GN).
+    var r = try scanAll(testing.allocator, "key: &an:chor v\nfoo: *an:chor\n- &\xF0\x9F\x98\x81 u\n");
+    defer r.deinit(testing.allocator);
+    var anchors: std.ArrayList([]const u8) = .empty;
+    defer anchors.deinit(testing.allocator);
+    var aliases: std.ArrayList([]const u8) = .empty;
+    defer aliases.deinit(testing.allocator);
+    for (r.toks.items) |t| {
+        switch (t.kind) {
+            .anchor => |a| try anchors.append(testing.allocator, a),
+            .alias => |a| try aliases.append(testing.allocator, a),
+            else => {},
+        }
+    }
+    try testing.expectEqualStrings("an:chor", anchors.items[0]);
+    try testing.expectEqualStrings("an:chor", aliases.items[0]);
+    try testing.expectEqualStrings("\xF0\x9F\x98\x81", anchors.items[1]);
+}
+
+test "tag URI stops before a trailing comma or bracket" {
+    // ',' and ']' terminate the tag when blanks follow; the tag token
+    // is well-formed and the leftover indicator errors later (U99R).
+    var r = try scanAll(testing.allocator, "!!str, xxx\n");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("!!", r.toks.items[1].kind.tag.handle);
+    try testing.expectEqualStrings("str", r.toks.items[1].kind.tag.suffix);
+    try testing.expectEqual(Token.Type.flow_entry, std.meta.activeTag(r.toks.items[2].kind));
 }
 
 test "anchor alias tag" {

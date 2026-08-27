@@ -844,3 +844,20 @@ test "trailing blanks after top-level flow collection parse" {
     }
     try testing.expectEqual(@as(usize, 3), scalars);
 }
+
+test "comma after a tag is rejected in block context" {
+    // Corpus U99R: '- !!str, xxx' — the tag stops at the comma and the
+    // comma itself is not valid block-context content.
+    const alloc = testing.allocator;
+    var p = try Parser.init(alloc, null, "- !!str, xxx\n");
+    defer p.deinit();
+    var outcome: ?anyerror = null;
+    while (true) {
+        const ev = p.nextEvent() catch |err| {
+            outcome = err;
+            break;
+        };
+        if (ev == null) break;
+    }
+    try testing.expectEqual(@as(?anyerror, error.InvalidSyntax), outcome);
+}
