@@ -42,9 +42,9 @@ corpus: ## Fetch the pinned YAML Test Suite corpus (gitignored vendor/)
 	sh scripts/fetch-corpus.sh
 
 conformance: corpus ## Run the pinned YAML Test Suite corpus through yayl
-	$(ZIG) build conformance
+	$(ZIG) build conformance --summary all
 
-verify: fmt check test test-release ## Full quality gate: fmt, compile, Debug and ReleaseSafe tests
+verify: fmt check test test-release conformance ## Full quality gate: fmt, compile, tests (Debug + ReleaseSafe), corpus
 
 clean: ## Remove build artifacts (zig-out/) and the incremental cache
 	rm -rf zig-cache .zig-cache-global zig-out

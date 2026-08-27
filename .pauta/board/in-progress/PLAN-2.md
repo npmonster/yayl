@@ -2,7 +2,7 @@
 id: PLAN-2
 title: Establish YAML conformance, fuzzing, and compatibility gates
 created: 2026-08-26T11:20:47Z
-updated: 2026-08-26T11:26:41Z
+updated: 2026-08-27T01:31:08Z
 tags: [yayl, quality, yaml-spec, future-work]
 deps: [PLAN-9]
 skills: []
@@ -34,3 +34,4 @@ Create the evidence framework that prevents yayl from accumulating parser/emitte
 
 ## Log
 - 2026-08-26T11:20:47Z created
+- 2026-08-27T01:31:08Z Overnight run (qwen-code, self-review policy): infrastructure + baseline landed; card stays in-progress. Done: (1) corpus pinned — yaml/yaml-test-suite @ da267a5c4782e7361e82889e76c0dc7df0e1e870 (MIT, Ingy döt Net), fetched via scripts/fetch-corpus.sh / make corpus into gitignored vendor/, provenance in tests/README.md; (2) harness tests/conformance.zig wired as `zig build conformance` + `make conformance` + CI step (report-only until triage; report artifact uploaded); capability-level event-tree comparison in corpus notation, fail:true rejection checks, JSON report zig-out/conformance-report.json, skips table with mandatory reason+target; (3) seeded fuzz (400 random ASCII inputs, no panic/leak) and write(parse()) fixpoint property tests in the unit suite (64 tests, make verify green). Baseline: 199 pass / 152 fail of 351. Failure classes: 43 indentation-differs, 45 line-content-differs (notation + real), 45 parse errors on valid input, 19 accepted-but-should-reject. Key finding: 18 corpus files are themselves structurally misparsed by yayl (harness reports >1 top-level record): 2G84, 3RLN, 4MUZ, 96NN, 9MQT, DE56, DK95, HM87, JEF9, KH5V, L24T, M2N8, MUS6, SM9W, UKK6, VJP3, Y79Y, ZYU8 — these poison their own cases and are high-value PLAN-3 bugs. Remaining for this card: per-failure triage into the skips table (reason + target card), resource-limit config (depth/input size/alias expansion) + adversarial fixtures, differential tests vs pinned libfyaml (needs a zig-cc build of the C lib), parseAll allocation-failure coverage, then flip CI gate from report-only to blocking.
