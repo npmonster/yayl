@@ -974,31 +974,21 @@ pub const Scanner = struct {
         errdefer value.deinit(self.alloc);
         var ws: std.ArrayList(u8) = .empty;
         defer ws.deinit(self.alloc);
+        var seg: std.ArrayList(u8) = .empty;
+        defer seg.deinit(self.alloc);
         var breaks: usize = 0;
         const stop_indent = self.indent + 1;
 
         while (true) {
-            // Document indicators and comments terminate a plain scalar.
+            // Document indicators and comments terminate a plain scalar;
+            // pending whitespace is trailing and therefore dropped.
             if (self.mark.column == 1 and
                 (self.matchAt("---", 0) or self.matchAt("...", 0)) and
                 ctype.isBlankz(self.at(3))) break;
             if (self.at(0) == '#') break;
 
-            // Commit any pending separator now that real content follows.
-            if (breaks > 0) {
-                if (breaks == 1) {
-                    try value.append(self.alloc, ' ');
-                } else {
-                    for (0..breaks - 1) |_| try value.append(self.alloc, '\n');
-                }
-                breaks = 0;
-                ws.clearRetainingCapacity();
-            } else if (ws.items.len > 0) {
-                try value.appendSlice(self.alloc, ws.items);
-                ws.clearRetainingCapacity();
-            }
-
-            // Consume one run of non-blank characters.
+            // Scan one run of non-blank characters.
+            seg.clearRetainingCapacity();
             while (!ctype.isBlankz(self.at(0))) {
                 const c = self.at(0);
                 if (self.flow_level > 0 and
@@ -1007,9 +997,28 @@ pub const Scanner = struct {
                     (ctype.isBlankz(self.at(1)) or
                         (self.flow_level > 0 and
                             (self.at(1) == ',' or self.at(1) == ']' or self.at(1) == '}')))) break;
-                try self.readCp(&value);
+                try self.readCp(&seg);
             }
-            if (!ctype.isBlank(self.at(0)) and !ctype.isBreak(self.at(0))) break;
+
+            // Empty run: the scalar ends at ':' or an indicator. Any
+            // pending whitespace was trailing, so it is dropped — YAML
+            // plain scalars never carry trailing spaces.
+            if (seg.items.len == 0) break;
+
+            // Content follows, so the pending separator joins the value:
+            // one line break folds to a space, N breaks keep N-1 newlines.
+            if (breaks > 0) {
+                if (breaks == 1) {
+                    try value.append(self.alloc, ' ');
+                } else {
+                    for (0..breaks - 1) |_| try value.append(self.alloc, '\n');
+                }
+                breaks = 0;
+            } else if (ws.items.len > 0) {
+                try value.appendSlice(self.alloc, ws.items);
+            }
+            ws.clearRetainingCapacity();
+            try value.appendSlice(self.alloc, seg.items);
 
             // Consume the whitespace/line breaks that follow the run.
             const snap_pos = self.pos;
@@ -1205,6 +1214,23 @@ test "block scalar chomping" {
     }
     try testing.expectEqualStrings("x", scalars.items[1]);
     try testing.expectEqualStrings("y\n\n", scalars.items[3]);
+}
+
+test "plain scalar never keeps trailing whitespace" {
+    // YAML 1.2: blanks before ':', before a break or at end of input are
+    // not part of a plain scalar's value.
+    var r = try scanAll(testing.allocator, "key   : value   \nflow: [a , b ]\n");
+    defer r.deinit(testing.allocator);
+    var scalars: std.ArrayList([]const u8) = .empty;
+    defer scalars.deinit(testing.allocator);
+    for (r.toks.items) |t| {
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+    }
+    try testing.expectEqualStrings("key", scalars.items[0]);
+    try testing.expectEqualStrings("value", scalars.items[1]);
+    try testing.expectEqualStrings("flow", scalars.items[2]);
+    try testing.expectEqualStrings("a", scalars.items[3]);
+    try testing.expectEqualStrings("b", scalars.items[4]);
 }
 
 test "anchor alias tag" {
