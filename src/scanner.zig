@@ -294,13 +294,36 @@ pub const Scanner = struct {
     // ------------------------------------------------------------------
 
     fn skipToNextToken(self: *Scanner) !void {
+        var line_start = self.mark.column == 1;
         while (true) {
-            // Eat whitespace. Tabs only in flow context or where a simple
-            // key cannot start (they may not be part of indentation).
-            while (self.at(0) == ' ' or
-                (self.at(0) == '\t' and (self.flow_level > 0 or !self.simple_key_allowed)))
-            {
-                self.skipCp();
+            // Eat whitespace. In block context a tab in the leading
+            // whitespace of a line is an indentation error when the
+            // content it indents is a block construct: '?', ':', '|',
+            // '>' or a '-' entry (libfyaml fy_ws_indentation_check).
+            while (true) {
+                const c = self.at(0);
+                if (c == ' ') {
+                    self.skipCp();
+                    continue;
+                }
+                if (c == '\t') {
+                    if (line_start and self.flow_level == 0) {
+                        var off: usize = 0;
+                        while (ctype.isBlank(self.at(off))) off += 1;
+                        const nc = self.at(off);
+                        const indents_block = switch (nc) {
+                            '?', ':', '|', '>' => true,
+                            '-' => ctype.isBlankz(self.at(off + 1)),
+                            else => false,
+                        };
+                        if (indents_block) {
+                            return self.failWith(error.InvalidIndentation, self.mark, "found a tab character where an indentation space is expected", .{});
+                        }
+                    }
+                    self.skipCp();
+                    continue;
+                }
+                break;
             }
             // Eat a comment until the line break.
             if (self.at(0) == '#') {
@@ -310,6 +333,7 @@ pub const Scanner = struct {
             if (ctype.isBreak(self.at(0))) {
                 self.skipLine();
                 if (self.flow_level == 0) self.simple_key_allowed = true;
+                line_start = true;
             } else break;
         }
     }
@@ -1276,6 +1300,34 @@ test "trailing blanks after top-level flow collection" {
         .stream_end,
     };
     try testing.expectEqualSlices(TokenType, want, types);
+}
+
+test "tabs before flow content are allowed, tab block indentation is not" {
+    // Corpus 6CA3/Q5MG: tabs may precede flow content; corpus tab
+    // indentation cases: tabs may not indent block constructs.
+    {
+        var r = try scanAll(testing.allocator, "\t[\n\t]\n");
+        defer r.deinit(testing.allocator);
+        const types = try tokenTypes(testing.allocator, r.toks.items);
+        defer testing.allocator.free(types);
+        const want: []const TokenType = &.{ .stream_start, .flow_sequence_start, .flow_sequence_end, .stream_end };
+        try testing.expectEqualSlices(TokenType, want, types);
+    }
+    try testing.expectError(error.InvalidIndentation, scanAll(testing.allocator, "\t- item\n"));
+    try testing.expectError(error.InvalidIndentation, scanAll(testing.allocator, "\t|literal\n"));
+    // A tab before plain content is not indentation of a block construct
+    // and is accepted.
+    {
+        var r = try scanAll(testing.allocator, "\tkey: value\n");
+        defer r.deinit(testing.allocator);
+        var scalars: std.ArrayList([]const u8) = .empty;
+        defer scalars.deinit(testing.allocator);
+        for (r.toks.items) |t| {
+            if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        }
+        try testing.expectEqualStrings("key", scalars.items[0]);
+        try testing.expectEqualStrings("value", scalars.items[1]);
+    }
 }
 
 test "anchor alias tag" {
