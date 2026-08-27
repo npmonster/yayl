@@ -720,6 +720,8 @@ pub const Scanner = struct {
 
         // empty_run: consecutive empty lines since the last content line.
         var empty_run: usize = 0;
+        // leading_breaks: empty lines before the first content line.
+        var leading_breaks: usize = 0;
         // Trailing breaks after the last content line (for keep chomping).
         var trailing_breaks: usize = 0;
         var have_content = false;
@@ -737,21 +739,16 @@ pub const Scanner = struct {
             const c = self.at(0);
 
             if (c == 0) break :outer;
-            if (ctype.isBreak(c) or c == '#') {
-                // Empty or comment-only line.
-                if (c == '#') {
-                    while (self.at(0) != 0 and !ctype.isBreak(self.at(0))) self.skipCp();
-                }
-                if (ctype.isBreak(self.at(0))) {
-                    self.skipLine();
-                    if (have_content) {
-                        empty_run += 1;
-                        trailing_breaks += 1;
-                    }
-                } else if (have_content) {
-                    // Comment line directly after content without a break
-                    // cannot happen; EOF after comment ends the scalar.
-                    break :outer;
+            if (ctype.isBreak(c)) {
+                // Empty line (it may contain whitespace). Lines starting
+                // with '#' are content: comments do not exist inside
+                // block scalars.
+                self.skipLine();
+                if (have_content) {
+                    empty_run += 1;
+                    trailing_breaks += 1;
+                } else {
+                    leading_breaks += 1;
                 }
                 continue :outer;
             }
@@ -799,6 +796,11 @@ pub const Scanner = struct {
                 } else {
                     for (0..k - 1) |_| try value.append(self.alloc, '\n');
                 }
+            } else if (leading_breaks > 0) {
+                // Leading empty lines survive as newlines in both styles;
+                // folding only applies between content lines.
+                for (0..leading_breaks) |_| try value.append(self.alloc, '\n');
+                leading_breaks = 0;
             }
             empty_run = 0;
             trailing_breaks = 0;
@@ -1231,6 +1233,19 @@ test "plain scalar never keeps trailing whitespace" {
     try testing.expectEqualStrings("flow", scalars.items[2]);
     try testing.expectEqualStrings("a", scalars.items[3]);
     try testing.expectEqualStrings("b", scalars.items[4]);
+}
+
+test "block scalar keeps '#' lines and leading empty lines" {
+    // Comments do not exist inside block scalars; leading empty lines
+    // are preserved (YAML 1.2 8.1.1, spec example 8.2).
+    var r = try scanAll(testing.allocator, "- >\n \n  \n  # detected\n");
+    defer r.deinit(testing.allocator);
+    var scalars: std.ArrayList([]const u8) = .empty;
+    defer scalars.deinit(testing.allocator);
+    for (r.toks.items) |t| {
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+    }
+    try testing.expectEqualStrings("\n\n# detected\n", scalars.items[0]);
 }
 
 test "anchor alias tag" {
