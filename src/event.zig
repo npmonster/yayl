@@ -2,8 +2,11 @@
 //!
 //! The parser is event based like libfyaml: scanning produces tokens, the
 //! state machine folds tokens into events, and the document builder turns
-//! the event stream into a node tree.
+//! the event stream into a node tree. An event is a single tagged union:
+//! the kind and its payload are one value, so a mismatched type/payload
+//! pair cannot be constructed.
 
+const std = @import("std");
 const diag = @import("diag.zig");
 const token_mod = @import("token.zig");
 
@@ -12,40 +15,43 @@ pub const ScalarStyle = token_mod.ScalarStyle;
 pub const TagDirective = token_mod.TagDirective;
 pub const VersionDirective = token_mod.VersionDirective;
 
-pub const EventType = enum {
-    stream_start,
-    stream_end,
-    document_start,
-    document_end,
-    sequence_start,
-    sequence_end,
-    mapping_start,
-    mapping_end,
-    scalar,
-    alias,
-};
-
 pub const CollectionStyle = enum { block, flow };
 
+/// One parser event. `start`/`end` are borrowed marks into the input;
+/// payload slices are arena-owned by the parser that produced them and
+/// live until its deinit.
 pub const Event = struct {
-    type: EventType,
+    kind: Kind,
     start: Mark,
     end: Mark,
-    data: Data = .{ .none = {} },
 
-    pub const Data = union(enum) {
-        none: void,
-        document_start: struct {
-            version: ?VersionDirective,
-            tags: []const TagDirective,
-            implicit: bool,
-        },
-        document_end: struct {
-            implicit: bool,
-        },
+    /// FYET_* event kinds.
+    pub const Kind = union(enum) {
+        stream_start,
+        stream_end,
+        document_start: DocumentStart,
+        document_end: DocumentEnd,
+        sequence_start: CollectionStart,
+        sequence_end,
+        mapping_start: CollectionStart,
+        mapping_end,
         scalar: ScalarEvent,
+        /// ALIAS payload: the alias name (without '*').
         alias: []const u8,
-        collection_start: CollectionStart,
+    };
+
+    /// The tag enum of `Kind`, for switches and tests that need the
+    /// discriminant without the payload.
+    pub const Type = std.meta.Tag(Kind);
+
+    pub const DocumentStart = struct {
+        version: ?VersionDirective,
+        tags: []const TagDirective,
+        implicit: bool,
+    };
+
+    pub const DocumentEnd = struct {
+        implicit: bool,
     };
 
     pub const ScalarEvent = struct {
@@ -61,3 +67,14 @@ pub const Event = struct {
         tag: ?[]const u8,
     };
 };
+
+test "event payload sanity" {
+    const e = Event{
+        .kind = .{ .scalar = .{ .value = "v", .style = .plain, .anchor = null, .tag = null } },
+        .start = .{},
+        .end = .{},
+    };
+    try std.testing.expectEqualStrings("v", e.kind.scalar.value);
+    try std.testing.expect(e.kind == .scalar);
+    try std.testing.expectEqual(Event.Type.scalar, std.meta.activeTag(e.kind));
+}

@@ -239,16 +239,16 @@ pub const Document = struct {
         }
 
         while (try p.nextEvent()) |ev| {
-            switch (ev.type) {
+            switch (ev.kind) {
                 .document_start => {
                     var d = Document.init(allocator);
-                    d.version = ev.data.document_start.version;
-                    d.explicit_start = !ev.data.document_start.implicit;
+                    d.version = ev.kind.document_start.version;
+                    d.explicit_start = !ev.kind.document_start.implicit;
                     // Copy directive strings into the pool so the document
                     // does not depend on the parser's lifetime. The two
                     // default handles the parser always installs are not
                     // document data and are not re-emitted.
-                    for (ev.data.document_start.tags) |td| {
+                    for (ev.kind.document_start.tags) |td| {
                         if (std.mem.eql(u8, td.handle, "!") and std.mem.eql(u8, td.prefix, "!")) continue;
                         if (std.mem.eql(u8, td.handle, "!!") and std.mem.eql(u8, td.prefix, "tag:yaml.org,2002:")) continue;
                         try d.tag_directives.append(allocator, .{
@@ -264,7 +264,7 @@ pub const Document = struct {
                     if (builder) |*b| b.finish();
                     builder = null;
                     var d = doc orelse return error.InvalidSyntax;
-                    d.explicit_end = !ev.data.document_end.implicit;
+                    d.explicit_end = !ev.kind.document_end.implicit;
                     doc = null;
                     try docs.append(allocator, d);
                     if (limit) |l| if (docs.items.len >= l) break;
@@ -481,44 +481,28 @@ const Builder = struct {
     }
 
     fn handle(self: *Builder, ev: Event) !void {
-        switch (ev.type) {
+        switch (ev.kind) {
             .scalar => {
                 const n = try self.doc.pool.create(Node);
                 n.* = .{
                     .mark = ev.start,
-                    .anchor = try self.dupeOptional(ev.data.scalar.anchor),
-                    .tag = try self.dupeOptional(ev.data.scalar.tag),
+                    .anchor = try self.dupeOptional(ev.kind.scalar.anchor),
+                    .tag = try self.dupeOptional(ev.kind.scalar.tag),
                     .data = .{ .scalar = .{
-                        .value = try self.doc.pool.dupe(ev.data.scalar.value),
-                        .style = ev.data.scalar.style,
+                        .value = try self.doc.pool.dupe(ev.kind.scalar.value),
+                        .style = ev.kind.scalar.style,
                     } },
                 };
                 try self.registerAnchor(n.anchor, n);
                 try self.attach(n);
             },
             .alias => {
-                const target = self.anchors.get(ev.data.alias) orelse
+                const target = self.anchors.get(ev.kind.alias) orelse
                     return error.UnknownAlias;
                 try self.attach(target);
             },
-            .sequence_start, .mapping_start => {
-                const cs = ev.data.collection_start;
-                const n = if (ev.type == .sequence_start)
-                    try self.doc.createSequence()
-                else
-                    try self.doc.createMapping();
-                n.mark = ev.start;
-                n.anchor = try self.dupeOptional(cs.anchor);
-                n.tag = try self.dupeOptional(cs.tag);
-                switch (n.data) {
-                    .sequence => |*s| s.style = cs.style,
-                    .mapping => |*m| m.style = cs.style,
-                    else => unreachable,
-                }
-                try self.registerAnchor(n.anchor, n);
-                try self.attach(n);
-                try self.stack.append(self.doc.alloc, .{ .node = n });
-            },
+            .sequence_start => try self.startCollection(ev, ev.kind.sequence_start),
+            .mapping_start => try self.startCollection(ev, ev.kind.mapping_start),
             .sequence_end => {
                 const frame = self.stack.pop().?;
                 if (frame.node.nodeType() != .sequence) return error.InvalidSyntax;
@@ -529,6 +513,24 @@ const Builder = struct {
             },
             else => {},
         }
+    }
+
+    fn startCollection(self: *Builder, ev: Event, cs: Event.CollectionStart) !void {
+        const n = if (ev.kind == .sequence_start)
+            try self.doc.createSequence()
+        else
+            try self.doc.createMapping();
+        n.mark = ev.start;
+        n.anchor = try self.dupeOptional(cs.anchor);
+        n.tag = try self.dupeOptional(cs.tag);
+        switch (n.data) {
+            .sequence => |*s| s.style = cs.style,
+            .mapping => |*m| m.style = cs.style,
+            else => unreachable,
+        }
+        try self.registerAnchor(n.anchor, n);
+        try self.attach(n);
+        try self.stack.append(self.doc.alloc, .{ .node = n });
     }
 
     /// Copy an optional parser-owned string into the document pool.

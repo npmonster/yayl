@@ -16,7 +16,7 @@ const utf8 = @import("utf8.zig");
 const Diag = diag.Diag;
 const Mark = diag.Mark;
 const Token = token_mod.Token;
-const TokenType = token_mod.TokenType;
+const TokenType = token_mod.Token.Type;
 const ScalarStyle = token_mod.ScalarStyle;
 const YamlError = diag.YamlError;
 
@@ -263,13 +263,13 @@ pub const Scanner = struct {
         sk.possible = false;
     }
 
-    fn rollIndent(self: *Scanner, column: usize, number: ?usize, ttype: TokenType, mark: Mark) !void {
+    fn rollIndent(self: *Scanner, column: usize, number: ?usize, kind: Token.Kind, mark: Mark) !void {
         if (self.flow_level > 0) return;
         const col: isize = @intCast(column);
         if (self.indent < col) {
             try self.indents.append(self.alloc, self.indent);
             self.indent = col;
-            const tok = Token{ .type = ttype, .start = mark, .end = mark };
+            const tok = Token{ .kind = kind, .start = mark, .end = mark };
             if (number) |n| {
                 try self.insertToken(n, tok);
             } else {
@@ -281,7 +281,7 @@ pub const Scanner = struct {
     fn unrollIndent(self: *Scanner, column: isize) !void {
         if (self.flow_level > 0) return;
         while (self.indent > column) {
-            try self.appendToken(.{ .type = .block_end, .start = self.mark, .end = self.mark });
+            try self.appendToken(.{ .kind = .block_end, .start = self.mark, .end = self.mark });
             self.indent = self.indents.pop().?;
         }
     }
@@ -370,7 +370,7 @@ pub const Scanner = struct {
 
     fn fetchStreamStart(self: *Scanner) !void {
         self.stream_start_produced = true;
-        try self.appendToken(.{ .type = .stream_start, .start = self.mark, .end = self.mark });
+        try self.appendToken(.{ .kind = .stream_start, .start = self.mark, .end = self.mark });
     }
 
     fn fetchStreamEnd(self: *Scanner) !void {
@@ -383,7 +383,7 @@ pub const Scanner = struct {
         try self.removeSimpleKey();
         self.simple_key_allowed = false;
         self.stream_end_produced = true;
-        try self.appendToken(.{ .type = .stream_end, .start = self.mark, .end = self.mark });
+        try self.appendToken(.{ .kind = .stream_end, .start = self.mark, .end = self.mark });
     }
 
     fn fetchDirective(self: *Scanner) !void {
@@ -394,7 +394,7 @@ pub const Scanner = struct {
         try self.appendToken(tok);
     }
 
-    fn fetchDocumentIndicator(self: *Scanner, ttype: TokenType) !void {
+    fn fetchDocumentIndicator(self: *Scanner, tag: Token.Type) !void {
         try self.unrollIndent(-1);
         try self.removeSimpleKey();
         self.simple_key_allowed = false;
@@ -402,14 +402,15 @@ pub const Scanner = struct {
         self.skipCp();
         self.skipCp();
         self.skipCp();
-        var tok = Token{ .type = ttype, .start = start, .end = self.mark };
-        if (ttype == .document_start) {
-            tok.data = .{ .document_start = .{ .explicit_marker = true } };
-        }
-        try self.appendToken(tok);
+        const k: Token.Kind = switch (tag) {
+            .document_start => .{ .document_start = .{ .explicit_marker = true } },
+            .document_end => .document_end,
+            else => unreachable, // only document indicators are passed
+        };
+        try self.appendToken(.{ .kind = k, .start = start, .end = self.mark });
     }
 
-    fn fetchFlowCollectionStart(self: *Scanner, ttype: TokenType) !void {
+    fn fetchFlowCollectionStart(self: *Scanner, kind: Token.Kind) !void {
         try self.saveSimpleKey();
         self.flow_level += 1;
         try self.simple_keys.append(self.alloc, .{});
@@ -417,10 +418,10 @@ pub const Scanner = struct {
         self.simple_key_allowed = true;
         const start = self.mark;
         self.skipCp();
-        try self.appendToken(.{ .type = ttype, .start = start, .end = self.mark });
+        try self.appendToken(.{ .kind = kind, .start = start, .end = self.mark });
     }
 
-    fn fetchFlowCollectionEnd(self: *Scanner, ttype: TokenType) !void {
+    fn fetchFlowCollectionEnd(self: *Scanner, kind: Token.Kind) !void {
         if (self.flow_level > 0) {
             self.flow_level -= 1;
             _ = self.simple_keys.pop();
@@ -428,14 +429,14 @@ pub const Scanner = struct {
         self.simple_key_allowed = false;
         const start = self.mark;
         self.skipCp();
-        try self.appendToken(.{ .type = ttype, .start = start, .end = self.mark });
+        try self.appendToken(.{ .kind = kind, .start = start, .end = self.mark });
     }
 
     fn fetchFlowEntry(self: *Scanner) !void {
         self.simple_key_allowed = true;
         const start = self.mark;
         self.skipCp();
-        try self.appendToken(.{ .type = .flow_entry, .start = start, .end = self.mark });
+        try self.appendToken(.{ .kind = .flow_entry, .start = start, .end = self.mark });
     }
 
     fn fetchBlockEntry(self: *Scanner) !void {
@@ -448,7 +449,7 @@ pub const Scanner = struct {
         self.simple_key_allowed = self.flow_level == 0;
         const start = self.mark;
         self.skipCp();
-        try self.appendToken(.{ .type = .block_entry, .start = start, .end = self.mark });
+        try self.appendToken(.{ .kind = .block_entry, .start = start, .end = self.mark });
     }
 
     fn fetchKey(self: *Scanner) !void {
@@ -461,13 +462,13 @@ pub const Scanner = struct {
         self.simple_key_allowed = self.flow_level == 0;
         const start = self.mark;
         self.skipCp();
-        try self.appendToken(.{ .type = .key, .start = start, .end = self.mark });
+        try self.appendToken(.{ .kind = .key, .start = start, .end = self.mark });
     }
 
     fn fetchValue(self: *Scanner) !void {
         const sk = &self.simple_keys.items[self.simple_keys.items.len - 1];
         if (sk.possible) {
-            try self.insertToken(sk.token_number, .{ .type = .key, .start = sk.mark, .end = sk.mark });
+            try self.insertToken(sk.token_number, .{ .kind = .key, .start = sk.mark, .end = sk.mark });
             // A confirmed simple key starts a block mapping at its own
             // position (inserted before the KEY token).
             try self.rollIndent(sk.mark.column, sk.token_number, .block_mapping_start, sk.mark);
@@ -484,13 +485,13 @@ pub const Scanner = struct {
         }
         const start = self.mark;
         self.skipCp();
-        try self.appendToken(.{ .type = .value, .start = start, .end = self.mark });
+        try self.appendToken(.{ .kind = .value, .start = start, .end = self.mark });
     }
 
-    fn fetchAnchor(self: *Scanner, ttype: TokenType) !void {
+    fn fetchAnchor(self: *Scanner, tag: Token.Type) !void {
         try self.saveSimpleKey();
         self.simple_key_allowed = false;
-        const tok = try self.scanAnchor(ttype);
+        const tok = try self.scanAnchor(tag);
         try self.appendToken(tok);
     }
 
@@ -559,14 +560,13 @@ pub const Scanner = struct {
         if (ctype.isBreak(self.at(0))) self.skipLine();
 
         return .{
-            .type = .directive,
+            .kind = .{ .directive = .{ .name = name, .params = try self.ownParams(&params) } },
             .start = start,
             .end = self.mark,
-            .data = .{ .directive = .{ .name = name, .params = try self.ownParams(&params) } },
         };
     }
 
-    fn scanAnchor(self: *Scanner, ttype: TokenType) !Token {
+    fn scanAnchor(self: *Scanner, tag: Token.Type) !Token {
         const start = self.mark;
         self.skipCp(); // '&' or '*'
         const name_start = self.pos;
@@ -578,10 +578,10 @@ pub const Scanner = struct {
             else => false,
         };
         if (name.len == 0 or !ok_after) {
-            return self.fail(start, "did not find expected alphabetic or numeric character in {s}", .{@tagName(ttype)});
+            return self.fail(start, "did not find expected alphabetic or numeric character in {s}", .{@tagName(tag)});
         }
-        const data: Token.Data = if (ttype == .anchor) .{ .anchor = name } else .{ .alias = name };
-        return .{ .type = ttype, .start = start, .end = self.mark, .data = data };
+        const k: Token.Kind = if (tag == .anchor) .{ .anchor = name } else .{ .alias = name };
+        return .{ .kind = k, .start = start, .end = self.mark };
     }
 
     fn scanTag(self: *Scanner) !Token {
@@ -634,10 +634,9 @@ pub const Scanner = struct {
             return self.fail(self.mark, "did not find expected whitespace or line break after tag", .{});
         }
         return .{
-            .type = .tag,
+            .kind = .{ .tag = .{ .handle = handle, .suffix = suffix } },
             .start = start,
             .end = self.mark,
-            .data = .{ .tag = .{ .handle = handle, .suffix = suffix } },
         };
     }
 
@@ -825,10 +824,9 @@ pub const Scanner = struct {
         }
 
         return .{
-            .type = .scalar,
+            .kind = .{ .scalar = .{ .value = try self.ownTemp(&value), .style = style } },
             .start = start,
             .end = self.mark,
-            .data = .{ .scalar = .{ .value = try self.ownTemp(&value), .style = style } },
         };
     }
 
@@ -884,10 +882,9 @@ pub const Scanner = struct {
         }
 
         return .{
-            .type = .scalar,
+            .kind = .{ .scalar = .{ .value = try self.ownTemp(&value), .style = style } },
             .start = start,
             .end = self.mark,
-            .data = .{ .scalar = .{ .value = try self.ownTemp(&value), .style = style } },
         };
     }
 
@@ -1045,10 +1042,9 @@ pub const Scanner = struct {
         }
 
         return .{
-            .type = .scalar,
+            .kind = .{ .scalar = .{ .value = try self.ownTemp(&value), .style = .plain } },
             .start = start,
             .end = self.mark,
-            .data = .{ .scalar = .{ .value = try self.ownTemp(&value), .style = .plain } },
         };
     }
 };
@@ -1085,7 +1081,7 @@ fn scanAll(alloc: std.mem.Allocator, input: []const u8) !ScanResult {
 
 fn tokenTypes(alloc: std.mem.Allocator, toks: []const Token) ![]const TokenType {
     var out = try alloc.alloc(TokenType, toks.len);
-    for (toks, 0..) |t, i| out[i] = t.type;
+    for (toks, 0..) |t, i| out[i] = std.meta.activeTag(t.kind);
     return out;
 }
 
@@ -1094,8 +1090,8 @@ test "empty stream" {
     defer r.deinit(testing.allocator);
     const toks = r.toks;
     try testing.expectEqual(@as(usize, 2), toks.items.len);
-    try testing.expectEqual(TokenType.stream_start, toks.items[0].type);
-    try testing.expectEqual(TokenType.stream_end, toks.items[1].type);
+    try testing.expectEqual(TokenType.stream_start, toks.items[0].kind);
+    try testing.expectEqual(TokenType.stream_end, toks.items[1].kind);
 }
 
 test "simple key value" {
@@ -1109,8 +1105,8 @@ test "simple key value" {
         .value,        .scalar,              .block_end, .stream_end,
     };
     try testing.expectEqualSlices(TokenType, want, types);
-    try testing.expectEqualStrings("a", toks.items[3].data.scalar.value);
-    try testing.expectEqualStrings("b", toks.items[5].data.scalar.value);
+    try testing.expectEqualStrings("a", toks.items[3].kind.scalar.value);
+    try testing.expectEqualStrings("b", toks.items[5].kind.scalar.value);
 }
 
 test "block sequence" {
@@ -1173,7 +1169,7 @@ test "quoted scalars" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (toks.items) |t| {
-        if (t.type == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
     }
     try testing.expectEqual(@as(usize, 2), scalars.items.len);
     try testing.expectEqualStrings("single 'q' end", scalars.items[0]);
@@ -1187,7 +1183,7 @@ test "block scalar literal and folded" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (toks.items) |t| {
-        if (t.type == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
     }
     try testing.expectEqualStrings("lit", scalars.items[0]);
     try testing.expectEqualStrings("line1\nline2\n", scalars.items[1]);
@@ -1202,7 +1198,7 @@ test "block scalar chomping" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (toks.items) |t| {
-        if (t.type == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
     }
     try testing.expectEqualStrings("x", scalars.items[1]);
     try testing.expectEqualStrings("y\n\n", scalars.items[3]);
@@ -1221,12 +1217,12 @@ test "anchor alias tag" {
         .stream_end,
     };
     try testing.expectEqualSlices(TokenType, want, types);
-    try testing.expectEqualStrings("a", toks.items[3].data.anchor);
-    try testing.expectEqualStrings("!!", toks.items[4].data.tag.handle);
-    try testing.expectEqualStrings("str", toks.items[4].data.tag.suffix);
-    try testing.expectEqualStrings("a", toks.items[7].data.alias);
-    try testing.expectEqualStrings("!", toks.items[9].data.tag.handle);
-    try testing.expectEqualStrings("local", toks.items[9].data.tag.suffix);
+    try testing.expectEqualStrings("a", toks.items[3].kind.anchor);
+    try testing.expectEqualStrings("!!", toks.items[4].kind.tag.handle);
+    try testing.expectEqualStrings("str", toks.items[4].kind.tag.suffix);
+    try testing.expectEqualStrings("a", toks.items[7].kind.alias);
+    try testing.expectEqualStrings("!", toks.items[9].kind.tag.handle);
+    try testing.expectEqualStrings("local", toks.items[9].kind.tag.suffix);
 }
 
 test "document markers and directives" {
@@ -1241,7 +1237,7 @@ test "document markers and directives" {
         .block_end,    .document_end, .stream_end,
     };
     try testing.expectEqualSlices(TokenType, want, types);
-    const d = toks.items[1].data.directive;
+    const d = toks.items[1].kind.directive;
     try testing.expectEqualStrings("YAML", d.name);
     try testing.expectEqual(@as(usize, 1), d.params.len);
     try testing.expectEqualStrings("1.2", d.params[0]);
@@ -1254,7 +1250,7 @@ test "plain scalar folding across lines" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (toks.items) |t| {
-        if (t.type == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
     }
     try testing.expectEqualStrings("k", scalars.items[0]);
     try testing.expectEqualStrings("a b", scalars.items[1]);
@@ -1267,7 +1263,7 @@ test "comment termination" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (toks.items) |t| {
-        if (t.type == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
     }
     try testing.expectEqualStrings("b", scalars.items[1]);
 }

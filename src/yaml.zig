@@ -45,8 +45,9 @@ pub const Pair = document.Pair;
 pub const Document = document.Document;
 pub const Parser = parser.Parser;
 pub const Scanner = scanner.Scanner;
+pub const Token = token.Token;
 pub const Event = event.Event;
-pub const EventType = event.EventType;
+pub const EventType = event.Event.Type;
 
 /// Parse the first YAML document in `input`. Additional documents in the
 /// same stream are ignored; use `parseAll` for multi-document streams.
