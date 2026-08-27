@@ -940,7 +940,13 @@ pub const Scanner = struct {
 
         const style: ScalarStyle = if (literal) .literal else .folded;
         if (!have_content) {
+            // A scalar made only of empty lines has no content; keep
+            // chomping ('+') still yields one newline per empty line
+            // (corpus K858, JEF9-1). Strip/clip chomp to the empty scalar.
             value.clearRetainingCapacity();
+            if (chomping > 0) {
+                for (0..leading_breaks) |_| try value.append(self.alloc, '\n');
+            }
         } else if (chomping >= 0) {
             const n: usize = if (chomping == 0) 1 else trailing_breaks;
             for (0..n) |_| try value.append(self.alloc, '\n');
@@ -1358,6 +1364,28 @@ test "block scalar chomping" {
     }
     try testing.expectEqualStrings("x", scalars.items[1]);
     try testing.expectEqualStrings("y\n\n", scalars.items[3]);
+}
+
+test "block scalar empty chomping" {
+    // A content-less scalar chomps differently by mode: keep ('+') retains
+    // one newline per empty line, clip (default) and strip empty it.
+    var keep = try scanAll(testing.allocator, "- |+\n\n\n");
+    defer keep.deinit(testing.allocator);
+    var clip = try scanAll(testing.allocator, "- |\n\n\n");
+    defer clip.deinit(testing.allocator);
+
+    var keep_vals: std.ArrayList([]const u8) = .empty;
+    defer keep_vals.deinit(testing.allocator);
+    for (keep.toks.items) |t| if (t.kind == .scalar) try keep_vals.append(testing.allocator, t.kind.scalar.value);
+
+    var clip_vals: std.ArrayList([]const u8) = .empty;
+    defer clip_vals.deinit(testing.allocator);
+    for (clip.toks.items) |t| if (t.kind == .scalar) try clip_vals.append(testing.allocator, t.kind.scalar.value);
+
+    try testing.expectEqual(@as(usize, 1), keep_vals.items.len);
+    try testing.expectEqualStrings("\n\n", keep_vals.items[0]);
+    try testing.expectEqual(@as(usize, 1), clip_vals.items.len);
+    try testing.expectEqualStrings("", clip_vals.items[0]);
 }
 
 test "plain scalar never keeps trailing whitespace" {

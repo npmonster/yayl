@@ -46,7 +46,6 @@ const skips: []const Skip = &.{
     .{ .id = "NB6Z", .reason = "tabs on empty lines in plain scalars", .target = "PLAN-3" },
     .{ .id = "96NN-1", .reason = "leading tab content in literal scalars", .target = "PLAN-3" },
     .{ .id = "R4YG", .reason = "block indentation indicator details (spec 8.2)", .target = "PLAN-3" },
-    .{ .id = "K858", .reason = "empty scalar chomping details (spec 8.6)", .target = "PLAN-3" },
     .{ .id = "UV7Q", .reason = "legal tab after indentation", .target = "PLAN-3" },
     // Wrongly accepted (must become rejections).
     .{ .id = "4EJS", .reason = "tab used as mapping indentation accepted", .target = "PLAN-3" },
@@ -54,8 +53,6 @@ const skips: []const Skip = &.{
     .{ .id = "9C9N", .reason = "wrong-indented flow continuation accepted", .target = "PLAN-3" },
     .{ .id = "QB6E", .reason = "wrong-indented multiline quoted scalar accepted", .target = "PLAN-3" },
     // Quoted scalar line handling.
-    .{ .id = "G4RS", .reason = "quoted scalar folding details (spec 2.17)", .target = "PLAN-3" },
-    .{ .id = "JEF9-1", .reason = "keep-chomping empty scalar via marker", .target = "PLAN-3" },
     .{ .id = "ZYU8-1", .reason = "directive variants", .target = "PLAN-3" },
 };
 
@@ -211,7 +208,8 @@ fn loadCases(alloc: std.mem.Allocator, io: std.Io, cases: *std.ArrayList(Case)) 
 ///   ␣ U+2423  significant trailing space
 ///   —…»       hard tab; up to 3 spaces before the marker are the tab's
 ///             column padding and collapse into the tab
-///   ↵ U+21B5  trailing newline
+///   ↵ U+21B5  trailing-newline visibility marker (dropped; the real
+///             newline is the line separator that follows it)
 ///   ← U+2190  carriage return
 ///   ⇔ U+21D4  byte order mark
 ///   ∎ U+220E  end of input (no final newline); terminates the input
@@ -234,7 +232,11 @@ fn replaceMarker(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
             try out.append(alloc, ' ');
             i += space_marker.len;
         } else if (starts(rest, newline_marker)) {
-            try out.append(alloc, '\n');
+            // ↵ is a *visibility* marker for a trailing newline: every
+            // occurrence in the corpus is immediately followed by a real
+            // '\n' (the block-scalar line separator), so emitting another
+            // newline here would double it (corpus JEF9-1/K858 keep
+            // chomping counts). Drop the marker only.
             i += newline_marker.len;
         } else if (starts(rest, cr_marker)) {
             try out.append(alloc, '\r');
@@ -449,6 +451,7 @@ fn appendEscaped(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: []con
             '\n' => try buf.appendSlice(alloc, "\\n"),
             '\t' => try buf.appendSlice(alloc, "\\t"),
             '\r' => try buf.appendSlice(alloc, "\\r"),
+            0x08 => try buf.appendSlice(alloc, "\\b"), // backspace (corpus G4RS)
             else => try buf.append(alloc, c),
         }
     }
