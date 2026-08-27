@@ -54,10 +54,6 @@ const skips: []const Skip = &.{
     .{ .id = "9C9N", .reason = "wrong-indented flow continuation accepted", .target = "PLAN-3" },
     .{ .id = "QB6E", .reason = "wrong-indented multiline quoted scalar accepted", .target = "PLAN-3" },
     // Quoted scalar line handling.
-    .{ .id = "7A4E", .reason = "double-quoted continuation indentation (spec 7.6)", .target = "PLAN-3" },
-    .{ .id = "9TFX", .reason = "double-quoted continuation indentation (spec 7.6, 1.3)", .target = "PLAN-3" },
-    .{ .id = "PRH3", .reason = "single-quoted continuation indentation (spec 7.9)", .target = "PLAN-3" },
-    .{ .id = "T4YY", .reason = "single-quoted continuation indentation (spec 7.9, 1.3)", .target = "PLAN-3" },
     .{ .id = "G4RS", .reason = "quoted scalar folding details (spec 2.17)", .target = "PLAN-3" },
     .{ .id = "NP9H", .reason = "double-quoted escaped line breaks (spec 7.5)", .target = "PLAN-3" },
     .{ .id = "Q8AD", .reason = "double-quoted escaped line breaks (spec 7.5, 1.3)", .target = "PLAN-3" },
@@ -275,7 +271,7 @@ const Outcome = struct {
 };
 
 /// Temporary triage aid: dump expected vs actual trees for these ids.
-const debug_ids: []const []const u8 = &.{ "7FWL", "C4HZ", "6BFJ" };
+const debug_ids: []const []const u8 = &.{};
 
 fn isDebugId(id: []const u8) bool {
     for (debug_ids) |d| if (std.mem.eql(u8, d, id)) return true;

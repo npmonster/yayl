@@ -980,15 +980,12 @@ pub const Scanner = struct {
                     self.skipCp();
                     continue;
                 }
-                // Closing quote: trailing whitespace is dropped, but a
-                // pending fold is content even when the scalar ends here
-                // ('\n' folded is a single space, corpus NAT4).
-                if (breaks == 1) {
-                    try value.append(self.alloc, ' ');
-                } else if (breaks > 1) {
-                    for (0..breaks - 1) |_| try value.append(self.alloc, '\n');
-                }
-                breaks = 0;
+                // Closing quote: commit any pending separator. A pending
+                // fold is content even when the scalar ends here
+                // ('\n' folded is a single space, corpus NAT4), and
+                // trailing whitespace after the last content line is
+                // itself content (corpus 7A4E).
+                try self.flushQuotedSeparators(&value, &breaks, &join_direct, &pending_ws);
                 self.skipCp();
                 break;
             }
@@ -1671,6 +1668,19 @@ test "block scalar leading empty lines must not outdent the content" {
         if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
     }
     try testing.expectEqualStrings("\nx\n", scalars.items[1]);
+}
+
+test "quoted scalar keeps trailing whitespace before the closing quote" {
+    // Corpus 7A4E/PRH3: trailing whitespace after the last content line
+    // is content (only whitespace before a line break is dropped).
+    var r = try scanAll(testing.allocator, "\"a \"\n");
+    defer r.deinit(testing.allocator);
+    var scalars: std.ArrayList([]const u8) = .empty;
+    defer scalars.deinit(testing.allocator);
+    for (r.toks.items) |t| {
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+    }
+    try testing.expectEqualStrings("a ", scalars.items[0]);
 }
 
 test "anchor alias tag" {
