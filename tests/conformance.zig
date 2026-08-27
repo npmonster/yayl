@@ -170,16 +170,22 @@ fn loadCases(alloc: std.mem.Allocator, io: std.Io, cases: *std.ArrayList(Case)) 
     }
 }
 
-/// The corpus marks significant trailing spaces with U+2423 (␣).
+/// The corpus marks significant trailing spaces with U+2423 (␣) and
+/// the end of input with U+220E (∎) — everything before the marker is
+/// the input, the marker itself is not.
 fn replaceMarker(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
-    const marker = "\xE2\x90\xA3";
+    const space_marker = "\xE2\x90\xA3";
+    const eof_marker = "\xE2\x88\x8E";
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     var i: usize = 0;
     while (i < input.len) {
-        if (i + marker.len <= input.len and std.mem.eql(u8, input[i .. i + marker.len], marker)) {
+        if (i + eof_marker.len <= input.len and std.mem.eql(u8, input[i .. i + eof_marker.len], eof_marker)) {
+            break;
+        }
+        if (i + space_marker.len <= input.len and std.mem.eql(u8, input[i .. i + space_marker.len], space_marker)) {
             try out.append(alloc, ' ');
-            i += marker.len;
+            i += space_marker.len;
         } else {
             try out.append(alloc, input[i]);
             i += 1;
@@ -192,6 +198,14 @@ const Outcome = struct {
     status: Status,
     reason: []const u8,
 };
+
+/// Temporary triage aid: dump expected vs actual trees for these ids.
+const debug_ids: []const []const u8 = &.{ "4QFQ", "6CK3" };
+
+fn isDebugId(id: []const u8) bool {
+    for (debug_ids) |d| if (std.mem.eql(u8, d, id)) return true;
+    return false;
+}
 
 fn runCase(alloc: std.mem.Allocator, case: Case) !Outcome {
     if (case.fail) {
@@ -214,6 +228,9 @@ fn runCase(alloc: std.mem.Allocator, case: Case) !Outcome {
 
     const expected = std.mem.trimEnd(u8, case.tree orelse "", " \n");
     const actual_trimmed = std.mem.trimEnd(u8, actual, "\n");
+    if (isDebugId(case.id)) {
+        std.debug.print("--- {s} expected ---\n{s}\n--- {s} actual ---\n{s}\n---\n", .{ case.id, expected, case.id, actual_trimmed });
+    }
     if (std.mem.eql(u8, expected, actual_trimmed)) {
         return .{ .status = .pass, .reason = "" };
     }
