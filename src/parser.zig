@@ -91,6 +91,7 @@ pub const Parser = struct {
     }
 
     fn trackTags(self: *Parser, s: []TagDirective) ![]TagDirective {
+        errdefer self.alloc.free(s);
         try self.temp_tags.append(self.alloc, s);
         return s;
     }

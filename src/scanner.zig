@@ -92,6 +92,7 @@ pub const Scanner = struct {
     /// Finalise a byte scratch buffer and register it for cleanup.
     fn ownTemp(self: *Scanner, buf: *std.ArrayList(u8)) ![]u8 {
         const s = try buf.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(s);
         try self.temp_bytes.append(self.alloc, s);
         return s;
     }
@@ -99,6 +100,7 @@ pub const Scanner = struct {
     /// Finalise a directive parameter list and register it for cleanup.
     fn ownParams(self: *Scanner, buf: *std.ArrayList([]const u8)) ![]const []const u8 {
         const s = try buf.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(s);
         try self.temp_params.append(self.alloc, s);
         return s;
     }

@@ -40,6 +40,7 @@ pub const YamlError = diag.YamlError;
 pub const ScalarStyle = token.ScalarStyle;
 pub const NodeType = document.NodeType;
 pub const ScalarKind = document.ScalarKind;
+pub const scalarKind = document.scalarKind;
 pub const Node = document.Node;
 pub const Pair = document.Pair;
 pub const Document = document.Document;
@@ -147,6 +148,27 @@ test "realistic configuration round trip" {
     try std.testing.expectEqualStrings("admin", doc2.pathGet(&.{ "database", "credentials", "user" }).?.scalarValue().?);
     try std.testing.expectEqualStrings("db-2", doc2.pathGet(&.{"replicas"}).?.items().?[1].scalarValue().?);
     try std.testing.expectEqualStrings("true", doc2.pathGet(&.{"enabled"}).?.scalarValue().?);
+}
+
+test "allocation failures leak nothing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseWriteRoundTrip, .{});
+}
+
+test "allocation failures in parse alone leak nothing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseOnly, .{});
+}
+
+fn parseOnly(alloc: std.mem.Allocator) !void {
+    var doc = try parse(alloc, "name: yayl\nitems:\n  - one\n  - two\n");
+    defer doc.deinit();
+}
+
+fn parseWriteRoundTrip(alloc: std.mem.Allocator) !void {
+    var doc = try parse(alloc, "name: yayl\nitems:\n  - one\n  - two\n");
+    defer doc.deinit();
+    try std.testing.expectEqualStrings("yayl", doc.pathGet(&.{"name"}).?.scalarValue().?);
+    const out = try doc.write(alloc);
+    defer alloc.free(out);
 }
 
 test "deep nesting and empty collections" {

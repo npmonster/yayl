@@ -265,8 +265,10 @@ pub const Document = struct {
                     builder = null;
                     var d = doc orelse return error.InvalidSyntax;
                     d.explicit_end = !ev.kind.document_end.implicit;
-                    doc = null;
+                    // Hand ownership over only once the append succeeds;
+                    // on failure the errdefer still sees `doc` and frees it.
                     try docs.append(allocator, d);
+                    doc = null;
                     if (limit) |l| if (docs.items.len >= l) break;
                 },
                 .stream_start, .stream_end => {},
