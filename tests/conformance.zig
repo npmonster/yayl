@@ -27,12 +27,6 @@ const Skip = struct {
 /// outlive a fix.
 const skips: []const Skip = &.{
     // Flow grammar: empty nodes, keys, multiline constructs.
-    .{ .id = "4MUZ-1", .reason = "flow mapping colon on line after key", .target = "PLAN-3" },
-    .{ .id = "5MUD", .reason = "flow colon with adjacent value on next line", .target = "PLAN-3" },
-    .{ .id = "K3WX", .reason = "flow colon after comment on next line", .target = "PLAN-3" },
-    .{ .id = "9SA2", .reason = "multiline double-quoted flow mapping key", .target = "PLAN-3" },
-    .{ .id = "NJ66", .reason = "multiline plain flow mapping key", .target = "PLAN-3" },
-    .{ .id = "UT92", .reason = "multiline plain key in flow (spec 9.4)", .target = "PLAN-3" },
     .{ .id = "CFD4", .reason = "empty implicit key in single-pair flow sequence", .target = "PLAN-3" },
     .{ .id = "FRK4", .reason = "completely empty flow nodes (spec 7.3)", .target = "PLAN-3" },
     .{ .id = "NKF9", .reason = "empty keys in block and flow mappings", .target = "PLAN-3" },

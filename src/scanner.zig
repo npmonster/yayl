@@ -45,6 +45,10 @@ pub const Scanner = struct {
     indents: std.ArrayList(isize) = .empty,
     simple_key_allowed: bool = true,
     simple_keys: std.ArrayList(SimpleKey) = .empty,
+    /// One boolean per flow level: true when the collection is a flow
+    /// sequence (`[`) and false for a flow mapping (`{`). Used to decide
+    /// whether a flow simple key may span a line.
+    flow_kinds: std.ArrayList(bool) = .empty,
 
     /// Token queue. `tokens_parsed` is the index of the first not yet
     /// consumed token; `token_base` is the absolute number of element 0,
@@ -88,6 +92,7 @@ pub const Scanner = struct {
     pub fn deinit(self: *Scanner) void {
         self.indents.deinit(self.alloc);
         self.simple_keys.deinit(self.alloc);
+        self.flow_kinds.deinit(self.alloc);
         self.tokens.deinit(self.alloc);
         for (self.temp_bytes.items) |buf| self.alloc.free(buf);
         self.temp_bytes.deinit(self.alloc);
@@ -249,9 +254,14 @@ pub const Scanner = struct {
     // ------------------------------------------------------------------
 
     fn staleSimpleKeys(self: *Scanner) !void {
-        for (self.simple_keys.items) |*sk| {
+        for (self.simple_keys.items, 0..) |*sk, i| {
+            // A simple key may span a line only inside a flow *mapping*.
+            // Block keys and flow-sequence single-pair keys are single-line
+            // (corpus 4MUZ/5MUD/9SA2 valid vs DK4H/ZXT5 invalid). The
+            // 1024-octet bound applies in every context.
+            const may_span_line = i > 0 and !self.flow_kinds.items[i - 1];
             if (sk.possible and
-                (sk.mark.line < self.mark.line or sk.mark.offset + max_simple_key_length < self.mark.offset))
+                ((!may_span_line and sk.mark.line < self.mark.line) or sk.mark.offset + max_simple_key_length < self.mark.offset))
             {
                 if (sk.required) {
                     return self.fail(self.mark, "simple key was expected", .{});
@@ -492,13 +502,25 @@ pub const Scanner = struct {
         try self.appendToken(.{ .kind = k, .start = start, .end = self.mark });
     }
 
+    /// In flow context a flow indicator (`[ { ] } , ? :`) must sit at a
+    /// column deeper than the enclosing block indent (libfyaml
+    /// fy_flow_indent_check). A continuation flush with the enclosing block
+    /// is an outdent and is rejected (corpus VJP3).
+    fn flowIndentOk(self: *const Scanner) bool {
+        return self.flow_level == 0 or @as(isize, @intCast(self.mark.column)) > self.indent;
+    }
+
     fn fetchFlowCollectionStart(self: *Scanner, kind: Token.Kind) !void {
+        if (!self.flowIndentOk()) {
+            return self.failWith(error.InvalidIndentation, self.mark, "wrongly indented flow collection start in flow mode", .{});
+        }
         if (self.flow_level >= self.max_nesting) {
             return self.failWith(error.NestingTooDeep, self.mark, "flow nesting is too deep", .{});
         }
         try self.saveSimpleKey();
         self.flow_level += 1;
         try self.simple_keys.append(self.alloc, .{});
+        try self.flow_kinds.append(self.alloc, kind == .flow_sequence_start);
         // A simple key may follow '[' and '{'.
         self.simple_key_allowed = true;
         const start = self.mark;
@@ -507,9 +529,13 @@ pub const Scanner = struct {
     }
 
     fn fetchFlowCollectionEnd(self: *Scanner, kind: Token.Kind) !void {
+        if (!self.flowIndentOk()) {
+            return self.failWith(error.InvalidIndentation, self.mark, "wrongly indented flow collection end in flow mode", .{});
+        }
         if (self.flow_level > 0) {
             self.flow_level -= 1;
             _ = self.simple_keys.pop();
+            _ = self.flow_kinds.pop();
         }
         self.simple_key_allowed = false;
         const start = self.mark;
@@ -518,6 +544,9 @@ pub const Scanner = struct {
     }
 
     fn fetchFlowEntry(self: *Scanner) !void {
+        if (!self.flowIndentOk()) {
+            return self.failWith(error.InvalidIndentation, self.mark, "wrongly indented flow entry in flow mode", .{});
+        }
         self.simple_key_allowed = true;
         const start = self.mark;
         self.skipCp();
@@ -538,6 +567,9 @@ pub const Scanner = struct {
     }
 
     fn fetchKey(self: *Scanner) !void {
+        if (self.flow_level > 0 and !self.flowIndentOk()) {
+            return self.failWith(error.InvalidIndentation, self.mark, "wrongly indented mapping key in flow mode", .{});
+        }
         if (self.flow_level == 0) {
             if (!self.simple_key_allowed) {
                 return self.fail(self.mark, "mapping keys are not allowed in this context", .{});
@@ -551,6 +583,9 @@ pub const Scanner = struct {
     }
 
     fn fetchValue(self: *Scanner) !void {
+        if (self.flow_level > 0 and !self.flowIndentOk()) {
+            return self.failWith(error.InvalidIndentation, self.mark, "wrongly indented mapping value in flow mode", .{});
+        }
         const sk = &self.simple_keys.items[self.simple_keys.items.len - 1];
         if (sk.possible) {
             try self.insertToken(sk.token_number, .{ .kind = .key, .start = sk.mark, .end = sk.mark });
@@ -1320,6 +1355,36 @@ test "flow collections" {
         .stream_start,       .flow_sequence_start, .scalar,            .flow_entry,
         .flow_mapping_start, .key,                 .scalar,            .value,
         .scalar,             .flow_mapping_end,    .flow_sequence_end, .stream_end,
+    };
+    try testing.expectEqualSlices(TokenType, want, types);
+}
+
+test "flow mapping key and value on separate lines" {
+    // A flow mapping key may span a line (corpus 4MUZ/5MUD: the ':' is
+    // on the following line).
+    var r = try scanAll(testing.allocator, "{\"foo\"\n: \"bar\"}\n");
+    defer r.deinit(testing.allocator);
+    const types = try tokenTypes(testing.allocator, r.toks.items);
+    defer testing.allocator.free(types);
+    const want: []const TokenType = &.{
+        .stream_start, .flow_mapping_start, .key,              .scalar,
+        .value,        .scalar,             .flow_mapping_end, .stream_end,
+    };
+    try testing.expectEqualSlices(TokenType, want, types);
+    try testing.expectEqualStrings("foo", r.toks.items[3].kind.scalar.value);
+    try testing.expectEqualStrings("bar", r.toks.items[5].kind.scalar.value);
+}
+
+test "flow sequence single-pair key cannot span a line" {
+    // corpus DK4H: in a flow sequence the ':' of a single-pair mapping
+    // must stay on the key's line, so no KEY token is produced here.
+    var r = try scanAll(testing.allocator, "[ key\n  : value ]\n");
+    defer r.deinit(testing.allocator);
+    const types = try tokenTypes(testing.allocator, r.toks.items);
+    defer testing.allocator.free(types);
+    const want: []const TokenType = &.{
+        .stream_start, .flow_sequence_start, .scalar,     .value,
+        .scalar,       .flow_sequence_end,   .stream_end,
     };
     try testing.expectEqualSlices(TokenType, want, types);
 }
