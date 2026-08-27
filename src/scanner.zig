@@ -825,6 +825,10 @@ pub const Scanner = struct {
         var empty_run: usize = 0;
         // leading_breaks: empty lines before the first content line.
         var leading_breaks: usize = 0;
+        // Deepest column reached by leading empty lines (libfyaml
+        // fy_scan_block_scalar_indent max_indent); the first content line
+        // must not be indented less than this.
+        var max_indent: isize = -1;
         // Trailing breaks after the last content line (for keep chomping).
         var trailing_breaks: usize = 0;
         var have_content = false;
@@ -856,6 +860,8 @@ pub const Scanner = struct {
                     trailing_breaks += 1;
                 } else {
                     leading_breaks += 1;
+                    const line_col: isize = @intCast(ws + 1);
+                    if (line_col > max_indent) max_indent = line_col;
                 }
                 continue :outer;
             }
@@ -877,6 +883,11 @@ pub const Scanner = struct {
                     self.pos = snap_pos;
                     self.mark = snap_mark;
                     break :outer;
+                }
+                // Leading empty lines must not be indented deeper than the
+                // first content line (corpus 5LLU/S98Z/W9L4).
+                if (max_indent > col) {
+                    return self.failWith(error.InvalidIndentation, self.mark, "found a block scalar with a wrong indented line after spaces only", .{});
                 }
                 indent = col;
             }
@@ -1642,6 +1653,24 @@ test "document indicator inside a quoted scalar is rejected" {
         if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
     }
     try testing.expectEqualStrings("x y", scalars.items[1]);
+}
+
+test "block scalar leading empty lines must not outdent the content" {
+    // Corpus 5LLU/S98Z/W9L4, libfyaml max_indent check: a leading
+    // space-only line indented deeper than the first content line is
+    // invalid.
+    try testing.expectError(error.InvalidIndentation, scanAll(testing.allocator, "a: >\n \n  \n   \n x\n"));
+    try testing.expectError(error.InvalidIndentation, scanAll(testing.allocator, "a: |\n     \n  x\n  y\n"));
+    // A leading empty line at or below the content indent stays valid and
+    // contributes a leading line break (corpus DWX9).
+    var r = try scanAll(testing.allocator, "a: |\n\n  x\n");
+    defer r.deinit(testing.allocator);
+    var scalars: std.ArrayList([]const u8) = .empty;
+    defer scalars.deinit(testing.allocator);
+    for (r.toks.items) |t| {
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+    }
+    try testing.expectEqualStrings("\nx\n", scalars.items[1]);
 }
 
 test "anchor alias tag" {

@@ -51,9 +51,6 @@ const skips: []const Skip = &.{
     // Wrongly accepted (must become rejections).
     .{ .id = "4EJS", .reason = "tab used as mapping indentation accepted", .target = "PLAN-3" },
     .{ .id = "Y79Y-1", .reason = "tabs in various contexts accepted", .target = "PLAN-3" },
-    .{ .id = "5LLU", .reason = "block scalar line under-indented after spaces accepted", .target = "PLAN-3" },
-    .{ .id = "S98Z", .reason = "block scalar line over-indented accepted", .target = "PLAN-3" },
-    .{ .id = "W9L4", .reason = "literal first line with extra spaces accepted", .target = "PLAN-3" },
     .{ .id = "9C9N", .reason = "wrong-indented flow continuation accepted", .target = "PLAN-3" },
     .{ .id = "QB6E", .reason = "wrong-indented multiline quoted scalar accepted", .target = "PLAN-3" },
     // Quoted scalar line handling.
