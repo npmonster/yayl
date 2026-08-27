@@ -325,8 +325,19 @@ pub const Scanner = struct {
                 }
                 break;
             }
-            // Eat a comment until the line break.
+            // Eat a comment until the line break. A '#' only starts a
+            // comment when preceded by whitespace or line start;
+            // "foo#bar" is not a comment (corpus 9JBA/CVW2/SU5Z).
+            // The separator may have been consumed by the previous
+            // token's scan, so look at the actual preceding byte.
             if (self.at(0) == '#') {
+                const preceded = self.pos == 0 or
+                    self.input[self.pos - 1] == ' ' or
+                    self.input[self.pos - 1] == '\t' or
+                    ctype.isBreak(self.input[self.pos - 1]);
+                if (!preceded) {
+                    return self.fail(self.mark, "found a '#' that cannot start a comment without preceding whitespace", .{});
+                }
                 while (self.at(0) != 0 and !ctype.isBreak(self.at(0))) self.skipCp();
             }
             // Eat line breaks; in block context a key may start afterwards.
@@ -367,7 +378,12 @@ pub const Scanner = struct {
             ']' => return self.fetchFlowCollectionEnd(.flow_sequence_end),
             '}' => return self.fetchFlowCollectionEnd(.flow_mapping_end),
             ',' => return self.fetchFlowEntry(),
-            '-' => if (ctype.isBlankz(self.at(1))) return self.fetchBlockEntry(),
+            '-' => if (ctype.isBlankz(self.at(1))) {
+                if (self.flow_level > 0) {
+                    return self.fail(self.mark, "found a block entry indicator inside a flow collection", .{});
+                }
+                return self.fetchBlockEntry();
+            },
             '?' => if (self.flow_level > 0 or ctype.isBlankz(self.at(1))) return self.fetchKey(),
             ':' => if (ctype.isBlankz(self.at(1)) or
                 (self.flow_level > 0 and
@@ -392,7 +408,16 @@ pub const Scanner = struct {
         const c = self.at(0);
         return switch (c) {
             0, ' ', '\t', '\n', '\r', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`' => false,
-            '-', '?', ':' => !ctype.isBlankz(self.at(1)),
+            '-', '?', ':' => blk: {
+                if (ctype.isBlankz(self.at(1))) break :blk false;
+                if (self.flow_level > 0) {
+                    // A dash followed by a flow indicator is not a plain
+                    // scalar (corpus G5U8/YJV2).
+                    const n = self.at(1);
+                    break :blk n != ',' and n != '[' and n != ']' and n != '{' and n != '}';
+                }
+                break :blk true;
+            },
             else => true,
         };
     }
@@ -431,6 +456,15 @@ pub const Scanner = struct {
         self.skipCp();
         self.skipCp();
         self.skipCp();
+        if (tag == .document_end) {
+            // Nothing but a comment may follow '...' on the same line
+            // (corpus 3HFZ).
+            while (self.at(0) == ' ') self.skipCp();
+            const c = self.at(0);
+            if (!ctype.isBlankz(c) and c != '#') {
+                return self.fail(self.mark, "did not find expected comment or line break after document end marker", .{});
+            }
+        }
         const k: Token.Kind = switch (tag) {
             .document_start => .{ .document_start = .{ .explicit_marker = true } },
             .document_end => .document_end,
@@ -725,9 +759,17 @@ pub const Scanner = struct {
                 self.skipCp();
             }
         }
-        // End of header: spaces, optional comment, then a line break.
-        while (self.at(0) == ' ') self.skipCp();
+        // End of header: spaces, optional comment (which must be
+        // whitespace-separated, corpus X4QW), then a line break.
+        var header_ws = false;
+        while (self.at(0) == ' ') {
+            self.skipCp();
+            header_ws = true;
+        }
         if (self.at(0) == '#') {
+            if (!header_ws) {
+                return self.fail(self.mark, "did not find expected comment or line break in block scalar header", .{});
+            }
             while (self.at(0) != 0 and !ctype.isBreak(self.at(0))) self.skipCp();
         }
         if (!ctype.isBlankz(self.at(0))) {
@@ -1327,6 +1369,28 @@ test "tabs before flow content are allowed, tab block indentation is not" {
         }
         try testing.expectEqualStrings("key", scalars.items[0]);
         try testing.expectEqualStrings("value", scalars.items[1]);
+    }
+}
+
+test "rejections required by the corpus" {
+    // '#' needs preceding whitespace to start a comment (9JBA/SU5Z).
+    try testing.expectError(error.InvalidSyntax, scanAll(testing.allocator, "key: \"value\"# c\n"));
+    try testing.expectError(error.InvalidSyntax, scanAll(testing.allocator, "[ a, b ]#c\n"));
+    // Nothing but a comment may follow '...' (3HFZ).
+    try testing.expectError(error.InvalidSyntax, scanAll(testing.allocator, "---\nkey: value\n... invalid\n"));
+    // A bare '-' is not a flow entry (G5U8/YJV2).
+    try testing.expectError(error.InvalidSyntax, scanAll(testing.allocator, "[-]\n"));
+    try testing.expectError(error.InvalidSyntax, scanAll(testing.allocator, "[-, a]\n"));
+    // Block scalar header comments need whitespace (X4QW).
+    try testing.expectError(error.InvalidSyntax, scanAll(testing.allocator, "block: ># c\n  x\n"));
+    // Sanity: the valid neighbours still parse.
+    {
+        var r = try scanAll(testing.allocator, "key: \"value\" # c\n");
+        defer r.deinit(testing.allocator);
+    }
+    {
+        var r = try scanAll(testing.allocator, "- [-a, b-c]\n");
+        defer r.deinit(testing.allocator);
     }
 }
 

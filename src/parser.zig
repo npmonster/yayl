@@ -195,6 +195,11 @@ pub const Parser = struct {
 
         // Explicit document: directives and/or a '---' marker.
         if (tok.kind == .directive or tok.kind == .document_start) {
+            // Directives are only allowed at the start of the stream or
+            // after a '...' marker (corpus EB22/RHX7).
+            if (tok.kind == .directive and !(implicit_allowed or had_doc_end)) {
+                return self.fail(tok.start, "found directive without preceding document end marker", .{});
+            }
             try self.processDirectives();
             tok = try self.peekToken();
             if (tok.kind != .document_start) {
