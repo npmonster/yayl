@@ -8,6 +8,8 @@
 
 const std = @import("std");
 
+/// Arena allocator: objects are freed in bulk via `reset`/`deinit`,
+/// never individually (fy-pool port).
 pub const Pool = struct {
     arena: std.heap.ArenaAllocator,
 

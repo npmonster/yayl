@@ -23,6 +23,7 @@ const TokenType = token_mod.Token.Type;
 const TagDirective = token_mod.TagDirective;
 const VersionDirective = token_mod.VersionDirective;
 
+/// Parser state-machine states (fy-parse port).
 pub const State = enum {
     stream_start,
     implicit_document_start,
@@ -50,6 +51,7 @@ pub const State = enum {
     end,
 };
 
+/// Event parser: folds the scanner's token stream into events.
 pub const Parser = struct {
     alloc: std.mem.Allocator,
     d: ?*Diag,

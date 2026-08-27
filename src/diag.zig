@@ -20,6 +20,7 @@ pub const Mark = struct {
     pub const start: Mark = .{};
 };
 
+/// Diagnostic severity.
 pub const Level = enum {
     debug,
     info,

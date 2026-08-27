@@ -23,28 +23,37 @@ const CollectionStyle = event_mod.CollectionStyle;
 const TagDirective = token_mod.TagDirective;
 const VersionDirective = token_mod.VersionDirective;
 
+/// The three YAML node shapes.
 pub const NodeType = enum { scalar, mapping, sequence };
 
+/// One mapping entry; both nodes are pool-owned.
 pub const Pair = struct {
     key: *Node,
     value: *Node,
 };
 
+/// Scalar node payload: the decoded value and its presentation style.
 pub const Scalar = struct {
     value: []const u8 = "",
     style: ScalarStyle = .plain,
 };
 
+/// Mapping payload. Add entries via `Document.mappingAppend`, which
+/// rejects duplicate keys.
 pub const Mapping = struct {
     pairs: std.ArrayList(Pair) = .empty,
     style: CollectionStyle = .block,
 };
 
+/// Sequence payload; items are pool-owned nodes.
 pub const Sequence = struct {
     items: std.ArrayList(*Node) = .empty,
     style: CollectionStyle = .block,
 };
 
+/// One YAML node: tagged union over the three shapes plus shared
+/// metadata. Pool-owned by the containing document; `parent` is a
+/// borrowed back-pointer.
 pub const Node = struct {
     parent: ?*Node = null,
     mark: Mark = .{},

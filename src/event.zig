@@ -11,10 +11,12 @@ const diag = @import("diag.zig");
 const token_mod = @import("token.zig");
 
 const Mark = diag.Mark;
+// Payload types shared with token.zig.
 pub const ScalarStyle = token_mod.ScalarStyle;
 pub const TagDirective = token_mod.TagDirective;
 pub const VersionDirective = token_mod.VersionDirective;
 
+/// Block or flow collection presentation.
 pub const CollectionStyle = enum { block, flow };
 
 /// One parser event. `start`/`end` are borrowed marks into the input;

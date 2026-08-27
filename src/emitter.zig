@@ -20,6 +20,7 @@ const ScalarStyle = token_mod.ScalarStyle;
 
 const yaml_tag_prefix = "tag:yaml.org,2002:";
 
+/// Serializes a document node tree to YAML text (fy-emit port).
 pub const Emitter = struct {
     alloc: std.mem.Allocator,
     out: *std.ArrayList(u8),

@@ -19,6 +19,7 @@
 
 const std = @import("std");
 
+/// A decoded codepoint and its byte length.
 pub const DecodeResult = struct {
     cp: u21,
     len: usize,

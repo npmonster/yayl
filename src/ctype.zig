@@ -56,6 +56,7 @@ pub fn isSpace(c: u8) bool {
     return c == ' ';
 }
 
+/// Tab.
 pub fn isTab(c: u8) bool {
     return c == '\t';
 }

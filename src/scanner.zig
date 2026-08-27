@@ -23,6 +23,7 @@ const YamlError = diag.YamlError;
 /// Maximum number of bytes a simple key may span (YAML 1.2 / libfyaml).
 const max_simple_key_length: usize = 1024;
 
+/// YAML tokenizer: turns input bytes into a token stream (fy-scan port).
 pub const Scanner = struct {
     alloc: std.mem.Allocator,
     d: ?*Diag,
