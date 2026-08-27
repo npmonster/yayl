@@ -170,28 +170,62 @@ fn loadCases(alloc: std.mem.Allocator, io: std.Io, cases: *std.ArrayList(Case)) 
     }
 }
 
-/// The corpus marks significant trailing spaces with U+2423 (␣) and
-/// the end of input with U+220E (∎) — everything before the marker is
-/// the input, the marker itself is not.
+/// The corpus encodes invisible characters with visible markers (see the
+/// corpus ReadMe):
+///
+///   ␣ U+2423  significant trailing space
+///   —…»       hard tab; up to 3 spaces before the marker are the tab's
+///             column padding and collapse into the tab
+///   ↵ U+21B5  trailing newline
+///   ← U+2190  carriage return
+///   ⇔ U+21D4  byte order mark
+///   ∎ U+220E  end of input (no final newline); terminates the input
 fn replaceMarker(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
-    const space_marker = "\xE2\x90\xA3";
-    const eof_marker = "\xE2\x88\x8E";
+    const space_marker = "\xE2\x90\xA3"; // ␣
+    const eof_marker = "\xE2\x88\x8E"; // ∎
+    const newline_marker = "\xE2\x86\xB5"; // ↵
+    const cr_marker = "\xE2\x86\x90"; // ←
+    const bom_marker = "\xE2\x87\x94"; // ⇔
+    const em_dash = "\xE2\x80\x94"; // —
+    const guillemet = "\xC2\xBB"; // »
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     var i: usize = 0;
     while (i < input.len) {
-        if (i + eof_marker.len <= input.len and std.mem.eql(u8, input[i .. i + eof_marker.len], eof_marker)) {
-            break;
-        }
-        if (i + space_marker.len <= input.len and std.mem.eql(u8, input[i .. i + space_marker.len], space_marker)) {
+        const rest = input[i..];
+        if (starts(rest, eof_marker)) break;
+        if (starts(rest, space_marker)) {
             try out.append(alloc, ' ');
             i += space_marker.len;
+        } else if (starts(rest, newline_marker)) {
+            try out.append(alloc, '\n');
+            i += newline_marker.len;
+        } else if (starts(rest, cr_marker)) {
+            try out.append(alloc, '\r');
+            i += cr_marker.len;
+        } else if (starts(rest, bom_marker)) {
+            try out.appendSlice(alloc, "\xEF\xBB\xBF");
+            i += bom_marker.len;
+        } else if (starts(rest, em_dash) or starts(rest, guillemet)) {
+            // Tab marker: drop up to 3 already-written spaces (the tab
+            // stop padding) and emit one tab.
+            var pop: usize = 0;
+            while (pop < 3 and out.items.len > pop and out.items[out.items.len - 1 - pop] == ' ') pop += 1;
+            out.shrinkRetainingCapacity(out.items.len - pop);
+            while (starts(input[i..], em_dash)) i += em_dash.len;
+            if (starts(input[i..], guillemet)) i += guillemet.len;
+            try out.append(alloc, '\t');
         } else {
             try out.append(alloc, input[i]);
             i += 1;
         }
     }
     return try out.toOwnedSlice(alloc);
+}
+
+fn starts(haystack: []const u8, needle: []const u8) bool {
+    return haystack.len >= needle.len and std.mem.eql(u8, haystack[0..needle.len], needle);
 }
 
 const Outcome = struct {
