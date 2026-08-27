@@ -56,8 +56,6 @@ const skips: []const Skip = &.{
     .{ .id = "W9L4", .reason = "literal first line with extra spaces accepted", .target = "PLAN-3" },
     .{ .id = "9C9N", .reason = "wrong-indented flow continuation accepted", .target = "PLAN-3" },
     .{ .id = "QB6E", .reason = "wrong-indented multiline quoted scalar accepted", .target = "PLAN-3" },
-    .{ .id = "5TRB", .reason = "'---' inside double-quoted scalar accepted", .target = "PLAN-3" },
-    .{ .id = "RXY3", .reason = "'...' inside single-quoted scalar accepted", .target = "PLAN-3" },
     // Quoted scalar line handling.
     .{ .id = "7A4E", .reason = "double-quoted continuation indentation (spec 7.6)", .target = "PLAN-3" },
     .{ .id = "9TFX", .reason = "double-quoted continuation indentation (spec 7.6, 1.3)", .target = "PLAN-3" },

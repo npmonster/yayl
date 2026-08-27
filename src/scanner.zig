@@ -985,6 +985,14 @@ pub const Scanner = struct {
                 pending_ws.clearRetainingCapacity();
                 self.skipLine();
                 breaks += 1;
+                // A document indicator cannot appear inside a quoted
+                // scalar (corpus 5TRB/RXY3).
+                if (self.mark.column == 1 and
+                    (self.matchAt("---", 0) or self.matchAt("...", 0)) and
+                    ctype.isBlankz(self.at(3)))
+                {
+                    return self.fail(self.mark, "found unexpected document indicator while scanning a quoted scalar", .{});
+                }
                 while (ctype.isBlank(self.at(0))) self.skipCp();
                 continue;
             }
@@ -1036,6 +1044,13 @@ pub const Scanner = struct {
         if (ctype.isBreak(c)) {
             // Escaped line break: content joins directly.
             self.skipLine();
+            // A document indicator cannot appear inside a quoted scalar.
+            if (self.mark.column == 1 and
+                (self.matchAt("---", 0) or self.matchAt("...", 0)) and
+                ctype.isBlankz(self.at(3)))
+            {
+                return self.fail(self.mark, "found unexpected document indicator while scanning a quoted scalar", .{});
+            }
             while (ctype.isBlank(self.at(0))) self.skipCp();
             join_direct.* = true;
             breaks.* = 0;
@@ -1611,6 +1626,22 @@ test "verbatim tags run to '>'" {
     defer r.deinit(testing.allocator);
     try testing.expectEqualStrings("", r.toks.items[1].kind.tag.handle);
     try testing.expectEqualStrings("!bar", r.toks.items[1].kind.tag.suffix);
+}
+
+test "document indicator inside a quoted scalar is rejected" {
+    // Corpus 5TRB/RXY3: '---'/'...' at column 1 cannot appear inside a
+    // multi-line quoted scalar.
+    try testing.expectError(error.InvalidSyntax, scanAll(testing.allocator, "---\n\"\n---\n\"\n"));
+    try testing.expectError(error.InvalidSyntax, scanAll(testing.allocator, "---\n'\n...\n'\n"));
+    // A valid multiline quoted scalar is unaffected.
+    var r = try scanAll(testing.allocator, "a: \"x\n  y\"\n");
+    defer r.deinit(testing.allocator);
+    var scalars: std.ArrayList([]const u8) = .empty;
+    defer scalars.deinit(testing.allocator);
+    for (r.toks.items) |t| {
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+    }
+    try testing.expectEqualStrings("x y", scalars.items[1]);
 }
 
 test "anchor alias tag" {
