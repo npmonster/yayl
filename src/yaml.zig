@@ -212,6 +212,56 @@ fn parseWriteRoundTrip(alloc: std.mem.Allocator) !void {
     defer alloc.free(out);
 }
 
+test "document marker streams" {
+    const alloc = std.testing.allocator;
+
+    // Two explicit markers: two documents with empty content (6XDY).
+    {
+        var docs = try parseAll(alloc, "---\n---\n");
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(alloc);
+        }
+        try std.testing.expectEqual(@as(usize, 2), docs.items.len);
+        try std.testing.expectEqualStrings("", docs.items[0].root.?.scalarValue().?);
+        try std.testing.expectEqualStrings("", docs.items[1].root.?.scalarValue().?);
+    }
+
+    // A lone '...' produces no document at all (HWV9).
+    {
+        var docs = try parseAll(alloc, "...\n");
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(alloc);
+        }
+        try std.testing.expectEqual(@as(usize, 0), docs.items.len);
+    }
+
+    // Trailing '---' opens a second, empty document (PUW8).
+    {
+        var docs = try parseAll(alloc, "---\na: b\n---\n");
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(alloc);
+        }
+        try std.testing.expectEqual(@as(usize, 2), docs.items.len);
+        try std.testing.expectEqualStrings("b", docs.items[0].pathGet(&.{"a"}).?.scalarValue().?);
+        try std.testing.expectEqualStrings("", docs.items[1].root.?.scalarValue().?);
+    }
+
+    // Bare document after '...' is implicit but present (7Z25).
+    {
+        var docs = try parseAll(alloc, "---\nscalar1\n...\nkey: value\n");
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(alloc);
+        }
+        try std.testing.expectEqual(@as(usize, 2), docs.items.len);
+        try std.testing.expectEqualStrings("scalar1", docs.items[0].root.?.scalarValue().?);
+        try std.testing.expectEqualStrings("value", docs.items[1].pathGet(&.{"key"}).?.scalarValue().?);
+    }
+}
+
 test "deep nesting and empty collections" {
     const alloc = std.testing.allocator;
     var doc = try parse(alloc, "a:\n  b:\n    c: []\n  d: {}\n");

@@ -183,33 +183,18 @@ pub const Parser = struct {
 
     fn parseDocumentStart(self: *Parser, implicit_allowed: bool) !Event {
         var tok = try self.peekToken();
-        if (!implicit_allowed) {
-            while (tok.kind == .document_end) {
-                self.scanner.skipToken();
-                tok = try self.peekToken();
-            }
+        // Extra '...' indicators are skipped wherever a document may
+        // start; after one was seen the following document is implicit
+        // (libfyaml had_doc_end semantics).
+        var had_doc_end = false;
+        while (tok.kind == .document_end) {
+            self.scanner.skipToken();
+            tok = try self.peekToken();
+            had_doc_end = true;
         }
 
-        // Implicit document: content without directives or '---'.
-        if (implicit_allowed and tok.kind != .directive and
-            tok.kind != .document_start and tok.kind != .stream_end)
-        {
-            try self.prepareDirectives();
-            try self.pushState(.document_end);
-            self.state = .block_node;
-            return .{
-                .start = tok.start,
-                .end = tok.start,
-                .kind = .{ .document_start = .{
-                    .version = self.version_directive,
-                    .tags = try self.trackTags(try self.alloc.dupe(TagDirective, self.tag_directives.items)),
-                    .implicit = true,
-                } },
-            };
-        }
-
-        if (tok.kind != .stream_end) {
-            // Explicit document, possibly preceded by directives.
+        // Explicit document: directives and/or a '---' marker.
+        if (tok.kind == .directive or tok.kind == .document_start) {
             try self.processDirectives();
             tok = try self.peekToken();
             if (tok.kind != .document_start) {
@@ -217,7 +202,7 @@ pub const Parser = struct {
             }
             self.scanner.skipToken();
             try self.pushState(.document_end);
-            self.state = .block_node;
+            self.state = .document_content;
             return .{
                 .start = tok.start,
                 .end = tok.end,
@@ -229,10 +214,31 @@ pub const Parser = struct {
             };
         }
 
-        // End of stream.
-        self.scanner.skipToken();
-        self.state = .end;
-        return Event{ .kind = .stream_end, .start = tok.start, .end = tok.end };
+        if (tok.kind == .stream_end) {
+            // End of stream.
+            self.scanner.skipToken();
+            self.state = .end;
+            return Event{ .kind = .stream_end, .start = tok.start, .end = tok.end };
+        }
+
+        // Bare content: an implicit document, either because the stream
+        // allows one or because a '...' marker was just skipped.
+        if (implicit_allowed or had_doc_end) {
+            try self.prepareDirectives();
+            try self.pushState(.document_end);
+            self.state = .document_content;
+            return .{
+                .start = tok.start,
+                .end = tok.start,
+                .kind = .{ .document_start = .{
+                    .version = self.version_directive,
+                    .tags = try self.trackTags(try self.alloc.dupe(TagDirective, self.tag_directives.items)),
+                    .implicit = true,
+                } },
+            };
+        }
+
+        return self.fail(tok.start, "did not find expected <document start>", .{});
     }
 
     fn parseDocumentContent(self: *Parser) !Event {
@@ -247,12 +253,12 @@ pub const Parser = struct {
     }
 
     fn parseDocumentEnd(self: *Parser) !Event {
-        var tok = try self.peekToken();
+        const tok = try self.peekToken();
         var implicit = true;
         if (tok.kind == .document_end) {
+            // Do not consume the '...' here: the next document-start
+            // skips it and treats the following document as implicit.
             implicit = false;
-            self.scanner.skipToken();
-            tok = try self.peekToken();
         }
         // Directive state is per-document (fy_parse resets between docs).
         self.tag_directives.clearRetainingCapacity();
