@@ -946,7 +946,16 @@ pub const Scanner = struct {
                     self.skipCp();
                     continue;
                 }
-                self.skipCp(); // closing quote; trailing whitespace is dropped
+                // Closing quote: trailing whitespace is dropped, but a
+                // pending fold is content even when the scalar ends here
+                // ('\n' folded is a single space, corpus NAT4).
+                if (breaks == 1) {
+                    try value.append(self.alloc, ' ');
+                } else if (breaks > 1) {
+                    for (0..breaks - 1) |_| try value.append(self.alloc, '\n');
+                }
+                breaks = 0;
+                self.skipCp();
                 break;
             }
             if (ctype.isBreak(c)) {
@@ -1464,6 +1473,22 @@ test "literal keeps whitespace-only lines deeper than the strip" {
         if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
     }
     try testing.expectEqualStrings("ab\n\n \nend\n", scalars.items[0]);
+}
+
+test "quoted scalar fold before closing quote is content" {
+    // A folded break directly before the closing quote still yields its
+    // separator: one break is a space, more keep N-1 newlines (NAT4).
+    var r = try scanAll(testing.allocator, "a: '\n  '\nb: '\n\n  '\n");
+    defer r.deinit(testing.allocator);
+    var scalars: std.ArrayList([]const u8) = .empty;
+    defer scalars.deinit(testing.allocator);
+    for (r.toks.items) |t| {
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+    }
+    try testing.expectEqualStrings("a", scalars.items[0]);
+    try testing.expectEqualStrings(" ", scalars.items[1]);
+    try testing.expectEqualStrings("b", scalars.items[2]);
+    try testing.expectEqualStrings("\n", scalars.items[3]);
 }
 
 test "anchor alias tag" {

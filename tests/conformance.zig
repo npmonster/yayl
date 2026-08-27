@@ -163,7 +163,7 @@ fn loadCases(alloc: std.mem.Allocator, io: std.Io, cases: *std.ArrayList(Case)) 
                 .id = case_id,
                 .name = try alloc.dupe(u8, name_val.scalarValue() orelse "?"),
                 .input = try replaceMarker(alloc, yaml_val.scalarValue() orelse ""),
-                .tree = if (tree_node) |t| try alloc.dupe(u8, t.scalarValue() orelse "") else null,
+                .tree = if (tree_node) |t| try replaceMarker(alloc, t.scalarValue() orelse "") else null,
                 .fail = if (fail_node) |f| std.mem.eql(u8, f.scalarValue() orelse "", "true") else false,
             });
         }
@@ -234,7 +234,7 @@ const Outcome = struct {
 };
 
 /// Temporary triage aid: dump expected vs actual trees for these ids.
-const debug_ids: []const []const u8 = &.{ "4QFQ", "6CK3" };
+const debug_ids: []const []const u8 = &.{ "652Z", "6FWR", "H2RW", "NAT4" };
 
 fn isDebugId(id: []const u8) bool {
     for (debug_ids) |d| if (std.mem.eql(u8, d, id)) return true;
@@ -256,7 +256,7 @@ fn runCase(alloc: std.mem.Allocator, case: Case) !Outcome {
     }
 
     const actual = renderTree(alloc, case.input) catch |err| {
-        return .{ .status = .fail, .reason = if (err == error.OutOfMemory) "oom" else "parse error" };
+        return .{ .status = .fail, .reason = if (err == error.OutOfMemory) "oom" else @errorName(err) };
     };
     defer alloc.free(actual);
 
@@ -290,19 +290,35 @@ fn firstMismatch(expected: []const u8, actual: []const u8) []const u8 {
     }
 }
 
+fn dumpDiags(diag: yaml.Diag) void {
+    for (diag.list.items) |d| {
+        std.debug.print("    diag {d}:{d}: {s}\n", .{ d.mark.line, d.mark.column, d.message });
+    }
+}
+
 /// Render the parser's event stream in the corpus tree notation:
 /// `+STR/+DOC/+SEQ/+MAP/...` with one space of indent per open container,
 /// anchors as `&name`, resolved tags as `<uri>`, scalar styles as
 /// `: ' " | >` prefixes, and `\`, `\n`, `\t`, `\r` escaped in values.
 fn renderTree(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
-    var p = try yaml.Parser.init(alloc, null, input);
+    var diag: yaml.Diag = .{ .alloc = alloc };
+    defer diag.deinit();
+    var p = yaml.Parser.init(alloc, &diag, input) catch |err| {
+        dumpDiags(diag);
+        return err;
+    };
     defer p.deinit();
 
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
 
     var depth: usize = 0;
-    while (try p.nextEvent()) |ev| {
+    while (true) {
+        const next = p.nextEvent() catch |err| {
+            dumpDiags(diag);
+            return err;
+        };
+        const ev = next orelse break;
         switch (ev.kind) {
             .stream_start => {
                 try writeLine(&buf, alloc, depth, "+STR");
