@@ -2,12 +2,15 @@
 id: PLAN-3
 title: Implement YAML scanner, parser, and streaming event API
 created: 2026-08-26T11:20:47Z
-updated: 2026-08-26T11:20:57Z
+updated: 2026-08-27T04:58:01Z
 tags: [yayl, core, parser, events, future-work]
 deps: [PLAN-2]
 skills: []
 review_rounds: 0
 priority: 1
+worker: qwen-code qwen3-coder
+reviewer: qwen-code qwen3-coder (self-review per user decision 2026-08-27)
+auto_review: true
 ---
 
 ## Plan

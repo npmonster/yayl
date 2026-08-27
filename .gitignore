@@ -4,3 +4,12 @@ zig-out/
 *.o
 vendor/
 .plumb/
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+.AppleDouble/
+.LSOverride/

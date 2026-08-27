@@ -2,7 +2,7 @@
 id: PLAN-9
 title: Refactor Yayl into an idiomatic, warning-free Zig 0.16 foundation
 created: 2026-08-26T11:26:32Z
-updated: 2026-08-26T15:27:16Z
+updated: 2026-08-27T01:05:17Z
 tags: [yayl, zig, quality, refactor, testing, architecture]
 deps: []
 skills: []
@@ -11,6 +11,7 @@ priority: 1
 worker: qwen-code qwen3-coder
 reviewer: qwen-code qwen3-coder (self-review per user decision 2026-08-27)
 auto_review: true
+blocked: ""
 ---
 
 ## Plan
@@ -173,3 +174,5 @@ This card should be completed before PLAN-2. PLAN-3 through PLAN-8 already depen
 ## Log
 - 2026-08-26T11:26:32Z created
 - 2026-08-26T15:27:16Z Reproduced current state (Zig 0.16.0, sandbox-safe cache via ZIG_GLOBAL_CACHE_DIR=./.zig-cache-global): zig build + test Debug 47/47 pass; ReleaseSafe 47/47 pass; zig fmt --check clean; ast-check clean. Findings since card creation: #2 fingerprint present (0xc49f7ed1a8db0b85), #3 src/yaml.zig exists, #4 fmt clean, #5 Pool.init shadowing fixed (param renamed gpa), #6 Diag leak fixed (deinit frees messages). Still open: #9 Token/Event dual tag+payload (directive tag now exists), #10 isPrintableAscii 0x80-0xFF true (no external callers), #11 utf8.encode unvalidated + countCodepoints prefix semantics (no external callers), #12 create/createUninit duplicate (zeroes removed), #13 render 4096-byte silent-truncate remains, build.zig.zon .paths = all (needs narrowing), emit() missing errdefer on append failure.
+- 2026-08-27T01:04:20Z Work complete (commits 70dae24..306d773 on main): Phase 0 — zon paths narrowed, fingerprint verified via zig build, build.zig compiles the public root by default (shared module + static-lib check step), make verify gate (fmt incl. build.zig.zon + check + Debug + ReleaseSafe), CI pinned to Zig 0.16.0 with bounded timeout, README allocator/lifetime section. Phase 1 — Token/Event are single tagged unions (mismatch unrepresentable; collection_start split into sequence_start/mapping_start; Type = std.meta.Tag(Kind)); Mark.zero -> Mark.start; ownership documented on Token/Event/Diagnostic/Mark; YamlError kept as one public vocabulary by design (all layers feed one diagnostic channel; mirrors libfyaml FYEC_* collapse) with rationale in the doc comment; token.Token/event.Event naming kept deliberately (module-qualified Zig style). Phase 2 — ctype: isPrintableAscii fixed to 0x20..0x7E, isAlpha -> isWordChar, isDigit -> std.ascii, exhaustive 256-byte tables; utf8: wraps std.unicode, decode distinguishes EOF vs invalid, encode/countCodepoints error-checked, added YAML 5.1 isPrintableCodepoint + differential/fuzz tests; pool: createUninit removed, backing_allocator naming, reset-invalidation docs, checkAllAllocationFailures; diag: emit errdefer, render truncation-free, ownership model documented. Phase 3 DRY inventory: scalar styles/directives single home (token.zig, re-exported), marks (diag.zig), one UTF-8 codec (std-backed), one render path (ArrayList print); no new abstractions introduced, rejected: per-layer error sets (above), std.ascii reuse where semantics differ (isBlank/isSpace keep YAML EOF/narrower semantics). Phase 4 — allocation-failure injection over public parse/write found and fixed 3 real leaks (ownTemp/ownParams, trackTags, parseStream ownership ordering); Debug+ReleaseSafe green (62 tests), x86_64-linux + aarch64-linux cross-compile verified, ZLS diagnostics clean.
+- 2026-08-27T01:05:17Z review passed
