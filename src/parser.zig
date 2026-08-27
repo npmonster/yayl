@@ -623,6 +623,17 @@ pub const Parser = struct {
                 }
             }
             if (tok.kind != .flow_sequence_end) {
+                if (tok.kind == .value) {
+                    // Empty-key single-pair mapping inside a flow sequence:
+                    // [: value] (corpus CFD4). The ':' is not consumed here.
+                    self.state = .flow_sequence_entry_mapping_key;
+                    try self.pushMark(tok.start);
+                    return .{
+                        .start = tok.start,
+                        .end = tok.start,
+                        .kind = .{ .mapping_start = .{ .style = .flow, .anchor = null, .tag = null } },
+                    };
+                }
                 if (tok.kind == .key) {
                     // Single-pair mapping inside a flow sequence: [a: b].
                     self.scanner.skipToken();
@@ -689,6 +700,12 @@ pub const Parser = struct {
                 } else {
                     return self.fail(tok.start, "did not find expected ',' or '}}'", .{});
                 }
+            }
+            if (tok.kind == .value) {
+                // Empty key: the ':' arrives without a preceding key node
+                // (corpus FRK4/NKF9).
+                self.state = .flow_mapping_value;
+                return self.processEmptyScalar(tok.start);
             }
             if (tok.kind == .key) {
                 self.scanner.skipToken();
@@ -832,6 +849,27 @@ test "unknown directives are ignored with a warning" {
         }
     }
     try testing.expect(found);
+}
+
+test "flow mapping empty key" {
+    var evs = try eventTypes(testing.allocator, "{: empty key}\n");
+    defer evs.deinit(testing.allocator);
+    const want: []const EventType = &.{
+        .stream_start, .document_start, .mapping_start, .scalar,
+        .scalar,       .mapping_end,    .document_end,  .stream_end,
+    };
+    try testing.expectEqualSlices(EventType, want, evs.items);
+}
+
+test "flow sequence empty-key single-pair mapping" {
+    var evs = try eventTypes(testing.allocator, "- [ : empty key ]\n");
+    defer evs.deinit(testing.allocator);
+    const want: []const EventType = &.{
+        .stream_start,  .document_start, .sequence_start, .sequence_start,
+        .mapping_start, .scalar,         .scalar,         .mapping_end,
+        .sequence_end,  .sequence_end,   .document_end,   .stream_end,
+    };
+    try testing.expectEqualSlices(EventType, want, evs.items);
 }
 
 test "trailing blanks after top-level flow collection parse" {

@@ -27,9 +27,6 @@ const Skip = struct {
 /// outlive a fix.
 const skips: []const Skip = &.{
     // Flow grammar: empty nodes, keys, multiline constructs.
-    .{ .id = "CFD4", .reason = "empty implicit key in single-pair flow sequence", .target = "PLAN-3" },
-    .{ .id = "FRK4", .reason = "completely empty flow nodes (spec 7.3)", .target = "PLAN-3" },
-    .{ .id = "NKF9", .reason = "empty keys in block and flow mappings", .target = "PLAN-3" },
     .{ .id = "6PBE", .reason = "zero-indented sequence in explicit mapping key", .target = "PLAN-3" },
     // Block scalars, tabs and indentation interplay.
     .{ .id = "MJS9", .reason = "block folding with tabs (spec 6.7)", .target = "PLAN-3" },
