@@ -396,7 +396,7 @@ pub const Scanner = struct {
                 }
                 return self.fetchBlockEntry();
             },
-            '?' => if (self.flow_level > 0 or ctype.isBlankz(self.at(1))) return self.fetchKey(),
+            '?' => if (ctype.isBlankz(self.at(1))) return self.fetchKey(),
             ':' => if (ctype.isBlankz(self.at(1)) or
                 (self.flow_level > 0 and
                     (self.last_node_end or self.at(1) == ',' or self.at(1) == ']' or self.at(1) == '}'))) return self.fetchValue(),
@@ -819,7 +819,11 @@ pub const Scanner = struct {
             const c = self.at(0);
 
             if (c == 0) break :outer;
-            if (ctype.isBreak(c)) {
+            // A whitespace-only line is empty unless its spaces reach
+            // deeper than the strip column — then the spaces are content
+            // (corpus 6FWR).
+            const ws_line_is_content = indent != 0 and @as(isize, @intCast(ws)) > indent - 1;
+            if (ctype.isBreak(c) and !ws_line_is_content) {
                 // Empty line (it may contain whitespace). Lines starting
                 // with '#' are content: comments do not exist inside
                 // block scalars.
@@ -1433,6 +1437,33 @@ test "flow adjacent values and '%' as a scalar in flow" {
         try testing.expectEqualStrings("%", scalars.items[0]);
         try testing.expectEqualStrings("1", scalars.items[1]);
     }
+}
+
+test "'?' without blank starts a plain scalar" {
+    // '?' is a key indicator only before blanks; '?foo' is a scalar
+    // even in flow (corpus 652Z).
+    var r = try scanAll(testing.allocator, "{?foo: bar}\n");
+    defer r.deinit(testing.allocator);
+    var scalars: std.ArrayList([]const u8) = .empty;
+    defer scalars.deinit(testing.allocator);
+    for (r.toks.items) |t| {
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+    }
+    try testing.expectEqualStrings("?foo", scalars.items[0]);
+    try testing.expectEqualStrings("bar", scalars.items[1]);
+}
+
+test "literal keeps whitespace-only lines deeper than the strip" {
+    // A space-only line below the strip column is content, not an empty
+    // line (corpus 6FWR).
+    var r = try scanAll(testing.allocator, "|\nab\n\n \nend\n");
+    defer r.deinit(testing.allocator);
+    var scalars: std.ArrayList([]const u8) = .empty;
+    defer scalars.deinit(testing.allocator);
+    for (r.toks.items) |t| {
+        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+    }
+    try testing.expectEqualStrings("ab\n\n \nend\n", scalars.items[0]);
 }
 
 test "anchor alias tag" {
