@@ -38,15 +38,8 @@ const skips: []const Skip = &.{
     .{ .id = "NKF9", .reason = "empty keys in block and flow mappings", .target = "PLAN-3" },
     .{ .id = "6PBE", .reason = "zero-indented sequence in explicit mapping key", .target = "PLAN-3" },
     // Block scalars, tabs and indentation interplay.
-    .{ .id = "4ZYM", .reason = "tab in block indentation region (spec 6.4)", .target = "PLAN-3" },
-    .{ .id = "J3BT", .reason = "tab after ':' in block context (spec 5.12)", .target = "PLAN-3" },
-    .{ .id = "M9B4", .reason = "literal scalar tab/indent interplay (spec 8.7)", .target = "PLAN-3" },
-    .{ .id = "T5N4", .reason = "literal scalar tab/indent interplay (spec 8.7, 1.3)", .target = "PLAN-3" },
     .{ .id = "MJS9", .reason = "block folding with tabs (spec 6.7)", .target = "PLAN-3" },
-    .{ .id = "NB6Z", .reason = "tabs on empty lines in plain scalars", .target = "PLAN-3" },
-    .{ .id = "96NN-1", .reason = "leading tab content in literal scalars", .target = "PLAN-3" },
     .{ .id = "R4YG", .reason = "block indentation indicator details (spec 8.2)", .target = "PLAN-3" },
-    .{ .id = "UV7Q", .reason = "legal tab after indentation", .target = "PLAN-3" },
     // Wrongly accepted (must become rejections).
     .{ .id = "4EJS", .reason = "tab used as mapping indentation accepted", .target = "PLAN-3" },
     .{ .id = "Y79Y-1", .reason = "tabs in various contexts accepted", .target = "PLAN-3" },
@@ -245,13 +238,10 @@ fn replaceMarker(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
             try out.appendSlice(alloc, "\xEF\xBB\xBF");
             i += bom_marker.len;
         } else if (starts(rest, em_dash) or starts(rest, guillemet)) {
-            // Tab marker: drop up to 3 already-written spaces (the tab
-            // stop padding) and emit one tab. Only spaces preceded by
-            // whitespace or line start are padding; spaces after content
-            // are part of the content.
-            var pop: usize = 0;
-            while (pop < 3 and out.items.len > pop + 1 and out.items[out.items.len - 1 - pop] == ' ' and (out.items[out.items.len - 2 - pop] == ' ' or out.items[out.items.len - 2 - pop] == '\t' or out.items[out.items.len - 2 - pop] == '\n')) pop += 1;
-            out.shrinkRetainingCapacity(out.items.len - pop);
+            // Hard-tab marker: `—*»` (any run of U+2014 then U+00BB) is a
+            // single tab. Surrounding spaces are preserved — block/flow
+            // scalar indentation, not the harness, decides which spaces
+            // are content (YAMLTestSuite.pm `s/—*»/\t/g`).
             while (starts(input[i..], em_dash)) i += em_dash.len;
             if (starts(input[i..], guillemet)) i += guillemet.len;
             try out.append(alloc, '\t');

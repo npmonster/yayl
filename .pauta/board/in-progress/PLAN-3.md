@@ -2,7 +2,7 @@
 id: PLAN-3
 title: Implement YAML scanner, parser, and streaming event API
 created: 2026-08-26T11:20:47Z
-updated: 2026-08-27T04:58:01Z
+updated: 2026-08-27T17:09:06Z
 tags: [yayl, core, parser, events, future-work]
 deps: [PLAN-2]
 skills: []
@@ -36,3 +36,4 @@ Turn the existing character, UTF-8, pool, and diagnostics primitives into a stan
 
 ## Log
 - 2026-08-26T11:20:47Z created
+- 2026-08-27T17:09:06Z Resolved 3 skips (G4RS, JEF9-1, K858): empty block-scalar keep-chomping, corpus ↵ visibility-marker handling, backspace escaping in tree render. 327/351 passing, 24 skips remain. Full `make verify` green. Commit 51464d1.
