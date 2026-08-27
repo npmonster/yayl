@@ -679,11 +679,12 @@ pub const Scanner = struct {
         var suffix: []const u8 = "";
 
         if (self.at(1) == '<') {
-            // Verbatim tag !<uri>
+            // Verbatim tag !<uri>: everything up to '>' is the URI
+            // (corpus 7FWL: '!' et al. are valid inside).
             self.skipCp();
             self.skipCp();
             const s_start = self.pos;
-            try self.scanTagUri();
+            while (!ctype.isBlankz(self.at(0)) and self.at(0) != '>') self.skipCp();
             suffix = self.input[s_start..self.pos];
             if (suffix.len == 0) {
                 return self.fail(start, "tag URI is empty", .{});
@@ -1601,6 +1602,15 @@ test "tag URI stops before a trailing comma or bracket" {
     try testing.expectEqualStrings("!!", r.toks.items[1].kind.tag.handle);
     try testing.expectEqualStrings("str", r.toks.items[1].kind.tag.suffix);
     try testing.expectEqual(Token.Type.flow_entry, std.meta.activeTag(r.toks.items[2].kind));
+}
+
+test "verbatim tags run to '>'" {
+    // Corpus 7FWL: the verbatim URI is everything up to '>', '!' and
+    // friends included.
+    var r = try scanAll(testing.allocator, "!<!bar> baz\n");
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualStrings("", r.toks.items[1].kind.tag.handle);
+    try testing.expectEqualStrings("!bar", r.toks.items[1].kind.tag.suffix);
 }
 
 test "anchor alias tag" {

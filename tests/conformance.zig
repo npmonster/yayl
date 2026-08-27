@@ -26,14 +26,6 @@ const Skip = struct {
 /// starts passing fails the gate ("stale skip") so this table cannot
 /// outlive a fix.
 const skips: []const Skip = &.{
-    // Anchor and alias rendering on flow nodes.
-    .{ .id = "6BFJ", .reason = "anchor rendering on flow sequence items", .target = "PLAN-3" },
-    .{ .id = "CN3R", .reason = "anchor positions in flow sequences", .target = "PLAN-3" },
-    .{ .id = "X38W", .reason = "alias rendering in flow objects", .target = "PLAN-3" },
-    // Tags.
-    .{ .id = "7FWL", .reason = "verbatim tags !<...>", .target = "PLAN-3" },
-    .{ .id = "C4HZ", .reason = "global tag rendering", .target = "PLAN-3" },
-    .{ .id = "EHF6", .reason = "tag rendering for flow objects", .target = "PLAN-3" },
     // Flow grammar: empty nodes, keys, multiline constructs.
     .{ .id = "4MUZ-1", .reason = "flow mapping colon on line after key", .target = "PLAN-3" },
     .{ .id = "5MUD", .reason = "flow colon with adjacent value on next line", .target = "PLAN-3" },
@@ -288,7 +280,7 @@ const Outcome = struct {
 };
 
 /// Temporary triage aid: dump expected vs actual trees for these ids.
-const debug_ids: []const []const u8 = &.{};
+const debug_ids: []const []const u8 = &.{ "7FWL", "C4HZ", "6BFJ" };
 
 fn isDebugId(id: []const u8) bool {
     for (debug_ids) |d| if (std.mem.eql(u8, d, id)) return true;
@@ -391,14 +383,12 @@ fn renderTree(alloc: std.mem.Allocator, input: []const u8, verbose: bool) ![]u8 
                 try writeLine(&buf, alloc, depth, if (!d.implicit) "-DOC ..." else "-DOC");
             },
             .sequence_start => |cs| {
-                try bufPrintMeta(&buf, alloc, depth, "+SEQ", cs.anchor, cs.tag);
-                if (cs.style == .flow) try buf.appendSlice(alloc, " []");
+                try bufPrintMeta(&buf, alloc, depth, "+SEQ", if (cs.style == .flow) " []" else "", cs.anchor, cs.tag);
                 try buf.append(alloc, '\n');
                 depth += 1;
             },
             .mapping_start => |cs| {
-                try bufPrintMeta(&buf, alloc, depth, "+MAP", cs.anchor, cs.tag);
-                if (cs.style == .flow) try buf.appendSlice(alloc, " {}");
+                try bufPrintMeta(&buf, alloc, depth, "+MAP", if (cs.style == .flow) " {}" else "", cs.anchor, cs.tag);
                 try buf.append(alloc, '\n');
                 depth += 1;
             },
@@ -411,7 +401,7 @@ fn renderTree(alloc: std.mem.Allocator, input: []const u8, verbose: bool) ![]u8 
                 try writeLine(&buf, alloc, depth, "-MAP");
             },
             .scalar => |s| {
-                try bufPrintMeta(&buf, alloc, depth, "=VAL", s.anchor, s.tag);
+                try bufPrintMeta(&buf, alloc, depth, "=VAL", "", s.anchor, s.tag);
                 try buf.append(alloc, ' ');
                 try buf.append(alloc, styleChar(s.style));
                 try appendEscaped(&buf, alloc, s.value);
@@ -426,9 +416,10 @@ fn renderTree(alloc: std.mem.Allocator, input: []const u8, verbose: bool) ![]u8 
     return try buf.toOwnedSlice(alloc);
 }
 
-fn bufPrintMeta(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, depth: usize, head: []const u8, anchor: ?[]const u8, tag: ?[]const u8) !void {
+fn bufPrintMeta(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, depth: usize, head: []const u8, style_suffix: []const u8, anchor: ?[]const u8, tag: ?[]const u8) !void {
     try indent(buf, alloc, depth);
     try buf.appendSlice(alloc, head);
+    try buf.appendSlice(alloc, style_suffix);
     if (anchor) |a| {
         try buf.append(alloc, ' ');
         try buf.append(alloc, '&');
