@@ -25,6 +25,7 @@ pub const diag = @import("diag.zig");
 pub const pool = @import("pool.zig");
 pub const utf8 = @import("utf8.zig");
 pub const ctype = @import("ctype.zig");
+pub const markup = @import("markup.zig");
 pub const token = @import("token.zig");
 pub const scanner = @import("scanner.zig");
 pub const event = @import("event.zig");
@@ -67,6 +68,7 @@ test {
     _ = pool;
     _ = utf8;
     _ = ctype;
+    _ = markup;
     _ = token;
     _ = scanner;
     _ = event;

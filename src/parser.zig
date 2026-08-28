@@ -163,7 +163,7 @@ pub const Parser = struct {
         return .{
             .start = mark,
             .end = mark,
-            .kind = .{ .scalar = .{ .value = "", .style = .plain, .anchor = null, .tag = null } },
+            .kind = .{ .scalar = .{ .value = "", .style = .plain, .anchor = null, .tag = null, .synthetic = true } },
         };
     }
 
@@ -567,8 +567,11 @@ pub const Parser = struct {
             self.scanner.skipToken();
             tok = try self.peekToken();
             if (tok.kind != .key and tok.kind != .value and tok.kind != .block_end) {
+                // Indentless sequences are allowed in key position too
+                // (corpus 6PBE: `?` followed by a zero-indented
+                // sequence), matching libyaml's parse_node(1, 1).
                 try self.pushState(.block_mapping_value);
-                return self.parseNode(true, false);
+                return self.parseNode(true, true);
             }
             self.state = .block_mapping_value;
             return self.processEmptyScalar(tok.start);

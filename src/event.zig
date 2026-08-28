@@ -61,6 +61,10 @@ pub const Event = struct {
         style: ScalarStyle,
         anchor: ?[]const u8,
         tag: ?[]const u8,
+        /// True when the parser synthesized this scalar for a missing
+        /// node (empty key/value). Its marks point at the *next* token,
+        /// so CST code must never emit its span verbatim.
+        synthetic: bool = false,
     };
 
     pub const CollectionStart = struct {

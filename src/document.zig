@@ -9,6 +9,7 @@ const std = @import("std");
 const ctype = @import("ctype.zig");
 const diag = @import("diag.zig");
 const event_mod = @import("event.zig");
+const markup = @import("markup.zig");
 const parser_mod = @import("parser.zig");
 const pool_mod = @import("pool.zig");
 const token_mod = @import("token.zig");
@@ -23,13 +24,20 @@ const CollectionStyle = event_mod.CollectionStyle;
 const TagDirective = token_mod.TagDirective;
 const VersionDirective = token_mod.VersionDirective;
 
-/// The three YAML node shapes.
-pub const NodeType = enum { scalar, mapping, sequence };
+/// The four YAML node shapes. Aliases are first-class nodes (fy_node
+/// alias semantics): `- *a` occupies its own slot in the tree with its
+/// own source span and formatting, pointing at the anchored target.
+pub const NodeType = enum { scalar, mapping, sequence, alias };
 
-/// One mapping entry; both nodes are pool-owned.
+/// One mapping entry; both nodes are pool-owned. `src` records where
+/// the pair's bytes end in the original source (see `Node.src`), so
+/// untouched pairs re-emit byte-identically.
 pub const Pair = struct {
     key: *Node,
     value: *Node,
+    /// Offset just past the pair's last content byte: the value's end,
+    /// or the `:` for valueless (null) pairs.
+    src_end: ?usize = null,
 };
 
 /// Scalar node payload: the decoded value and its presentation style.
@@ -43,15 +51,21 @@ pub const Scalar = struct {
 pub const Mapping = struct {
     pairs: std.ArrayList(Pair) = .empty,
     style: CollectionStyle = .block,
+    /// Source byte ranges of removed entries (tombstones): the emitter
+    /// skips these inside preserved gaps so deleted entries do not
+    /// re-appear verbatim.
+    dropped: std.ArrayList([2]usize) = .empty,
 };
 
 /// Sequence payload; items are pool-owned nodes.
 pub const Sequence = struct {
     items: std.ArrayList(*Node) = .empty,
     style: CollectionStyle = .block,
+    /// See `Mapping.dropped`.
+    dropped: std.ArrayList([2]usize) = .empty,
 };
 
-/// One YAML node: tagged union over the three shapes plus shared
+/// One YAML node: tagged union over the four shapes plus shared
 /// metadata. Pool-owned by the containing document; `parent` is a
 /// borrowed back-pointer.
 pub const Node = struct {
@@ -60,31 +74,62 @@ pub const Node = struct {
     anchor: ?[]const u8 = null,
     /// Fully resolved tag URI (e.g. `tag:yaml.org,2002:int`), or null.
     tag: ?[]const u8 = null,
+    /// Presentation metadata into `Document.source` (PLAN-4 CST). Null
+    /// for programmatically created nodes, which re-emit normalized.
+    src: ?markup.Src = null,
+    /// True once the node's value or child list was modified after
+    /// parsing; its span is no longer trusted for verbatim emission.
+    modified: bool = false,
     data: Data = .{ .scalar = .{} },
 
     pub const Data = union(NodeType) {
         scalar: Scalar,
         mapping: Mapping,
         sequence: Sequence,
+        alias: Alias,
+    };
+
+    /// Alias payload: the `*name` occurrence and the node it resolves
+    /// to. Accessors on an alias node forward to the target.
+    pub const Alias = struct {
+        name: []const u8,
+        target: *Node,
     };
 
     pub fn nodeType(self: *const Node) NodeType {
         return std.meta.activeTag(self.data);
     }
 
-    pub fn isScalar(self: *const Node) bool {
-        return self.nodeType() == .scalar;
-    }
-    pub fn isMapping(self: *const Node) bool {
-        return self.nodeType() == .mapping;
-    }
-    pub fn isSequence(self: *const Node) bool {
-        return self.nodeType() == .sequence;
+    pub fn isAlias(self: *const Node) bool {
+        return self.data == .alias;
     }
 
-    /// Scalar value or null for collections.
+    /// Follow alias nodes to the underlying node. Bounded so a
+    /// programmatically built alias cycle terminates (the scanner
+    /// rejects cycles in parsed input).
+    pub fn resolveAlias(self: *const Node) *const Node {
+        var cur = self;
+        var depth: usize = 0;
+        while (cur.data == .alias and depth < max_alias_depth) : (depth += 1) {
+            cur = cur.data.alias.target;
+        }
+        return cur;
+    }
+
+    pub fn isScalar(self: *const Node) bool {
+        return self.resolveAlias().nodeType() == .scalar;
+    }
+    pub fn isMapping(self: *const Node) bool {
+        return self.resolveAlias().nodeType() == .mapping;
+    }
+    pub fn isSequence(self: *const Node) bool {
+        return self.resolveAlias().nodeType() == .sequence;
+    }
+
+    /// Scalar value or null for collections. Alias nodes forward to
+    /// their target.
     pub fn scalarValue(self: *const Node) ?[]const u8 {
-        return switch (self.data) {
+        return switch (self.resolveAlias().data) {
             .scalar => |s| s.value,
             else => null,
         };
@@ -92,7 +137,7 @@ pub const Node = struct {
 
     /// Mapping pairs or null.
     pub fn pairs(self: *const Node) ?[]const Pair {
-        return switch (self.data) {
+        return switch (self.resolveAlias().data) {
             .mapping => |m| m.pairs.items,
             else => null,
         };
@@ -100,15 +145,16 @@ pub const Node = struct {
 
     /// Sequence items or null.
     pub fn items(self: *const Node) ?[]const *Node {
-        return switch (self.data) {
+        return switch (self.resolveAlias().data) {
             .sequence => |s| s.items.items,
             else => null,
         };
     }
 
-    /// Look up a mapping entry by scalar key text.
+    /// Look up a mapping entry by scalar key text. Alias nodes forward
+    /// to their target.
     pub fn lookup(self: *const Node, key: []const u8) ?*Node {
-        const ps = self.pairs() orelse return null;
+        const ps = self.resolveAlias().pairs() orelse return null;
         for (ps) |p| {
             if (std.mem.eql(u8, p.key.scalarValue() orelse continue, key)) return p.value;
         }
@@ -116,6 +162,7 @@ pub const Node = struct {
     }
 
     /// Resolve a node by a path of mapping keys, e.g. `&.{ "a", "b" }`.
+    /// Alias nodes are followed.
     pub fn byPath(self: *const Node, path: []const []const u8) ?*Node {
         var cur: *const Node = self;
         for (path) |seg| {
@@ -123,6 +170,9 @@ pub const Node = struct {
         }
         return @constCast(cur);
     }
+
+    /// Depth bound for alias chasing (resolveAlias, emitter).
+    pub const max_alias_depth: usize = 100;
 };
 
 /// The resolved data kind of a plain scalar (fy_node scalar typing).
@@ -206,6 +256,28 @@ pub const Document = struct {
     tag_directives: std.ArrayList(TagDirective) = .empty,
     explicit_start: bool = false,
     explicit_end: bool = false,
+    /// The original input this document was parsed from, duplicated
+    /// into the pool so the document owns its bytes. Null for
+    /// programmatically built documents. Every parsed document carries
+    /// its own copy (a multi-document stream duplicates once per
+    /// document); this is what makes byte-faithful round trips
+    /// possible (PLAN-4).
+    ///
+    /// PORT NOTE: libfyaml borrows the reader's buffer instead; here
+    /// the copy keeps the documented ownership model (a Document is
+    /// valid after the caller frees the input).
+    source: ?[]const u8 = null,
+    /// Round-trip region of this document within `source`:
+    /// [region_start, body_start) is the verbatim head (directives,
+    /// `---`, leading comments), the root node's span is the body, and
+    /// [root end, region_end) is the verbatim tail (trailing comments,
+    /// `...`). Adjacent documents tile the stream exactly. `body_end`
+    /// records the original root extent so a replaced root still finds
+    /// the tail.
+    region_start: usize = 0,
+    body_start: usize = 0,
+    body_end: usize = 0,
+    region_end: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Document {
         return .{ .alloc = allocator, .pool = Pool.init(allocator) };
@@ -222,7 +294,7 @@ pub const Document = struct {
     pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Document {
         var p = try Parser.init(allocator, null, input);
         defer p.deinit();
-        var docs = try parseStream(allocator, &p, 1);
+        var docs = try parseStream(allocator, &p, 1, input);
         defer docs.deinit(allocator);
         if (docs.items.len == 0) return Document.init(allocator);
         return docs.items[0];
@@ -232,13 +304,14 @@ pub const Document = struct {
     pub fn parseAll(allocator: std.mem.Allocator, input: []const u8) !std.ArrayList(Document) {
         var p = try Parser.init(allocator, null, input);
         defer p.deinit();
-        return parseStream(allocator, &p, null);
+        return parseStream(allocator, &p, null, input);
     }
 
-    fn parseStream(allocator: std.mem.Allocator, p: *Parser, limit: ?usize) !std.ArrayList(Document) {
+    fn parseStream(allocator: std.mem.Allocator, p: *Parser, limit: ?usize, input: []const u8) !std.ArrayList(Document) {
         var docs: std.ArrayList(Document) = .empty;
         var doc: ?Document = null;
         var builder: ?Builder = null;
+        var cursor: usize = 0;
         errdefer {
             // Release every finished document plus the one in flight.
             for (docs.items) |*d| d.deinit();
@@ -253,6 +326,11 @@ pub const Document = struct {
                     var d = Document.init(allocator);
                     d.version = ev.kind.document_start.version;
                     d.explicit_start = !ev.kind.document_start.implicit;
+                    // Copy the stream input into this document's pool so
+                    // presentation spans stay valid for the document's
+                    // whole lifetime.
+                    d.source = try d.pool.dupe(input);
+                    d.region_start = cursor;
                     // Copy directive strings into the pool so the document
                     // does not depend on the parser's lifetime. The two
                     // default handles the parser always installs are not
@@ -274,13 +352,24 @@ pub const Document = struct {
                     builder = null;
                     var d = doc orelse return error.InvalidSyntax;
                     d.explicit_end = !ev.kind.document_end.implicit;
+                    d.finishRegion(ev.start.offset);
                     // Hand ownership over only once the append succeeds;
                     // on failure the errdefer still sees `doc` and frees it.
                     try docs.append(allocator, d);
                     doc = null;
+                    if (docs.items.len > 0) cursor = docs.items[docs.items.len - 1].region_end;
                     if (limit) |l| if (docs.items.len >= l) break;
                 },
-                .stream_start, .stream_end => {},
+                .stream_start, .stream_end => {
+                    if (ev.kind == .stream_end) {
+                        // The last document owns everything up to EOF, so
+                        // trailing comments after its content (or after
+                        // its `...`) stay in its region.
+                        if (docs.items.len > 0) {
+                            docs.items[docs.items.len - 1].region_end = input.len;
+                        }
+                    }
+                },
                 else => {
                     if (builder) |*b| try b.handle(ev);
                 },
@@ -325,6 +414,13 @@ pub const Document = struct {
 
     /// Append a key/value pair to a mapping node, maintaining parent links.
     pub fn mappingAppend(self: *Document, map: *Node, key: *Node, value: *Node) !void {
+        try self.attachPair(map, key, value);
+        map.modified = true;
+    }
+
+    /// Structural append without the `modified` mark (the builder uses
+    /// this while composing a parsed tree).
+    fn attachPair(self: *Document, map: *Node, key: *Node, value: *Node) !void {
         switch (map.data) {
             .mapping => |*m| {
                 try m.pairs.append(self.pool.allocator(), .{ .key = key, .value = value });
@@ -337,6 +433,12 @@ pub const Document = struct {
 
     /// Append an item to a sequence node, maintaining parent links.
     pub fn sequenceAppend(self: *Document, seq: *Node, item: *Node) !void {
+        try self.attachItem(seq, item);
+        seq.modified = true;
+    }
+
+    /// Structural append without the `modified` mark.
+    fn attachItem(self: *Document, seq: *Node, item: *Node) !void {
         switch (seq.data) {
             .sequence => |*s| {
                 try s.items.append(self.pool.allocator(), item);
@@ -352,22 +454,25 @@ pub const Document = struct {
             .sequence => |*s| {
                 try s.items.insert(self.pool.allocator(), index, item);
                 item.parent = seq;
+                seq.modified = true;
             },
             else => return error.InvalidSyntax,
         }
     }
 
     /// Remove the mapping entry with scalar key `key`; returns the removed
-    /// value node or null when no such key exists.
+    /// value node or null when no such key exists. The entry's source
+    /// bytes are tombstoned so emission skips them.
     pub fn mappingRemove(self: *Document, map: *Node, key: []const u8) !?*Node {
-        _ = self;
         switch (map.data) {
             .mapping => |*m| {
                 for (m.pairs.items, 0..) |p, i| {
                     if (std.mem.eql(u8, p.key.scalarValue() orelse continue, key)) {
+                        self.dropPairSpan(map, p);
                         const removed = m.pairs.orderedRemove(i);
                         removed.value.parent = null;
                         removed.key.parent = null;
+                        map.modified = true;
                         return removed.value;
                     }
                 }
@@ -379,15 +484,47 @@ pub const Document = struct {
 
     /// Remove the sequence item at `index`.
     pub fn sequenceRemove(self: *Document, seq: *Node, index: usize) !?*Node {
-        _ = self;
         switch (seq.data) {
             .sequence => |*s| {
                 if (index >= s.items.items.len) return null;
                 const removed = s.items.orderedRemove(index);
+                self.dropItemSpan(seq, removed);
                 removed.parent = null;
+                seq.modified = true;
                 return removed;
             },
             else => return error.InvalidSyntax,
+        }
+    }
+
+    /// Tombstone the source bytes a mapping entry occupied (its whole
+    /// line, including the line terminator).
+    fn dropPairSpan(self: *Document, map: *Node, p: Pair) void {
+        const src = self.source orelse return;
+        const ks = p.key.src orelse return;
+        if (ks.synthetic) return;
+        const from = ks.entry_start;
+        const to = markup.lineEnd(src, p.src_end orelse ks.end);
+        if (to > from) {
+            switch (map.data) {
+                .mapping => |*m| m.dropped.append(self.pool.allocator(), .{ from, to }) catch {},
+                else => {},
+            }
+        }
+    }
+
+    /// Tombstone the source bytes a sequence item occupied.
+    fn dropItemSpan(self: *Document, seq: *Node, item: *Node) void {
+        const src = self.source orelse return;
+        const is = item.src orelse return;
+        if (is.synthetic) return;
+        const from = is.entry_start;
+        const to = markup.lineEnd(src, is.end);
+        if (to > from) {
+            switch (seq.data) {
+                .sequence => |*s| s.dropped.append(self.pool.allocator(), .{ from, to }) catch {},
+                else => {},
+            }
         }
     }
 
@@ -451,7 +588,45 @@ pub const Document = struct {
         return (try self.mappingRemove(cur, path[path.len - 1])) != null;
     }
 
+    /// The `dropped` tombstone list of a collection node (source ranges
+    /// of removed entries that verbatim emission must skip).
+    pub fn droppedOf(node: *const Node) []const [2]usize {
+        return switch (node.data) {
+            .mapping => |m| m.dropped.items,
+            .sequence => |s| s.dropped.items,
+            else => &.{},
+        };
+    }
+
+    /// Compute the round-trip region once the tree is complete.
+    /// `doc_end` is the byte offset of the `...` token when the document
+    /// ended explicitly (otherwise ignored). The tail runs to the end of
+    /// the content's line (implicit end) or of the `...` line.
+    fn finishRegion(self: *Document, doc_end: usize) void {
+        const src = self.source orelse return;
+        const root = self.root orelse return;
+        const rs = root.src orelse return;
+        self.body_start = rs.entry_start;
+        self.body_end = rs.end;
+        var end = rs.end;
+        if (self.explicit_end) {
+            end = markup.lineEnd(src, doc_end);
+        } else if (end < src.len) {
+            if (src[end] == '\r' and end + 1 < src.len and src[end + 1] == '\n') {
+                end += 2;
+            } else if (src[end] == '\n') {
+                end += 1;
+            }
+        }
+        self.region_end = @max(end, self.body_start);
+    }
+
     /// Render the document back to YAML text (see emitter.zig).
+    ///
+    /// Documents produced by `parse`/`parseAll` re-emit their original
+    /// bytes verbatim (comments, blank lines, quoting, key order and
+    /// indentation included) unless a node was modified after parsing;
+    /// modified subtrees are re-emitted normalized in place.
     pub fn write(self: *const Document, allocator: std.mem.Allocator) ![]u8 {
         const emitter_mod = @import("emitter.zig");
         var out: std.ArrayList(u8) = .empty;
@@ -463,9 +638,12 @@ pub const Document = struct {
     }
 };
 
-/// Builds a node tree out of parser events (fy_docbuilder).
+/// Builds a node tree out of parser events (fy_docbuilder). While
+/// building, every node records its source span (see `markup.Src`) so
+/// untouched regions re-emit byte-identically (PLAN-4).
 const Builder = struct {
     doc: *Document,
+    source: []const u8,
     stack: std.ArrayList(Frame),
     anchors: std.StringHashMap(*Node),
 
@@ -477,6 +655,7 @@ const Builder = struct {
     fn init(doc: *Document) Builder {
         return .{
             .doc = doc,
+            .source = doc.source orelse "",
             .stack = .empty,
             .anchors = std.StringHashMap(*Node).init(doc.alloc),
         };
@@ -491,6 +670,24 @@ const Builder = struct {
         self.deinit();
     }
 
+    /// Presentation span for an event: byte offsets into the document
+    /// source, with the entry indicator (`-`/`?`) walked backwards.
+    fn spanOf(self: *Builder, ev: Event) markup.Src {
+        const synthetic = switch (ev.kind) {
+            .scalar => |s| s.synthetic,
+            else => false,
+        };
+        return .{
+            .entry_start = if (synthetic)
+                ev.start.offset
+            else
+                markup.entryStart(self.source, ev.start.offset),
+            .start = ev.start.offset,
+            .end = ev.end.offset,
+            .synthetic = synthetic,
+        };
+    }
+
     fn handle(self: *Builder, ev: Event) !void {
         switch (ev.kind) {
             .scalar => {
@@ -499,6 +696,7 @@ const Builder = struct {
                     .mark = ev.start,
                     .anchor = try self.dupeOptional(ev.kind.scalar.anchor),
                     .tag = try self.dupeOptional(ev.kind.scalar.tag),
+                    .src = self.spanOf(ev),
                     .data = .{ .scalar = .{
                         .value = try self.doc.pool.dupe(ev.kind.scalar.value),
                         .style = ev.kind.scalar.style,
@@ -510,17 +708,58 @@ const Builder = struct {
             .alias => {
                 const target = self.anchors.get(ev.kind.alias) orelse
                     return error.UnknownAlias;
-                try self.attach(target);
+                const n = try self.doc.pool.create(Node);
+                n.* = .{
+                    .mark = ev.start,
+                    .src = self.spanOf(ev),
+                    .data = .{ .alias = .{
+                        .name = try self.doc.pool.dupe(ev.kind.alias),
+                        .target = target,
+                    } },
+                };
+                try self.attach(n);
             },
             .sequence_start => try self.startCollection(ev, ev.kind.sequence_start),
             .mapping_start => try self.startCollection(ev, ev.kind.mapping_start),
             .sequence_end => {
                 const frame = self.stack.pop().?;
                 if (frame.node.nodeType() != .sequence) return error.InvalidSyntax;
+                // Flow collections close with a bracket: their span ends
+                // there. Block collections keep the last child's end.
+                if (frame.node.data == .sequence and frame.node.data.sequence.style == .flow) {
+                    if (frame.node.src) |*s| s.end = ev.end.offset;
+                }
+                self.finishChild(frame.node);
             },
             .mapping_end => {
                 const frame = self.stack.pop().?;
                 if (frame.node.nodeType() != .mapping) return error.InvalidSyntax;
+                if (frame.node.data == .mapping and frame.node.data.mapping.style == .flow) {
+                    if (frame.node.src) |*s| s.end = ev.end.offset;
+                }
+                self.finishChild(frame.node);
+            },
+            else => {},
+        }
+    }
+
+    /// A collection just closed: its span end is now final. Propagate it
+    /// to the slot it occupies — the enclosing pair's `src_end` (an
+    /// attach-time snapshot of a collection value still pointed at its
+    /// opening bracket) and the parent container's span.
+    fn finishChild(self: *Builder, coll: *Node) void {
+        const cs = coll.src orelse return;
+        const parent = coll.parent orelse return;
+        switch (parent.data) {
+            .sequence => self.growSpan(parent, cs),
+            .mapping => {
+                for (parent.data.mapping.pairs.items) |*p| {
+                    if (p.value == coll) {
+                        p.src_end = cs.end;
+                        self.growSpan(parent, cs);
+                        return;
+                    }
+                }
             },
             else => {},
         }
@@ -534,6 +773,7 @@ const Builder = struct {
         n.mark = ev.start;
         n.anchor = try self.dupeOptional(cs.anchor);
         n.tag = try self.dupeOptional(cs.tag);
+        n.src = self.spanOf(ev);
         switch (n.data) {
             .sequence => |*s| s.style = cs.style,
             .mapping => |*m| m.style = cs.style,
@@ -552,12 +792,15 @@ const Builder = struct {
 
     fn registerAnchor(self: *Builder, anchor: ?[]const u8, n: *Node) !void {
         const a = anchor orelse return;
+        // Re-anchoring is legal (corpus 3GZX/PW8X, libyaml semantics):
+        // a second `&a` definition shadows the first for later aliases,
+        // exactly like the event-level parser already treats it.
         const gop = try self.anchors.getOrPut(a);
-        if (gop.found_existing) return error.DuplicateAnchor;
         gop.value_ptr.* = n;
     }
 
-    /// Attach a freshly produced node at the current position.
+    /// Attach a freshly produced node at the current position, growing
+    /// the enclosing container's span to cover it.
     fn attach(self: *Builder, n: *Node) !void {
         if (self.stack.items.len == 0) {
             self.doc.root = n;
@@ -565,16 +808,39 @@ const Builder = struct {
         }
         const frame = &self.stack.items[self.stack.items.len - 1];
         switch (frame.node.data) {
-            .sequence => try self.doc.sequenceAppend(frame.node, n),
+            .sequence => {
+                try self.doc.attachItem(frame.node, n);
+                self.growSpan(frame.node, n.src orelse return);
+            },
             .mapping => {
                 if (frame.pending_key) |key| {
-                    try self.doc.mappingAppend(frame.node, key, n);
+                    try self.doc.attachPair(frame.node, key, n);
+                    // A valueless pair ends at its ':'; a synthesized
+                    // empty value's own span points at the next token
+                    // and must not be trusted.
+                    const key_end: usize = if (key.src) |ks| ks.end else key.mark.offset;
+                    const pair_end: usize = if (n.src) |vs|
+                        (if (vs.synthetic) markup.colonEnd(self.source, key_end) else vs.end)
+                    else
+                        key_end;
+                    if (frame.node.data == .mapping) {
+                        const pairs = frame.node.data.mapping.pairs.items;
+                        if (pairs.len > 0) pairs[pairs.len - 1].src_end = pair_end;
+                    }
+                    self.growSpan(frame.node, .{ .entry_start = 0, .start = 0, .end = pair_end });
                     frame.pending_key = null;
                 } else {
                     frame.pending_key = n;
                 }
             },
-            .scalar => return error.InvalidSyntax,
+            .scalar, .alias => return error.InvalidSyntax,
+        }
+    }
+
+    fn growSpan(self: *Builder, parent: *Node, child_span: markup.Src) void {
+        _ = self;
+        if (parent.src) |*ps| {
+            if (child_span.end > ps.end) ps.end = child_span.end;
         }
     }
 };
@@ -597,12 +863,20 @@ test "parse simple document" {
     try testing.expectEqualStrings("y", seq.items().?[1].scalarValue().?);
 }
 
-test "alias shares node" {
+test "alias resolves to target" {
     var doc = try Document.parse(testing.allocator, "- &v 42\n- *v\n");
     defer doc.deinit();
     const seq = doc.root.?;
-    try testing.expect(seq.items().?[0] == seq.items().?[1]);
-    try testing.expectEqualStrings("42", seq.items().?[0].scalarValue().?);
+    const items = seq.items().?;
+    // The alias is its own node (`*v`) pointing at the anchor target.
+    try testing.expect(items[0] != items[1]);
+    try testing.expect(items[1].isAlias());
+    try testing.expect(items[1].resolveAlias() == items[0]);
+    try testing.expectEqualStrings("42", items[1].scalarValue().?);
+    // Byte-faithful emission keeps the alias form.
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("- &v 42\n- *v\n", out);
 }
 
 test "unknown alias fails" {

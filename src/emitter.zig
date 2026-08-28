@@ -1,21 +1,33 @@
 //! Emitter — Zig port of libfyaml's fy-emit.
 //!
-//! Serialises a `Document` back to YAML text. Block style is the default;
-//! collections parsed from flow style (and empty collections) are emitted
-//! in flow style. Scalar styles are honoured when safe, with quoting rules
-//! that guarantee the re-parsed value is identical.
+//! Serialises a `Document` back to YAML text. Two modes:
 //!
-//! PORT NOTE: libfyaml's emitter is CST based and reproduces the original
-//! formatting byte for byte in round-trip mode. This port emits from the
-//! semantic document tree: comments are not preserved yet and layout is
-//! normalised. Closing that gap is tracked in AGENTS.md.
+//! *Faithful* (parsed documents, PLAN-4): every node carries a span
+//! into the original source; untouched regions re-emit byte for byte
+//! (comments, blank lines, quoting, key order, indentation), and only
+//! modified subtrees are re-emitted, in place, with the surrounding
+//! bytes preserved. This is libfyaml's round-trip behaviour.
+//!
+//! *Normalized* (programmatic documents): emitted from the semantic
+//! tree. Block style is the default; collections parsed from flow style
+//! (and empty collections) are emitted in flow style. Scalar styles are
+//! honoured when safe, with quoting rules that guarantee the re-parsed
+//! value is identical.
+//!
+//! PORT NOTE: libfyaml's CST covers every byte including intra-node
+//! layout; this port keeps per-node/entry spans, so re-emitted
+//! subtrees normalize their internal layout (e.g. multi-line flow
+//! collapses to one line). Untouched bytes are exact.
 
 const std = @import("std");
+const diag = @import("diag.zig");
 const document_mod = @import("document.zig");
+const markup = @import("markup.zig");
 const token_mod = @import("token.zig");
 
 const Document = document_mod.Document;
 const Node = document_mod.Node;
+const Pair = document_mod.Pair;
 const ScalarStyle = token_mod.ScalarStyle;
 
 const yaml_tag_prefix = "tag:yaml.org,2002:";
@@ -26,21 +38,29 @@ pub const Emitter = struct {
     out: *std.ArrayList(u8),
     /// Anchored nodes already emitted: re-emission becomes an alias.
     seen: std.AutoHashMap(*const Node, []const u8),
+    /// Nodes emitted by the faithful walker (cycle/duplicate guard for
+    /// programmatically shared nodes).
+    emitted: std.AutoHashMap(*const Node, void),
+    /// Active source for faithful emission (empty when normalized).
+    src: []const u8 = "",
     indent_step: usize = 2,
 
-    /// Emission only fails when the output buffer cannot grow.
-    pub const Error = std.mem.Allocator.Error;
+    /// Emission fails on output allocation or on a programmatic node
+    /// graph that cannot be serialized (unanchored cycle).
+    pub const Error = std.mem.Allocator.Error || diag.YamlError;
 
     pub fn init(alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Emitter {
         return .{
             .alloc = alloc,
             .out = out,
             .seen = std.AutoHashMap(*const Node, []const u8).init(alloc),
+            .emitted = std.AutoHashMap(*const Node, void).init(alloc),
         };
     }
 
     pub fn deinit(self: *Emitter) void {
         self.seen.deinit();
+        self.emitted.deinit();
     }
 
     // ------------------------------------------------------------------
@@ -75,6 +95,12 @@ pub const Emitter = struct {
     // ------------------------------------------------------------------
 
     pub fn emitDocument(self: *Emitter, doc: *const Document) Error!void {
+        if (doc.source) |src| {
+            self.src = src;
+            defer self.src = "";
+            return self.emitFaithful(doc);
+        }
+
         var have_directives = false;
         if (doc.version) |v| {
             var buf: [32]u8 = undefined;
@@ -98,6 +124,319 @@ pub const Emitter = struct {
         try self.emitNode(root, 0);
         if (!self.endsWithNewline()) try self.writeByte('\n');
         if (doc.explicit_end) try self.write("...\n");
+    }
+
+    // ------------------------------------------------------------------
+    // Faithful emission (PLAN-4): unmodified subtrees re-emit verbatim.
+    //
+    // Contract: slot emitters (`emitPair`, `emitItem`) receive the
+    // source offset where the *gap* into their entry begins (just past
+    // the previous entry's original bytes) and return the offset where
+    // the next gap starts. Gaps are verbatim source bytes with removed
+    // entries tombstoned, so comments, blank lines and indentation
+    // between surviving entries survive edits byte for byte.
+    // ------------------------------------------------------------------
+
+    fn emitFaithful(self: *Emitter, doc: *const Document) Error!void {
+        const src = self.src;
+        try self.write(src[doc.region_start..doc.body_start]);
+        var stop = doc.body_start;
+        if (doc.root) |root| {
+            stop = try self.emitRoot(root, markup.columnOf(src, doc.body_start), doc.body_end);
+        }
+        if (stop < doc.region_end) {
+            try self.write(src[stop..doc.region_end]);
+        }
+    }
+
+    /// Emit the root node; returns the source offset where the document
+    /// tail begins. `orig_end` is the original root extent, used when
+    /// the root was replaced by a programmatic node.
+    fn emitRoot(self: *Emitter, node: *Node, indent: usize, orig_end: usize) Error!usize {
+        const s = node.src orelse {
+            // Root replaced by a programmatic node: emit normalized and
+            // keep the original tail.
+            _ = try self.emitContent(node, indent);
+            return orig_end;
+        };
+        if (s.synthetic) return s.end; // empty document: head/tail only
+        if (try self.writeCleanSlice(node, s.entry_start)) |end| return end;
+        switch (node.data) {
+            // Modified scalar/alias: re-emit content, then the original
+            // line remainder (trailing comment) and tail from there.
+            .scalar, .alias => {
+                _ = try self.emitContent(node, indent);
+                return self.writeRemainder(s.end);
+            },
+            // Modified container: its slot walk consumes through the
+            // last entry's line end.
+            else => return self.emitContent(node, indent),
+        }
+    }
+
+    /// Emit a mapping entry. `gap_start` is where this entry's leading
+    /// gap begins in the source; returns where the next gap begins.
+    fn emitPair(self: *Emitter, container: *const Node, pair: Pair, entry_col: usize, gap_start: usize) Error!usize {
+        const src = self.src;
+        const key = pair.key;
+        const value = pair.value;
+
+        // Fast path: the whole entry is original and untouched.
+        if (self.nodeClean(key) and self.nodeClean(value)) {
+            if (pair.src_end) |pend| {
+                try self.emitted.put(key, {});
+                try self.emitted.put(value, {});
+                try self.writeGap(container, gap_start, key.src.?.entry_start);
+                try self.write(src[key.src.?.entry_start..pend]);
+                return pend;
+            }
+        }
+        return self.emitPairEdited(container, pair, entry_col, gap_start);
+    }
+
+    /// Re-emission path for a mapping entry that gained, lost or
+    /// changed content.
+    fn emitPairEdited(self: *Emitter, container: *const Node, pair: Pair, entry_col: usize, gap_start: usize) Error!usize {
+        const src = self.src;
+        const key = pair.key;
+        const value = pair.value;
+        const ks = key.src;
+        const key_clean = ks != null and !ks.?.synthetic;
+        const pair_end = pair.src_end;
+        const value_empty = pairEndsAtColon(pair);
+
+        // Leading gap: original bytes up to the entry's key. Brand-new
+        // pairs derive their own newline + column instead and leave the
+        // gap anchor untouched for the next original sibling.
+        if (ks) |s| {
+            if (!s.synthetic) {
+                try self.writeGap(container, gap_start, s.entry_start);
+            }
+        } else if (pair_end == null) {
+            try self.writeNewlineIndent(entry_col);
+            try self.emitEntry(key, value, entry_col);
+            return gap_start;
+        }
+
+        // Key.
+        if (key_clean) {
+            try self.emitted.put(key, {});
+            try self.write(src[ks.?.entry_start..ks.?.end]);
+        } else {
+            try self.emitted.put(key, {});
+            _ = try self.emitContent(key, if (ks) |s| markup.columnOf(src, s.start) else entry_col);
+        }
+
+        // Valueless entry (`key:` / `? key`): emit the original colon
+        // bytes and stop.
+        if (value_empty) {
+            if (ks != null and pair_end != null) {
+                try self.write(src[ks.?.end..pair_end.?]);
+                return self.writeRemainder(pair_end.?);
+            }
+            try self.writeByte(':');
+            if (pair_end) |pe| return self.writeRemainder(pe);
+            return gap_start;
+        }
+
+        // Colon bytes between key and value, then the value itself.
+        if (value.src) |vs| {
+            if (!vs.synthetic) {
+                // Original layout (": " or a block ":\n    ").
+                if (ks) |s| try self.write(src[s.end..vs.entry_start]);
+                if (try self.writeCleanSlice(value, vs.entry_start)) |vend| {
+                    return self.writeRemainder(pair_end orelse vend);
+                }
+                _ = try self.emitContent(value, markup.columnOf(src, vs.start));
+                return self.writeRemainder(pair_end orelse vs.end);
+            }
+            // Replaced by an empty value node: normalized colon.
+            try self.write(": ");
+            _ = try self.emitContent(value, entry_col + self.indent_step);
+            if (pair_end) |pe| return self.writeRemainder(pe);
+            return gap_start;
+        }
+        // Brand-new value: layout by its shape.
+        if (inlineValue(value)) {
+            try self.write(": ");
+            _ = try self.emitContent(value, entry_col + self.indent_step);
+        } else {
+            try self.writeByte(':');
+            try self.writeNewlineIndent(entry_col + self.indent_step);
+            _ = try self.emitContent(value, entry_col + self.indent_step);
+        }
+        if (pair_end) |pe| return self.writeRemainder(pe);
+        return gap_start;
+    }
+
+    /// Emit a sequence item slot; same gap contract as `emitPair`.
+    fn emitItem(self: *Emitter, item: *Node, entry_col: usize, gap_start: usize) Error!usize {
+        const src = self.src;
+        const s = item.src orelse {
+            // Brand-new or moved item: sibling-local indentation.
+            try self.writeNewlineIndent(entry_col);
+            try self.write("- ");
+            _ = try self.emitContent(item, entry_col + 2);
+            return gap_start;
+        };
+        if (self.emitted.contains(item)) {
+            if (item.anchor) |a| {
+                try self.write(src[gap_start..s.entry_start]);
+                try self.writeByte('*');
+                try self.write(a);
+                return markup.lineEnd(src, s.end);
+            }
+            return error.AliasCycle;
+        }
+        try self.writeGap(item, gap_start, s.entry_start);
+        if (!s.synthetic) {
+            if (try self.writeCleanSlice(item, s.entry_start)) |end| return end;
+            try self.emitted.put(item, {});
+            _ = try self.emitContent(item, markup.columnOf(src, s.start));
+            return self.writeRemainder(s.end);
+        }
+        // Synthesized empty item: the entry shell only.
+        try self.emitted.put(item, {});
+        try self.write(src[s.entry_start..s.start]);
+        return s.end;
+    }
+
+    /// Emit a node's own content (properties + body) at the cursor.
+    /// Modified block containers walk their slots so untouched entries
+    /// stay verbatim; everything else re-emits normalized.
+    fn emitContent(self: *Emitter, node: *Node, indent: usize) Error!usize {
+        switch (node.data) {
+            .scalar => |s| {
+                const props = try self.writeProperties(node);
+                if (props) try self.writeByte(' ');
+                try self.emitScalarValue(s.value, s.style, indent, true);
+                return if (node.src) |sn| sn.end else 0;
+            },
+            .alias => |a| {
+                try self.writeByte('*');
+                try self.write(a.name);
+                return if (node.src) |sn| sn.end else 0;
+            },
+            .mapping => |*m| {
+                if (node.src == null or m.style == .flow or m.pairs.items.len == 0) {
+                    // New, flow-styled, or emptied in place: block
+                    // layout cannot express an empty mapping.
+                    try self.emitFlowNode(node);
+                    return if (node.src) |sn| markup.lineEnd(self.src, sn.end) else 0;
+                }
+                var gap = node.src.?.start;
+                const col = self.entryColumn(node, indent);
+                for (m.pairs.items) |pair| {
+                    gap = try self.emitPair(node, pair, col, gap);
+                }
+                return gap;
+            },
+            .sequence => |*sq| {
+                if (node.src == null or sq.style == .flow or sq.items.items.len == 0) {
+                    try self.emitFlowNode(node);
+                    return if (node.src) |sn| markup.lineEnd(self.src, sn.end) else 0;
+                }
+                var gap = node.src.?.start;
+                const col = self.entryColumn(node, indent);
+                for (sq.items.items) |item| {
+                    gap = try self.emitItem(item, col, gap);
+                }
+                return gap;
+            },
+        }
+    }
+
+    /// True when a pair's value is a synthesized empty node (`key:` with
+    /// nothing after the colon, or an explicit-key-only pair).
+    fn pairEndsAtColon(pair: Pair) bool {
+        const v = pair.value;
+        if (v.nodeType() != .scalar) return false;
+        if (v.data.scalar.value.len != 0) return false;
+        const vs = v.src orelse return false;
+        return vs.synthetic;
+    }
+
+    /// True when a value can sit on the same line as its key.
+    fn inlineValue(value: *const Node) bool {
+        return switch (value.data) {
+            .scalar, .alias => true,
+            .mapping => |m| m.pairs.items.len == 0 or m.style == .flow,
+            .sequence => |s| s.items.items.len == 0 or s.style == .flow,
+        };
+    }
+
+    /// Column where a container's entries sit: derived from the first
+    /// original child, falling back to `fallback` + one indent step.
+    fn entryColumn(self: *Emitter, node: *Node, fallback: usize) usize {
+        const src = self.src;
+        switch (node.data) {
+            .mapping => |m| {
+                for (m.pairs.items) |pair| {
+                    if (pair.key.src) |s| {
+                        if (!s.synthetic) return markup.columnOf(src, s.entry_start);
+                    }
+                }
+            },
+            .sequence => |s| {
+                for (s.items.items) |item| {
+                    if (item.src) |is| {
+                        if (!is.synthetic) return markup.columnOf(src, is.entry_start);
+                    }
+                }
+            },
+            else => {},
+        }
+        return fallback + self.indent_step;
+    }
+
+    /// True when a node can be emitted from its original bytes.
+    fn nodeClean(self: *Emitter, node: *Node) bool {
+        const s = node.src orelse return false;
+        return !s.synthetic and !node.modified and !self.emitted.contains(node);
+    }
+
+    /// Write a node's original bytes when it is untouched; returns the
+    /// end offset on success, null when the caller must re-emit.
+    fn writeCleanSlice(self: *Emitter, node: *Node, from: usize) Error!?usize {
+        if (!self.nodeClean(node)) return null;
+        const s = node.src.?;
+        try self.emitted.put(node, {});
+        try self.write(self.src[from..s.end]);
+        return s.end;
+    }
+
+    /// Write the gap bytes [from, to), skipping tombstoned ranges of
+    /// removed entries inside the container.
+    fn writeGap(self: *Emitter, container: *const Node, from: usize, to: usize) Error!void {
+        const src = self.src;
+        if (to <= from) return;
+        const drops = Document.droppedOf(container);
+        var i: usize = from;
+        outer: while (i < to) {
+            for (drops) |d| {
+                if (d[0] < to and d[1] > i) {
+                    if (d[0] > i) try self.write(src[i..d[0]]);
+                    i = @max(i, d[1]);
+                    continue :outer;
+                }
+            }
+            try self.write(src[i..to]);
+            return;
+        }
+    }
+
+    /// Write the rest of the line after `offset` (trailing comment,
+    /// line terminator) and return the offset just past it.
+    fn writeRemainder(self: *Emitter, offset: usize) Error!usize {
+        const src = self.src;
+        const le = markup.lineEnd(src, offset);
+        if (offset < le) try self.write(src[offset..le]);
+        return le;
+    }
+
+    fn writeNewlineIndent(self: *Emitter, indent: usize) Error!void {
+        try self.writeByte('\n');
+        try self.writeIndent(indent);
     }
 
     // ------------------------------------------------------------------
@@ -151,6 +490,10 @@ pub const Emitter = struct {
                     try self.emitNode(item, indent + 2);
                 }
             },
+            .alias => |a| {
+                try self.writeByte('*');
+                try self.write(a.name);
+            },
         }
     }
 
@@ -172,7 +515,7 @@ pub const Emitter = struct {
         // Value placement: scalars and flow collections stay inline,
         // block collections start on the next, deeper line.
         const inline_value = switch (value.data) {
-            .scalar => true,
+            .scalar, .alias => true,
             .mapping => |m| m.pairs.items.len == 0 or m.style == .flow,
             .sequence => |s| s.items.items.len == 0 or s.style == .flow,
         };
@@ -212,6 +555,10 @@ pub const Emitter = struct {
         }
         switch (node.data) {
             .scalar => |s| try self.emitScalarValue(s.value, s.style, 0, false),
+            .alias => |a| {
+                try self.writeByte('*');
+                try self.write(a.name);
+            },
             .mapping => |*m| {
                 try self.writeByte('{');
                 for (m.pairs.items, 0..) |pair, i| {

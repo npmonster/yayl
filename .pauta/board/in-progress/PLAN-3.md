@@ -2,15 +2,15 @@
 id: PLAN-3
 title: Implement YAML scanner, parser, and streaming event API
 created: 2026-08-26T11:20:47Z
-updated: 2026-08-27T17:09:06Z
+updated: 2026-08-28T20:10:41Z
 tags: [yayl, core, parser, events, future-work]
 deps: [PLAN-2]
 skills: []
 review_rounds: 0
 priority: 1
-worker: qwen-code qwen3-coder
+worker: zcode glm-5.3-flash (taking over per user instruction 2026-08-29)
 reviewer: qwen-code qwen3-coder (self-review per user decision 2026-08-27)
-auto_review: true
+auto_review: false
 ---
 
 ## Plan
@@ -37,3 +37,6 @@ Turn the existing character, UTF-8, pool, and diagnostics primitives into a stan
 ## Log
 - 2026-08-26T11:20:47Z created
 - 2026-08-27T17:09:06Z Resolved 3 skips (G4RS, JEF9-1, K858): empty block-scalar keep-chomping, corpus ↵ visibility-marker handling, backspace escaping in tree render. 327/351 passing, 24 skips remain. Full `make verify` green. Commit 51464d1.
+- 2026-08-27T17:38:38Z Resolved 16 more skips across 3 commits: tab-marker translation (4ZYM/J3BT/M9B4/T5N4/NB6Z/96NN-1/UV7Q), flow simple-key line-span + flow indentation checks (4MUZ-1/5MUD/K3WX/9SA2/NJ66/UT92), and empty flow keys (CFD4/FRK4/NKF9). 343/351 passing; 8 skips remain: 6PBE, 4EJS, Y79Y-1, MJS9, R4YG, 9C9N, QB6E, ZYU8-1.
+- 2026-08-27T17:44:58Z Resolved ZYU8-1 (dotted reserved directive names). 344/351 passing; 7 skips remain: 6PBE, 4EJS, Y79Y-1, MJS9, R4YG, 9C9N, QB6E. All commits green on `make verify`.
+- 2026-08-28T20:10:27Z 2026-08-29: Fixed 6PBE (indentless sequences allowed in explicit-key position, matching libyaml parse_node(1,1)) and re-anchoring semantics in the builder (corpus 3GZX/PW8X: a second `&a` shadows the first, matching event-level behavior). 345/351 passing; 6 skips remain: 4EJS, Y79Y-1, MJS9, R4YG, 9C9N, QB6E (all tab/indentation-strictness cases).

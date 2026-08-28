@@ -8,7 +8,7 @@ ZIG ?= zig
 .DEFAULT_GOAL := help
 .MAIN: help
 
-.PHONY: help all build check test test-release fmt fmt-write docs corpus conformance verify clean
+.PHONY: help all build check test test-release fmt fmt-write docs corpus conformance roundtrip verify clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' Makefile
@@ -44,7 +44,10 @@ corpus: ## Fetch the pinned YAML Test Suite corpus (gitignored vendor/)
 conformance: corpus ## Run the pinned YAML Test Suite corpus through yayl
 	$(ZIG) build conformance --summary all
 
-verify: fmt check test test-release conformance ## Full quality gate: fmt, compile, tests (Debug + ReleaseSafe), corpus
+roundtrip: corpus ## Byte-faithful round trip over the corpus and tests/fixtures
+	$(ZIG) build roundtrip --summary all
+
+verify: fmt check test test-release conformance roundtrip ## Full quality gate: fmt, compile, tests (Debug + ReleaseSafe), corpus, round trip
 
 clean: ## Remove build artifacts (zig-out/) and the incremental cache
 	rm -rf zig-cache .zig-cache-global zig-out

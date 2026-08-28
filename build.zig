@@ -47,4 +47,18 @@ pub fn build(b: *std.Build) void {
     const run_conformance = b.addRunArtifact(conformance_tests);
     const conformance_step = b.step("conformance", "Run the pinned YAML Test Suite corpus");
     conformance_step.dependOn(&run_conformance.step);
+
+    // Byte-faithful round trip: emit(parseAll(input)) == input over the
+    // corpus and the real-world fixtures (PLAN-4 presentation layer).
+    const roundtrip_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/roundtrip.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "yayl", .module = module }},
+        }),
+    });
+    const run_roundtrip = b.addRunArtifact(roundtrip_tests);
+    const roundtrip_step = b.step("roundtrip", "Byte-faithful round trip over corpus and fixtures");
+    roundtrip_step.dependOn(&run_roundtrip.step);
 }
