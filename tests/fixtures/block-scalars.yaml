@@ -1,0 +1,51 @@
+# Comment/formatting torture fixture in the shape of a real config:
+# folded and literal scalars, nested quoting, comments everywhere.
+name: yayl-config
+description: >
+  A longer description that would
+  normally be folded across several lines
+  and keeps its paragraph shape.
+
+script: |
+  #!/bin/sh
+  set -eu
+  echo "hello world"
+  exit 0
+
+regexes:
+  semver: '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$'
+  quoted: "with: colon and # hash"
+  empty: ""
+  single: 'it''s fine'
+  multiline: "line one
+    line two"
+
+numbers:
+  ints: [0, -1, 42, 0x1F, 0o17]
+  floats: [1.5, -2e10, .inf]
+  # A numeric-looking string must stay a string
+  versions:
+    - "1.0"
+    - '2'
+    - 3
+
+nested:
+  deep:
+    deeper:
+      deepest:
+        key: value # trailing comment
+      list:
+        - a
+        - b: c
+        - - nested
+          - sequence
+  flow: { a: 1, b: [x, y], c: { d: e } }
+
+anchors:
+  base: &base
+    shared: setting
+    n: &num 42
+  derived:
+    <<: *base
+    extra: true
+  reference: *num

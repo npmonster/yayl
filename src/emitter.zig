@@ -247,8 +247,13 @@ pub const Emitter = struct {
                 if (try self.writeCleanSlice(value, vs.entry_start)) |vend| {
                     return self.writeRemainder(pair_end orelse vend);
                 }
-                _ = try self.emitContent(value, markup.columnOf(src, vs.start));
-                return self.writeRemainder(pair_end orelse vs.end);
+                const stop = try self.emitContent(value, markup.columnOf(src, vs.start));
+                // A container walk that reached the line end already
+                // consumed the terminator; deeper slots must not write
+                // it twice.
+                const base = pair_end orelse vs.end;
+                if (stop >= markup.lineEnd(src, base)) return stop;
+                return self.writeRemainder(base);
             }
             // Replaced by an empty value node: normalized colon.
             try self.write(": ");
@@ -270,7 +275,7 @@ pub const Emitter = struct {
     }
 
     /// Emit a sequence item slot; same gap contract as `emitPair`.
-    fn emitItem(self: *Emitter, item: *Node, entry_col: usize, gap_start: usize) Error!usize {
+    fn emitItem(self: *Emitter, container: *const Node, item: *Node, entry_col: usize, gap_start: usize) Error!usize {
         const src = self.src;
         const s = item.src orelse {
             // Brand-new or moved item: sibling-local indentation.
@@ -281,14 +286,14 @@ pub const Emitter = struct {
         };
         if (self.emitted.contains(item)) {
             if (item.anchor) |a| {
-                try self.write(src[gap_start..s.entry_start]);
+                try self.writeGap(container, gap_start, s.entry_start);
                 try self.writeByte('*');
                 try self.write(a);
                 return markup.lineEnd(src, s.end);
             }
             return error.AliasCycle;
         }
-        try self.writeGap(item, gap_start, s.entry_start);
+        try self.writeGap(container, gap_start, s.entry_start);
         if (!s.synthetic) {
             if (try self.writeCleanSlice(item, s.entry_start)) |end| return end;
             try self.emitted.put(item, {});
@@ -339,7 +344,7 @@ pub const Emitter = struct {
                 var gap = node.src.?.start;
                 const col = self.entryColumn(node, indent);
                 for (sq.items.items) |item| {
-                    gap = try self.emitItem(item, col, gap);
+                    gap = try self.emitItem(node, item, col, gap);
                 }
                 return gap;
             },

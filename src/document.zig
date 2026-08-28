@@ -415,7 +415,7 @@ pub const Document = struct {
     /// Append a key/value pair to a mapping node, maintaining parent links.
     pub fn mappingAppend(self: *Document, map: *Node, key: *Node, value: *Node) !void {
         try self.attachPair(map, key, value);
-        map.modified = true;
+        self.markModified(map);
     }
 
     /// Structural append without the `modified` mark (the builder uses
@@ -434,7 +434,7 @@ pub const Document = struct {
     /// Append an item to a sequence node, maintaining parent links.
     pub fn sequenceAppend(self: *Document, seq: *Node, item: *Node) !void {
         try self.attachItem(seq, item);
-        seq.modified = true;
+        self.markModified(seq);
     }
 
     /// Structural append without the `modified` mark.
@@ -454,7 +454,7 @@ pub const Document = struct {
             .sequence => |*s| {
                 try s.items.insert(self.pool.allocator(), index, item);
                 item.parent = seq;
-                seq.modified = true;
+                self.markModified(seq);
             },
             else => return error.InvalidSyntax,
         }
@@ -472,7 +472,7 @@ pub const Document = struct {
                         const removed = m.pairs.orderedRemove(i);
                         removed.value.parent = null;
                         removed.key.parent = null;
-                        map.modified = true;
+                        self.markModified(map);
                         return removed.value;
                     }
                 }
@@ -490,7 +490,7 @@ pub const Document = struct {
                 const removed = s.items.orderedRemove(index);
                 self.dropItemSpan(seq, removed);
                 removed.parent = null;
-                seq.modified = true;
+                self.markModified(seq);
                 return removed;
             },
             else => return error.InvalidSyntax,
@@ -503,7 +503,7 @@ pub const Document = struct {
         const src = self.source orelse return;
         const ks = p.key.src orelse return;
         if (ks.synthetic) return;
-        const from = ks.entry_start;
+        const from = markup.lineStart(src, ks.entry_start);
         const to = markup.lineEnd(src, p.src_end orelse ks.end);
         if (to > from) {
             switch (map.data) {
@@ -518,7 +518,7 @@ pub const Document = struct {
         const src = self.source orelse return;
         const is = item.src orelse return;
         if (is.synthetic) return;
-        const from = is.entry_start;
+        const from = markup.lineStart(src, is.entry_start);
         const to = markup.lineEnd(src, is.end);
         if (to > from) {
             switch (seq.data) {
@@ -567,6 +567,7 @@ pub const Document = struct {
                         if (p.value == existing) {
                             value.parent = cur;
                             p.value = value;
+                            self.markModified(cur);
                             return;
                         }
                     }
@@ -586,6 +587,20 @@ pub const Document = struct {
             cur = cur.lookup(seg) orelse return false;
         }
         return (try self.mappingRemove(cur, path[path.len - 1])) != null;
+    }
+
+    /// Mark a node's subtree as no longer byte-trustworthy, propagating
+    /// to every ancestor: a container whose bytes changed must not be
+    /// re-emitted verbatim from its parent slot, and the parent's parent
+    /// must not re-emit *it* verbatim, and so on. Unmodified siblings
+    /// stay verbatim regardless (the emitter walks per slot).
+    fn markModified(self: *Document, node: *Node) void {
+        _ = self;
+        var cur: ?*Node = node;
+        while (cur) |n| {
+            n.modified = true;
+            cur = n.parent;
+        }
     }
 
     /// The `dropped` tombstone list of a collection node (source ranges
@@ -677,13 +692,25 @@ const Builder = struct {
             .scalar => |s| s.synthetic,
             else => false,
         };
+        var end = ev.end.offset;
+        // The scanner's scalar end marks swallow trailing blanks (and,
+        // for block scalars, the final line break). Those bytes are
+        // structure, not content: trim them off the span so the gap
+        // bytes carry them instead. Quoted scalars end at the closing
+        // quote and are unaffected.
+        if (ev.kind == .scalar and !synthetic) {
+            const src = self.source;
+            while (end > ev.start.offset and end <= src.len and
+                (src[end - 1] == ' ' or src[end - 1] == '\t' or
+                    src[end - 1] == '\r' or src[end - 1] == '\n')) end -= 1;
+        }
         return .{
             .entry_start = if (synthetic)
                 ev.start.offset
             else
                 markup.entryStart(self.source, ev.start.offset),
             .start = ev.start.offset,
-            .end = ev.end.offset,
+            .end = end,
             .synthetic = synthetic,
         };
     }
@@ -933,4 +960,235 @@ test "sequence mutation" {
     try testing.expectEqualStrings("c", seq.items().?[2].scalarValue().?);
     _ = try doc.sequenceRemove(seq, 1);
     try testing.expectEqual(@as(usize, 2), seq.items().?.len);
+}
+
+// ----------------------------------------------------------------------
+// Round-trip editing tests (PLAN-4): targeted edits keep untouched
+// bytes — comments, blank lines, quoting, key order, indentation.
+// ----------------------------------------------------------------------
+
+test "edit one value keeps sibling bytes verbatim" {
+    const src =
+        \\# service configuration
+        \\name: api
+        \\port: 8080   # user facing
+        \\
+        \\# debug section
+        \\debug: false
+        \\
+    ;
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try doc.pathSet(&.{"port"}, try doc.createScalar("9090", .plain));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        \\# service configuration
+        \\name: api
+        \\port: 9090   # user facing
+        \\
+        \\# debug section
+        \\debug: false
+        \\
+    , out);
+}
+
+test "deep edit preserves outer formatting" {
+    const src =
+        \\server:
+        \\  # the main host
+        \\  host: localhost
+        \\  ports:
+        \\    - 80
+        \\    - 443
+        \\tls: true
+        \\
+    ;
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try doc.pathSet(&.{ "server", "host" }, try doc.createScalar("example.org", .plain));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        \\server:
+        \\  # the main host
+        \\  host: example.org
+        \\  ports:
+        \\    - 80
+        \\    - 443
+        \\tls: true
+        \\
+    , out);
+}
+
+test "delete entry removes its line but keeps neighbours" {
+    const src =
+        \\keep-a: 1
+        \\drop-me: 2 # gone
+        \\keep-b: 3
+        \\
+    ;
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try testing.expect(try doc.pathDelete(&.{"drop-me"}));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("keep-a: 1\nkeep-b: 3\n", out);
+}
+
+test "append entry at end of mapping" {
+    const src = "a: 1\nb: 2\n";
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    const root = doc.root.?;
+    try doc.mappingAppend(root, try doc.createScalar("c", .plain), try doc.createScalar("3", .plain));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a: 1\nb: 2\nc: 3\n", out);
+}
+
+test "append entry uses sibling indentation" {
+    const src =
+        \\top:
+        \\    deep:
+        \\        one: 1
+        \\
+    ;
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    const deep = doc.pathGet(&.{ "top", "deep" }).?;
+    try doc.mappingAppend(deep, try doc.createScalar("two", .plain), try doc.createScalar("2", .plain));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        \\top:
+        \\    deep:
+        \\        one: 1
+        \\        two: 2
+        \\
+    , out);
+}
+
+test "sequence append keeps items verbatim" {
+    const src =
+        \\items:
+        \\  - first  # keep
+        \\  - second
+        \\
+    ;
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    const items = doc.pathGet(&.{"items"}).?;
+    try doc.sequenceAppend(items, try doc.createScalar("third", .plain));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        \\items:
+        \\  - first  # keep
+        \\  - second
+        \\  - third
+        \\
+    , out);
+}
+
+test "sequence remove drops the item line" {
+    const src =
+        \\items:
+        \\  - first
+        \\  - second
+        \\  - third
+        \\
+    ;
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    const items = doc.pathGet(&.{"items"}).?;
+    _ = try doc.sequenceRemove(items, 1);
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("items:\n  - first\n  - third\n", out);
+}
+
+test "replace value whose key carries a trailing comment" {
+    const src =
+        \\a:
+        \\  b: 1 # answer
+        \\
+    ;
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try doc.pathSet(&.{ "a", "b" }, try doc.createScalar("42", .plain));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a:\n  b: 42 # answer\n", out);
+}
+
+test "edit in one document of a stream leaves the others verbatim" {
+    const src =
+        \\---
+        \\first: 1
+        \\---
+        \\second: 2
+        \\---
+        \\third: 3
+        \\
+    ;
+    var docs = try Document.parseAll(testing.allocator, src);
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(testing.allocator);
+    }
+    try testing.expectEqual(@as(usize, 3), docs.items.len);
+    try docs.items[1].pathSet(&.{"second"}, try docs.items[1].createScalar("TWO", .plain));
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    for (docs.items) |*d| {
+        const t = try d.write(testing.allocator);
+        defer testing.allocator.free(t);
+        try out.appendSlice(testing.allocator, t);
+    }
+    try testing.expectEqualStrings(
+        \\---
+        \\first: 1
+        \\---
+        \\second: TWO
+        \\---
+        \\third: 3
+        \\
+    , out.items);
+}
+
+test "replace block scalar value in place" {
+    const src =
+        \\# script
+        \\run: |
+        \\  echo one
+        \\  echo two
+        \\after: true
+        \\
+    ;
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try doc.pathSet(&.{"run"}, try doc.createScalar("echo three", .plain));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        \\# script
+        \\run: echo three
+        \\after: true
+        \\
+    , out);
+}
+
+test "allocation failures in edit+write leak nothing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, editWrite, .{});
+}
+
+fn editWrite(alloc: std.mem.Allocator) !void {
+    var doc = try Document.parse(alloc, "a: 1\nb:\n  - x  # keep\n  - y\n");
+    defer doc.deinit();
+    try doc.pathSet(&.{"a"}, try doc.createScalar("2", .plain));
+    const items = doc.pathGet(&.{"b"}).?;
+    try doc.sequenceAppend(items, try doc.createScalar("z", .plain));
+    const out = try doc.write(alloc);
+    defer alloc.free(out);
 }

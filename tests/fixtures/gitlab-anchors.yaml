@@ -1,0 +1,52 @@
+# Realistic GitLab CI configuration using anchors for job templates.
+# GitLab CI pipelines commonly re-use job definitions through YAML
+# anchors; `.`-prefixed keys are hidden jobs.
+
+.stages: &stages
+  - build
+  - test
+  - deploy
+
+.defaults: &defaults
+  image: rust:1.79
+  before_script:
+    - rustc --version
+    - cargo --version
+  # Retry twice on flaky infrastructure
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+build-job:
+  <<: *defaults
+  stage: build
+  script:
+    - cargo build --release
+  artifacts:
+    paths:
+      - target/release/
+    expire_in: 1 week
+
+test-job:
+  <<: *defaults
+  stage: test
+  variables:
+    RUST_BACKTRACE: "full"
+  script:
+    - cargo test --workspace
+  coverage: '/^\d+.\d+% coverage$/'
+
+deploy-job:
+  stage: deploy
+  script:
+    - echo "Deploying to production"
+    - './deploy.sh --env=production --dry-run=false'
+  environment:
+    name: production
+    url: https://example.example.com
+  only:
+    refs:
+      - main
+      - tags
