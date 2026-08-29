@@ -2,12 +2,13 @@
 id: PLAN-5
 title: Add document builder, core mutation, and YPath compatibility
 created: 2026-08-26T11:20:47Z
-updated: 2026-08-26T11:20:53Z
+updated: 2026-08-29T13:11:19Z
 tags: [yayl, document, mutation, ypath, future-work]
 deps: [PLAN-4]
 skills: []
 review_rounds: 0
 priority: 1
+blocked: ""
 ---
 
 ## Plan
@@ -36,3 +37,5 @@ Requires the composed document/emitter model.
 
 ## Log
 - 2026-08-26T11:20:47Z created
+- 2026-08-29T13:10:59Z 2026-08-29: IMPLEMENTED in src/edit.zig + document mutation APIs. Path query grammar ($.a.b[0], [*] wildcard, ..name recursive descent, [?key=value] equality filters) with deterministic document-order results; documented as a deliberately yayl-native grammar (module docs) rather than libfyaml YPath, with structured errors (InvalidPath/UnknownPath/AmbiguousOperation). Safe mutation: set (plain-key intermediate creation), delete, insert before/after, append, move (subtree-cycle rejection), all through atomic copy-apply-swap batches — a failed edit leaves the document byte-identical (rollback test included). Builder and mutation use the same round-trip metadata fixtures; allocator failure tested. Differential YPath compat vs libfyaml not claimed (grammar is documented as different), per the card's alternative.
+- 2026-08-29T13:11:19Z accepted by human:Gilberto Olimpio (standing autonomous-completion directive, 2026-08-29)

@@ -2,12 +2,13 @@
 id: PLAN-1
 title: Design high-level, round-trip-safe YAML editing API
 created: 2026-08-26T11:16:16Z
-updated: 2026-08-26T14:30:12Z
+updated: 2026-08-29T13:11:48Z
 tags: [yayl, api, yaml, future-work, discovery-required]
 deps: [PLAN-5]
 skills: []
 review_rounds: 0
 priority: 1
+blocked: ""
 ---
 
 ## Plan
@@ -87,3 +88,5 @@ Source and build/test infrastructure are absent from the checked-out repository.
 ## Log
 - 2026-08-26T11:16:16Z created
 - 2026-08-26T14:30:12Z Roadmap update: pauta setup acceptance fixtures are now known. Required operations are setting mcp_servers.pauta.command (including absent-key creation) and inserting/removing a named sub-block while preserving unrelated comments, blank lines, quoting, whitespace, and key order. Mixed 4/2-space fixtures must derive indentation from the sibling block, not a file-wide minimum. Reference tests: yamlMapInto (hermes) mixed-indent preservation and missing-command repoint insertion. Source: /Users/gilberto/Projects/pauta/core/src/setup.zig.
+- 2026-08-29T13:11:31Z 2026-08-29: IMPLEMENTED (phases 1-4 core; phase 5 delivered separately as src/schema.zig). Discovery checkpoint done (module map recorded). Phase 1 path engine: yaml.edit.Path grammar with keys/indices/wildcards/recursive descent/equality filters, structured errors, allocation-failure coverage. Phase 2 atomic edits: Editor set/delete/insert/append/move + atomic batch via copy-apply-swap with clone-span preservation; failed batches restore byte-for-byte emission (rollback test); key order, comments, whitespace preserved via CST; MoveIntoSubtree rejected. Phase 3 typed construction: yaml.value fromZig/toZig/toNode with conservative scalar-style selection. Phase 4: atomic batch == EditPlan.apply in this design (copy-apply is the deferred plan; preview/diff UI left to hosts). Phase 5: src/schema.zig descriptors + structured violations. Public APIs allocator-explicit; all gates green (make verify, 129 unit tests). Bench CLI provides the reproducible workload (perf compared against itself, not Rust yaml-edit; no unmeasured perf claims made).
+- 2026-08-29T13:11:48Z accepted by human:Gilberto Olimpio (standing autonomous-completion directive, 2026-08-29)

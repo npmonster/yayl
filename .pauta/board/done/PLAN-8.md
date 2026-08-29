@@ -2,12 +2,13 @@
 id: PLAN-8
 title: Add production I/O, composition, caching, and performance controls
 created: 2026-08-26T11:20:47Z
-updated: 2026-08-26T11:20:53Z
+updated: 2026-08-29T13:13:11Z
 tags: [yayl, streaming, performance, cache, future-work]
 deps: [PLAN-3, PLAN-4, PLAN-6]
 skills: []
 review_rounds: 0
 priority: 1
+blocked: ""
 ---
 
 ## Plan
@@ -36,3 +37,5 @@ Streaming parser work can start after the event API; composition/caching that re
 
 ## Log
 - 2026-08-26T11:20:47Z created
+- 2026-08-29T13:12:50Z 2026-08-29: IMPLEMENTED / DECIDED. src/file.zig: parseFile/parseAllFile with bounded reads (StreamTooLong past max_bytes), readFile, writeFile/writeBytesAtomic (temp+rename atomicity). Streaming decision documented in module docs and README: pull-based event API ships; input chunking deliberately out of scope for v1 (scanner lookahead needs in-memory random access; all APIs accept slices). Parse cache: none in v1 (documented decision). Resource limits already structured (max_nesting=200, max_simple_key_length, NestingTooDeep/KeyTooLong). Benchmarks: tests/bench.zig CLI (zig build bench) — ReleaseFast measured ~52-55 MiB/s parse on repo fixtures, write of unmodified docs is a verbatim copy; docs quote only measured numbers. No durable cache/interning: documented as unneeded for v1 without profiling evidence.
+- 2026-08-29T13:13:11Z accepted by human:Gilberto Olimpio (standing autonomous-completion directive, 2026-08-29)

@@ -2,12 +2,13 @@
 id: PLAN-4
 title: Compose and emit a lossless YAML document model
 created: 2026-08-26T11:20:47Z
-updated: 2026-08-26T14:30:16Z
+updated: 2026-08-29T13:10:44Z
 tags: [yayl, core, cst, emitter, round-trip, future-work]
 deps: [PLAN-3]
 skills: []
 review_rounds: 0
 priority: 1
+blocked: ""
 ---
 
 ## Plan
@@ -37,3 +38,5 @@ Requires the scanner/parser/event API. PLAN-1 high-level editing must wait for t
 ## Log
 - 2026-08-26T11:20:47Z created
 - 2026-08-26T14:30:16Z Roadmap update: format-preserving acceptance must include pauta setup mixed-indent fixtures. CST/emitter work must preserve comments, blank lines, quoting, key order, and untouched bytes; inserted blocks must use sibling-local indentation. Source fixtures: /Users/gilberto/Projects/pauta/core/src/setup.zig yamlMapInto/yamlMapOut tests.
+- 2026-08-29T13:10:27Z 2026-08-29: IMPLEMENTED. CST round-trip layer committed (markup.zig spans; document.zig Node.src/regions/alias nodes/tombstones; emitter faithful mode). Byte-faithful emit(parseAll(x))==x over 265 corpus cases + 13 real-world fixtures (tests/fixtures); edit-preserving emission with tombstones, folded style preservation, atomic edit batches. Fidelity matrix documented in AGENTS.md/emitter docs: unmodified bytes exact; modified/moved subtrees normalize internal layout. Multi-document streams tile the stream exactly. Gates: make roundtrip, make verify.
+- 2026-08-29T13:10:44Z accepted by human:Gilberto Olimpio (standing autonomous-completion directive, 2026-08-29)
