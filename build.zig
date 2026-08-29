@@ -77,4 +77,18 @@ pub fn build(b: *std.Build) void {
     const dump_step = b.step("dump", "Build the event-tree dump CLI");
     dump_step.dependOn(&dump_exe.step);
     b.installArtifact(dump_exe);
+
+    // Throughput benchmark CLI (PLAN-8): measured numbers for the docs.
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "yayl", .module = module }},
+        }),
+    });
+    const bench_step = b.step("bench", "Build the throughput benchmark CLI");
+    bench_step.dependOn(&bench_exe.step);
+    b.installArtifact(bench_exe);
 }
