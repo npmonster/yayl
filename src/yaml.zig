@@ -34,6 +34,7 @@ pub const document = @import("document.zig");
 pub const emitter = @import("emitter.zig");
 pub const edit = @import("edit.zig");
 pub const value = @import("value.zig");
+pub const schema = @import("schema.zig");
 
 // Public vocabulary, flattened for convenience.
 pub const Mark = diag.Mark;
@@ -79,6 +80,7 @@ test {
     _ = emitter;
     _ = edit;
     _ = value;
+    _ = schema;
 }
 
 test "parse and write round trip" {
