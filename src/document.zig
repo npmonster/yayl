@@ -420,7 +420,7 @@ pub const Document = struct {
 
     /// Structural append without the `modified` mark (the builder uses
     /// this while composing a parsed tree).
-    fn attachPair(self: *Document, map: *Node, key: *Node, value: *Node) !void {
+    pub fn attachPair(self: *Document, map: *Node, key: *Node, value: *Node) !void {
         switch (map.data) {
             .mapping => |*m| {
                 try m.pairs.append(self.pool.allocator(), .{ .key = key, .value = value });
@@ -438,7 +438,7 @@ pub const Document = struct {
     }
 
     /// Structural append without the `modified` mark.
-    fn attachItem(self: *Document, seq: *Node, item: *Node) !void {
+    pub fn attachItem(self: *Document, seq: *Node, item: *Node) !void {
         switch (seq.data) {
             .sequence => |*s| {
                 try s.items.append(self.pool.allocator(), item);
@@ -499,7 +499,7 @@ pub const Document = struct {
 
     /// Tombstone the source bytes a mapping entry occupied (its whole
     /// line, including the line terminator).
-    fn dropPairSpan(self: *Document, map: *Node, p: Pair) void {
+    pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) void {
         const src = self.source orelse return;
         const ks = p.key.src orelse return;
         if (ks.synthetic) return;
@@ -514,7 +514,7 @@ pub const Document = struct {
     }
 
     /// Tombstone the source bytes a sequence item occupied.
-    fn dropItemSpan(self: *Document, seq: *Node, item: *Node) void {
+    pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) void {
         const src = self.source orelse return;
         const is = item.src orelse return;
         if (is.synthetic) return;
@@ -594,7 +594,7 @@ pub const Document = struct {
     /// re-emitted verbatim from its parent slot, and the parent's parent
     /// must not re-emit *it* verbatim, and so on. Unmodified siblings
     /// stay verbatim regardless (the emitter walks per slot).
-    fn markModified(self: *Document, node: *Node) void {
+    pub fn markModified(self: *Document, node: *Node) void {
         _ = self;
         var cur: ?*Node = node;
         while (cur) |n| {

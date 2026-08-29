@@ -145,7 +145,22 @@ pub const Emitter = struct {
             stop = try self.emitRoot(root, markup.columnOf(src, doc.body_start), doc.body_end);
         }
         if (stop < doc.region_end) {
-            try self.write(src[stop..doc.region_end]);
+            // Deleted-entry tombstones of the root container can reach
+            // into the tail (when the last surviving entry is new).
+            const before = self.out.items.len;
+            if (doc.root != null and doc.root.?.src != null) {
+                try self.writeGap(doc.root.?, stop, doc.region_end);
+            } else {
+                try self.write(src[stop..doc.region_end]);
+            }
+            // If everything remaining was deleted, the file's final
+            // newline is still structural: keep the output terminated.
+            if (self.out.items.len == before and self.out.items.len > 0 and
+                self.out.items[self.out.items.len - 1] != '\n' and
+                src.len > 0 and src[src.len - 1] == '\n')
+            {
+                try self.writeByte('\n');
+            }
         }
     }
 
@@ -213,7 +228,9 @@ pub const Emitter = struct {
                 try self.writeGap(container, gap_start, s.entry_start);
             }
         } else if (pair_end == null) {
-            try self.writeNewlineIndent(entry_col);
+            // Brand-new pair: the previous entry's remainder already
+            // ended the line when it was re-emitted in place.
+            if (!self.endsWithNewline()) try self.writeNewlineIndent(entry_col);
             try self.emitEntry(key, value, entry_col);
             return gap_start;
         }
@@ -288,7 +305,7 @@ pub const Emitter = struct {
         const src = self.src;
         const s = item.src orelse {
             // Brand-new or moved item: sibling-local indentation.
-            try self.writeNewlineIndent(entry_col);
+            if (!self.endsWithNewline()) try self.writeNewlineIndent(entry_col);
             try self.write("- ");
             _ = try self.emitContent(item, entry_col + 2);
             return gap_start;
@@ -336,7 +353,8 @@ pub const Emitter = struct {
                     // New, flow-styled, or emptied in place: block
                     // layout cannot express an empty mapping.
                     try self.emitFlowNode(node);
-                    return if (node.src) |sn| markup.lineEnd(self.src, sn.end) else 0;
+                    // The line terminator was not consumed.
+                    return if (node.src) |sn| sn.end else 0;
                 }
                 var gap = node.src.?.start;
                 const col = self.entryColumn(node, indent);
@@ -348,7 +366,8 @@ pub const Emitter = struct {
             .sequence => |*sq| {
                 if (node.src == null or sq.style == .flow or sq.items.items.len == 0) {
                     try self.emitFlowNode(node);
-                    return if (node.src) |sn| markup.lineEnd(self.src, sn.end) else 0;
+                    // The line terminator was not consumed.
+                    return if (node.src) |sn| sn.end else 0;
                 }
                 var gap = node.src.?.start;
                 const col = self.entryColumn(node, indent);
