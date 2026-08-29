@@ -8,7 +8,7 @@ ZIG ?= zig
 .DEFAULT_GOAL := help
 .MAIN: help
 
-.PHONY: help all build check test test-release fmt fmt-write docs corpus conformance roundtrip verify clean
+.PHONY: help all build check test test-release fmt fmt-write docs corpus conformance roundtrip differential verify clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' Makefile
@@ -46,6 +46,9 @@ conformance: corpus ## Run the pinned YAML Test Suite corpus through yayl
 
 roundtrip: corpus ## Byte-faithful round trip over the corpus and tests/fixtures
 	$(ZIG) build roundtrip --summary all
+
+differential: corpus ## Compare yayl vs libfyaml event streams over the corpus (needs a C compiler)
+	sh scripts/differential.sh
 
 verify: fmt check test test-release conformance roundtrip ## Full quality gate: fmt, compile, tests (Debug + ReleaseSafe), corpus, round trip
 

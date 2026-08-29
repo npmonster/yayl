@@ -61,4 +61,20 @@ pub fn build(b: *std.Build) void {
     const run_roundtrip = b.addRunArtifact(roundtrip_tests);
     const roundtrip_step = b.step("roundtrip", "Byte-faithful round trip over corpus and fixtures");
     roundtrip_step.dependOn(&run_roundtrip.step);
+
+    // Event-tree dump CLI for the libfyaml differential harness
+    // (scripts/differential.sh compiles the C reference with the
+    // system compiler and compares its event trees against ours).
+    const dump_exe = b.addExecutable(.{
+        .name = "dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/dump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "yayl", .module = module }},
+        }),
+    });
+    const dump_step = b.step("dump", "Build the event-tree dump CLI");
+    dump_step.dependOn(&dump_exe.step);
+    b.installArtifact(dump_exe);
 }

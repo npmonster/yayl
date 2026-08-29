@@ -68,7 +68,7 @@ fn runCase(alloc: std.mem.Allocator, case: corpus.Case, verbose: bool) !Outcome 
         return .{ .status = .fail, .reason = "expected parse error, got success" };
     }
 
-    const actual = renderTree(alloc, case.input, verbose) catch |err| {
+    const actual = corpus.renderTree(alloc, case.input, verbose) catch |err| {
         return .{ .status = .fail, .reason = if (err == error.OutOfMemory) "oom" else @errorName(err) };
     };
     defer alloc.free(actual);
@@ -103,134 +103,14 @@ fn firstMismatch(expected: []const u8, actual: []const u8) []const u8 {
     }
 }
 
-fn dumpDiags(diag: yaml.Diag) void {
-    for (diag.list.items) |d| {
-        std.debug.print("    diag {d}:{d}: {s}\n", .{ d.mark.line, d.mark.column, d.message });
-    }
-}
-
-/// Render the parser's event stream in the corpus tree notation:
-/// `+STR/+DOC/+SEQ/+MAP/...` with one space of indent per open container,
-/// anchors as `&name`, resolved tags as `<uri>`, scalar styles as
-/// `: ' " | >` prefixes, and `\`, `\n`, `\t`, `\r` escaped in values.
-fn renderTree(alloc: std.mem.Allocator, input: []const u8, verbose: bool) ![]u8 {
-    var diag: yaml.Diag = .{ .alloc = alloc };
-    defer diag.deinit();
-    var p = yaml.Parser.init(alloc, &diag, input) catch |err| {
-        if (verbose) dumpDiags(diag);
-        return err;
-    };
-    defer p.deinit();
-
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-
-    var depth: usize = 0;
-    while (true) {
-        const next = p.nextEvent() catch |err| {
-            if (verbose) dumpDiags(diag);
-            return err;
-        };
-        const ev = next orelse break;
-        switch (ev.kind) {
-            .stream_start => {
-                try writeLine(&buf, alloc, depth, "+STR");
-                depth += 1;
-            },
-            .stream_end => {
-                depth -= 1;
-                try writeLine(&buf, alloc, depth, "-STR");
-            },
-            .document_start => |d| {
-                try writeLine(&buf, alloc, depth, if (!d.implicit) "+DOC ---" else "+DOC");
-                depth += 1;
-            },
-            .document_end => |d| {
-                depth -= 1;
-                try writeLine(&buf, alloc, depth, if (!d.implicit) "-DOC ..." else "-DOC");
-            },
-            .sequence_start => |cs| {
-                try bufPrintMeta(&buf, alloc, depth, "+SEQ", if (cs.style == .flow) " []" else "", cs.anchor, cs.tag);
-                try buf.append(alloc, '\n');
-                depth += 1;
-            },
-            .mapping_start => |cs| {
-                try bufPrintMeta(&buf, alloc, depth, "+MAP", if (cs.style == .flow) " {}" else "", cs.anchor, cs.tag);
-                try buf.append(alloc, '\n');
-                depth += 1;
-            },
-            .sequence_end => {
-                depth -= 1;
-                try writeLine(&buf, alloc, depth, "-SEQ");
-            },
-            .mapping_end => {
-                depth -= 1;
-                try writeLine(&buf, alloc, depth, "-MAP");
-            },
-            .scalar => |s| {
-                try bufPrintMeta(&buf, alloc, depth, "=VAL", "", s.anchor, s.tag);
-                try buf.append(alloc, ' ');
-                try buf.append(alloc, styleChar(s.style));
-                try appendEscaped(&buf, alloc, s.value);
-                try buf.append(alloc, '\n');
-            },
-            .alias => |a| {
-                try indent(&buf, alloc, depth);
-                try buf.print(alloc, "=ALI *{s}\n", .{a});
-            },
-        }
-    }
-    return try buf.toOwnedSlice(alloc);
-}
-
-fn bufPrintMeta(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, depth: usize, head: []const u8, style_suffix: []const u8, anchor: ?[]const u8, tag: ?[]const u8) !void {
-    try indent(buf, alloc, depth);
-    try buf.appendSlice(alloc, head);
-    try buf.appendSlice(alloc, style_suffix);
-    if (anchor) |a| {
-        try buf.append(alloc, ' ');
-        try buf.append(alloc, '&');
-        try buf.appendSlice(alloc, a);
-    }
-    if (tag) |t| {
-        try buf.print(alloc, " <{s}>", .{t});
-    }
-}
-
-fn writeLine(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, depth: usize, text: []const u8) !void {
-    try indent(buf, alloc, depth);
-    try buf.appendSlice(alloc, text);
-    try buf.append(alloc, '\n');
-}
-
-fn indent(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, depth: usize) !void {
-    var i: usize = 0;
-    while (i < depth) : (i += 1) try buf.append(alloc, ' ');
-}
-
-fn styleChar(style: yaml.ScalarStyle) u8 {
-    return switch (style) {
-        .plain, .any => ':',
-        .single_quoted => '\'',
-        .double_quoted => '"',
-        .literal => '|',
-        .folded => '>',
-    };
-}
-
-fn appendEscaped(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: []const u8) !void {
-    for (value) |c| {
+fn appendJsonEscaped(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+    for (s) |c| {
         switch (c) {
-            '\\' => try buf.appendSlice(alloc, "\\\\"),
-            '\n' => try buf.appendSlice(alloc, "\\n"),
-            '\t' => try buf.appendSlice(alloc, "\\t"),
-            '\r' => try buf.appendSlice(alloc, "\\r"),
-            0x08 => try buf.appendSlice(alloc, "\\b"), // backspace (corpus G4RS)
+            '"' => try buf.appendSlice(alloc, "\\\""),
             else => try buf.append(alloc, c),
         }
     }
 }
-
 fn writeReport(alloc: std.mem.Allocator, io: std.Io, results: []const Result) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
@@ -316,13 +196,4 @@ test "yaml test suite corpus" {
     }
     try std.testing.expectEqual(@as(usize, 0), fail);
     try std.testing.expectEqual(@as(usize, 0), stale);
-}
-
-fn appendJsonEscaped(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(alloc, "\\\""),
-            else => try buf.append(alloc, c),
-        }
-    }
 }
