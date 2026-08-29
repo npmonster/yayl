@@ -2,7 +2,7 @@
 
 A native Zig YAML parser, document model, and emitter. yayl follows the architecture and observable behavior of [libfyaml](https://github.com/pantoniou/libfyaml), using Zig allocators, error unions, and tagged unions.
 
-> **Status: early release.** The scanner, parser, document API, and emitter support practical YAML 1.2 inputs. Output is semantic, not byte-preserving: comments, whitespace, and original formatting are normalized.
+> **Status: v1 feature-complete.** The scanner, parser, CST-backed document model, and emitter pass the full yaml-test-suite corpus (351/351), produce **byte-faithful round trips** — comments, blank lines, quoting, key order, indentation — and ship an editing API, a generic value runtime, optional schema validation, and bounded file I/O. `make verify` gates all of it.
 
 See the [usage guide](docs/USAGE.md) for library examples and API patterns.
 
@@ -110,11 +110,39 @@ try doc.pathSet(
 
 Available mutation APIs: `createScalar`, `createMapping`, `createSequence`, `mappingAppend`, `mappingRemove`, `sequenceAppend`, `sequenceInsert`, `sequenceRemove`, `pathSet`, and `pathDelete`.
 
-## Write
+## Write — byte-faithful round trips
 
-`doc.write(allocator) ![]u8` serializes a document. The returned buffer belongs to the allocator and must be freed by the caller.
+`doc.write(allocator) ![]u8` serializes a document. For documents produced by `parse`/`parseAll`, untouched parts re-emit **byte for byte**: comments, blank lines, quoting, key order, indentation, anchors/aliases, tags, directives, document markers, block scalar chomping. Modified values re-emit in place, keeping their style when lossless (a folded scalar stays folded, for example).
 
-The emitter preserves document markers, tags, anchors, aliases, and flow versus block collection style. It chooses a safe scalar presentation when needed.
+```zig
+var doc = try yaml.parse(alloc, "# config\nport: 8080 # user facing\n");
+defer doc.deinit();
+try doc.pathSet(&.{"port"}, try doc.createScalar("9090", .plain));
+const out = try doc.write(alloc); // "# config\nport: 9090 # user facing\n"
+defer alloc.free(out);
+```
+
+## Edit with paths, batch atomically
+
+`yaml.edit.Editor` queries with a path grammar (`$.a.b[0]`, `[*]`,
+`..name`, `[?key=value]`) and applies edits — set, delete, insert,
+append, move — as an atomic batch over a deep clone of the tree:
+
+```zig
+var ed = yaml.edit.Editor.init(&doc);
+try ed.apply(&.{
+    .{ .set = .{ .path = "$.port", .value = try doc.createScalar("9090", .plain) } },
+    .{ .delete = "$.legacy" },
+});
+```
+
+A failed batch leaves the original document byte-identical.
+
+## Values, schemas, files
+
+- `yaml.value` — tagged `Value`, lossless parse-to-value / value-to-node, and Zig-native `toZig`/`fromZig` for structs, optionals, enums, slices.
+- `yaml.schema` — optional validation descriptors (types, ranges, enums, required keys) with structured violations.
+- `yaml.file` — bounded file reads and atomic writes.
 
 ## Ownership
 
@@ -123,23 +151,25 @@ The emitter preserves document markers, tags, anchors, aliases, and flow versus 
 - Values returned by `doc.write()` and `Diag.render()` must be freed with the allocator supplied to those calls.
 - `Scanner` and `Parser` own transient token/event data; copy data that must outlive them into a document.
 
-## Current limitations
+## Current limitations (deliberate v1 scope)
 
-- Input must fit in memory; streaming input is not implemented.
-- Formatting is normalized. Comments, blank lines, indentation width, and other source layout are not preserved.
-- Round-trip editing is semantic: `write(parse(input))` can differ textually from `input`.
-- Full libfyaml parity is still in progress.
+- Input must fit in memory; the parser streams *events* (pull-based), not input chunks (documented decision in `src/file.zig`).
+- Re-emitted (modified) subtrees normalize their internal layout — e.g. multi-line flow collapses to one line; untouched bytes are exact.
+- Moved subtrees re-emit normalized at their destination.
+- No parse cache in v1 (documented decision).
 
 ## Development
 
 ```sh
-zig build
-zig build test
-zig build test -Doptimize=ReleaseSafe
-make verify
+make verify        # fmt + compile + tests (Debug & ReleaseSafe)
+                   #   + corpus conformance (351/351)
+                   #   + byte-faithful round-trip gate
+make roundtrip     # emit(parse(x)) == x over corpus + fixtures
+make differential  # event-stream parity vs libfyaml (needs a C compiler)
+zig build bench    # throughput CLI
 ```
 
-`make verify` is the project quality gate: formatting, library compilation, and Debug and ReleaseSafe tests.
+Quality gates: 351/351 yaml-test-suite conformance (zero skips), 265/265 byte-faithful corpus round trips plus real-world fixtures, 269/269 event-tree parity against vendored libfyaml, allocation-failure injection with zero leaks, Debug and ReleaseSafe.
 
 ## License
 

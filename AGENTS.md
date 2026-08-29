@@ -61,54 +61,50 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 | `fy-wpool.c`          | —                      | ⬜ out of scope for v1 (threading)                                 |
 | `fy-markup.c`         | —                      | ⬜ not ported (fy-extension markup)                                |
 
-### Scanner gaps (`fy-scan.c` parity work)
+### Scanner status
 
-- Complex keys via `?` are tokenized but not exercised end-to-end.
-- Edge cases of plain-scalar continuation (document indicators mid-scalar,
-  tab-in-indentation diagnostics) implemented but lightly tested.
-- No input chunking/streaming reader yet: the whole input must be in memory
-  (libfyaml has a reader layer; Zig port reads a `[]const u8`).
+The full pinned yaml-test-suite corpus passes (351/351, zero skips):
+complex keys, tab strictness (column-0 tabs indenting constructs are
+rejected; separation tabs are fine), flow/quoted continuation
+indentation bounds, block scalar folding/indentation indicators.
+`make verify` and `make roundtrip` keep it honest (stale-skip guard).
 
-### Parser gaps
+### Parser status
 
-- Anchor redefinition rules per document are enforced (duplicate → error),
-  but libfyaml's exact alias/anchor mark bookkeeping is simplified.
-- `%YAML` versions > 1.x are rejected; libfyaml warns on some.
+Event streams are byte-identical to vendored libfyaml on all 269
+comparable corpus cases (`make differential`). Anchor re-definition
+shadows (corpus semantics). Nesting/length limits are structured
+errors.
 
-### Emitter gaps (the big one)
+### Emitter status
 
-- Emits from the **semantic tree**, so formatting is normalized: original
-  comments, blank lines, indentation width and key order quirks are not
-  preserved. libfyaml's round-trip mode preserves all of these via the CST.
-- Anchored nodes are de-duplicated with `*alias` on second emission; nodes
-  without anchors are duplicated (graph → tree flattening).
-- Folded scalars (`>`) are emitted as literal (`|`) when re-quoting is
-  required (lossless, but style changes).
+Two modes: **faithful** (parsed documents: untouched subtrees re-emit
+verbatim via `markup.Src` spans; modified slots re-emit in place with
+sibling bytes preserved; tombstones skip deleted entries; folded
+scalars keep `>` when re-folding is lossless) and **normalized**
+(programmatic documents). Modified/moved subtrees normalize their
+internal layout; untouched bytes are exact.
 
-## The main remaining goal: comment-preserving round trip
+## Documented v1 scope decisions
 
-libfyaml's headline feature is byte-faithful round-trip editing, which
-requires a **CST** that keeps comments and original formatting. Path:
-
-1. Vendor the reference: `git clone https://github.com/pantoniou/libfyaml
-   vendor/libfyaml` (already in `.gitignore`; treat as read-only reference).
-2. Port `fy-markup`/comment attachment: extend `Token` with comment spans,
-   attach to adjacent nodes during build.
-3. Add per-node "original text" spans so unmodified subtrees re-emit
-   byte-identically; fall back to the current emitter for new/modified nodes.
-4. Differential testing: for a corpus of YAML files, assert
-   `emit(parse(x)) == x` byte-for-byte.
+- **Streaming input**: the parser is pull-based at the event level;
+  input chunking is deliberately out of scope (see `src/file.zig`
+  module docs for the rationale).
+- **Parse cache**: none in v1 (same note).
+- **Threading (`fy-wpool`)** and **atom interning (`fy-atom`)** remain
+  optional, out of scope.
 
 ## Verification strategy
 
-- **Unit tests** (current): token streams, event streams, scalar values,
-  emitter quoting, round trips, allocation-failure injection over the public
-  parse/write API — `zig build test` (62 tests).
-- **Next**: port libfyaml's `tests/` data-driven cases (YAML test suite
-  inputs with expected token/event/dump outputs) as embedded or generated
-  fixtures; compare Zig output to recorded libfyaml output.
-- **Later**: differential fuzzing (Zig parser vs. C parser via `zig cc`
-  build of vendored libfyaml).
+- **Unit tests**: token streams, event streams, scalar values, emitter
+  quoting, round trips, editing, value conversion, schemas, file I/O,
+  allocation-failure injection — `zig build test`.
+- **Conformance gate**: full yaml-test-suite corpus, event-tree
+  comparison, zero skips — `make conformance`.
+- **Round-trip gate**: `emit(parseAll(x)) == x` over the corpus and
+  real-world fixtures — `make roundtrip`.
+- **Differential gate**: event streams vs the compiled vendored
+  libfyaml over the corpus — `make differential`.
 
 ## Zig 0.16 gotchas already paid for (don't re-learn these)
 

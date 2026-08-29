@@ -1,104 +1,89 @@
-# Using yayl
+# yayl developer guide
 
-This guide covers the public document API. Start with [README](../README.md) for installation and project status.
+This is the developer-facing guide to using yayl in your Zig code.
+The [README](../README.md) covers project status and quality gates.
+
+Contents:
+
+1. [Adding yayl to a project](#adding-yayl-to-a-project)
+2. [Parse and inspect](#parse-and-inspect)
+3. [Build a document](#build-a-document)
+4. [Change a parsed document](#change-a-parsed-document)
+5. [Byte-faithful round trips](#byte-faithful-round-trips-the-headline)
+6. [Editing: paths, batches, moves](#editing-paths-batches-moves)
+7. [Values: schema-free data and Zig conversion](#values-schema-free-data-and-zig-conversion)
+8. [Validation: optional schemas](#validation-optional-schemas)
+9. [Files](#files)
+10. [Events and tokens (lower levels)](#events-and-tokens-lower-levels)
+11. [Memory and error model](#memory-and-error-model)
+12. [Building and testing from source](#building-and-testing-from-source)
+
+## Adding yayl to a project
+
+yayl is a Zig 0.16 package. Every allocating call takes an allocator
+explicitly. A `Document` owns its nodes and all of their strings;
+`deinit` releases everything in one shot. Errors are error unions
+(`error.InvalidSyntax`, ...) — when a `Diag` is attached, positioned
+human-readable messages are collected too (see `yaml.Diag`).
 
 ~~~zig
 const std = @import("std");
 const yaml = @import("yayl");
 ~~~
 
-Every allocating call receives an allocator. A Document owns its nodes and strings; call deinit once when finished.
+## Parse and inspect
 
-## Parse a document
-
-yaml.parse reads the first document in a stream.
+`yaml.parse` reads the first document of a stream; `yaml.parseAll`
+reads every document (an unmanaged `std.ArrayList(Document)`;
+deinitialize every document, then the list).
 
 ~~~zig
-var doc = try yaml.parse(
-    alloc,
+var doc = try yaml.parse(alloc,
     \\name: yayl
     \\enabled: true
     \\ports: [8080, 8443]
-    \\,
+    \\
 );
 defer doc.deinit();
 
 const root = doc.root orelse return error.EmptyDocument;
 const name = root.lookup("name").?.scalarValue().?;
-std.debug.print("{s}\n", .{name});
-~~~
-
-A node is a scalar, mapping, or sequence. Use the optional accessors when the expected shape is known:
-
-~~~zig
-const enabled = root.lookup("enabled").?.scalarValue().?;
 const ports = root.lookup("ports").?.items().?;
-
-for (ports) |port| {
-    std.debug.print("port: {s}\n", .{port.scalarValue().?});
-}
-_ = enabled;
 ~~~
 
-Use lookup for one mapping key and byPath or Document.pathGet for nested mapping keys:
-
-~~~zig
-const port = doc.pathGet(&.{ "server", "port" }) orelse return error.MissingPort;
-const value = port.scalarValue().?;
-_ = value;
-~~~
-
-## Inspect node types
-
-Use nodeType for a quick check, or switch on node.data when behavior depends on the payload.
+Nodes are a tagged union (`yaml.Node`): `.scalar`, `.mapping`,
+`.sequence` or `.alias`. Accessors forward through aliases, so a
+`*ref` behaves like its target:
 
 ~~~zig
 switch (root.data) {
-    .scalar => |scalar| std.debug.print("scalar: {s}\n", .{scalar.value}),
-    .mapping => |mapping| {
-        for (mapping.pairs.items) |pair| {
-            const key = pair.key.scalarValue() orelse continue;
-            std.debug.print("key: {s}\n", .{key});
-        }
+    .scalar  => |s| std.debug.print("{s}\n", .{s.value}),
+    .mapping => |m| for (m.pairs.items) |p| {
+        std.debug.print("{s}\n", .{p.key.scalarValue() orelse continue});
     },
-    .sequence => |sequence| {
-        std.debug.print("{} items\n", .{sequence.items.items.len});
-    },
+    .sequence => |s| for (s.items.items) |item| { _ = item; },
+    .alias    => |a| std.debug.print("*{s}\n", .{a.name}),
 }
 ~~~
 
-yaml.scalarKind(value, style) classifies a scalar according to the YAML core schema. It only resolves plain scalars; quoted values remain strings.
+Nested lookup by key path (`pathGet`), or `node.lookup` for one key:
 
 ~~~zig
-const kind = yaml.scalarKind("42", .plain); // .int
-_ = kind;
+const port = doc.pathGet(&.{ "server", "port" }) orelse return error.Missing;
 ~~~
 
-## Change a parsed document
+`yaml.scalarKind(value, style)` classifies a scalar per the YAML core
+schema; quoted values are always strings.
 
-Create values through the document so they are owned by its pool, then use path helpers to replace or add values.
-
-~~~zig
-var doc = try yaml.parse(alloc, "server:\n  host: localhost\n");
-defer doc.deinit();
-
-try doc.pathSet(
-    &.{ "server", "port" },
-    try doc.createScalar("8080", .plain),
-);
-
-const removed = try doc.pathDelete(&.{"legacy"});
-_ = removed;
-
-const output = try doc.write(alloc);
-defer alloc.free(output);
-~~~
-
-pathSet creates missing intermediate mappings. Its path components are mapping keys, not sequence indices.
+Anchors and aliases are first-class nodes: `- &v 42` followed by
+`- *v` produces a distinct alias node resolving to the anchor target
+(`node.isAlias()`, `node.resolveAlias()`).
 
 ## Build a document
 
-Create a root node, assign it to doc.root, then connect children with the collection helpers.
+Create a root node, assign it to `doc.root`, then connect children
+with the collection helpers. Do not allocate nodes directly;
+document constructors establish ownership and parent links.
 
 ~~~zig
 var doc = yaml.Document.init(alloc);
@@ -108,11 +93,7 @@ const root = try doc.createMapping();
 doc.root = root;
 
 const ports = try doc.createSequence();
-try doc.mappingAppend(
-    root,
-    try doc.createScalar("ports", .plain),
-    ports,
-);
+try doc.mappingAppend(root, try doc.createScalar("ports", .plain), ports);
 try doc.sequenceAppend(ports, try doc.createScalar("8080", .plain));
 try doc.sequenceAppend(ports, try doc.createScalar("8443", .plain));
 
@@ -120,58 +101,211 @@ const output = try doc.write(alloc);
 defer alloc.free(output);
 ~~~
 
-Use mappingAppend, mappingRemove, sequenceAppend, sequenceInsert, and sequenceRemove for collection changes. Do not allocate nodes directly; document constructors establish the required ownership and parent links.
+Programmatically built documents emit normalized YAML.
 
-## Read a multi-document stream
+## Change a parsed document
 
-yaml.parseAll returns an unmanaged std.ArrayList(Document). Deinitialize every document before the list.
+Create values through the document so the pool owns them, then use
+the path helpers or the editor (next section).
 
 ~~~zig
-var docs = try yaml.parseAll(alloc, "---\nname: first\n---\nname: second\n");
-defer {
-    for (docs.items) |*doc| doc.deinit();
-    docs.deinit(alloc);
+var doc = try yaml.parse(alloc, "server:\n  host: localhost\n");
+defer doc.deinit();
+
+try doc.pathSet(&.{ "server", "port" }, try doc.createScalar("8080", .plain));
+_ = try doc.pathDelete(&.{"legacy"});
+~~~
+
+`pathSet` creates missing intermediate mappings; its components are
+mapping keys, not sequence indices.
+
+## Byte-faithful round trips (the headline)
+
+Documents produced by `parse`/`parseAll` remember where every node
+came from. `doc.write` re-emits the original bytes exactly — comments,
+blank lines, quoting, key order, indentation, block scalar chomping,
+anchors/aliases, tags, directives and document markers included —
+unless you modified that part of the tree:
+
+~~~zig
+var doc = try yaml.parse(alloc,
+    \\# service config
+    \\name: api
+    \\port: 8080   # user facing
+    \\
+);
+defer doc.deinit();
+
+try doc.pathSet(&.{"port"}, try doc.createScalar("9090", .plain));
+
+const out = try doc.write(alloc);
+defer alloc.free(out);
+// out == "# service config\nname: api\nport: 9090   # user facing\n"
+~~~
+
+Modified values keep their scalar style when that is lossless: a
+folded (`>`) scalar you replace re-emits folded if the content
+re-folds exactly, falling back to literal (`|`) or quoted otherwise.
+Multi-document streams preserve the bytes of *all* documents; editing
+one leaves the others byte-identical. Deleting an entry removes its
+whole line (leading indent and trailing comment included); appends
+use the sibling entries' indentation.
+
+## Editing: paths, batches, moves
+
+`yaml.edit.Editor` layers a documented path grammar and atomic edits
+on the document model:
+
+| Syntax | Meaning |
+| --- | --- |
+| `$.a.b[0]` | map keys and sequence indices (`$` optional) |
+| `[*]` | every child, in document order |
+| `..name` | recursive descent: every `name` at any depth |
+| `[?key=value]` | mapping items whose `key` equals `value` |
+
+~~~zig
+var ed = yaml.edit.Editor.init(&doc);
+
+// Query: exactly one match, or every match (caller frees the slice).
+const first = try ed.one("$.store.book[0].title");
+const titles = try ed.all("$.store.book[*].title");
+
+// Edits. `apply` is atomic: edits run on a deep clone of the tree
+// (presentation spans included) and swap in only if ALL succeeded.
+try ed.apply(&.{
+    .{ .set    = .{ .path = "$.port", .value = try doc.createScalar("9090", .plain) } },
+    .{ .append = .{ .sequence = "$.items", .value = try doc.createScalar("new", .plain) } },
+    .{ .insert = .{ .sequence = "$.items", .position = "$.items[0]",
+                   .value = try doc.createScalar("first", .plain), .before = true } },
+    .{ .delete = "$.obsolete" },
+    .{ .move   = .{ .from = "$.a[1]", .to = "$.b", .key = "moved" } },
+});
+~~~
+
+`set` auto-creates intermediate mappings only along plain-key paths.
+A failed batch (unknown path, wrong shape, allocation failure) leaves
+the original document byte-identical. Moved nodes re-emit normalized
+at their new location; untouched siblings stay verbatim. Moving a
+node into its own subtree is rejected (`error.MoveIntoSubtree`).
+
+## Values: schema-free data and Zig conversion
+
+`yaml.value` is a tagged value for data-oriented work:
+
+~~~zig
+const v = try yaml.value.parseToValue(alloc, input);
+defer yaml.value.freeValue(alloc, v);
+
+const count = v.get("count").?.int;      // i64
+const tags  = v.get("tags").?.list;      // []const Value
+~~~
+
+Typing follows the YAML 1.2 core schema and is never lossy: a quoted
+`"42"` stays a string; integers beyond i64 keep their exact text
+(`.bigint`).
+
+Convert straight into Zig types and back:
+
+~~~zig
+const Config = struct {
+    name: []const u8,
+    replicas: u8 = 1,          // defaults apply
+    enabled: bool,
+    mode: enum { fast, slow }, // enums match by name
+};
+
+var doc = try yaml.parse(alloc, input);
+defer doc.deinit();
+const val = try yaml.value.nodeToValue(alloc, doc.root.?);
+defer yaml.value.freeValue(alloc, val);
+const cfg = try yaml.value.toZig(Config, alloc, val);
+defer alloc.free(cfg.name);
+
+// Zig values -> YAML:
+var v = try yaml.value.fromZig(alloc, cfg);
+defer yaml.value.freeValue(alloc, v);
+doc.root = try yaml.value.toNode(&doc, v);
+~~~
+
+## Validation: optional schemas
+
+`yaml.schema` validates a node against a small descriptor and
+produces structured violations (logical path + rule + detail). It is
+opt-in: nothing pays for it unless invoked.
+
+~~~zig
+const schema = yaml.schema.Schema.map(&.{
+    .{ .key = "name", .schema = &yaml.schema.Schema.str, .required = true },
+    .{ .key = "port", .schema = &yaml.schema.Schema.intRange(1, 65535), .required = true },
+    .{ .key = "mode", .schema = &yaml.schema.Schema.strEnum(&.{ "fast", "slow" }) },
+});
+
+const violations = try schema.validate(alloc, doc.root.?, "$");
+defer yaml.schema.freeViolations(alloc, violations);
+for (violations) |viol| {
+    std.debug.print("{s}: {s} ({s})\n", .{ viol.path, viol.rule, viol.detail });
 }
-
-for (docs.items) |*doc| {
-    const name = doc.pathGet(&.{"name"}).?.scalarValue().?;
-    std.debug.print("{s}\n", .{name});
-}
 ~~~
 
-## Write YAML
+Use `Schema.mapStrict` to also reject undeclared keys.
 
-Document.write allocates the result with the allocator you pass. Free that result with the same allocator.
+## Files
+
+`yaml.file` wraps parsing and writing with production safeguards:
+reads are bounded (`max_bytes`, so a huge file fails with
+`error.StreamTooLong`, not OOM) and writes are atomic (temp file +
+rename — a crash never leaves a half-written YAML file).
 
 ~~~zig
-const output = try doc.write(alloc);
-defer alloc.free(output);
-std.debug.print("{s}", .{output});
+var threaded: std.Io.Threaded = .init(alloc, .{});
+defer threaded.deinit();
+const io = threaded.io();
+
+var doc = try yaml.file.parseFile(alloc, io, "config.yaml", yaml.file.max_bytes_default);
+defer doc.deinit();
+
+// ... edit ...
+try yaml.file.writeFile(&doc, alloc, io, "config.yaml");
 ~~~
 
-The emitter retains document markers, tags, anchors, aliases, and flow versus block collection style. It may choose a different safe scalar style. It does not preserve comments, blank lines, or original whitespace.
+## Events and tokens (lower levels)
 
-## Parser events and diagnostics
+The layering mirrors libfyaml and is public:
 
-Most programs should use yaml.parse. Use Parser when you need the event stream or positioned diagnostics.
+* `yaml.Scanner` — token stream (`peekToken`/`skipToken`).
+* `yaml.Parser` — pull-based event stream (`nextEvent`), suitable for
+  processing large multi-document inputs without building trees.
+  Streaming *input chunking* is deliberately out of scope in v1 (see
+  the decision note in `src/file.zig`'s module docs): the event API
+  streams events; the input itself lives in memory.
+* `yaml.markup` — the source-span arithmetic behind round trips.
+* Nesting is capped (`Scanner.max_nesting`, 200) and simple keys are
+  length-capped, so adversarial input fails with structured errors
+  (`error.NestingTooDeep`, `error.KeyTooLong`).
 
-~~~zig
-var diag = yaml.Diag{ .alloc = alloc };
-defer diag.deinit();
+## Memory and error model
 
-var parser = try yaml.Parser.init(alloc, &diag, input);
-defer parser.deinit();
+* Every `Document` owns an arena (`yaml.Pool`); nodes, strings and
+  edits live and die with it. Nothing outlives `deinit`.
+* Values returned by `yaml.value.toZig` are allocated by YOUR
+  allocator and freed by you (`freeValue` for `Value` trees).
+* All fallible operations are allocation-failure tested
+  (`checkAllAllocationFailures`): an OOM mid-operation either
+  completes or leaves the document intact.
 
-while (try parser.nextEvent()) |_| {}
+## Building and testing from source
 
-const report = try diag.render(alloc);
-defer alloc.free(report);
+~~~sh
+make help         # target list
+make verify       # fmt + compile + tests (Debug & ReleaseSafe)
+                  #   + corpus conformance (351/351)
+                  #   + byte-faithful round-trip gate
+make roundtrip    # emit(parse(x)) == x over corpus + fixtures
+make differential # event-stream parity vs libfyaml (needs a C compiler)
+zig-out/bin/bench tests/fixtures/serde-ci.yml 500   # throughput
 ~~~
 
-The parser and scanner own event/token payloads. Copy values into a Document if they must outlive the parser.
-
-## Errors and limits
-
-Public operations return Zig error unions. YAML-specific failures are exposed through yaml.YamlError; allocation failures use std.mem.Allocator.Error.
-
-The scanner limits collection nesting to 200 levels by default and returns error.NestingTooDeep for deeper input. Input is currently read from an in-memory byte slice; streaming is not available.
+Measured throughput (ReleaseFast, small fixtures): ~52-55 MiB/s
+parse; writing an unmodified document is a verbatim slice copy.
+Reproduce with `bench`; please avoid quoting performance numbers you
+did not measure with it.
