@@ -250,9 +250,12 @@ pub const Emitter = struct {
                 const stop = try self.emitContent(value, markup.columnOf(src, vs.start));
                 // A container walk that reached the line end already
                 // consumed the terminator; deeper slots must not write
-                // it twice.
+                // it twice. A re-emitted block scalar closes its own
+                // line with its chomping break.
                 const base = pair_end orelse vs.end;
-                if (stop >= markup.lineEnd(src, base)) return stop;
+                const le = markup.lineEnd(src, base);
+                if (stop >= le) return stop;
+                if (self.endsWithNewline()) return le;
                 return self.writeRemainder(base);
             }
             // Replaced by an empty value node: normalized colon.
@@ -270,7 +273,13 @@ pub const Emitter = struct {
             try self.writeNewlineIndent(entry_col + self.indent_step);
             _ = try self.emitContent(value, entry_col + self.indent_step);
         }
-        if (pair_end) |pe| return self.writeRemainder(pe);
+        // A re-emitted block scalar closed its own line with its
+        // chomping break; only advance the gap anchor.
+        if (pair_end) |pe| {
+            const le = markup.lineEnd(src, pe);
+            if (self.endsWithNewline()) return le;
+            return self.writeRemainder(pe);
+        }
         return gap_start;
     }
 
@@ -639,7 +648,8 @@ pub const Emitter = struct {
                 try self.writeByte('\'');
             },
             .double_quoted => try self.writeDoubleQuoted(value),
-            .literal, .folded => try self.writeLiteral(value, indent),
+            .literal => try self.writeLiteral(value, indent),
+            .folded => try self.writeFolded(value, indent),
             .any => unreachable,
         }
     }
@@ -703,6 +713,9 @@ pub const Emitter = struct {
         if (value.len == 0) return .double_quoted;
         const has_break = std.mem.indexOfScalar(u8, value, '\n') != null;
         if (has_break) {
+            // Modified scalars keep their parsed block style when the
+            // content can be re-emitted losslessly in it.
+            if (block_ok and prefer == .folded and foldedSafe(value)) return .folded;
             if (block_ok and literalSafe(value)) return .literal;
             return .double_quoted;
         }
@@ -721,6 +734,68 @@ pub const Emitter = struct {
         // A leading space would need an explicit indentation indicator.
         if (value[0] == ' ') return false;
         return true;
+    }
+
+    /// A folded re-emission must re-parse to exactly `value`: no leading
+    /// blank line, no more-indented lines, no tabs, and no trailing
+    /// whitespace on any line (folding strips those).
+    fn foldedSafe(value: []const u8) bool {
+        if (value.len == 0) return false;
+        switch (value[0]) {
+            '\n', ' ', '\t' => return false,
+            else => {},
+        }
+        var it = std.mem.splitScalar(u8, value, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            if (line[0] == ' ' or line[0] == '\t') return false;
+            if (std.mem.indexOfScalar(u8, line, '\t') != null) return false;
+            const last = line[line.len - 1];
+            if (last == ' ' or last == '\t') return false;
+        }
+        return true;
+    }
+
+    /// Folded block scalar (`>`). Folding joins consecutive lines with
+    /// a space; a newline in the value therefore needs one blank output
+    /// line (k consecutive breaks fold to k-1 newlines). Each value
+    /// newline between content lines emits `breaks = newlines + 1`.
+    /// Chomping mirrors `writeLiteral`.
+    fn writeFolded(self: *Emitter, value: []const u8, indent: usize) Error!void {
+        var core = value;
+        var trailing: usize = 0;
+        while (core.len > 0 and core[core.len - 1] == '\n') {
+            trailing += 1;
+            core = core[0 .. core.len - 1];
+        }
+        try self.writeByte('>');
+        if (trailing == 0) {
+            try self.writeByte('-');
+        } else if (trailing > 1) {
+            try self.writeByte('+');
+        }
+        try self.writeByte('\n');
+
+        var it = std.mem.splitScalar(u8, core, '\n');
+        var have_line = false;
+        var blanks: usize = 0; // blank value lines since the last content line
+        while (it.next()) |line| {
+            if (line.len == 0) {
+                blanks += 1;
+                continue;
+            }
+            if (have_line) {
+                // Terminate the previous line, then one blank output
+                // line per value newline (the separator itself plus
+                // each blank value line).
+                for (0..blanks + 2) |_| try self.writeByte('\n');
+            }
+            blanks = 0;
+            have_line = true;
+            try self.writeIndent(indent);
+            try self.write(line);
+        }
+        for (0..trailing) |_| try self.writeByte('\n');
     }
 
     fn plainSafe(value: []const u8) bool {
@@ -851,4 +926,30 @@ test "emit tags" {
     const out = try roundTrip(testing.allocator, src);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings(src, out);
+}
+
+test "modified folded scalar keeps folded style" {
+    const src = "desc: >\n  first paragraph\n  more text\nother: 1\n";
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try doc.pathSet(&.{"desc"}, try doc.createScalar("new paragraph\nstill folded\n", .folded));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("desc: >\n  new paragraph\n\n  still folded\nother: 1\n", out);
+    // The re-emitted text re-parses to the same value.
+    var doc2 = try Document.parse(testing.allocator, out);
+    defer doc2.deinit();
+    try testing.expectEqualStrings("new paragraph\nstill folded\n", doc2.pathGet(&.{"desc"}).?.scalarValue().?);
+}
+
+test "unsafe folded content falls back to literal" {
+    var doc = Document.init(testing.allocator);
+    defer doc.deinit();
+    const root = try doc.createMapping();
+    doc.root = root;
+    // A line with trailing whitespace cannot round-trip folded.
+    try doc.pathSet(&.{"x"}, try doc.createScalar("line one \nline two\n", .folded));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("x: |\n  line one \n  line two\n", out);
 }
