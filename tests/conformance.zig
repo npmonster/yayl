@@ -22,20 +22,10 @@ const Skip = struct {
     target: []const u8,
 };
 
-/// Known gaps, triaged 2026-08-27 from the 301/351 baseline. Every entry
-/// carries a reason and the card tracking the fix; a skipped case that
-/// starts passing fails the gate ("stale skip") so this table cannot
-/// outlive a fix.
-const skips: []const Skip = &.{
-    // Block scalars, tabs and indentation interplay.
-    .{ .id = "MJS9", .reason = "block folding with tabs (spec 6.7)", .target = "PLAN-3" },
-    .{ .id = "R4YG", .reason = "block indentation indicator details (spec 8.2)", .target = "PLAN-3" },
-    // Wrongly accepted (must become rejections).
-    .{ .id = "4EJS", .reason = "tab used as mapping indentation accepted", .target = "PLAN-3" },
-    .{ .id = "Y79Y-1", .reason = "tabs in various contexts accepted", .target = "PLAN-3" },
-    .{ .id = "9C9N", .reason = "wrong-indented flow continuation accepted", .target = "PLAN-3" },
-    .{ .id = "QB6E", .reason = "wrong-indented multiline quoted scalar accepted", .target = "PLAN-3" },
-};
+/// Cases yayl does not handle yet: none. The pinned corpus passes in
+/// full (351/351 as of 2026-08-29). The stale-skip guard keeps this
+/// table honest if it ever grows again.
+const skips: []const Skip = &.{};
 
 fn findSkip(id: []const u8) ?Skip {
     for (skips) |s| if (std.mem.eql(u8, s.id, id)) return s;
@@ -241,25 +231,6 @@ fn appendEscaped(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: []con
     }
 }
 
-fn appendJsonEscaped(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(alloc, "\\\""),
-            '\\' => try buf.appendSlice(alloc, "\\\\"),
-            '\n' => try buf.appendSlice(alloc, "\\n"),
-            '\t' => try buf.appendSlice(alloc, "\\t"),
-            '\r' => try buf.appendSlice(alloc, "\\r"),
-            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
-                const hexd = "0123456789abcdef";
-                try buf.appendSlice(alloc, "\\u00");
-                try buf.append(alloc, hexd[(c >> 4) & 0xF]);
-                try buf.append(alloc, hexd[c & 0xF]);
-            },
-            else => try buf.append(alloc, c),
-        }
-    }
-}
-
 fn writeReport(alloc: std.mem.Allocator, io: std.Io, results: []const Result) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
@@ -281,4 +252,77 @@ fn writeReport(alloc: std.mem.Allocator, io: std.Io, results: []const Result) !v
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, "zig-out");
     try cwd.writeFile(io, .{ .sub_path = report_path, .data = buf.items });
+}
+
+// ----------------------------------------------------------------------
+// Corpus gate
+// ----------------------------------------------------------------------
+
+test "yaml test suite corpus" {
+    const alloc = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cases: std.ArrayList(corpus.Case) = .empty;
+    defer {
+        for (cases.items) |*c| corpus.freeCase(alloc, c);
+        cases.deinit(alloc);
+    }
+    corpus.loadCases(alloc, io, &cases) catch |err| {
+        std.debug.print(
+            "conformance: cannot load corpus from {s} ({}); run `make corpus` first\n",
+            .{ corpus_dir, err },
+        );
+        return err;
+    };
+
+    var results: std.ArrayList(Result) = .empty;
+    defer results.deinit(alloc);
+
+    var pass: usize = 0;
+    var fail: usize = 0;
+    var stale: usize = 0;
+    for (cases.items) |case| {
+        const skip = findSkip(case.id);
+        const outcome = runCase(alloc, case, skip == null) catch |err| {
+            var reason_buf: [128]u8 = undefined;
+            const reason = std.fmt.bufPrint(&reason_buf, "harness error: {}", .{err}) catch "harness error";
+            try results.append(alloc, .{ .id = case.id, .name = case.name, .status = .fail, .reason = reason });
+            continue;
+        };
+        if (skip) |s| {
+            if (outcome.status == .pass) {
+                // A skipped case that now passes means the table is stale.
+                stale += 1;
+                try results.append(alloc, .{ .id = case.id, .name = case.name, .status = .fail, .reason = "stale skip: case passes, remove from skips table" });
+            } else {
+                try results.append(alloc, .{ .id = case.id, .name = case.name, .status = .skip, .reason = s.reason });
+            }
+            continue;
+        }
+        if (outcome.status == .pass) pass += 1;
+        if (outcome.status == .fail) fail += 1;
+        try results.append(alloc, .{ .id = case.id, .name = case.name, .status = outcome.status, .reason = outcome.reason });
+    }
+
+    try writeReport(alloc, io, results.items);
+
+    std.debug.print("conformance: {d} pass, {d} fail, {d} skip, {d} stale\n", .{ pass, fail, results.items.len - pass - fail, stale });
+    for (results.items) |r| {
+        if (r.status == .fail) {
+            std.debug.print("  FAIL {s} {s}: {s}\n", .{ r.id, r.name, r.reason });
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), fail);
+    try std.testing.expectEqual(@as(usize, 0), stale);
+}
+
+fn appendJsonEscaped(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(alloc, "\\\""),
+            else => try buf.append(alloc, c),
+        }
+    }
 }

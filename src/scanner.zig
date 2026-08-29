@@ -326,9 +326,9 @@ pub const Scanner = struct {
         var line_start = self.mark.column == 1;
         while (true) {
             // Eat whitespace. In block context a tab in the leading
-            // whitespace of a line is an indentation error when the
-            // content it indents is a block construct: '?', ':', '|',
-            // '>' or a '-' entry (libfyaml fy_ws_indentation_check).
+            // whitespace of a line is never indentation (corpus 4EJS):
+            // it may only separate tokens later in the line, or precede
+            // a comment / blank line.
             while (true) {
                 const c = self.at(0);
                 if (c == ' ') {
@@ -337,16 +337,35 @@ pub const Scanner = struct {
                 }
                 if (c == '\t') {
                     if (line_start and self.flow_level == 0) {
-                        var off: usize = 0;
-                        while (ctype.isBlank(self.at(off))) off += 1;
-                        const nc = self.at(off);
-                        const indents_block = switch (nc) {
-                            '?', ':', '|', '>' => true,
-                            '-' => ctype.isBlankz(self.at(off + 1)),
-                            else => false,
-                        };
-                        if (indents_block) {
-                            return self.failWith(error.InvalidIndentation, self.mark, "found a tab character where an indentation space is expected", .{});
+                        // A tab in a block-context line's leading
+                        // whitespace is only decoration, never
+                        // indentation: it is an error when the content
+                        // it precedes would roll a block indent. Tab at
+                        // column 0 before a plain scalar that turns out
+                        // to be a key is exactly that (corpus 4EJS);
+                        // tabs after a leading space (DK95), before
+                        // flow indicators (6CA3/Q5MG), before a comment
+                        // or a blank line are acceptable.
+                        if (self.mark.column == 1) {
+                            var off: usize = 0;
+                            while (ctype.isBlank(self.at(off))) off += 1;
+                            const nc = self.at(off);
+                            const blank_after = ctype.isBlankz(self.at(off + 1));
+                            const block_indicator = switch (nc) {
+                                '-', '?', ':', '|', '>' => blank_after or nc != '-',
+                                else => false,
+                            };
+                            // Nested inside a block collection a
+                            // column-0 tab that tries to indent any
+                            // construct is an error (corpus 4EJS); at
+                            // the top level only block indicators
+                            // reject.
+                            const nested = self.indent >= 0;
+                            const flows = nc == '[' or nc == '{';
+                            const inert = nc == 0 or ctype.isBreak(nc) or nc == '#';
+                            if (block_indicator or (nested and !flows and !inert)) {
+                                return self.failWith(error.InvalidIndentation, self.mark, "found a tab character where an indentation space is expected", .{});
+                            }
                         }
                     }
                     self.skipCp();
@@ -375,6 +394,14 @@ pub const Scanner = struct {
                 if (self.flow_level == 0) self.simple_key_allowed = true;
                 line_start = true;
             } else break;
+        }
+        // Flow content may not dedent to the enclosing block
+        // indentation (corpus 9C9N): a continuation line inside a flow
+        // collection must sit deeper than the current block level.
+        if (line_start and self.flow_level > 0 and
+            @as(isize, @intCast(self.mark.column)) <= self.indent)
+        {
+            return self.fail(self.mark, "found a wrongly indented flow continuation", .{});
         }
     }
 
@@ -914,6 +941,11 @@ pub const Scanner = struct {
                 self.mark = snap_mark;
                 break :outer;
             }
+            // A tab in the first column tries to be indentation, which
+            // a tab cannot be (corpus Y79Y).
+            if (c == '\t' and self.mark.column == 1) {
+                return self.failWith(error.InvalidIndentation, self.mark, "found a tab character where an indentation space is expected", .{});
+            }
             if (indent == 0) {
                 // Auto-detect: content must sit deeper than the enclosing
                 // indentation, otherwise the scalar is empty.
@@ -929,18 +961,18 @@ pub const Scanner = struct {
                 }
                 indent = col;
             }
-            // A tab inside the indentation region is an error.
-            const strip: usize = @intCast(indent - 1);
-            if (c == '\t' and ws < strip) {
-                return self.failWith(error.InvalidIndentation, self.mark, "found a tab character where an indentation space is expected", .{});
-            }
             if (col < indent) {
                 self.pos = snap_pos;
                 self.mark = snap_mark;
                 break :outer;
             }
 
-            const more = col > indent;
+            // A tab in a line's leading region is content, and the line
+            // folds literally (it counts as more-indented) — corpus
+            // MJS9/R4YG.
+            const leading_tab = c == '\t';
+            const strip: usize = @intCast(indent - 1);
+            const more = col > indent or leading_tab;
 
             // Separator before this content line.
             if (have_content) {
@@ -1046,6 +1078,13 @@ pub const Scanner = struct {
                     return self.fail(self.mark, "found unexpected document indicator while scanning a quoted scalar", .{});
                 }
                 while (ctype.isBlank(self.at(0))) self.skipCp();
+                // A continuation line in block context must stay deeper
+                // than the enclosing indentation (corpus QB6E).
+                if (self.flow_level == 0 and !ctype.isBreak(self.at(0)) and
+                    @as(isize, @intCast(self.mark.column)) <= self.indent)
+                {
+                    return self.fail(self.mark, "found a quoted scalar with a wrongly indented continuation line", .{});
+                }
                 continue;
             }
             // Whitespace stays pending until real content decides whether
