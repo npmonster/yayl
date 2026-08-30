@@ -4,6 +4,7 @@ zig-out/
 *.o
 vendor/
 .plumb/
+.zcode/
 
 # macOS
 .DS_Store

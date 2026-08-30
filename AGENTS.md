@@ -19,7 +19,7 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 
 ## Ground rules for changes
 
-- **Work through plumb.** Agents working in this repository MUST use the
+- **Work through plumb** ([github.com/plumbkit/plumb](https://github.com/plumbkit/plumb)). Agents working in this repository MUST use the
   plumb MCP tools for code work: `session_start` on arrival,
   `read_file`/`read_multiple_files` (they return mtime/sha for
   concurrency-checked edits), `edit_file`/`write_file`/`transaction_apply`
@@ -158,6 +158,7 @@ README.md                          user-facing docs
 
 ## Working with plumb
 
+All code work in this repository goes through the [plumb](https://github.com/plumbkit/plumb) MCP daemon. If you are an external contributor and don't have plumb yet, install it from <https://github.com/plumbkit/plumb> and run `plumb serve` in this workspace (see its README for MCP client setup).
 Operate this workspace through the plumb MCP daemon, and start with
 `session_start({workspace: <absolute path>})` — passing a stable
 per-conversation `session_id` (mint one shaped like `dsh-yayl-x7q2`; use your
