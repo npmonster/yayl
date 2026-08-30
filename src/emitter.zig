@@ -90,6 +90,101 @@ pub const Emitter = struct {
         return self.out.items.len > 0 and self.out.items[self.out.items.len - 1] == '\n';
     }
 
+    /// The bytes written since the last line terminator: the partially
+    /// built current line.
+    fn pendingLine(self: *const Emitter) []const u8 {
+        const items = self.out.items;
+        const start = if (std.mem.lastIndexOfScalar(u8, items, '\n')) |i| i + 1 else 0;
+        return items[start..];
+    }
+
+    /// Write the framing bytes a container carries ahead of its first
+    /// entry — an outer `- ` indicator when the container is itself a
+    /// sequence item. They are normally re-emitted with the first
+    /// original entry, so a BRAND-NEW first entry has to claim them.
+    /// Returns the gap offset to continue from.
+    fn writeContainerFraming(self: *Emitter, container: *const Node, gap_start: usize) Error!usize {
+        const cs = container.src orelse return gap_start;
+        if (cs.synthetic or gap_start >= cs.start) return gap_start;
+        try self.writeGap(container, gap_start, cs.start);
+        return cs.start;
+    }
+
+    /// An emptied container re-emits as `{}` / `[]` straight from the
+    /// tree, which skips the slot walk that would otherwise have
+    /// re-emitted its framing along with the first entry. When the
+    /// container is a sequence ITEM, that framing is the `- ` indicator
+    /// — and without it the item vanishes and the `{}` is left dangling
+    /// at the parent's column, which does not parse.
+    fn writeEmptiedFraming(self: *Emitter, node: *Node) Error!void {
+        const cs = node.src orelse return;
+        if (cs.synthetic) return;
+        const parent = node.parent orelse return;
+        if (parent.nodeType() != .sequence) return;
+        _ = try self.writeContainerFraming(node, cs.entry_start);
+    }
+
+    /// True when the pending line holds nothing but block-entry framing:
+    /// indentation and `- ` indicators. The cursor then already sits
+    /// where an entry belongs (`- ` left behind by a deleted first
+    /// entry, or a nested `- - `), so no line break is owed.
+    fn isEntryFraming(pending: []const u8) bool {
+        var i: usize = 0;
+        while (i < pending.len and pending[i] == ' ') i += 1;
+        while (i < pending.len) {
+            if (pending[i] != '-') return false;
+            i += 1;
+            if (i >= pending.len or pending[i] != ' ') return false;
+            while (i < pending.len and pending[i] == ' ') i += 1;
+        }
+        return true;
+    }
+
+    /// Open a line at `col` for a BRAND-NEW block entry, whose layout
+    /// the emitter owns. The gap before it may have supplied the
+    /// indentation already, none of it (the original indentation went
+    /// with a deleted sibling's tombstone), or a whole previous entry.
+    /// Returns true when the entry lands on a line the previous entry
+    /// had already terminated — nothing downstream will close this one,
+    /// so the entry owes its own line terminator. Without it the entry
+    /// borrows the NEXT line's newline and swallows a blank separator.
+    fn openEntryLine(self: *Emitter, col: usize) Error!bool {
+        const pending = self.pendingLine();
+        // Fresh line with nothing on it: the indentation is ours to write.
+        if (pending.len == 0) {
+            try self.writeIndent(col);
+            return true;
+        }
+        // Indentation, or an indicator left by a deleted entry, already
+        // in place: keep the original bytes.
+        if (isEntryFraming(pending)) return false;
+        try self.writeByte('\n');
+        try self.writeIndent(col);
+        return false;
+    }
+
+    /// A block entry starts its own line. Called once its leading gap is
+    /// written, this restores the line break when the gap could not: a
+    /// deleted first entry's tombstone swallows the line terminator that
+    /// would have separated a replacement from the next sibling.
+    /// The break goes BEFORE the indentation the gap already wrote, so
+    /// the entry keeps its original column byte for byte.
+    fn breakBeforeEntry(self: *Emitter, col: usize) Error!void {
+        const pending = self.pendingLine();
+        if (pending.len == 0) return; // already at a fresh line
+        // Indentation, or an indicator a deleted entry left behind: the
+        // cursor is already where this entry goes.
+        if (isEntryFraming(pending)) return;
+        var k = pending.len;
+        while (k > 0 and pending[k - 1] == ' ') k -= 1;
+        if (k == pending.len) {
+            // No indentation was written either: supply the whole prefix.
+            try self.writeByte('\n');
+            return self.writeIndent(col);
+        }
+        try self.out.insert(self.alloc, self.out.items.len - (pending.len - k), '\n');
+    }
+
     // ------------------------------------------------------------------
     // Document level
     // ------------------------------------------------------------------
@@ -209,6 +304,7 @@ pub const Emitter = struct {
                 try self.emitted.put(key, {});
                 try self.emitted.put(value, {});
                 try self.writeGap(container, gap_start, key.src.?.entry_start);
+                try self.breakBeforeEntry(entry_col);
                 try self.write(src[key.src.?.entry_start..pend]);
                 return pend;
             }
@@ -233,13 +329,27 @@ pub const Emitter = struct {
         if (ks) |s| {
             if (!s.synthetic) {
                 try self.writeGap(container, gap_start, s.entry_start);
+                try self.breakBeforeEntry(entry_col);
             }
         } else if (pair_end == null) {
-            // Brand-new pair: the previous entry's remainder already
-            // ended the line when it was re-emitted in place.
-            if (!self.endsWithNewline()) try self.writeNewlineIndent(entry_col);
+            // Brand-new pair. While the previous entry's line is still
+            // open, its remainder — a trailing comment — belongs to THAT
+            // entry: write it before opening a line of our own, or the
+            // new entry slots in ahead of the comment and steals it.
+            var gap = gap_start;
+            var owed_terminator = false;
+            if (!self.endsWithNewline() and markup.remainderHasComment(src, gap)) {
+                const nl = markup.newlineAt(src, gap);
+                gap = try self.writeRemainder(gap);
+                // `writeRemainder` took the line terminator along with
+                // the comment; this entry now owes the line ending.
+                owed_terminator = gap > nl;
+            }
+            gap = try self.writeContainerFraming(container, gap);
+            if (try self.openEntryLine(entry_col)) owed_terminator = true;
             try self.emitEntry(key, value, entry_col);
-            return gap_start;
+            if (owed_terminator and !self.endsWithNewline()) try self.writeByte('\n');
+            return gap;
         }
 
         // Key.
@@ -266,8 +376,31 @@ pub const Emitter = struct {
         // Colon bytes between key and value, then the value itself.
         if (value.src) |vs| {
             if (!vs.synthetic) {
-                // Original layout (": " or a block ":\n    ").
-                if (ks) |s| try self.write(src[s.end..vs.entry_start]);
+                // Original layout (": " or a block ":\n    "). For a
+                // block value these bytes carry its FIRST entry's
+                // indentation, so they must honour that container's
+                // tombstones: deleting the first child otherwise leaves
+                // the indent behind for the new first child to add its
+                // own on top of (2 -> 4).
+                //
+                // Unless every entry is gone. A surviving entry arrives
+                // carrying its own indentation, which is what makes the
+                // tombstone the right answer above; an emptied
+                // container has no successor to carry anything, so the
+                // `{}` / `[]` standing in for it would be written
+                // wherever the cursor happens to sit -- column 0, where
+                // it is no longer the value of its key and no longer
+                // parses. These bytes place the VALUE; only their
+                // overlap with the first entry ever belonged to that
+                // entry.
+                if (ks) |s| {
+                    if (emptiedCollection(value)) {
+                        try self.write(src[s.end..vs.entry_start]);
+                        try self.indentEmptied(markup.columnOf(src, s.entry_start));
+                    } else {
+                        try self.writeGap(value, s.end, vs.entry_start);
+                    }
+                }
                 if (try self.writeCleanSlice(value, vs.entry_start)) |vend| {
                     return self.writeRemainder(pair_end orelse vend);
                 }
@@ -280,7 +413,19 @@ pub const Emitter = struct {
                 const le = markup.lineEnd(src, base);
                 if (stop >= le) return stop;
                 if (self.endsWithNewline()) return le;
-                return self.writeRemainder(base);
+                // Write the remainder of the line the walk actually
+                // stopped on — when the value's LAST entry was deleted,
+                // `base` sits on a tombstoned line whose remainder is
+                // that entry's trailing comment, and writing it would
+                // overwrite the surviving entry's own. `stop` only says
+                // where the next gap starts, so it is usable just when
+                // it points at live bytes: after a brand-new last entry
+                // it still sits inside the deleted entry's text.
+                const from = if (stop < base and !dropCovers(value, stop)) stop else base;
+                _ = try self.writeRemainder(from);
+                // Advance past the value's original extent either way,
+                // so the tombstoned tail is not re-emitted.
+                return le;
             }
             // Replaced by an empty value node: normalized colon.
             try self.write(": ");
@@ -311,15 +456,27 @@ pub const Emitter = struct {
     fn emitItem(self: *Emitter, container: *const Node, item: *Node, entry_col: usize, gap_start: usize) Error!usize {
         const src = self.src;
         const s = item.src orelse {
-            // Brand-new or moved item: sibling-local indentation.
-            if (!self.endsWithNewline()) try self.writeNewlineIndent(entry_col);
+            // Brand-new or moved item: sibling-local indentation. The
+            // previous item's trailing comment belongs to it (see the
+            // brand-new pair case in `emitPairEdited`).
+            var gap = gap_start;
+            var owed_terminator = false;
+            if (!self.endsWithNewline() and markup.remainderHasComment(src, gap)) {
+                const nl = markup.newlineAt(src, gap);
+                gap = try self.writeRemainder(gap);
+                owed_terminator = gap > nl; // see the pair case
+            }
+            gap = try self.writeContainerFraming(container, gap);
+            if (try self.openEntryLine(entry_col)) owed_terminator = true;
             try self.write("- ");
             _ = try self.emitContent(item, entry_col + 2);
-            return gap_start;
+            if (owed_terminator and !self.endsWithNewline()) try self.writeByte('\n');
+            return gap;
         };
         if (self.emitted.contains(item)) {
             if (item.anchor) |a| {
                 try self.writeGap(container, gap_start, s.entry_start);
+                try self.breakBeforeEntry(entry_col);
                 try self.writeByte('*');
                 try self.write(a);
                 return markup.lineEnd(src, s.end);
@@ -327,10 +484,17 @@ pub const Emitter = struct {
             return error.AliasCycle;
         }
         try self.writeGap(container, gap_start, s.entry_start);
+        try self.breakBeforeEntry(entry_col);
         if (!s.synthetic) {
             if (try self.writeCleanSlice(item, s.entry_start)) |end| return end;
             try self.emitted.put(item, {});
-            _ = try self.emitContent(item, markup.columnOf(src, s.start));
+            const stop = try self.emitContent(item, markup.columnOf(src, s.start));
+            // A container walk that re-emitted its last entry already
+            // consumed the line terminator; writing the remainder on top
+            // of that would append a blank line after the item.
+            const le = markup.lineEnd(src, s.end);
+            if (stop >= le) return stop;
+            if (self.endsWithNewline()) return le;
             return self.writeRemainder(s.end);
         }
         // Synthesized empty item: the entry shell only.
@@ -359,11 +523,17 @@ pub const Emitter = struct {
                 if (node.src == null or m.style == .flow or m.pairs.items.len == 0) {
                     // New, flow-styled, or emptied in place: block
                     // layout cannot express an empty mapping.
+                    if (m.pairs.items.len == 0) try self.writeEmptiedFraming(node);
                     try self.emitFlowNode(node);
                     // The line terminator was not consumed.
                     return if (node.src) |sn| sn.end else 0;
                 }
-                var gap = node.src.?.start;
+                // The walk starts at `entry_start`, not `start`: a
+                // mapping that is a sequence item carries the `- `
+                // indicator in those leading bytes. They are normally
+                // re-emitted with the first entry, but when that entry
+                // is deleted the next one must pick them up.
+                var gap = node.src.?.entry_start;
                 const col = self.entryColumn(node, indent);
                 for (m.pairs.items) |pair| {
                     gap = try self.emitPair(node, pair, col, gap);
@@ -372,11 +542,12 @@ pub const Emitter = struct {
             },
             .sequence => |*sq| {
                 if (node.src == null or sq.style == .flow or sq.items.items.len == 0) {
+                    if (sq.items.items.len == 0) try self.writeEmptiedFraming(node);
                     try self.emitFlowNode(node);
                     // The line terminator was not consumed.
                     return if (node.src) |sn| sn.end else 0;
                 }
-                var gap = node.src.?.start;
+                var gap = node.src.?.entry_start; // see the mapping case
                 const col = self.entryColumn(node, indent);
                 for (sq.items.items) |item| {
                     gap = try self.emitItem(node, item, col, gap);
@@ -394,6 +565,42 @@ pub const Emitter = struct {
         if (v.data.scalar.value.len != 0) return false;
         const vs = v.src orelse return false;
         return vs.synthetic;
+    }
+
+    /// Indent an emptied collection's `{}` / `[]` deeper than the key it
+    /// belongs to, when the preserved placement would not be.
+    ///
+    /// A block sequence is allowed to sit at its parent key's own column:
+    ///
+    ///     ports:
+    ///     - containerPort: 80
+    ///
+    /// (the k8s and mkdocs house style). Its ENTRIES are legal there --
+    /// a `- ` indicator is unambiguous at any column >= the key's. The
+    /// `{}` / `[]` replacing them is not: it is a FLOW node, and a flow
+    /// value sitting at its key's column reads as the key's SIBLING, so
+    /// the document stops parsing. Nothing is being preserved once the
+    /// collection is empty, so step it in far enough to be read as the
+    /// value it is.
+    fn indentEmptied(self: *Emitter, key_col: usize) Error!void {
+        const pending = self.pendingLine();
+        // Only when the placement left us on a fresh line: a value still
+        // sharing the key's line is already unambiguous.
+        if (pending.len > 0 and std.mem.indexOfNone(u8, pending, " ") != null) return;
+        if (pending.len > key_col) return;
+        try self.writeIndent(key_col + self.indent_step - pending.len);
+    }
+
+    /// A collection every entry of which has been removed. It re-emits
+    /// as `{}` / `[]` (block layout cannot express an empty collection),
+    /// so no entry follows to supply the indentation that places it
+    /// after its key -- the gap bytes have to.
+    fn emptiedCollection(node: *const Node) bool {
+        return switch (node.data) {
+            .mapping => |m| m.pairs.items.len == 0,
+            .sequence => |s| s.items.items.len == 0,
+            else => false,
+        };
     }
 
     /// True when a value can sit on the same line as its key.
@@ -425,6 +632,14 @@ pub const Emitter = struct {
                 }
             },
             else => {},
+        }
+        // No original entry left to copy the column from (they were all
+        // deleted or replaced). The container's own `entry_start` still
+        // records where its first entry sat, which is the column its
+        // entries belong at — `fallback` is the container's own column,
+        // so stepping in from it would indent one level too deep.
+        if (node.src) |s| {
+            if (!s.synthetic) return markup.columnOf(src, s.entry_start);
         }
         return fallback + self.indent_step;
     }
@@ -463,6 +678,15 @@ pub const Emitter = struct {
             try self.write(src[i..to]);
             return;
         }
+    }
+
+    /// True when `offset` falls inside one of `container`'s tombstoned
+    /// ranges, i.e. points at bytes a deleted entry used to own.
+    fn dropCovers(container: *const Node, offset: usize) bool {
+        for (Document.droppedOf(container)) |d| {
+            if (offset >= d[0] and offset < d[1]) return true;
+        }
+        return false;
     }
 
     /// Write the rest of the line after `offset` (trailing comment,

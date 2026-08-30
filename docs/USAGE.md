@@ -171,6 +171,24 @@ one leaves the others byte-identical. Deleting an entry removes its
 whole line (leading indent and trailing comment included); appends
 use the sibling entries' indentation.
 
+One case is not a plain line removal. When the deleted entry is the
+first key of a mapping that is itself a sequence item, its line also
+carries the `- ` indicator — and that indicator belongs to the item,
+not to the entry, so it stays and the next entry moves up onto it:
+
+~~~yaml
+# before                    # after `delete $.steps[0].name`
+steps:                      steps:
+  - name: checkout            - uses: actions/checkout@v4
+    uses: actions/checkout@v4
+~~~
+
+If a comment sits between the two entries it cannot be moved, so the
+indicator keeps a line of its own instead. Editing an entry inside a
+flow collection rewrites only that line, and no edit re-indents a
+sibling it did not touch. These are enforced per position over the
+real-world fixtures by `make preservation`.
+
 ## Editing: paths, batches, moves
 
 `yaml.edit.Editor` layers a documented path grammar and atomic edits

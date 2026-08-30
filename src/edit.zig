@@ -212,9 +212,11 @@ pub const Insert = struct { sequence: []const u8, position: []const u8, value: *
 /// `Document.createScalar`/`createMapping`/...); the batch takes no
 /// ownership, the document pool does as usual.
 pub const Edit = union(enum) {
-    /// Set the (single) node at `path`; creates intermediate mappings
-    /// for the trailing segments only when every segment is a plain
-    /// key (deterministic; anything else is `UnknownPath`).
+    /// Set the (single) node at `path`. Intermediate segments walk
+    /// mappings (auto-created when missing; plain keys only). The
+    /// final segment addresses the entry to set: a mapping key
+    /// (replaced in place, or appended when new) or a sequence index
+    /// (the item at that position is replaced in place).
     set: struct { path: []const u8, value: *Node },
     /// Delete the (single) node at `path`. No match is not an error.
     delete: []const u8,
@@ -300,6 +302,34 @@ pub const Editor = struct {
         }
     }
 
+    /// True when every segment is a plain key, the case in which `set`
+    /// is allowed to auto-create the intermediate mappings.
+    fn allPlainKeys(segs: []const Segment) bool {
+        for (segs) |seg| {
+            if (seg != .key) return false;
+        }
+        return true;
+    }
+
+    /// Resolve the container a `set` addresses: the node the final
+    /// segment indexes into. Plain-key parents auto-create intermediate
+    /// mappings when `may_create` (the documented deterministic case);
+    /// anything else addresses existing structure only, so it goes
+    /// through the general resolver and must match exactly once.
+    fn setContainer(doc: *Document, parent: []const Segment, may_create: bool) Error!*Node {
+        if (may_create and allPlainKeys(parent)) {
+            const keys = try doc.alloc.alloc([]const u8, parent.len);
+            defer doc.alloc.free(keys);
+            for (parent, 0..) |seg, i| keys[i] = seg.key;
+            return doc.mappingWalkOrCreate(keys);
+        }
+        const root = doc.root orelse return error.UnknownPath;
+        const found = try resolve(doc.alloc, root, .{ .segments = parent });
+        defer doc.alloc.free(found);
+        if (found.len != 1) return error.UnknownPath;
+        return found[0];
+    }
+
     fn applySet(doc: *Document, path: []const u8, value: *Node) Error!void {
         var p = try Path.parse(doc.alloc, path);
         defer p.deinit(doc.alloc);
@@ -307,23 +337,38 @@ pub const Editor = struct {
             doc.root = value;
             return;
         }
-        // Only plain-key paths auto-create intermediate mappings.
-        var keys = try doc.alloc.alloc([]const u8, p.segments.len);
-        defer doc.alloc.free(keys);
-        for (p.segments, 0..) |seg, i| {
-            if (seg != .key) return error.AmbiguousOperation;
-            keys[i] = seg.key;
+        const parent = p.segments[0 .. p.segments.len - 1];
+        switch (p.segments[p.segments.len - 1]) {
+            // A final key names a mapping entry: replaced in place when
+            // it exists, appended when it does not.
+            .key => |last| {
+                const cur = try setContainer(doc, parent, true);
+                if (!cur.isMapping()) return error.NotAMapping;
+                if (cur.lookup(last)) |existing| {
+                    // `lookup` only matches values of the mapping `cur`,
+                    // so the in-place replace must succeed; falling
+                    // through would append a duplicate key.
+                    if (!doc.mappingReplace(cur, existing, value)) return error.InvalidSyntax;
+                    return;
+                }
+                try doc.mappingAppend(cur, try doc.createScalar(last, .plain), value);
+            },
+            // A final index names an existing sequence slot; there is
+            // nothing sensible to auto-create at a position.
+            .index => |ix| {
+                const cur = try setContainer(doc, parent, false);
+                if (!cur.isSequence()) return error.NotASequence;
+                // Tombstone the old item's line, drop it, and splice the
+                // replacement in at the same position: untouched
+                // siblings re-emit verbatim, the new item normalizes at
+                // the sibling indentation.
+                _ = (try doc.sequenceRemove(cur, ix)) orelse return error.UnknownPath;
+                try doc.sequenceInsert(cur, ix, value);
+            },
+            // Wildcards, filters and recursive descent can match any
+            // number of nodes: not a single deterministic target.
+            else => return error.AmbiguousOperation,
         }
-        const cur = try doc.mappingWalkOrCreate(keys[0 .. keys.len - 1]);
-        const last = keys[keys.len - 1];
-        if (cur.lookup(last)) |existing| {
-            // `lookup` only matches values of the mapping `cur`, so the
-            // in-place replace must succeed; falling through would
-            // append a duplicate key.
-            if (!doc.mappingReplace(cur, existing, value)) return error.InvalidSyntax;
-            return;
-        }
-        try doc.mappingAppend(cur, try doc.createScalar(last, .plain), value);
     }
 
     fn applyDelete(doc: *Document, path: []const u8) Error!void {
@@ -332,9 +377,17 @@ pub const Editor = struct {
         if (p.segments.len == 0) return error.AmbiguousOperation;
         const root = doc.root orelse return;
         var cur = root;
+        // Keys and indices both step to exactly one node, so either can
+        // address the parent. Wildcards, filters and recursive descent
+        // can match many: not a single deterministic target.
         for (p.segments[0 .. p.segments.len - 1]) |seg| {
             switch (seg) {
                 .key => |k| cur = cur.lookup(k) orelse return,
+                .index => |ix| {
+                    const items = cur.items() orelse return;
+                    if (ix >= items.len) return;
+                    cur = items[ix];
+                },
                 else => return error.AmbiguousOperation,
             }
         }
@@ -619,7 +672,8 @@ test "failed batch leaves the document untouched" {
         .{ .set = .{ .path = "$.a", .value = try doc.createScalar("10", .plain) } },
         .{ .set = .{ .path = "$.b[0].x", .value = try doc.createScalar("boom", .plain) } },
     };
-    try testing.expectError(error.AmbiguousOperation, ed.apply(&batch));
+    // `b` is a scalar, so `$.b[0]` resolves to nothing.
+    try testing.expectError(error.UnknownPath, ed.apply(&batch));
 
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
@@ -666,8 +720,248 @@ test "deleting a missing path is a no-op" {
     try testing.expectEqualStrings("a: 1\n", out);
 }
 
+test "deleting a nested first child keeps the surviving siblings' indentation" {
+    // The bytes between a key's colon and its block value's first entry
+    // carry that entry's indentation. Deleting the first child must not
+    // leave those bytes behind for the new first child to indent on top
+    // of (they would double: 2 -> 4).
+    const cases = [_]struct { src: []const u8, path: []const u8, want: []const u8 }{
+        .{ .src = "top:\n  a: 1\n  b: 2\n", .path = "$.top.a", .want = "top:\n  b: 2\n" },
+        .{ .src = "top:\n    a: 1\n    b: 2\n", .path = "$.top.a", .want = "top:\n    b: 2\n" },
+        .{ .src = "top:\n  mid:\n    a: 1\n    b: 2\n", .path = "$.top.mid.a", .want = "top:\n  mid:\n    b: 2\n" },
+        .{ .src = "top:\n  a: 1\n  b: 2\n  c: 3\n", .path = "$.top.a", .want = "top:\n  b: 2\n  c: 3\n" },
+        .{ .src = "top:\n  - a\n  - b\n", .path = "$.top[0]", .want = "top:\n  - b\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete(c.path);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}
+
+test "editing a sequence item's last key adds no blank line" {
+    // A modified item's container walk already consumes the line
+    // terminator; writing the line remainder on top of it appended a
+    // blank line after every list-of-mappings entry that was edited.
+    const src =
+        \\list:
+        \\  - name: a
+        \\    port: 1
+        \\  - name: b
+        \\    port: 2
+        \\after: 3
+        \\
+    ;
+    const cases = [_]struct { path: []const u8, want: []const u8 }{
+        .{ .path = "$.list[0].port", .want = "list:\n  - name: a\n    port: Z\n  - name: b\n    port: 2\nafter: 3\n" },
+        .{ .path = "$.list[1].port", .want = "list:\n  - name: a\n    port: 1\n  - name: b\n    port: Z\nafter: 3\n" },
+        .{ .path = "$.list[0].name", .want = "list:\n  - name: Z\n    port: 1\n  - name: b\n    port: 2\nafter: 3\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.set(c.path, try doc.createScalar("Z", .plain));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}
+
+test "replacing the first entry of a block collection keeps the layout" {
+    // The replacement is a brand-new node, so the emitter owns its
+    // layout: it must supply the indentation the deleted entry's
+    // tombstone took with it, and the line break the tombstone
+    // swallowed along with the original terminator.
+    const cases = [_]struct { src: []const u8, path: []const u8, want: []const u8 }{
+        .{ .src = "items:\n  - a\n  - b\n  - c\n", .path = "$.items[0]", .want = "items:\n  - Z\n  - b\n  - c\n" },
+        .{ .src = "items:\n  - a\n  - b\n", .path = "$.items[1]", .want = "items:\n  - a\n  - Z\n" },
+        .{ .src = "list:\n  - name: a\n    port: 1\n  - name: b\n", .path = "$.list[0]", .want = "list:\n  - Z\n  - name: b\n" },
+        .{ .src = "top:\n  a: 1\n  b: 2\n", .path = "$.top.a", .want = "top:\n  a: Z\n  b: 2\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.set(c.path, try doc.createScalar("Z", .plain));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}
+
+test "editing inside a flow collection keeps the entry's key intact" {
+    // Flow entries share their line with the parent's `key:`, so the
+    // line-range tombstones that let block emission skip a removed entry
+    // would swallow the `key: ` bytes as well.
+    const src = "numbers:\n  ints: [0, -1, 42]\n  flow: {a: 1, b: 2}\n";
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.set("$.numbers.ints[0]", try doc.createScalar("Z", .plain));
+    try ed.delete("$.numbers.flow.a");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("numbers:\n  ints: [Z, -1, 42]\n  flow: {b: 2}\n", out);
+    // The result must still be valid YAML.
+    var re = try Document.parse(testing.allocator, out);
+    re.deinit();
+}
+
+test "deleting a sequence item's first key keeps the item indicator" {
+    // The `- ` indicator lives in the first entry's leading bytes but
+    // belongs to the sequence ITEM: deleting that entry used to take the
+    // indicator with it and emit structurally invalid YAML.
+    const src =
+        \\steps:
+        \\  - name: Checkout
+        \\    uses: actions/checkout@v4
+        \\  - name: Build
+        \\    run: make
+        \\
+    ;
+    const cases = [_]struct { path: []const u8, want: []const u8 }{
+        .{
+            .path = "$.steps[0].name",
+            .want = "steps:\n  - uses: actions/checkout@v4\n  - name: Build\n    run: make\n",
+        },
+        .{
+            .path = "$.steps[1].name",
+            .want = "steps:\n  - name: Checkout\n    uses: actions/checkout@v4\n  - run: make\n",
+        },
+        .{
+            .path = "$.steps[0].uses",
+            .want = "steps:\n  - name: Checkout\n  - name: Build\n    run: make\n",
+        },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete(c.path);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+        // Structurally valid, not merely textually plausible.
+        var re = try Document.parse(testing.allocator, out);
+        re.deinit();
+    }
+}
+
+test "a comment between entries survives a first-key delete" {
+    // Re-anchoring the successor onto the indicator line consumes the
+    // blanks between them. A comment cannot be moved, so the successor
+    // stays put and the indicator keeps a line of its own — the item
+    // must not dissolve into its predecessor.
+    const src = "steps:\n  - name: Checkout\n    # keep me\n    uses: x\n  - name: Build\n";
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.delete("$.steps[0].name");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("steps:\n  -\n    # keep me\n    uses: x\n  - name: Build\n", out);
+    // Still two items, and the survivor still belongs to the first.
+    var re = try Document.parse(testing.allocator, out);
+    defer re.deinit();
+    try testing.expectEqual(@as(usize, 2), re.pathGet(&.{"steps"}).?.items().?.len);
+    var re_ed = Editor.init(&re);
+    _ = try re_ed.one("$.steps[0].uses");
+    try testing.expectError(error.UnknownPath, re_ed.one("$.steps[0].name"));
+}
+
+test "appending keeps the previous entry's trailing comment attached" {
+    // The appended entry used to slot in ahead of the unwritten line
+    // remainder, so the comment ended up on the NEW line and the entry
+    // it documented lost it.
+    var doc = try Document.parse(testing.allocator, "cfg:\n  key: value # trailing comment\n");
+    defer doc.deinit();
+    const cfg = doc.pathGet(&.{"cfg"}).?;
+    try doc.mappingAppend(cfg, try doc.createScalar("added", .plain), try doc.createScalar("1", .plain));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("cfg:\n  key: value # trailing comment\n  added: 1\n", out);
+}
+
+test "replacing an item of a nested sequence keeps the outer indicator" {
+    // `- - a` puts the OUTER item's indicator on the inner item's line;
+    // it outlives the inner item and the replacement must sit under it.
+    var doc = try Document.parse(testing.allocator, "list:\n  - - nested\n    - sequence\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.set("$.list[0][0]", try doc.createScalar("Z", .plain));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("list:\n  - - Z\n    - sequence\n", out);
+    // The structure must survive, not merely the bytes.
+    var re = try Document.parse(testing.allocator, out);
+    defer re.deinit();
+    var re_ed = Editor.init(&re);
+    _ = try re_ed.one("$.list[0][1]");
+}
+
+test "replacing a collection's only entry keeps the sibling column" {
+    // With no original entry left to copy the column from, the entry
+    // column fell back to the container's own column PLUS one indent
+    // step — but that column already is where the entries sit, so the
+    // replacement landed one level too deep.
+    const cases = [_]struct { src: []const u8, path: []const u8, want: []const u8 }{
+        .{ .src = "secrets:\n  - db-password\n", .path = "$.secrets[0]", .want = "secrets:\n  - Z\n" },
+        .{ .src = "secrets:\n    - db-password\n", .path = "$.secrets[0]", .want = "secrets:\n    - Z\n" },
+        .{ .src = "top:\n  only: 1\n", .path = "$.top.only", .want = "top:\n  only: Z\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.set(c.path, try doc.createScalar("Z", .plain));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}
+
 test "allocation failures in a delete batch propagate and leak nothing" {
     try std.testing.checkAllAllocationFailures(testing.allocator, deleteBatch, .{});
+}
+
+test "set replaces a sequence item in place" {
+    var doc = try Document.parse(testing.allocator, "items:\n  - a\n  - b\n  - c\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.set("$.items[1]", try doc.createScalar("B", .plain));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("items:\n  - a\n  - B\n  - c\n", out);
+    try testing.expectError(error.UnknownPath, ed.set("$.items[9]", try doc.createScalar("x", .plain)));
+    try testing.expectError(error.NotAMapping, ed.set("$.items.a", try doc.createScalar("x", .plain)));
+}
+
+test "set addresses through sequence indices in mid-path" {
+    var doc = try Document.parse(testing.allocator,
+        \\list:
+        \\  - name: a
+        \\    port: 1
+        \\  - name: b
+        \\    port: 2
+        \\
+    );
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    // Index in the middle, key final.
+    try ed.set("$.list[1].port", try doc.createScalar("9", .plain));
+    // Index final, replacing a whole item.
+    try ed.set("$.list[0]", try doc.createScalar("gone", .plain));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("list:\n  - gone\n  - name: b\n    port: 9\n", out);
+    // A path that cannot resolve to exactly one node is not a set target.
+    try testing.expectError(error.UnknownPath, ed.set("$.list[9].port", try doc.createScalar("x", .plain)));
+    try testing.expectError(error.AmbiguousOperation, ed.set("$.list[*]", try doc.createScalar("x", .plain)));
 }
 
 test "allocation failures in a set+append batch leak nothing" {
@@ -696,4 +990,149 @@ fn deleteBatch(alloc: std.mem.Allocator) !void {
     const out = try doc.write(alloc);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("a: 1\n", out);
+}
+
+test "emptying a collection keeps the value's placement under its key" {
+    // Removing a container's LAST entry leaves `{}` / `[]` behind. The
+    // bytes between the key's colon and the (now departed) first entry
+    // are what place that value under its key. They must survive: a
+    // surviving sibling would arrive carrying its own indentation, but
+    // an emptied container has no successor to carry any, so letting
+    // the deleted entry's tombstone eat those bytes drops the `{}` at
+    // column 0 -- where it is no longer the value of anything, and the
+    // document no longer parses at all.
+    const cases = [_]struct { src: []const u8, path: []const u8, want: []const u8 }{
+        .{ .src = "src:\n  item: 1\ndest: 2\n", .path = "$.src.item", .want = "src:\n  {}\ndest: 2\n" },
+        .{ .src = "src:\n  - only\ndest: 2\n", .path = "$.src[0]", .want = "src:\n  []\ndest: 2\n" },
+        // Four-space file: the placement is whatever the author wrote.
+        .{ .src = "a:\n    only: 1\nb: 2\n", .path = "$.a.only", .want = "a:\n    {}\nb: 2\n" },
+        // Nested, with a surviving sibling in the grandparent.
+        .{ .src = "top:\n  mid:\n    only: 1\n  after: 2\n", .path = "$.top.mid.only", .want = "top:\n  mid:\n    {}\n  after: 2\n" },
+        // A comment on the key's line is not part of the placement.
+        .{ .src = "a: # why\n  only: 1\nb: 2\n", .path = "$.a.only", .want = "a: # why\n  {}\nb: 2\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete(c.path);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+        // The invariant that matters more than the exact bytes: the
+        // emitter must never produce something we cannot read back.
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+    }
+}
+
+test "moving out a collection's last entry keeps the source's placement" {
+    // Same defect reached through `move` rather than `delete` -- the
+    // detach side is shared, so both paths have to be held.
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{
+            .src = "src:\n  item:\n    a: 1\ndest:\n  keep: y\n",
+            .want = "src:\n  {}\ndest:\n  keep: y\n  moved:\n    a: 1\n",
+        },
+        // Deliberately 2-space only. A 4-space fixture here would also
+        // measure the indentation the emitter gives the MOVED subtree's
+        // own children, which is a separate concern (indent_step) with
+        // its own test; a fixture that trips two things cannot tell you
+        // which one broke. Source-side placement at other widths is
+        // covered by the delete cases above.
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .move = .{ .from = "$.src.item", .to = "$.dest", .key = "moved" } }});
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+    }
+}
+
+test "emptying a sequence item keeps the item and its indicator" {
+    // The `- ` indicator lives in the first entry's leading bytes but
+    // belongs to the ITEM, which survives its last key as `- {}`. Two
+    // things used to go wrong together here, and only one of them was
+    // visible: the tombstone ate the indicator (deleting a sequence
+    // entry nobody asked to delete), and the `{}` was then left at the
+    // parent key's own column, where a FLOW node reads as the key's
+    // sibling rather than its value and the document stops parsing.
+    //
+    // The zero-indent style below -- `- ` items at their parent key's
+    // column -- is the Kubernetes and mkdocs house style, so this is
+    // not an exotic shape.
+    const cases = [_]struct { src: []const u8, path: []const u8, want: []const u8 }{
+        .{
+            .src = "spec:\n  ports:\n  - containerPort: 80\n  other: 1\n",
+            .path = "$.spec.ports[0].containerPort",
+            .want = "spec:\n  ports:\n  - {}\n  other: 1\n",
+        },
+        .{
+            .src = "ports:\n- containerPort: 80\nother: 1\n",
+            .path = "$.ports[0].containerPort",
+            .want = "ports:\n- {}\nother: 1\n",
+        },
+        // Conventionally indented. This one always PARSED; it was
+        // silently dropping the item, which no re-parse check can see.
+        .{
+            .src = "spec:\n  ports:\n    - containerPort: 80\n  other: 1\n",
+            .path = "$.spec.ports[0].containerPort",
+            .want = "spec:\n  ports:\n    - {}\n  other: 1\n",
+        },
+        .{
+            .src = "nav:\n  - Home: index.md\n  - About: about.md\n",
+            .path = "$.nav[0].Home",
+            .want = "nav:\n  - {}\n  - About: about.md\n",
+        },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete(c.path);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+
+        // The weak invariant that actually caught this: the output must
+        // parse. Note the third case parsed BEFORE the fix too, while
+        // silently dropping the item -- which is why the expected bytes
+        // above matter as much as the re-parse.
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+    }
+}
+
+test "emptying a zero-indent sequence value indents its placeholder" {
+    // Deleting the sole ITEM (rather than the item's sole key) empties
+    // the sequence itself. Same column hazard: `[]` at the key's own
+    // column is the key's sibling, not its value.
+    const cases = [_]struct { src: []const u8, path: []const u8, want: []const u8 }{
+        .{
+            .src = "spec:\n  containers:\n  - name: nginx\n  other: 1\n",
+            .path = "$.spec.containers[0]",
+            .want = "spec:\n  containers:\n    []\n  other: 1\n",
+        },
+        .{
+            .src = "items:\n- only\nafter: 1\n",
+            .path = "$.items[0]",
+            .want = "items:\n  []\nafter: 1\n",
+        },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete(c.path);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+    }
 }

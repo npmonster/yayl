@@ -16,6 +16,59 @@ series; APIs may still move, and anything that does is listed here.
   strings.
 - Atomic file writes remove their temporary file when the final rename
   fails.
+- A simple key of fewer than 1024 characters could be rejected if it
+  contained non-ASCII text: the 1024 bound counted bytes rather than
+  characters. It now counts characters, per YAML 1.2.2 7.4.2 and 8.2.2.
+- A version string, semver-style key or IP fragment could be typed as a
+  number during core-schema tag resolution: `+0x1F` resolved to the
+  integer 31, and `1.2.3` to a float. The hex and octal int forms take
+  no sign and are lowercase only, and the float form allows a single dot
+  before a single exponent whose digits are required (YAML 1.2.2
+  10.3.2). Present since v0.9.0.
+- Corrected published claims that were false: the round-trip gate is
+  265/269 with four documented skips, not 265/265; `error.KeyTooLong`
+  was documented as reachable and is not; `Unterminated` was documented
+  for flow collections, which return `InvalidSyntax`.
+- Deleting the first key of a mapping that is a sequence item destroyed
+  the item's `- ` indicator, silently turning a sequence of mappings
+  into a mapping. The result re-parsed cleanly, so nothing downstream
+  caught it. The indicator belongs to the item rather than the entry: it
+  now stays, and the next entry moves up onto it — or keeps a line of
+  its own when a comment sits between them and cannot be moved.
+- Deleting the first child of a nested block collection re-indented the
+  surviving sibling, doubling its indentation (two spaces became four).
+  Invisible at the top level, where the indent is zero.
+- Editing an entry inside a flow collection dropped the parent's `: `,
+  emitting `ints[0, 1]` for `ints: [0, 1]`. Flow entries share a line
+  with their parent key, so the line-range tombstones that let block
+  emission skip a removed entry are no longer recorded for them.
+- Setting the last key of a mapping that is a sequence item appended a
+  blank line — that is, every list-of-objects document: Kubernetes
+  containers, CI job steps, Compose services.
+- Deleting a mapping's last entry could overwrite the surviving entry's
+  trailing comment with the deleted entry's own.
+- Appending to a mapping placed the new entry ahead of the previous
+  entry's trailing comment, moving the comment onto the new line; and
+  could swallow a blank line separating the block from what followed.
+- Replacing an item of a nested sequence (`- - a`) consumed the outer
+  item's indicator, and replacing a collection's only entry indented the
+  replacement one level too deep.
+- Replacing or emptying a collection placed `{}` / `[]` at column zero
+  instead of under its key, which does not re-parse.
+
+### Added
+
+- `Editor.set` and `Editor.delete` accept sequence indices anywhere in a
+  path (`$.list[2].name`, `$.list[2][0]`), not only as the final
+  segment; `set` addresses a sequence slot by index. Previously these
+  returned `error.AmbiguousOperation`.
+- `make preservation`: an edit-preservation gate that sweeps every
+  addressable edit position in every real-world fixture and asserts an
+  edit changes only the lines it should — deletes remove one contiguous
+  run, sets change one line, adds insert without disturbing anything.
+  Positions exempt from line-shape assertions (documented
+  normalizations) still assert the weaker invariant that the emitter
+  never produces invalid YAML. Every fix above was found by this sweep.
 
 ## 0.9.0 — 2026-08-30
 
