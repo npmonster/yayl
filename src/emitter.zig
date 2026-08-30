@@ -241,6 +241,16 @@ pub const Emitter = struct {
 
     fn emitFaithful(self: *Emitter, doc: *const Document) Error!void {
         const src = self.src;
+        // Adopt the document's indentation convention before emitting
+        // anything, so new subtrees match the file they land in. Bounded
+        // because a pathological source (or a tab-indented one measured
+        // in columns) must not make the emitter write absurd runs of
+        // spaces; two is the YAML house default when unmeasurable.
+        if (doc.root) |root| {
+            if (self.inferIndentStep(root)) |step| {
+                self.indent_step = @min(@max(step, 1), 8);
+            }
+        }
         try self.write(src[doc.region_start..doc.body_start]);
         var stop = doc.body_start;
         if (doc.root) |root| {
@@ -520,13 +530,22 @@ pub const Emitter = struct {
                 return if (node.src) |sn| sn.end else 0;
             },
             .mapping => |*m| {
-                if (node.src == null or m.style == .flow or m.pairs.items.len == 0) {
-                    // New, flow-styled, or emptied in place: block
-                    // layout cannot express an empty mapping.
+                if (m.style == .flow or m.pairs.items.len == 0) {
+                    // Flow-styled in the source, or emptied in place:
+                    // block layout cannot express an empty mapping.
                     if (m.pairs.items.len == 0) try self.writeEmptiedFraming(node);
                     try self.emitFlowNode(node);
                     // The line terminator was not consumed.
                     return if (node.src) |sn| sn.end else 0;
+                }
+                if (node.src == null) {
+                    // Brand-new or moved block mapping: no source bytes
+                    // describe it, so its layout is the emitter's to
+                    // choose -- and block is what the surrounding
+                    // document is written in. One-line flow here would
+                    // be valid but alien to the file.
+                    try self.emitNode(node, indent);
+                    return 0;
                 }
                 // The walk starts at `entry_start`, not `start`: a
                 // mapping that is a sequence item carries the `- `
@@ -541,11 +560,17 @@ pub const Emitter = struct {
                 return gap;
             },
             .sequence => |*sq| {
-                if (node.src == null or sq.style == .flow or sq.items.items.len == 0) {
+                if (sq.style == .flow or sq.items.items.len == 0) {
                     if (sq.items.items.len == 0) try self.writeEmptiedFraming(node);
                     try self.emitFlowNode(node);
                     // The line terminator was not consumed.
                     return if (node.src) |sn| sn.end else 0;
+                }
+                if (node.src == null) {
+                    // Brand-new or moved block sequence: see the
+                    // mapping arm above.
+                    try self.emitNode(node, indent);
+                    return 0;
                 }
                 var gap = node.src.?.entry_start; // see the mapping case
                 const col = self.entryColumn(node, indent);
@@ -614,6 +639,65 @@ pub const Emitter = struct {
 
     /// Column where a container's entries sit: derived from the first
     /// original child, falling back to `fallback` + one indent step.
+    /// Column of a block container's first original entry, or null when
+    /// the node is not a block container or nothing in it came from the
+    /// source. Unlike `entryColumn` this never invents a fallback --
+    /// callers that need to know whether the source actually says
+    /// anything use this one.
+    fn originalEntryColumn(self: *const Emitter, node: *const Node) ?usize {
+        switch (node.data) {
+            .mapping => |m| {
+                if (m.style == .flow) return null;
+                for (m.pairs.items) |pair| {
+                    if (pair.key.src) |s| {
+                        if (!s.synthetic) return markup.columnOf(self.src, s.entry_start);
+                    }
+                }
+            },
+            .sequence => |sq| {
+                if (sq.style == .flow) return null;
+                for (sq.items.items) |item| {
+                    if (item.src) |is| {
+                        if (!is.synthetic) return markup.columnOf(self.src, is.entry_start);
+                    }
+                }
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    /// The document's own indentation convention, measured as the first
+    /// nested block container's entry column minus the column of the key
+    /// that owns it. A brand-new or moved subtree adopts this, so an
+    /// insert into a four-space file does not arrive wearing two-space
+    /// indentation. Null when the document nests nowhere and there is
+    /// nothing to measure.
+    fn inferIndentStep(self: *const Emitter, node: *const Node) ?usize {
+        switch (node.data) {
+            .mapping => |m| {
+                for (m.pairs.items) |pair| {
+                    const ks = pair.key.src orelse continue;
+                    if (ks.synthetic) continue;
+                    const key_col = markup.columnOf(self.src, ks.entry_start);
+                    if (self.originalEntryColumn(pair.value)) |child_col| {
+                        // A block value on the SAME line as its key (a
+                        // compact `- name: a`) measures nothing.
+                        if (child_col > key_col) return child_col - key_col;
+                    }
+                    if (self.inferIndentStep(pair.value)) |d| return d;
+                }
+            },
+            .sequence => |sq| {
+                for (sq.items.items) |item| {
+                    if (self.inferIndentStep(item)) |d| return d;
+                }
+            },
+            else => {},
+        }
+        return null;
+    }
+
     fn entryColumn(self: *Emitter, node: *Node, fallback: usize) usize {
         const src = self.src;
         switch (node.data) {
@@ -1211,4 +1295,54 @@ test "unsafe folded content falls back to literal" {
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("x: |\n  line one \n  line two\n", out);
+}
+
+test "a new subtree adopts the document's indent width" {
+    // A subtree the emitter owns has no indentation of its own to
+    // preserve, so it inherits the file's. Measuring beats assuming:
+    // hard-coding two spaces makes an insert into a four-space file
+    // look like it came from somewhere else.
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{
+            .src = "top:\n  a: 1\n",
+            .want = "top:\n  a: 1\n  added:\n    x: 1\n",
+        },
+        .{
+            .src = "top:\n    a: 1\n",
+            .want = "top:\n    a: 1\n    added:\n        x: 1\n",
+        },
+        .{
+            .src = "top:\n   a: 1\n",
+            .want = "top:\n   a: 1\n   added:\n      x: 1\n",
+        },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.src);
+        defer doc.deinit();
+        const m = try doc.createMapping();
+        try doc.mappingAppend(m, try doc.createScalar("x", .plain), try doc.createScalar("1", .plain));
+        try doc.pathSet(&.{ "top", "added" }, m);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+        // Whatever the width, the result must still parse back.
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        try testing.expectEqualStrings(
+            "1",
+            again.pathGet(&.{ "top", "added", "x" }).?.scalarValue().?,
+        );
+    }
+}
+
+test "a document with nothing to measure keeps the two-space default" {
+    // Flat documents nest nowhere, so there is no convention to read.
+    var doc = try Document.parse(testing.allocator, "a: 1\nb: 2\n");
+    defer doc.deinit();
+    const m = try doc.createMapping();
+    try doc.mappingAppend(m, try doc.createScalar("x", .plain), try doc.createScalar("1", .plain));
+    try doc.pathSet(&.{"c"}, m);
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a: 1\nb: 2\nc:\n  x: 1\n", out);
 }

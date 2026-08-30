@@ -1136,3 +1136,138 @@ test "emptying a zero-indent sequence value indents its placeholder" {
         defer again.deinit();
     }
 }
+
+// ----------------------------------------------------------------------
+// Block layout for subtrees the emitter owns (new and moved).
+//
+// A container with no source span has no layout to preserve, so the
+// emitter picks one. It used to pick single-line flow, which is valid
+// YAML but alien to a block-styled file -- and inconsistent, since a
+// brand-new *pair* already went through the block path. These pin the
+// consistent behaviour: block in, block out.
+// ----------------------------------------------------------------------
+
+/// A fresh two-key mapping, the stand-in for "a subtree the caller built".
+fn twoKeyMapping(doc: *Document) !*Node {
+    const m = try doc.createMapping();
+    try doc.mappingAppend(m, try doc.createScalar("host", .plain), try doc.createScalar("h", .plain));
+    try doc.mappingAppend(m, try doc.createScalar("port", .plain), try doc.createScalar("80", .plain));
+    return m;
+}
+
+test "a new collection replacing a value emits block, not flow" {
+    const cases = [_]struct { src: []const u8, path: []const u8, want: []const u8 }{
+        // Replacing a scalar at the root.
+        .{
+            .src = "server: old\nother: 1\n",
+            .path = "$.server",
+            .want = "server:\n  host: h\n  port: 80\nother: 1\n",
+        },
+        // Nested one level: the new subtree indents from its own key.
+        .{
+            .src = "a:\n  server: old\n  other: 1\n",
+            .path = "$.a.server",
+            .want = "a:\n  server:\n    host: h\n    port: 80\n  other: 1\n",
+        },
+        // Comments on neighbouring lines are untouched.
+        .{
+            .src = "# lead\nserver: old\n# trail\nother: 1\n",
+            .path = "$.server",
+            .want = "# lead\nserver:\n  host: h\n  port: 80\n# trail\nother: 1\n",
+        },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.set(c.path, try twoKeyMapping(&doc));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}
+
+test "a replaced value's trailing comment rides the last emitted line" {
+    // Documented consequence, not a target: the original line remainder
+    // is written after the new value, so a comment that annotated a
+    // one-line scalar ends up annotating the block's final line. Pinned
+    // so that changing it is a decision rather than an accident.
+    var doc = try Document.parse(testing.allocator, "server: old # keep me\nother: 1\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.set("$.server", try twoKeyMapping(&doc));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("server:\n  host: h\n  port: 80 # keep me\nother: 1\n", out);
+}
+
+test "a new collection appended to a block sequence emits block" {
+    var doc = try Document.parse(testing.allocator, "list:\n  - name: a\n  - name: b\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    const m = try doc.createMapping();
+    try doc.mappingAppend(m, try doc.createScalar("name", .plain), try doc.createScalar("c", .plain));
+    try doc.mappingAppend(m, try doc.createScalar("port", .plain), try doc.createScalar("9", .plain));
+    try ed.apply(&.{.{ .append = .{ .sequence = "$.list", .value = m } }});
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("list:\n  - name: a\n  - name: b\n  - name: c\n    port: 9\n", out);
+}
+
+test "a moved subtree emits block at its destination" {
+    // `move` clears the node's span (it describes the OLD location), so
+    // the destination slot is emitter-owned and takes the same path as
+    // a brand-new subtree. Untouched siblings stay verbatim.
+    // NOTE on fixture shape: `keep` deliberately comes BEFORE `item`, so
+    // the moved node is not its container's FIRST entry. Moving out a
+    // first entry additionally exercises the source-side indentation of
+    // the surviving sibling, which is a separate concern from where the
+    // node lands. Keep those apart -- a fixture that trips both cannot
+    // tell you which one broke.
+    {
+        // Into a block mapping.
+        var doc = try Document.parse(testing.allocator, "src:\n  keep: k\n  item:\n    a: 1\n    b: 2\ndest:\n  have: h\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .move = .{ .from = "$.src.item", .to = "$.dest", .key = "moved" } }});
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("src:\n  keep: k\ndest:\n  have: h\n  moved:\n    a: 1\n    b: 2\n", out);
+    }
+    {
+        // Into a block sequence.
+        var doc = try Document.parse(testing.allocator, "src:\n  keep: k\n  item:\n    a: 1\n    b: 2\ndest:\n  - first\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .move = .{ .from = "$.src.item", .to = "$.dest" } }});
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("src:\n  keep: k\ndest:\n  - first\n  - a: 1\n    b: 2\n", out);
+    }
+}
+
+test "emitter-owned subtrees still re-parse to the values they were given" {
+    // The layout is the emitter's choice, but the meaning is not: every
+    // shape above must survive a round trip through the parser.
+    const srcs = [_][]const u8{
+        "server: old\nother: 1\n",
+        "a:\n  server: old\n  other: 1\n",
+        "server: old # keep me\nother: 1\n",
+    };
+    const paths = [_][]const u8{ "$.server", "$.a.server", "$.server" };
+    for (srcs, paths) |src, path| {
+        var doc = try Document.parse(testing.allocator, src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.set(path, try twoKeyMapping(&doc));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        var ed2 = Editor.init(&again);
+        const moved = try ed2.one(path);
+        try testing.expectEqualStrings("h", moved.lookup("host").?.scalarValue().?);
+        try testing.expectEqualStrings("80", moved.lookup("port").?.scalarValue().?);
+    }
+}
