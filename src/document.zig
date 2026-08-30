@@ -181,7 +181,7 @@ pub const Node = struct {
 /// The Core Schema tag a plain scalar resolves to, in the spec's
 /// shorthand form (`tag:yaml.org,2002:int` is `.int`). Distinct from
 /// `Node.tag`, which holds a fully resolved tag URI.
-pub const CoreTag = enum { null_, bool_, int, float, str };
+pub const CoreTag = enum { null, bool, int, float, str };
 
 /// Resolve a plain scalar to its YAML 1.2.2 Core Schema tag (spec
 /// 10.3.2). Non-plain styles always resolve to `str`.
@@ -189,10 +189,10 @@ pub fn resolveCoreTag(value: []const u8, style: ScalarStyle) CoreTag {
     if (style != .plain) return .str;
     if (value.len == 0 or std.mem.eql(u8, value, "~") or
         std.mem.eql(u8, value, "null") or std.mem.eql(u8, value, "Null") or
-        std.mem.eql(u8, value, "NULL")) return .null_;
+        std.mem.eql(u8, value, "NULL")) return .null;
     if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "True") or
         std.mem.eql(u8, value, "TRUE") or std.mem.eql(u8, value, "false") or
-        std.mem.eql(u8, value, "False") or std.mem.eql(u8, value, "FALSE")) return .bool_;
+        std.mem.eql(u8, value, "False") or std.mem.eql(u8, value, "FALSE")) return .bool;
     if (looksLikeInt(value)) return .int;
     if (looksLikeFloat(value)) return .float;
     return .str;
@@ -460,8 +460,14 @@ pub const Document = struct {
         self.markModified(map);
     }
 
-    /// Structural append without the `modified` mark (the builder uses
-    /// this while composing a parsed tree).
+    /// INTERNAL. Structural append that deliberately skips the `modified`
+    /// mark, for the builder composing a parsed tree. Calling this from
+    /// outside leaves the subtree looking clean, so it re-emits verbatim
+    /// from source and your change is silently dropped — that omission is
+    /// what made `move` a silent copy until 9162c7d. Use `mappingAppend`.
+    ///
+    /// `pub` only because `edit.zig` needs it; Zig has no module-internal
+    /// visibility. Not part of the supported API.
     pub fn attachPair(self: *Document, map: *Node, key: *Node, value: *Node) !void {
         switch (map.data) {
             .mapping => |*m| {
@@ -479,7 +485,10 @@ pub const Document = struct {
         self.markModified(seq);
     }
 
-    /// Structural append without the `modified` mark.
+    /// INTERNAL. Structural append without the `modified` mark. Same
+    /// hazard as `attachPair`; use `sequenceAppend`.
+    ///
+    /// `pub` only because `edit.zig` needs it. Not part of the supported API.
     pub fn attachItem(self: *Document, seq: *Node, item: *Node) !void {
         switch (seq.data) {
             .sequence => |*s| {
@@ -585,8 +594,16 @@ pub const Document = struct {
         try drops.insert(self.pool.allocator(), i, .{ from, to });
     }
 
-    /// Tombstone the source bytes a mapping entry occupied (its whole
-    /// line, including the line terminator).
+    /// INTERNAL. Tombstone the source bytes a mapping entry occupied.
+    ///
+    /// MUST run BEFORE the entry is detached: the span is derived from
+    /// where the NEXT entry starts, and the fate of a `- ` sequence
+    /// indicator on the same line is decided from the successor. Called
+    /// after detaching, it tombstones the wrong bytes silently. Returns
+    /// early for flow containers — an emitter gap-walk invariant, not a
+    /// document-model one.
+    ///
+    /// `pub` only because `edit.zig` needs it. Not part of the supported API.
     pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
         const src = self.source orelse return;
         const ks = p.key.src orelse return;
@@ -646,7 +663,12 @@ pub const Document = struct {
         }
     }
 
-    /// Tombstone the source bytes a sequence item occupied.
+    /// INTERNAL. Tombstone the source bytes a sequence entry occupied.
+    /// Same ordering requirement as `dropPairSpan`: the span depends on
+    /// where the next entry starts, so it must run before the item is
+    /// detached. Returns early for flow containers.
+    ///
+    /// `pub` only because `edit.zig` needs it. Not part of the supported API.
     pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
         const src = self.source orelse return;
         const is = item.src orelse return;
@@ -1078,9 +1100,9 @@ test "unknown alias fails" {
 }
 
 test "scalar kind classification" {
-    try testing.expectEqual(CoreTag.null_, resolveCoreTag("~", .plain));
-    try testing.expectEqual(CoreTag.null_, resolveCoreTag("", .plain));
-    try testing.expectEqual(CoreTag.bool_, resolveCoreTag("true", .plain));
+    try testing.expectEqual(CoreTag.null, resolveCoreTag("~", .plain));
+    try testing.expectEqual(CoreTag.null, resolveCoreTag("", .plain));
+    try testing.expectEqual(CoreTag.bool, resolveCoreTag("true", .plain));
     try testing.expectEqual(CoreTag.int, resolveCoreTag("-42", .plain));
     try testing.expectEqual(CoreTag.int, resolveCoreTag("0x1F", .plain));
     try testing.expectEqual(CoreTag.float, resolveCoreTag("1.5e3", .plain));

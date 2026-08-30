@@ -1478,21 +1478,21 @@ fn assertsReparse(alloc: std.mem.Allocator, name: []const u8, what: []const u8, 
 fn valueEql(a: yaml.value.Value, b: yaml.value.Value) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     switch (a) {
-        .null_ => return true,
-        .bool_ => |v| return v == b.bool_,
+        .null => return true,
+        .bool => |v| return v == b.bool,
         .int => |v| return v == b.int,
         .bigint => |s| return std.mem.eql(u8, s, b.bigint),
         .float => |v| return v == b.float or (std.math.isNan(v) and std.math.isNan(b.float)),
         .string => |s| return std.mem.eql(u8, s, b.string),
-        .list => |items| {
-            if (items.len != b.list.len) return false;
-            for (items, b.list) |x, y| {
+        .sequence => |items| {
+            if (items.len != b.sequence.len) return false;
+            for (items, b.sequence) |x, y| {
                 if (!valueEql(x, y)) return false;
             }
             return true;
         },
-        .map => |members| {
-            if (members.len != b.map.len) return false;
+        .mapping => |members| {
+            if (members.len != b.mapping.len) return false;
             for (members) |m| {
                 const other = b.get(m.key) orelse return false;
                 if (!valueEql(m.value, other)) return false;
@@ -1540,8 +1540,8 @@ fn moveDestinationAfterDetach(alloc: std.mem.Allocator, from: []const u8, to: []
 
 fn valueIsEmptySlot(v: yaml.value.Value) bool {
     return switch (v) {
-        .list => |l| l.len == 0,
-        .map => |m| m.len == 0,
+        .sequence => |l| l.len == 0,
+        .mapping => |m| m.len == 0,
         else => false,
     };
 }
@@ -1552,38 +1552,38 @@ fn valueMinusEql(vin: yaml.value.Value, vout: yaml.value.Value, segs: []const ya
     if (segs.len == 0) return false; // root deletion is not swept
     switch (segs[0]) {
         .key => |k| {
-            if (vin != .map or vout != .map) return false;
+            if (vin != .mapping or vout != .mapping) return false;
             if (segs.len == 1) {
                 if (vin.get(k) == null) return false; // target must exist
                 if (vout.get(k) != null) return false; // and be gone
                 var j: usize = 0;
-                for (vin.map) |m| {
+                for (vin.mapping) |m| {
                     if (std.mem.eql(u8, m.key, k)) continue;
-                    if (j >= vout.map.len) return false;
-                    if (!std.mem.eql(u8, m.key, vout.map[j].key)) return false;
-                    if (!valueEql(m.value, vout.map[j].value)) return false;
+                    if (j >= vout.mapping.len) return false;
+                    if (!std.mem.eql(u8, m.key, vout.mapping[j].key)) return false;
+                    if (!valueEql(m.value, vout.mapping[j].value)) return false;
                     j += 1;
                 }
-                return j == vout.map.len;
+                return j == vout.mapping.len;
             }
             return valueMinusEql(vin.get(k) orelse return false, vout.get(k) orelse return false, segs[1..]);
         },
         .index => |ix| {
-            if (vin != .list) return false;
-            if (ix >= vin.list.len) return false;
+            if (vin != .sequence) return false;
+            if (ix >= vin.sequence.len) return false;
             if (segs.len == 1) {
-                if (vout != .list) return false;
-                if (vout.list.len != vin.list.len - 1) return false;
+                if (vout != .sequence) return false;
+                if (vout.sequence.len != vin.sequence.len - 1) return false;
                 for (0..ix) |i| {
-                    if (!valueEql(vin.list[i], vout.list[i])) return false;
+                    if (!valueEql(vin.sequence[i], vout.sequence[i])) return false;
                 }
-                for (ix..vout.list.len) |i| {
-                    if (!valueEql(vin.list[i + 1], vout.list[i])) return false;
+                for (ix..vout.sequence.len) |i| {
+                    if (!valueEql(vin.sequence[i + 1], vout.sequence[i])) return false;
                 }
                 return true;
             }
-            if (vout != .list or ix >= vout.list.len) return false;
-            return valueMinusEql(vin.list[ix], vout.list[ix], segs[1..]);
+            if (vout != .sequence or ix >= vout.sequence.len) return false;
+            return valueMinusEql(vin.sequence[ix], vout.sequence[ix], segs[1..]);
         },
         else => return false,
     }
@@ -1599,32 +1599,32 @@ fn valueSetEql(vin: yaml.value.Value, vout: yaml.value.Value, segs: []const yaml
     }
     switch (segs[0]) {
         .key => |k| {
-            if (vin != .map or vout != .map) return false;
+            if (vin != .mapping or vout != .mapping) return false;
             if (segs.len == 1) {
                 const sentinel_value: yaml.value.Value = .{ .string = sentinel_text };
                 var ia: usize = 0;
                 var ib: usize = 0;
                 var seen_target = false;
-                while (ia < vin.map.len or ib < vout.map.len) {
-                    const a_ok = ia < vin.map.len;
-                    const b_ok = ib < vout.map.len;
-                    if (a_ok and std.mem.eql(u8, vin.map[ia].key, k)) {
+                while (ia < vin.mapping.len or ib < vout.mapping.len) {
+                    const a_ok = ia < vin.mapping.len;
+                    const b_ok = ib < vout.mapping.len;
+                    if (a_ok and std.mem.eql(u8, vin.mapping[ia].key, k)) {
                         // Existed: replaced in place, position kept.
-                        if (!b_ok or !std.mem.eql(u8, vout.map[ib].key, k)) return false;
-                        if (!valueEql(vout.map[ib].value, sentinel_value)) return false;
+                        if (!b_ok or !std.mem.eql(u8, vout.mapping[ib].key, k)) return false;
+                        if (!valueEql(vout.mapping[ib].value, sentinel_value)) return false;
                         seen_target = true;
                         ia += 1;
                         ib += 1;
-                    } else if (b_ok and std.mem.eql(u8, vout.map[ib].key, k)) {
+                    } else if (b_ok and std.mem.eql(u8, vout.mapping[ib].key, k)) {
                         // New key: appended at the end only.
                         if (a_ok) return false;
-                        if (!valueEql(vout.map[ib].value, sentinel_value)) return false;
+                        if (!valueEql(vout.mapping[ib].value, sentinel_value)) return false;
                         seen_target = true;
                         ib += 1;
                     } else {
                         if (!a_ok or !b_ok) return false;
-                        if (!std.mem.eql(u8, vin.map[ia].key, vout.map[ib].key)) return false;
-                        if (!valueEql(vin.map[ia].value, vout.map[ib].value)) return false;
+                        if (!std.mem.eql(u8, vin.mapping[ia].key, vout.mapping[ib].key)) return false;
+                        if (!valueEql(vin.mapping[ia].value, vout.mapping[ib].value)) return false;
                         ia += 1;
                         ib += 1;
                     }
@@ -1634,9 +1634,9 @@ fn valueSetEql(vin: yaml.value.Value, vout: yaml.value.Value, segs: []const yaml
             return valueSetEql(vin.get(k) orelse return false, vout.get(k) orelse return false, segs[1..], sentinel_text);
         },
         .index => |ix| {
-            if (vin != .list or vout != .list) return false;
-            if (ix >= vin.list.len or ix >= vout.list.len) return false;
-            return valueSetEql(vin.list[ix], vout.list[ix], segs[1..], sentinel_text);
+            if (vin != .sequence or vout != .sequence) return false;
+            if (ix >= vin.sequence.len or ix >= vout.sequence.len) return false;
+            return valueSetEql(vin.sequence[ix], vout.sequence[ix], segs[1..], sentinel_text);
         },
         else => return false,
     }
@@ -2049,7 +2049,7 @@ test "preservation: deleting two siblings composes identically in either order" 
     try std.testing.expectEqualStrings(outs.items[0], outs.items[1]);
 
     // And order-independent meaning: exactly `c: 3` survives.
-    const expected: yaml.value.Value = .{ .map = &[_]yaml.value.Value.Member{
+    const expected: yaml.value.Value = .{ .mapping = &[_]yaml.value.Value.Pair{
         .{ .key = "c", .value = .{ .int = 3 } },
     } };
     for (outs.items) |o| {

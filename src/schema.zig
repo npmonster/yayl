@@ -29,7 +29,7 @@ pub const Schema = struct {
     pub const Kind = union(enum) {
         any,
         str,
-        bool_,
+        bool,
         int,
         float,
         /// Scalar string restricted to a fixed set.
@@ -52,7 +52,7 @@ pub const Schema = struct {
     };
 
     pub const str = Schema{ .kind = .str };
-    pub const bool_ = Schema{ .kind = .bool_ };
+    pub const boolean = Schema{ .kind = .bool };
     pub const int = Schema{ .kind = .int };
     pub const float = Schema{ .kind = .float };
     pub const scalar = Schema{ .kind = .scalar };
@@ -155,8 +155,8 @@ fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Nod
                 try typeErr(alloc, path, "a string", out);
             }
         },
-        .bool_ => {
-            if (checkNodeCoreTag(cur) != .bool_) try typeErr(alloc, path, "a boolean", out);
+        .bool => {
+            if (checkNodeCoreTag(cur) != .bool) try typeErr(alloc, path, "a boolean", out);
         },
         .int => {
             if (checkNodeCoreTag(cur) != .int) try typeErr(alloc, path, "an integer", out);
@@ -247,7 +247,7 @@ test "valid and invalid configurations" {
         .{ .key = "port", .schema = &Schema.intRange(1, 65535), .required = true },
         .{ .key = "mode", .schema = &Schema.strEnum(&.{ "fast", "slow" }) },
         .{ .key = "tags", .schema = &Schema.seq(&Schema.str) },
-        .{ .key = "debug", .schema = &Schema.bool_ },
+        .{ .key = "debug", .schema = &Schema.boolean },
     });
 
     var good = try document_mod.Document.parse(testing.allocator,

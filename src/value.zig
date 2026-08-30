@@ -27,30 +27,33 @@ const ScalarStyle = token_mod.ScalarStyle;
 
 /// A parsed, untyped YAML value.
 pub const Value = union(enum) {
-    null_,
-    bool_: bool,
+    null,
+    bool: bool,
     int: i64,
     /// Integers beyond i64 keep their text (no silent loss).
     bigint: []const u8,
     float: f64,
     string: []const u8,
-    list: []const Value,
-    map: []const Member,
+    /// Spelled as the node model spells it: the spec's node kinds are
+    /// scalar, sequence and mapping (3.2.1.1).
+    sequence: []const Value,
+    mapping: []const Pair,
 
-    pub const Member = struct { key: []const u8, value: Value };
+    /// One key/value pair of a mapping (spec 3.2.1.1).
+    pub const Pair = struct { key: []const u8, value: Value };
 
     pub fn get(self: Value, key: []const u8) ?Value {
-        if (self != .map) return null;
-        for (self.map) |m| {
+        if (self != .mapping) return null;
+        for (self.mapping) |m| {
             if (std.mem.eql(u8, m.key, key)) return m.value;
         }
         return null;
     }
 
     pub fn at(self: Value, index: usize) ?Value {
-        if (self != .list) return null;
-        if (index >= self.list.len) return null;
-        return self.list[index];
+        if (self != .sequence) return null;
+        if (index >= self.sequence.len) return null;
+        return self.sequence[index];
     }
 };
 
@@ -65,7 +68,7 @@ pub const Error = error{ TypeMismatch, UnsupportedType, OutOfMemory } || diag_mo
 pub fn parseToValue(alloc: std.mem.Allocator, input: []const u8) Error!Value {
     var doc = try document_mod.Document.parse(alloc, input);
     defer doc.deinit();
-    const root = doc.root orelse return .null_;
+    const root = doc.root orelse return .null;
     return nodeToValue(alloc, root);
 }
 
@@ -87,10 +90,10 @@ pub fn nodeToValue(alloc: std.mem.Allocator, node: *const Node) Error!Value {
                 out[i] = try nodeToValue(alloc, item);
                 filled = i + 1;
             }
-            return .{ .list = out };
+            return .{ .sequence = out };
         },
         .mapping => |m| {
-            var out = try alloc.alloc(Value.Member, m.pairs.items.len);
+            var out = try alloc.alloc(Value.Pair, m.pairs.items.len);
             var filled: usize = 0;
             errdefer {
                 for (out[0..filled]) |memb| {
@@ -112,7 +115,7 @@ pub fn nodeToValue(alloc: std.mem.Allocator, node: *const Node) Error!Value {
                 };
                 filled = i + 1;
             }
-            return .{ .map = out };
+            return .{ .mapping = out };
         },
     }
 }
@@ -122,8 +125,8 @@ pub fn nodeToValue(alloc: std.mem.Allocator, node: *const Node) Error!Value {
 pub fn scalarToValue(alloc: std.mem.Allocator, text: []const u8, style: ScalarStyle) Error!Value {
     if (style != .plain) return .{ .string = try alloc.dupe(u8, text) };
     switch (document_mod.resolveCoreTag(text, .plain)) {
-        .null_ => return .null_,
-        .bool_ => return .{ .bool_ = text[0] == 't' or text[0] == 'T' },
+        .null => return .null,
+        .bool => return .{ .bool = text[0] == 't' or text[0] == 'T' },
         .int => {
             if (std.fmt.parseInt(i64, text, 0)) |i| return .{ .int = i } else |_| {}
             // Out-of-range integers keep their exact text.
@@ -142,8 +145,8 @@ pub fn scalarToValue(alloc: std.mem.Allocator, text: []const u8, style: ScalarSt
 /// Materialize a Value as a document tree node (owned by `doc`).
 pub fn toNode(doc: *Document, value: Value) Error!*Node {
     switch (value) {
-        .null_ => return doc.createScalar("", .plain),
-        .bool_ => |b| return doc.createScalar(if (b) "true" else "false", .plain),
+        .null => return doc.createScalar("", .plain),
+        .bool => |b| return doc.createScalar(if (b) "true" else "false", .plain),
         .int => |i| {
             var buf: [32]u8 = undefined;
             const text = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
@@ -159,14 +162,14 @@ pub fn toNode(doc: *Document, value: Value) Error!*Node {
             return doc.createScalar(text, .plain);
         },
         .string => |s| return doc.createScalar(s, .any),
-        .list => |items| {
+        .sequence => |items| {
             const seq = try doc.createSequence();
             for (items) |item| {
                 try doc.sequenceAppend(seq, try toNode(doc, item));
             }
             return seq;
         },
-        .map => |members| {
+        .mapping => |members| {
             const map = try doc.createMapping();
             for (members) |m| {
                 try doc.mappingAppend(map, try doc.createScalar(m.key, .any), try toNode(doc, m.value));
@@ -192,7 +195,7 @@ pub fn toZig(comptime T: type, alloc: std.mem.Allocator, value: Value) Error!T {
     const info = @typeInfo(T);
     switch (info) {
         .bool => switch (value) {
-            .bool_ => |b| return b,
+            .bool => |b| return b,
             else => return error.TypeMismatch,
         },
         .int => switch (value) {
@@ -209,7 +212,7 @@ pub fn toZig(comptime T: type, alloc: std.mem.Allocator, value: Value) Error!T {
             else => return error.TypeMismatch,
         },
         .optional => |opt| {
-            if (value == .null_) return null;
+            if (value == .null) return null;
             return try toZig(opt.child, alloc, value);
         },
         .@"enum" => |en| switch (value) {
@@ -232,7 +235,7 @@ pub fn toZig(comptime T: type, alloc: std.mem.Allocator, value: Value) Error!T {
                     }
                 }
                 switch (value) {
-                    .list => |items| {
+                    .sequence => |items| {
                         const out = try alloc.alloc(ptr.child, items.len);
                         var filled: usize = 0;
                         errdefer {
@@ -251,7 +254,7 @@ pub fn toZig(comptime T: type, alloc: std.mem.Allocator, value: Value) Error!T {
             return error.UnsupportedType;
         },
         .array => |arr| switch (value) {
-            .list => |items| {
+            .sequence => |items| {
                 if (items.len != arr.len) return error.TypeMismatch;
                 var out: T = undefined;
                 var filled: usize = 0;
@@ -265,7 +268,7 @@ pub fn toZig(comptime T: type, alloc: std.mem.Allocator, value: Value) Error!T {
             else => return error.TypeMismatch,
         },
         .@"struct" => switch (value) {
-            .map => |members| return toZigStruct(T, alloc, members),
+            .mapping => |members| return toZigStruct(T, alloc, members),
             else => return error.TypeMismatch,
         },
         else => return error.UnsupportedType,
@@ -347,7 +350,7 @@ fn cloneZig(comptime T: type, alloc: std.mem.Allocator, value: T) Error!T {
 
 /// Struct arm of `toZig`: fields matched by name; defaults and
 /// optionals honored; a missing required field is `TypeMismatch`.
-fn toZigStruct(comptime T: type, alloc: std.mem.Allocator, members: []const Value.Member) Error!T {
+fn toZigStruct(comptime T: type, alloc: std.mem.Allocator, members: []const Value.Pair) Error!T {
     const st = @typeInfo(T).@"struct";
     var out: T = undefined;
     var initialized = [_]bool{false} ** st.fields.len;
@@ -388,11 +391,11 @@ pub fn fromZig(alloc: std.mem.Allocator, value: anytype) Error!Value {
     const T = @TypeOf(value);
     const info = @typeInfo(T);
     switch (info) {
-        .bool => return .{ .bool_ = value },
+        .bool => return .{ .bool = value },
         .int => return .{ .int = std.math.cast(i64, value) orelse return error.TypeMismatch },
         .comptime_int => return .{ .int = value },
         .float, .comptime_float => return .{ .float = @floatCast(value) },
-        .optional => return if (value) |v| fromZig(alloc, v) else .null_,
+        .optional => return if (value) |v| fromZig(alloc, v) else .null,
         .@"enum" => return .{ .string = try alloc.dupe(u8, @tagName(value)) },
         .pointer => |ptr| {
             if (ptr.size == .slice) {
@@ -407,7 +410,7 @@ pub fn fromZig(alloc: std.mem.Allocator, value: anytype) Error!Value {
                     out[i] = try fromZig(alloc, item);
                     filled = i + 1;
                 }
-                return .{ .list = out };
+                return .{ .sequence = out };
             }
             if (ptr.size == .one) return fromZig(alloc, value.*);
             return error.UnsupportedType;
@@ -423,10 +426,10 @@ pub fn fromZig(alloc: std.mem.Allocator, value: anytype) Error!Value {
                 out[i] = try fromZig(alloc, item);
                 filled = i + 1;
             }
-            return .{ .list = out };
+            return .{ .sequence = out };
         },
         .@"struct" => |st| {
-            const members = try alloc.alloc(Value.Member, st.fields.len);
+            const members = try alloc.alloc(Value.Pair, st.fields.len);
             var filled: usize = 0;
             errdefer {
                 for (members[0..filled]) |m| {
@@ -441,9 +444,9 @@ pub fn fromZig(alloc: std.mem.Allocator, value: anytype) Error!Value {
                 members[i] = .{ .key = key, .value = try fromZig(alloc, @field(value, field.name)) };
                 filled = i + 1;
             }
-            return .{ .map = members };
+            return .{ .mapping = members };
         },
-        .null => return .null_,
+        .null => return .null,
         else => return error.UnsupportedType,
     }
 }
@@ -469,11 +472,11 @@ test "parse to value and inspect" {
     try testing.expectEqualStrings("yayl", v.get("name").?.string);
     try testing.expectEqual(@as(i64, 3), v.get("count").?.int);
     try testing.expectEqual(@as(f64, 2.5), v.get("ratio").?.float);
-    try testing.expect(v.get("enabled").?.bool_);
-    try testing.expectEqual(@as(usize, 2), v.get("tags").?.list.len);
+    try testing.expect(v.get("enabled").?.bool);
+    try testing.expectEqual(@as(usize, 2), v.get("tags").?.sequence.len);
     // Quoted "42" stays a string: no silent type inference.
     try testing.expectEqualStrings("42", v.get("note").?.string);
-    try testing.expect(v.get("missing").? == .null_);
+    try testing.expect(v.get("missing").? == .null);
 }
 
 test "value round trip through the document model" {
@@ -611,11 +614,11 @@ pub fn freeValue(alloc: std.mem.Allocator, v: Value) void {
     switch (v) {
         .string => |s| alloc.free(s),
         .bigint => |s| alloc.free(s),
-        .list => |items| {
+        .sequence => |items| {
             for (items) |item| freeValue(alloc, item);
             alloc.free(items);
         },
-        .map => |members| {
+        .mapping => |members| {
             for (members) |m| {
                 alloc.free(m.key);
                 freeValue(alloc, m.value);

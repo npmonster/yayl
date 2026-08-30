@@ -253,7 +253,7 @@ const v = try yaml.value.parseToValue(alloc, input);
 defer yaml.value.freeValue(alloc, v);
 
 const count = v.get("count").?.int;      // i64
-const tags  = v.get("tags").?.list;      // []const Value
+const tags  = v.get("tags").?.sequence;  // []const Value
 ~~~
 
 Plain scalars use the library's YAML 1.2 core-schema resolver. Quoted
