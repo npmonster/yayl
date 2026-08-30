@@ -193,25 +193,26 @@ pub fn scalarKind(value: []const u8, style: ScalarStyle) ScalarKind {
     return .str;
 }
 
+/// Core schema int (spec 10.3.2): `[-+]? [0-9]+`, `0o [0-7]+` or
+/// `0x [0-9a-fA-F]+`. The radix forms take no sign and are lowercase
+/// only, so `+0x1F`, `-0x1F`, `0X1F` and `0O7` are all strings.
 fn looksLikeInt(value: []const u8) bool {
-    var s = value;
-    if (s.len == 0) return false;
-    if (s[0] == '+' or s[0] == '-') s = s[1..];
-    if (s.len == 0) return false;
-    if (s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')) {
-        if (s.len == 2) return false;
-        for (s[2..]) |c| {
+    if (value.len == 0) return false;
+    if (value.len > 2 and value[0] == '0' and value[1] == 'x') {
+        for (value[2..]) |c| {
             if (ctype.hexValue(c) == null) return false;
         }
         return true;
     }
-    if (s.len >= 2 and s[0] == '0' and (s[1] == 'o' or s[1] == 'O')) {
-        if (s.len == 2) return false;
-        for (s[2..]) |c| {
+    if (value.len > 2 and value[0] == '0' and value[1] == 'o') {
+        for (value[2..]) |c| {
             if (c < '0' or c > '7') return false;
         }
         return true;
     }
+    var s = value;
+    if (s[0] == '+' or s[0] == '-') s = s[1..];
+    if (s.len == 0) return false;
     for (s) |c| {
         if (c < '0' or c > '9') return false;
     }
@@ -238,27 +239,35 @@ pub fn floatSpecial(value: []const u8) ?f64 {
     return null;
 }
 
+/// Core schema float (spec 10.3.2):
+/// `[-+]? ( \. [0-9]+ | [0-9]+ ( \. [0-9]* )? ) ( [eE] [-+]? [0-9]+ )?`
+/// plus the `.inf`/`.nan` spellings. At most one dot and one exponent,
+/// the dot before the exponent, and the exponent digits are required —
+/// so `1.2.3`, `1..2`, `1.2e3.4` and `1e` are all strings.
 fn looksLikeFloat(value: []const u8) bool {
     if (floatSpecial(value) != null) return true;
-    var has_dot = false;
-    var has_exp = false;
-    var has_digit = false;
-    for (value, 0..) |c, i| {
-        switch (c) {
-            '0'...'9' => has_digit = true,
-            '.',
-            => has_dot = true,
-            'e', 'E' => {
-                if (i == 0 or !has_digit) return false;
-                has_exp = true;
-            },
-            '+', '-' => {
-                if (i != 0 and value[i - 1] != 'e' and value[i - 1] != 'E') return false;
-            },
-            else => return false,
-        }
+    var i: usize = 0;
+    if (i < value.len and (value[i] == '+' or value[i] == '-')) i += 1;
+
+    var int_digits: usize = 0;
+    while (i < value.len and value[i] >= '0' and value[i] <= '9') : (i += 1) int_digits += 1;
+
+    var frac_digits: usize = 0;
+    if (i < value.len and value[i] == '.') {
+        i += 1;
+        while (i < value.len and value[i] >= '0' and value[i] <= '9') : (i += 1) frac_digits += 1;
     }
-    return has_digit and (has_dot or has_exp);
+    if (int_digits == 0 and frac_digits == 0) return false;
+
+    if (i < value.len and (value[i] == 'e' or value[i] == 'E')) {
+        i += 1;
+        if (i < value.len and (value[i] == '+' or value[i] == '-')) i += 1;
+        var exp_digits: usize = 0;
+        while (i < value.len and value[i] >= '0' and value[i] <= '9') : (i += 1) exp_digits += 1;
+        if (exp_digits == 0) return false;
+    }
+    // Anything left over (a second dot, a stray character) is not a float.
+    return i == value.len;
 }
 
 /// A parsed YAML document. All nodes live in `pool`; `deinit` releases
@@ -968,6 +977,38 @@ test "scalar kind classification" {
     try testing.expectEqual(ScalarKind.str, scalarKind("true", .single_quoted));
     try testing.expectEqual(ScalarKind.str, scalarKind("0x1F", .double_quoted));
     try testing.expectEqual(ScalarKind.str, scalarKind("hello", .plain));
+}
+
+test "core schema tag resolution rejects near-miss int and float forms" {
+    // Spec 10.3.2. Every lexeme here resolves to str: the hex and octal
+    // int forms take no sign and are lowercase only, and the float
+    // production allows one dot, before one exponent, whose digits are
+    // required. Nothing in the pinned corpus exercises this table, so it
+    // is the only thing standing between these and a silent regression.
+    const str_cases = [_][]const u8{
+        "+0x1F", "-0x1F",   "0X1F", "0O7",     "+0o7",
+        "1.2.3", "1.2.3.4", "1..2", "1.2e3.4", "1e",
+        "1e+",   ".",       "+",    "-",
+    };
+    for (str_cases) |c| {
+        testing.expectEqual(ScalarKind.str, scalarKind(c, .plain)) catch |err| {
+            std.debug.print("expected str for \"{s}\", got {s}\n", .{ c, @tagName(scalarKind(c, .plain)) });
+            return err;
+        };
+    }
+
+    // The forms the spec does accept must keep resolving.
+    try testing.expectEqual(ScalarKind.int, scalarKind("0x1F", .plain));
+    try testing.expectEqual(ScalarKind.int, scalarKind("0o7", .plain));
+    try testing.expectEqual(ScalarKind.int, scalarKind("-42", .plain));
+    try testing.expectEqual(ScalarKind.int, scalarKind("+42", .plain));
+    try testing.expectEqual(ScalarKind.float, scalarKind("1.5e3", .plain));
+    try testing.expectEqual(ScalarKind.float, scalarKind("-1.5E-3", .plain));
+    try testing.expectEqual(ScalarKind.float, scalarKind(".5", .plain));
+    try testing.expectEqual(ScalarKind.float, scalarKind("1.", .plain));
+    try testing.expectEqual(ScalarKind.float, scalarKind(".inf", .plain));
+    try testing.expectEqual(ScalarKind.float, scalarKind("-.INF", .plain));
+    try testing.expectEqual(ScalarKind.float, scalarKind(".nan", .plain));
 }
 
 test "builder API and path API" {
