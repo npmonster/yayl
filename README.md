@@ -24,11 +24,16 @@ yayl neither links nor embeds [libfyaml](https://github.com/pantoniou/libfyaml),
 
 ## Install
 
-Add the package:
+Add the package, pinned to a release:
 
 ```sh
-zig fetch --save git+https://github.com/npmonster/yayl
+zig fetch --save git+https://github.com/npmonster/yayl#v0.9.0
 ```
+
+This records the resolved commit and a content hash in your
+`build.zig.zon`, so the build is reproducible even if the tag later
+moves or disappears. Omitting `#v0.9.0` pins whatever `main` happens to
+be at that moment, which is rarely what you want.
 
 Import its module in your `build.zig`:
 

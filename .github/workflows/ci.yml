@@ -7,6 +7,7 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 jobs:
@@ -68,3 +69,49 @@ jobs:
         with:
           name: conformance-report
           path: zig-out/conformance-report.json
+
+  # The in-tree gates above all build from the working tree, so they
+  # cannot see the one failure mode that breaks every dependent while
+  # staying green here: a source file missing from `.paths` in
+  # build.zig.zon. `zig fetch` on a directory runs the real packaging
+  # path -- it applies `.paths` and produces the same content-hashed
+  # tarball a `zig fetch --save git+https://...` would -- so building a
+  # throwaway package against this checkout reproduces exactly what a
+  # downstream project gets. No network and no pushed commit required,
+  # so this also works on pull requests from forks.
+  consume:
+    name: Consume as a dependency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build a fresh consumer against this checkout
+        run: sh scripts/consumer-smoke.sh
+
+  # A tag is permanent and the package hash is content-addressed, so a
+  # tag whose name disagrees with build.zig.zon cannot be corrected in
+  # place -- it can only be superseded by another release. Catch the
+  # mismatch while it is still just a tag push.
+  tag-version-match:
+    name: Tag matches build.zig.zon version
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert tag == .version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          zon=$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)
+          echo "tag version:          $tag"
+          echo "build.zig.zon version: $zon"
+          if [ "$tag" != "$zon" ]; then
+            echo "::error::tag $GITHUB_REF_NAME disagrees with build.zig.zon .version = \"$zon\""
+            exit 1
+          fi
