@@ -4,9 +4,19 @@ A native Zig YAML parser, document model, and emitter. yayl follows the architec
 
 > **Status: 0.9 — feature-complete, public hardening release.** The scanner, parser, CST-backed document model, and emitter pass the full yaml-test-suite corpus (351/351), produce **byte-faithful round trips** — comments, blank lines, quoting, key order, indentation — and ship an editing API, a generic value runtime, optional schema validation, and bounded file I/O. `make verify` gates all of it.
 
-> **Developed by agents.** yayl is written end-to-end by AI coding agents — planning, implementation, tests, docs, and review — under human direction. The playbook lives in [AGENTS.md](AGENTS.md); the work is tracked as evidence-logged cards on a pauta board.
+> **Developed by agents.** Written end-to-end by AI coding agents under human direction — see the [full disclosure](#ai-development-disclosure) below.
 
 See the [usage guide](docs/USAGE.md) for library examples and API patterns.
+
+## AI development disclosure
+
+yayl is developed end-to-end by AI coding agents — several of them, powered by different large language models over the course of the project — with humans leading the ideas, the review, and the release decisions. Agents plan the work on an evidence-logged card board, write the code and tests, run the quality gates, debug what fails, and review each other's output. People decide what gets built, judge every plan and result, and own what ships. Every change reaches `main` through the same gates: corpus conformance, byte-faithful round trips, differential parity against libfyaml, allocation-failure injection, and independent review passes recorded on each card.
+
+We say this openly because it shaped how the project was built. The playbook the agents follow lives in [AGENTS.md](AGENTS.md), and the audit trail of every card is committed with the source. If AI-developed code is a dealbreaker for you, this library is not for you — no hard feelings.
+
+### Acknowledgements — libfyaml
+
+yayl neither links nor embeds [libfyaml](https://github.com/pantoniou/libfyaml), but it exists thanks to the path that project opened. libfyaml's architecture is the blueprint this port follows — the scanner → parser → document model → emitter layering, the event model, and round-trip-faithful emission backed by source spans — and its observable behavior is the specification yayl is tested against: a vendored libfyaml (development environments only) powers the differential gate that compares event streams across the whole yaml-test-suite corpus. We are thankful and indebted to libfyaml and its contributors.
 
 ## Requirements
 
