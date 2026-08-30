@@ -8,19 +8,42 @@
 //!
 //! STREAMING DECISION (documented, deliberate): yayl's parser is
 //! pull-based at the *event* level (`Parser.nextEvent`) but requires
-//! the whole input in memory; there is no chunked reader. Rationale:
-//! the scanner's lookahead (simple keys, block indentation, flow
-//! continuation) needs random access behind the cursor, and every
-//! public API already accepts `[]const u8`, so applications can mmap
-//! or read once and process many documents with bounded per-document
-//! copies (regions share the pooled source). Chunked streaming is a
-//! possible future layer on top of `Parser`, not a limitation of the
-//! event API.
+//! the whole input in memory; there is no chunked reader.
 //!
-//! CACHING DECISION: no parse cache ships in v1. Correctness of an
-//! mtime/hash-keyed cache depends on filesystem semantics this
-//! library does not own; applications that need one can key a cache
-//! on `parseFile`'s inputs trivially.
+//! The load-bearing reason is round-trip fidelity, not scanning.
+//! `Document.parse` duplicates the entire input into the document's
+//! pool (`document.zig`, `d.source = try d.pool.dupe(input)`), and
+//! every `Node.src` is an absolute byte offset into that copy. Faithful
+//! emission is then literally `src[a..b]` slicing: "untouched bytes are
+//! exact" is a promise that the original bytes are still there to
+//! copy. A reader that discards consumed chunks cannot keep that
+//! promise. Chunked input is therefore not merely awkward here -- it is
+//! incompatible with the library's central guarantee, and a chunked
+//! layer would have to be a parse-only mode with round-tripping off.
+//!
+//! Scanner lookahead is the lesser constraint and is often quoted as
+//! the reason; it is bounded. Simple keys expire after
+//! `scanner.max_simple_key_length` (1 KiB), so a sliding window would
+//! serve the scanner. It is the CST that needs the whole buffer.
+//!
+//! The *event* API is already chunk-ready: `Parser.nextEvent` pulls,
+//! and the scanner compacts its token queue as it goes. So a streaming
+//! layer on top of `Parser` remains possible for callers who want
+//! events and not byte-faithful re-emission.
+//!
+//! CACHING DECISION: no parse cache ships in v1.
+//!
+//! The usual objection is invalidation -- an mtime/hash-keyed cache
+//! depends on filesystem semantics this library does not own (mtime
+//! granularity, hard links, network clock skew). True, but the sharper
+//! objection is that a `Document` is mutable. Edits mark nodes in place
+//! (`Node.modified`) and rewrite the tree, so two callers handed the
+//! same cached document would corrupt each other. A correct cache would
+//! have to hand out `edit.cloneTree` copies, and cloning a tree along
+//! with its spans and dropped-entry tombstones is not clearly cheaper
+//! than re-parsing the bytes. That is why this is a non-goal rather
+//! than merely deferred work. Applications that know their own access
+//! pattern can key a cache on `parseFile`'s inputs trivially.
 //!
 //! PARAMETER ORDER: the allocator comes first (after the document
 //! receiver for write-style functions), then `io`, then `path`, then
