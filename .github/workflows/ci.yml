@@ -115,3 +115,61 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME disagrees with build.zig.zon .version = \"$zon\""
             exit 1
           fi
+
+  # The gates above run only on ubuntu-x64. A YAML library is exactly the
+  # kind of code where that is not enough: the scanner has to deal with
+  # CRLF, and src/file.zig's atomic write (temp + fsync + rename) has
+  # genuinely different semantics on Windows, where renaming onto an
+  # existing file is not the same call it is on POSIX.
+  #
+  # Runs the portable core only. `fmt` is platform-independent and the
+  # differential gate needs a C toolchain plus a libfyaml build, so both
+  # stay on the Linux job rather than being reproduced badly here.
+  #
+  # core.autocrlf is forced off BEFORE checkout: git on Windows would
+  # otherwise rewrite the fixtures' line endings, and a byte-exact
+  # round-trip gate compared against rewritten fixtures tests nothing.
+  # Any CRLF handling we assert should come from the corpus, not the
+  # checkout.
+  platform:
+    name: ${{ matrix.os }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-13, windows-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Do not rewrite line endings on checkout
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: zig version
+        run: zig version
+
+      - name: Compile the library (analyse the public root)
+        run: zig build check --summary all
+
+      - name: Unit tests (Debug, leak-checked)
+        run: zig build test --summary all
+
+      - name: Unit tests (ReleaseSafe)
+        run: zig build test -Doptimize=ReleaseSafe --summary all
+
+      - name: Fetch pinned YAML Test Suite corpus
+        run: sh scripts/fetch-corpus.sh
+
+      - name: Conformance corpus
+        run: zig build conformance --summary all
+
+      - name: Round-trip gate (byte-faithful emit(parse(x)) == x)
+        run: zig build roundtrip --summary all
