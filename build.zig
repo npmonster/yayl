@@ -74,9 +74,13 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "yayl", .module = module }},
         }),
     });
+    // Depend on the install, not the compile: scripts/differential.sh runs
+    // `zig build dump` and then executes zig-out/bin/dump, and compiling
+    // alone leaves the binary in the cache.
+    const dump_install = b.addInstallArtifact(dump_exe, .{});
     const dump_step = b.step("dump", "Build the event-tree dump CLI");
-    dump_step.dependOn(&dump_exe.step);
-    b.installArtifact(dump_exe);
+    dump_step.dependOn(&dump_install.step);
+    b.getInstallStep().dependOn(&dump_install.step);
 
     // Throughput benchmark CLI (PLAN-8): measured numbers for the docs.
     const bench_exe = b.addExecutable(.{
@@ -88,9 +92,10 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "yayl", .module = module }},
         }),
     });
+    const bench_install = b.addInstallArtifact(bench_exe, .{});
     const bench_step = b.step("bench", "Build the throughput benchmark CLI");
-    bench_step.dependOn(&bench_exe.step);
-    b.installArtifact(bench_exe);
+    bench_step.dependOn(&bench_install.step);
+    b.getInstallStep().dependOn(&bench_install.step);
 
     // Examples: small compile-checked programs (see examples/).
     const examples_step = b.step("examples", "Build the example programs");
