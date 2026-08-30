@@ -26,7 +26,7 @@ const max_simple_key_chars: usize = 1024;
 
 /// YAML tokenizer: turns input bytes into a token stream (fy-scan port).
 pub const Scanner = struct {
-    alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     d: ?*Diag,
 
     input: []const u8,
@@ -73,7 +73,7 @@ pub const Scanner = struct {
         pos: usize = 0,
     };
 
-    pub fn init(alloc: std.mem.Allocator, d: ?*Diag, input: []const u8) !Scanner {
+    pub fn init(allocator: std.mem.Allocator, d: ?*Diag, input: []const u8) !Scanner {
         // libyaml/fy_reader treat a NUL byte as end of input.
         var end = input.len;
         if (std.mem.indexOfScalar(u8, input, 0)) |i| end = i;
@@ -84,7 +84,7 @@ pub const Scanner = struct {
             return error.InvalidUtf8;
         }
 
-        var self: Scanner = .{ .alloc = alloc, .d = d, .input = eff, .pos = 0, .mark = .{} };
+        var self: Scanner = .{ .allocator = allocator, .d = d, .input = eff, .pos = 0, .mark = .{} };
         // Skip a UTF-8 BOM if present (fy_reader does this too). The
         // mark travels with `pos`: every span built from a mark is an
         // absolute byte offset into `input`, so leaving `mark.offset`
@@ -96,34 +96,34 @@ pub const Scanner = struct {
             self.mark.offset = 3;
         }
         // One simple key slot per flow level; level 0 always exists.
-        try self.simple_keys.append(alloc, .{});
+        try self.simple_keys.append(allocator, .{});
         return self;
     }
 
     pub fn deinit(self: *Scanner) void {
-        self.indents.deinit(self.alloc);
-        self.simple_keys.deinit(self.alloc);
-        self.flow_kinds.deinit(self.alloc);
-        self.tokens.deinit(self.alloc);
-        for (self.temp_bytes.items) |buf| self.alloc.free(buf);
-        self.temp_bytes.deinit(self.alloc);
-        for (self.temp_params.items) |p| self.alloc.free(p);
-        self.temp_params.deinit(self.alloc);
+        self.indents.deinit(self.allocator);
+        self.simple_keys.deinit(self.allocator);
+        self.flow_kinds.deinit(self.allocator);
+        self.tokens.deinit(self.allocator);
+        for (self.temp_bytes.items) |buf| self.allocator.free(buf);
+        self.temp_bytes.deinit(self.allocator);
+        for (self.temp_params.items) |p| self.allocator.free(p);
+        self.temp_params.deinit(self.allocator);
     }
 
     /// Finalize a byte scratch buffer and register it for cleanup.
     fn ownTemp(self: *Scanner, buf: *std.ArrayList(u8)) ![]u8 {
-        const s = try buf.toOwnedSlice(self.alloc);
-        errdefer self.alloc.free(s);
-        try self.temp_bytes.append(self.alloc, s);
+        const s = try buf.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(s);
+        try self.temp_bytes.append(self.allocator, s);
         return s;
     }
 
     /// Finalize a directive parameter list and register it for cleanup.
     fn ownParams(self: *Scanner, buf: *std.ArrayList([]const u8)) ![]const []const u8 {
-        const s = try buf.toOwnedSlice(self.alloc);
-        errdefer self.alloc.free(s);
-        try self.temp_params.append(self.alloc, s);
+        const s = try buf.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(s);
+        try self.temp_params.append(self.allocator, s);
         return s;
     }
 
@@ -232,7 +232,7 @@ pub const Scanner = struct {
     /// Append the codepoint at the cursor to `out` and advance.
     fn readCp(self: *Scanner, out: *std.ArrayList(u8)) !void {
         const r = (utf8.decode(self.input, self.pos) catch unreachable) orelse unreachable;
-        try out.appendSlice(self.alloc, self.input[self.pos .. self.pos + r.len]);
+        try out.appendSlice(self.allocator, self.input[self.pos .. self.pos + r.len]);
         self.skipCp();
     }
 
@@ -241,13 +241,13 @@ pub const Scanner = struct {
     // ------------------------------------------------------------------
 
     fn appendToken(self: *Scanner, tok: Token) !void {
-        try self.tokens.append(self.alloc, tok);
+        try self.tokens.append(self.allocator, tok);
         self.noteNodeEnd(tok.data);
     }
 
     fn insertToken(self: *Scanner, number: usize, tok: Token) !void {
         const index = number - self.token_base;
-        try self.tokens.insert(self.alloc, index, tok);
+        try self.tokens.insert(self.allocator, index, tok);
         self.noteNodeEnd(tok.data);
     }
 
@@ -323,7 +323,7 @@ pub const Scanner = struct {
             if (self.indents.items.len >= self.max_nesting) {
                 return self.failWith(error.NestingTooDeep, mark, "block nesting is too deep", .{});
             }
-            try self.indents.append(self.alloc, self.indent);
+            try self.indents.append(self.allocator, self.indent);
             self.indent = col;
             const tok = Token{ .data = kind, .start = mark, .end = mark };
             if (number) |n| {
@@ -575,8 +575,8 @@ pub const Scanner = struct {
         }
         try self.saveSimpleKey();
         self.flow_level += 1;
-        try self.simple_keys.append(self.alloc, .{});
-        try self.flow_kinds.append(self.alloc, kind == .flow_sequence_start);
+        try self.simple_keys.append(self.allocator, .{});
+        try self.flow_kinds.append(self.allocator, kind == .flow_sequence_start);
         // A simple key may follow '[' and '{'.
         self.simple_key_allowed = true;
         const start = self.mark;
@@ -722,12 +722,12 @@ pub const Scanner = struct {
         }
 
         var params: std.ArrayList([]const u8) = .empty;
-        errdefer params.deinit(self.alloc);
+        errdefer params.deinit(self.allocator);
         while (self.at(0) == ' ' or self.at(0) == '\t') self.skipCp();
         while (!ctype.isBlankz(self.at(0)) and self.at(0) != '#') {
             const p_start = self.pos;
             while (!ctype.isBlankz(self.at(0))) self.skipCp();
-            try params.append(self.alloc, self.input[p_start..self.pos]);
+            try params.append(self.allocator, self.input[p_start..self.pos]);
             while (self.at(0) == ' ' or self.at(0) == '\t') self.skipCp();
         }
         if (self.at(0) == '#') {
@@ -913,7 +913,7 @@ pub const Scanner = struct {
         }
 
         var value: std.ArrayList(u8) = .empty;
-        errdefer value.deinit(self.alloc);
+        errdefer value.deinit(self.allocator);
 
         // empty_run: consecutive empty lines since the last content line.
         var empty_run: usize = 0;
@@ -1007,16 +1007,16 @@ pub const Scanner = struct {
             if (have_content) {
                 const k = empty_run + 1;
                 if (literal or prev_more or more) {
-                    for (0..k) |_| try value.append(self.alloc, '\n');
+                    for (0..k) |_| try value.append(self.allocator, '\n');
                 } else if (k == 1) {
-                    try value.append(self.alloc, ' ');
+                    try value.append(self.allocator, ' ');
                 } else {
-                    for (0..k - 1) |_| try value.append(self.alloc, '\n');
+                    for (0..k - 1) |_| try value.append(self.allocator, '\n');
                 }
             } else if (leading_breaks > 0) {
                 // Leading empty lines survive as newlines in both styles;
                 // folding only applies between content lines.
-                for (0..leading_breaks) |_| try value.append(self.alloc, '\n');
+                for (0..leading_breaks) |_| try value.append(self.allocator, '\n');
                 leading_breaks = 0;
             }
             empty_run = 0;
@@ -1026,7 +1026,7 @@ pub const Scanner = struct {
             // (they belong to more-indented lines).
             const text_start = self.pos - (ws - strip);
             while (self.at(0) != 0 and !ctype.isBreak(self.at(0))) self.skipCp();
-            try value.appendSlice(self.alloc, self.input[text_start..self.pos]);
+            try value.appendSlice(self.allocator, self.input[text_start..self.pos]);
 
             have_content = true;
             prev_more = more;
@@ -1044,11 +1044,11 @@ pub const Scanner = struct {
             // (corpus K858, JEF9-1). Strip/clip chomp to the empty scalar.
             value.clearRetainingCapacity();
             if (chomping > 0) {
-                for (0..leading_breaks) |_| try value.append(self.alloc, '\n');
+                for (0..leading_breaks) |_| try value.append(self.allocator, '\n');
             }
         } else if (chomping >= 0) {
             const n: usize = if (chomping == 0) 1 else trailing_breaks;
-            for (0..n) |_| try value.append(self.alloc, '\n');
+            for (0..n) |_| try value.append(self.allocator, '\n');
         }
 
         return .{
@@ -1065,9 +1065,9 @@ pub const Scanner = struct {
         self.skipCp(); // opening quote
 
         var value: std.ArrayList(u8) = .empty;
-        errdefer value.deinit(self.alloc);
+        errdefer value.deinit(self.allocator);
         var pending_ws: std.ArrayList(u8) = .empty;
-        defer pending_ws.deinit(self.alloc);
+        defer pending_ws.deinit(self.allocator);
         var breaks: usize = 0;
         var join_direct = false;
 
@@ -1080,7 +1080,7 @@ pub const Scanner = struct {
                 if (style == .single_quoted and self.at(1) == quote) {
                     // An escaped quote is content: commit separators first.
                     try self.flushQuotedSeparators(&value, &breaks, &join_direct, &pending_ws);
-                    try value.append(self.alloc, quote);
+                    try value.append(self.allocator, quote);
                     self.skipCp();
                     self.skipCp();
                     continue;
@@ -1120,7 +1120,7 @@ pub const Scanner = struct {
             // it is interior (kept) or trailing (dropped by a following
             // break or the closing quote).
             if (ctype.isBlank(c)) {
-                try pending_ws.append(self.alloc, c);
+                try pending_ws.append(self.allocator, c);
                 self.skipCp();
                 continue;
             }
@@ -1144,16 +1144,16 @@ pub const Scanner = struct {
     fn flushQuotedSeparators(self: *Scanner, value: *std.ArrayList(u8), breaks: *usize, join_direct: *bool, pending_ws: *std.ArrayList(u8)) !void {
         if (breaks.* > 0) {
             if (breaks.* == 1) {
-                try value.append(self.alloc, ' ');
+                try value.append(self.allocator, ' ');
             } else {
-                for (0..breaks.* - 1) |_| try value.append(self.alloc, '\n');
+                for (0..breaks.* - 1) |_| try value.append(self.allocator, '\n');
             }
             breaks.* = 0;
             join_direct.* = false;
         } else if (join_direct.*) {
             join_direct.* = false;
         } else if (pending_ws.items.len > 0) {
-            try value.appendSlice(self.alloc, pending_ws.items);
+            try value.appendSlice(self.allocator, pending_ws.items);
             pending_ws.clearRetainingCapacity();
         }
     }
@@ -1220,18 +1220,18 @@ pub const Scanner = struct {
         if (c != 'x' and c != 'u' and c != 'U') self.skipCp();
         var buf: [4]u8 = undefined;
         const len = try utf8.encode(cp, &buf);
-        try value.appendSlice(self.alloc, buf[0..len]);
+        try value.appendSlice(self.allocator, buf[0..len]);
     }
 
     /// Plain (unquoted) scalar with multi-line folding.
     fn scanPlainScalar(self: *Scanner) !Token {
         const start = self.mark;
         var value: std.ArrayList(u8) = .empty;
-        errdefer value.deinit(self.alloc);
+        errdefer value.deinit(self.allocator);
         var ws: std.ArrayList(u8) = .empty;
-        defer ws.deinit(self.alloc);
+        defer ws.deinit(self.allocator);
         var seg: std.ArrayList(u8) = .empty;
-        defer seg.deinit(self.alloc);
+        defer seg.deinit(self.allocator);
         var breaks: usize = 0;
         const stop_indent = self.indent + 1;
 
@@ -1265,16 +1265,16 @@ pub const Scanner = struct {
             // one line break folds to a space, N breaks keep N-1 newlines.
             if (breaks > 0) {
                 if (breaks == 1) {
-                    try value.append(self.alloc, ' ');
+                    try value.append(self.allocator, ' ');
                 } else {
-                    for (0..breaks - 1) |_| try value.append(self.alloc, '\n');
+                    for (0..breaks - 1) |_| try value.append(self.allocator, '\n');
                 }
                 breaks = 0;
             } else if (ws.items.len > 0) {
-                try value.appendSlice(self.alloc, ws.items);
+                try value.appendSlice(self.allocator, ws.items);
             }
             ws.clearRetainingCapacity();
-            try value.appendSlice(self.alloc, seg.items);
+            try value.appendSlice(self.allocator, seg.items);
 
             // Consume the whitespace/line breaks that follow the run.
             const snap_pos = self.pos;
@@ -1289,7 +1289,7 @@ pub const Scanner = struct {
                     {
                         return self.failWith(error.InvalidIndentation, self.mark, "found a tab character that violates indentation", .{});
                     }
-                    if (breaks == 0) try ws.append(self.alloc, self.at(0));
+                    if (breaks == 0) try ws.append(self.allocator, self.at(0));
                     self.skipCp();
                 }
             }
@@ -1329,26 +1329,26 @@ const ScanResult = struct {
     scanner: Scanner,
     toks: std.ArrayList(Token),
 
-    fn deinit(self: *ScanResult, alloc: std.mem.Allocator) void {
-        self.toks.deinit(alloc);
+    fn deinit(self: *ScanResult, allocator: std.mem.Allocator) void {
+        self.toks.deinit(allocator);
         self.scanner.deinit();
     }
 };
 
-fn scanAll(alloc: std.mem.Allocator, input: []const u8) !ScanResult {
-    var s = try Scanner.init(alloc, null, input);
+fn scanAll(allocator: std.mem.Allocator, input: []const u8) !ScanResult {
+    var s = try Scanner.init(allocator, null, input);
     errdefer s.deinit();
     var out: std.ArrayList(Token) = .empty;
-    errdefer out.deinit(alloc);
+    errdefer out.deinit(allocator);
     while (try s.peekToken()) |tok| {
-        try out.append(alloc, tok);
+        try out.append(allocator, tok);
         s.skipToken();
     }
     return .{ .scanner = s, .toks = out };
 }
 
-fn tokenTypes(alloc: std.mem.Allocator, toks: []const Token) ![]const TokenKind {
-    var out = try alloc.alloc(TokenKind, toks.len);
+fn tokenTypes(allocator: std.mem.Allocator, toks: []const Token) ![]const TokenKind {
+    var out = try allocator.alloc(TokenKind, toks.len);
     for (toks, 0..) |t, i| out[i] = std.meta.activeTag(t.data);
     return out;
 }

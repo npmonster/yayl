@@ -92,7 +92,7 @@ defer {
 Want positioned error messages? Attach a `Diag` and use `yaml.parseDiag`:
 
 ```zig
-var d: yaml.Diag = .{ .alloc = alloc };
+var d: yaml.Diag = .{ .allocator = alloc };
 defer d.deinit();
 if (yaml.parseDiag(alloc, input, &d)) |doc| {
     var document = doc;

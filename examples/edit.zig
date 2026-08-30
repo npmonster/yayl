@@ -7,7 +7,7 @@ const std = @import("std");
 const yaml = @import("yayl");
 
 pub fn main(init: std.process.Init) !void {
-    const alloc = init.arena.allocator();
+    const allocator = init.arena.allocator();
 
     const input =
         \\# deployment config
@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
         \\
     ;
 
-    var doc = try yaml.parse(alloc, input);
+    var doc = try yaml.parse(allocator, input);
     defer doc.deinit();
 
     // Atomic batch: edits run on a clone and swap in only if ALL
@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .delete = "$.legacy" },
     });
 
-    const out = try doc.write(alloc);
+    const out = try doc.write(allocator);
     std.debug.print("{s}", .{out});
     // # deployment config
     // name: api

@@ -54,7 +54,7 @@ const ports = root.lookup("ports").?.items().?;
 To learn *where* a parse failed, attach a `Diag`:
 
 ~~~zig
-var d: yaml.Diag = .{ .alloc = alloc };
+var d: yaml.Diag = .{ .allocator = alloc };
 defer d.deinit();
 if (yaml.parseDiag(alloc, input, &d)) |doc| {
     var document = doc;

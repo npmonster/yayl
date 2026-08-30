@@ -73,7 +73,7 @@ pub fn parseAll(allocator: std.mem.Allocator, input: []const u8) !std.ArrayList(
 /// unchanged — `d` carries the human-readable detail, e.g.:
 ///
 /// ```zig
-/// var d: yaml.Diag = .{ .alloc = allocator };
+/// var d: yaml.Diag = .{ .allocator = allocator };
 /// defer d.deinit();
 /// if (yaml.parseDiag(allocator, input, &d)) |doc| {
 ///     var document = doc;
@@ -111,18 +111,18 @@ test {
 }
 
 test "parse and write round trip" {
-    const alloc = std.testing.allocator;
-    var doc = try parse(alloc, "name: yayl\nlang: zig\n");
+    const allocator = std.testing.allocator;
+    var doc = try parse(allocator, "name: yayl\nlang: zig\n");
     defer doc.deinit();
     try std.testing.expectEqualStrings("yayl", doc.pathGet(&.{"name"}).?.scalarValue().?);
-    const out = try doc.write(alloc);
-    defer alloc.free(out);
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
     try std.testing.expectEqualStrings("name: yayl\nlang: zig\n", out);
 }
 
 test "build a document programmatically" {
-    const alloc = std.testing.allocator;
-    var doc = Document.init(alloc);
+    const allocator = std.testing.allocator;
+    var doc = Document.init(allocator);
     defer doc.deinit();
 
     const root = try doc.createMapping();
@@ -132,40 +132,40 @@ test "build a document programmatically" {
     try doc.sequenceAppend(list, try doc.createScalar("one", .plain));
     try doc.sequenceAppend(list, try doc.createScalar("two", .plain));
 
-    const out = try doc.write(alloc);
-    defer alloc.free(out);
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
     try std.testing.expectEqualStrings("items:\n  - one\n  - two\n", out);
 }
 
 test "invalid input surfaces a yaml error" {
-    const alloc = std.testing.allocator;
-    const r = parse(alloc, "a: b\n  c: d\n"); // bad indentation
+    const allocator = std.testing.allocator;
+    const r = parse(allocator, "a: b\n  c: d\n"); // bad indentation
     try std.testing.expectError(error.InvalidSyntax, r);
 }
 
 test "parseDiag surfaces positioned diagnostics" {
-    const alloc = std.testing.allocator;
-    var d: Diag = .{ .alloc = alloc };
+    const allocator = std.testing.allocator;
+    var d: Diag = .{ .allocator = allocator };
     defer d.deinit();
-    const r = parseDiag(alloc, "a: b\n  c: d\n", &d);
+    const r = parseDiag(allocator, "a: b\n  c: d\n", &d);
     try std.testing.expectError(error.InvalidSyntax, r);
     try std.testing.expect(d.list.items.len > 0);
     try std.testing.expect(d.list.items[0].mark.line >= 1);
 
     // Valid input records nothing.
-    var d2: Diag = .{ .alloc = alloc };
+    var d2: Diag = .{ .allocator = allocator };
     defer d2.deinit();
-    var doc = try parseDiag(alloc, "ok: 1\n", &d2);
+    var doc = try parseDiag(allocator, "ok: 1\n", &d2);
     defer doc.deinit();
     try std.testing.expectEqual(@as(usize, 0), d2.list.items.len);
 }
 
 test "multi-document stream" {
-    const alloc = std.testing.allocator;
-    var docs = try parseAll(alloc, "---\na: 1\n---\nb: 2\n");
+    const allocator = std.testing.allocator;
+    var docs = try parseAll(allocator, "---\na: 1\n---\nb: 2\n");
     defer {
         for (docs.items) |*d| d.deinit();
-        docs.deinit(alloc);
+        docs.deinit(allocator);
     }
     try std.testing.expectEqual(@as(usize, 2), docs.items.len);
     try std.testing.expectEqualStrings("1", docs.items[0].pathGet(&.{"a"}).?.scalarValue().?);
@@ -173,7 +173,7 @@ test "multi-document stream" {
 }
 
 test "realistic configuration round trip" {
-    const alloc = std.testing.allocator;
+    const allocator = std.testing.allocator;
     const src =
         \\database:
         \\  host: localhost
@@ -188,14 +188,14 @@ test "realistic configuration round trip" {
         \\enabled: true
         \\
     ;
-    var doc = try parse(alloc, src);
+    var doc = try parse(allocator, src);
     defer doc.deinit();
     try std.testing.expectEqualStrings("admin", doc.pathGet(&.{ "database", "credentials", "user" }).?.scalarValue().?);
     try std.testing.expectEqualStrings("db-2", doc.pathGet(&.{"replicas"}).?.items().?[1].scalarValue().?);
-    const out = try doc.write(alloc);
-    defer alloc.free(out);
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
     // Re-parse the emitted text and compare the tree semantically.
-    var doc2 = try parse(alloc, out);
+    var doc2 = try parse(allocator, out);
     defer doc2.deinit();
     try std.testing.expectEqualStrings("admin", doc2.pathGet(&.{ "database", "credentials", "user" }).?.scalarValue().?);
     try std.testing.expectEqualStrings("db-2", doc2.pathGet(&.{"replicas"}).?.items().?[1].scalarValue().?);
@@ -214,17 +214,17 @@ test "allocation failures in parseAll leak nothing" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, parseMultiDoc, .{});
 }
 
-fn parseMultiDoc(alloc: std.mem.Allocator) !void {
-    var docs = try parseAll(alloc, "---\nname: first\n---\nname: second\n");
+fn parseMultiDoc(allocator: std.mem.Allocator) !void {
+    var docs = try parseAll(allocator, "---\nname: first\n---\nname: second\n");
     defer {
         for (docs.items) |*d| d.deinit();
-        docs.deinit(alloc);
+        docs.deinit(allocator);
     }
     try std.testing.expectEqual(@as(usize, 2), docs.items.len);
 }
 
 test "seeded fuzz: random ASCII input never panics or leaks" {
-    const alloc = std.testing.allocator;
+    const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5eed); // fixed seed: deterministic
     const random = prng.random();
     var buf: [256]u8 = undefined;
@@ -235,21 +235,21 @@ test "seeded fuzz: random ASCII input never panics or leaks" {
         // ASCII keeps the input valid UTF-8; InvalidUtf8 is covered by
         // dedicated tests.
         for (buf[0..len]) |*b| b.* &= 0x7F;
-        var docs = parseAll(alloc, buf[0..len]) catch continue;
+        var docs = parseAll(allocator, buf[0..len]) catch continue;
         defer {
             for (docs.items) |*d| d.deinit();
-            docs.deinit(alloc);
+            docs.deinit(allocator);
         }
         // Emission paths (span arithmetic, quoting) get fuzzed too.
         for (docs.items) |*d| {
-            const out = try d.write(alloc);
-            alloc.free(out);
+            const out = try d.write(allocator);
+            allocator.free(out);
         }
     }
 }
 
 test "seeded fuzz: random multibyte UTF-8 input never panics or leaks" {
-    const alloc = std.testing.allocator;
+    const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5eed0002); // fixed seed: deterministic
     const random = prng.random();
     var buf: [256]u8 = undefined;
@@ -272,20 +272,20 @@ test "seeded fuzz: random multibyte UTF-8 input never panics or leaks" {
                 len += n;
             }
         }
-        var docs = parseAll(alloc, buf[0..len]) catch continue;
+        var docs = parseAll(allocator, buf[0..len]) catch continue;
         defer {
             for (docs.items) |*d| d.deinit();
-            docs.deinit(alloc);
+            docs.deinit(allocator);
         }
         for (docs.items) |*d| {
-            const out = try d.write(alloc);
-            alloc.free(out);
+            const out = try d.write(allocator);
+            allocator.free(out);
         }
     }
 }
 
 test "seeded fuzz: arbitrary bytes never panic or leak" {
-    const alloc = std.testing.allocator;
+    const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5eed0003); // fixed seed: deterministic
     const random = prng.random();
     var buf: [256]u8 = undefined;
@@ -293,20 +293,20 @@ test "seeded fuzz: arbitrary bytes never panic or leak" {
     while (i < 400) : (i += 1) {
         const len = random.uintAtMost(usize, buf.len);
         random.bytes(buf[0..len]);
-        var docs = parseAll(alloc, buf[0..len]) catch continue;
+        var docs = parseAll(allocator, buf[0..len]) catch continue;
         defer {
             for (docs.items) |*d| d.deinit();
-            docs.deinit(alloc);
+            docs.deinit(allocator);
         }
         for (docs.items) |*d| {
-            const out = try d.write(alloc);
-            alloc.free(out);
+            const out = try d.write(allocator);
+            allocator.free(out);
         }
     }
 }
 
 test "property: write(parse(write(parse(x)))) is a fixpoint" {
-    const alloc = std.testing.allocator;
+    const allocator = std.testing.allocator;
     const samples = [_][]const u8{
         "a: 1\nb:\n  - x\n  - y: z\n",
         "top:\n  nested:\n    deep: value\n  list:\n    - 1\n    - two\n",
@@ -314,40 +314,40 @@ test "property: write(parse(write(parse(x)))) is a fixpoint" {
         "---\nfirst: doc\n---\nsecond: doc\n",
     };
     for (samples) |src| {
-        var d1 = try parse(alloc, src);
+        var d1 = try parse(allocator, src);
         defer d1.deinit();
-        const out1 = try d1.write(alloc);
-        defer alloc.free(out1);
-        var d2 = try parse(alloc, out1);
+        const out1 = try d1.write(allocator);
+        defer allocator.free(out1);
+        var d2 = try parse(allocator, out1);
         defer d2.deinit();
-        const out2 = try d2.write(alloc);
-        defer alloc.free(out2);
+        const out2 = try d2.write(allocator);
+        defer allocator.free(out2);
         try std.testing.expectEqualStrings(out1, out2);
     }
 }
 
-fn parseOnly(alloc: std.mem.Allocator) !void {
-    var doc = try parse(alloc, "name: yayl\nitems:\n  - one\n  - two\n");
+fn parseOnly(allocator: std.mem.Allocator) !void {
+    var doc = try parse(allocator, "name: yayl\nitems:\n  - one\n  - two\n");
     defer doc.deinit();
 }
 
-fn parseWriteRoundTrip(alloc: std.mem.Allocator) !void {
-    var doc = try parse(alloc, "name: yayl\nitems:\n  - one\n  - two\n");
+fn parseWriteRoundTrip(allocator: std.mem.Allocator) !void {
+    var doc = try parse(allocator, "name: yayl\nitems:\n  - one\n  - two\n");
     defer doc.deinit();
     try std.testing.expectEqualStrings("yayl", doc.pathGet(&.{"name"}).?.scalarValue().?);
-    const out = try doc.write(alloc);
-    defer alloc.free(out);
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
 }
 
 test "document marker streams" {
-    const alloc = std.testing.allocator;
+    const allocator = std.testing.allocator;
 
     // Two explicit markers: two documents with empty content (6XDY).
     {
-        var docs = try parseAll(alloc, "---\n---\n");
+        var docs = try parseAll(allocator, "---\n---\n");
         defer {
             for (docs.items) |*d| d.deinit();
-            docs.deinit(alloc);
+            docs.deinit(allocator);
         }
         try std.testing.expectEqual(@as(usize, 2), docs.items.len);
         try std.testing.expectEqualStrings("", docs.items[0].root.?.scalarValue().?);
@@ -356,20 +356,20 @@ test "document marker streams" {
 
     // A lone '...' produces no document at all (HWV9).
     {
-        var docs = try parseAll(alloc, "...\n");
+        var docs = try parseAll(allocator, "...\n");
         defer {
             for (docs.items) |*d| d.deinit();
-            docs.deinit(alloc);
+            docs.deinit(allocator);
         }
         try std.testing.expectEqual(@as(usize, 0), docs.items.len);
     }
 
     // Trailing '---' opens a second, empty document (PUW8).
     {
-        var docs = try parseAll(alloc, "---\na: b\n---\n");
+        var docs = try parseAll(allocator, "---\na: b\n---\n");
         defer {
             for (docs.items) |*d| d.deinit();
-            docs.deinit(alloc);
+            docs.deinit(allocator);
         }
         try std.testing.expectEqual(@as(usize, 2), docs.items.len);
         try std.testing.expectEqualStrings("b", docs.items[0].pathGet(&.{"a"}).?.scalarValue().?);
@@ -378,10 +378,10 @@ test "document marker streams" {
 
     // Bare document after '...' is implicit but present (7Z25).
     {
-        var docs = try parseAll(alloc, "---\nscalar1\n...\nkey: value\n");
+        var docs = try parseAll(allocator, "---\nscalar1\n...\nkey: value\n");
         defer {
             for (docs.items) |*d| d.deinit();
-            docs.deinit(alloc);
+            docs.deinit(allocator);
         }
         try std.testing.expectEqual(@as(usize, 2), docs.items.len);
         try std.testing.expectEqualStrings("scalar1", docs.items[0].root.?.scalarValue().?);
@@ -390,12 +390,12 @@ test "document marker streams" {
 }
 
 test "deep nesting and empty collections" {
-    const alloc = std.testing.allocator;
-    var doc = try parse(alloc, "a:\n  b:\n    c: []\n  d: {}\n");
+    const allocator = std.testing.allocator;
+    var doc = try parse(allocator, "a:\n  b:\n    c: []\n  d: {}\n");
     defer doc.deinit();
-    const out = try doc.write(alloc);
-    defer alloc.free(out);
-    var doc2 = try parse(alloc, out);
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    var doc2 = try parse(allocator, out);
     defer doc2.deinit();
     try std.testing.expect(doc2.pathGet(&.{ "a", "b", "c" }).?.isSequence());
     try std.testing.expect(doc2.pathGet(&.{ "a", "d" }).?.isMapping());

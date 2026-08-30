@@ -59,9 +59,9 @@ pub const Path = struct {
     segments: []const Segment,
 
     /// Segment byte length in the source string, for error reporting.
-    pub fn parse(alloc: std.mem.Allocator, input: []const u8) Error!Path {
+    pub fn parse(allocator: std.mem.Allocator, input: []const u8) Error!Path {
         var segments: std.ArrayList(Segment) = .empty;
-        errdefer segments.deinit(alloc);
+        errdefer segments.deinit(allocator);
 
         var i: usize = 0;
         // Optional root marker.
@@ -77,13 +77,13 @@ pub const Path = struct {
                     const start = i;
                     while (i < input.len and input[i] != '.' and input[i] != '[') i += 1;
                     if (i == start) return error.InvalidPath;
-                    try segments.append(alloc, .{ .descend = input[start..i] });
+                    try segments.append(allocator, .{ .descend = input[start..i] });
                     continue;
                 }
                 const start = i;
                 while (i < input.len and input[i] != '.' and input[i] != '[') i += 1;
                 if (i == start) return error.InvalidPath;
-                try segments.append(alloc, .{ .key = input[start..i] });
+                try segments.append(allocator, .{ .key = input[start..i] });
             } else if (c == '[') {
                 i += 1;
                 if (i >= input.len) return error.InvalidPath;
@@ -91,7 +91,7 @@ pub const Path = struct {
                     i += 1;
                     if (i >= input.len or input[i] != ']') return error.InvalidPath;
                     i += 1;
-                    try segments.append(alloc, .wildcard);
+                    try segments.append(allocator, .wildcard);
                 } else if (input[i] == '?') {
                     // [?key=value]
                     i += 1;
@@ -102,14 +102,14 @@ pub const Path = struct {
                     const value = input[eq + 1 .. close];
                     if (value.len == 0) return error.InvalidPath;
                     i = close + 1;
-                    try segments.append(alloc, .{ .filter = .{ .key = key, .value = value } });
+                    try segments.append(allocator, .{ .filter = .{ .key = key, .value = value } });
                 } else if (std.ascii.isDigit(input[i])) {
                     const start = i;
                     while (i < input.len and std.ascii.isDigit(input[i])) i += 1;
                     if (i >= input.len or input[i] != ']') return error.InvalidPath;
                     const index = std.fmt.parseInt(usize, input[start..i], 10) catch return error.InvalidPath;
                     i += 1;
-                    try segments.append(alloc, .{ .index = index });
+                    try segments.append(allocator, .{ .index = index });
                 } else {
                     return error.InvalidPath;
                 }
@@ -117,64 +117,64 @@ pub const Path = struct {
                 // Bare leading key (`a.b` without `$` or `.`).
                 const start = i;
                 while (i < input.len and input[i] != '.' and input[i] != '[') i += 1;
-                try segments.append(alloc, .{ .key = input[start..i] });
+                try segments.append(allocator, .{ .key = input[start..i] });
             }
         }
-        return .{ .segments = try segments.toOwnedSlice(alloc) };
+        return .{ .segments = try segments.toOwnedSlice(allocator) };
     }
 
-    pub fn deinit(self: *Path, alloc: std.mem.Allocator) void {
-        alloc.free(self.segments);
+    pub fn deinit(self: *Path, allocator: std.mem.Allocator) void {
+        allocator.free(self.segments);
     }
 };
 
 /// Evaluate `path` against `root`. Results are in document order;
 /// aliases are followed (bounded). Caller owns the returned slice.
-pub fn resolve(alloc: std.mem.Allocator, root: *Node, path: Path) Error![]*Node {
+pub fn resolve(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*Node {
     var results: std.ArrayList(*Node) = .empty;
-    errdefer results.deinit(alloc);
+    errdefer results.deinit(allocator);
     var current: std.ArrayList(*Node) = .empty;
-    defer current.deinit(alloc);
-    try current.append(alloc, root);
+    defer current.deinit(allocator);
+    try current.append(allocator, root);
 
     for (path.segments) |seg| {
         var next: std.ArrayList(*Node) = .empty;
-        errdefer next.deinit(alloc);
+        errdefer next.deinit(allocator);
         for (current.items) |node| {
             switch (seg) {
-                .key => |k| if (node.lookup(k)) |child| try next.append(alloc, child),
+                .key => |k| if (node.lookup(k)) |child| try next.append(allocator, child),
                 .index => |ix| {
                     const items = node.items() orelse continue;
-                    if (ix < items.len) try next.append(alloc, items[ix]);
+                    if (ix < items.len) try next.append(allocator, items[ix]);
                 },
                 .wildcard => {
                     if (node.items()) |items| {
-                        for (items) |child| try next.append(alloc, child);
+                        for (items) |child| try next.append(allocator, child);
                     } else if (node.pairs()) |pairs| {
-                        for (pairs) |p| try next.append(alloc, p.value);
+                        for (pairs) |p| try next.append(allocator, p.value);
                     }
                 },
-                .descend => |k| try collectDescend(alloc, node, k, &next),
+                .descend => |k| try collectDescend(allocator, node, k, &next),
                 .filter => |f| {
                     // Sequences: every item whose mapping carries
                     // key == value. Mappings: every value that does.
                     if (node.items()) |items| {
                         for (items) |item| {
-                            if (filterMatches(item, f.key, f.value)) try next.append(alloc, item);
+                            if (filterMatches(item, f.key, f.value)) try next.append(allocator, item);
                         }
                     } else if (node.pairs()) |ps| {
                         for (ps) |p| {
-                            if (filterMatches(p.value, f.key, f.value)) try next.append(alloc, p.value);
+                            if (filterMatches(p.value, f.key, f.value)) try next.append(allocator, p.value);
                         }
                     }
                 },
             }
         }
-        current.deinit(alloc);
+        current.deinit(allocator);
         current = next;
     }
-    try results.appendSlice(alloc, current.items);
-    return results.toOwnedSlice(alloc);
+    try results.appendSlice(allocator, current.items);
+    return results.toOwnedSlice(allocator);
 }
 
 fn filterMatches(candidate: *Node, key: []const u8, value: []const u8) bool {
@@ -190,17 +190,17 @@ fn filterMatches(candidate: *Node, key: []const u8, value: []const u8) bool {
     return false;
 }
 
-fn collectDescend(alloc: std.mem.Allocator, node: *Node, key: []const u8, out: *std.ArrayList(*Node)) Error!void {
+fn collectDescend(allocator: std.mem.Allocator, node: *Node, key: []const u8, out: *std.ArrayList(*Node)) Error!void {
     // Depth-bounded pre-order walk collecting every `key` match.
     const cur = node.resolveAlias();
     if (cur.pairs()) |pairs| {
         for (pairs) |p| {
             const kv = p.key.scalarValue() orelse continue;
-            if (std.mem.eql(u8, kv, key)) try out.append(alloc, p.value);
+            if (std.mem.eql(u8, kv, key)) try out.append(allocator, p.value);
         }
-        for (pairs) |p| try collectDescend(alloc, p.value, key, out);
+        for (pairs) |p| try collectDescend(allocator, p.value, key, out);
     } else if (cur.items()) |items| {
-        for (items) |child| try collectDescend(alloc, child, key, out);
+        for (items) |child| try collectDescend(allocator, child, key, out);
     }
 }
 
@@ -246,21 +246,21 @@ pub const Editor = struct {
 
     /// Resolve exactly one node, or `error.UnknownPath`.
     pub fn one(self: *Editor, path: []const u8) Error!*Node {
-        var p = try Path.parse(self.doc.alloc, path);
-        defer p.deinit(self.doc.alloc);
+        var p = try Path.parse(self.doc.allocator, path);
+        defer p.deinit(self.doc.allocator);
         const root = self.doc.root orelse return error.UnknownPath;
-        const found = try resolve(self.doc.alloc, root, p);
-        defer self.doc.alloc.free(found);
+        const found = try resolve(self.doc.allocator, root, p);
+        defer self.doc.allocator.free(found);
         if (found.len != 1) return error.UnknownPath;
         return found[0];
     }
 
     /// Query convenience: every match for `path`.
     pub fn all(self: *Editor, path: []const u8) Error![]*Node {
-        var p = try Path.parse(self.doc.alloc, path);
-        defer p.deinit(self.doc.alloc);
+        var p = try Path.parse(self.doc.allocator, path);
+        defer p.deinit(self.doc.allocator);
         const root = self.doc.root orelse return error.UnknownPath;
-        return resolve(self.doc.alloc, root, p);
+        return resolve(self.doc.allocator, root, p);
     }
 
     pub fn set(self: *Editor, path: []const u8, value: *Node) Error!void {
@@ -323,21 +323,21 @@ pub const Editor = struct {
     /// through the general resolver and must match exactly once.
     fn setContainer(doc: *Document, parent: []const Segment, may_create: bool) Error!*Node {
         if (may_create and allPlainKeys(parent)) {
-            const keys = try doc.alloc.alloc([]const u8, parent.len);
-            defer doc.alloc.free(keys);
+            const keys = try doc.allocator.alloc([]const u8, parent.len);
+            defer doc.allocator.free(keys);
             for (parent, 0..) |seg, i| keys[i] = seg.key;
             return doc.mappingWalkOrCreate(keys);
         }
         const root = doc.root orelse return error.UnknownPath;
-        const found = try resolve(doc.alloc, root, .{ .segments = parent });
-        defer doc.alloc.free(found);
+        const found = try resolve(doc.allocator, root, .{ .segments = parent });
+        defer doc.allocator.free(found);
         if (found.len != 1) return error.UnknownPath;
         return found[0];
     }
 
     fn applySet(doc: *Document, path: []const u8, value: *Node) Error!void {
-        var p = try Path.parse(doc.alloc, path);
-        defer p.deinit(doc.alloc);
+        var p = try Path.parse(doc.allocator, path);
+        defer p.deinit(doc.allocator);
         if (p.segments.len == 0) {
             if (doc.root) |root| {
                 if (sameScalarPresentation(root, value)) return;
@@ -405,8 +405,8 @@ pub const Editor = struct {
     }
 
     fn applyDelete(doc: *Document, path: []const u8) Error!void {
-        var p = try Path.parse(doc.alloc, path);
-        defer p.deinit(doc.alloc);
+        var p = try Path.parse(doc.allocator, path);
+        defer p.deinit(doc.allocator);
         if (p.segments.len == 0) return error.AmbiguousOperation;
         const root = doc.root orelse return;
         var cur = root;
@@ -524,7 +524,7 @@ fn clearSpans(node: *Node) void {
 /// spans (so a rolled-back-to clone still round-trips untouched parts
 /// byte-identically) and rebuilding alias targets within the clone.
 pub fn cloneTree(doc: *Document, root: *Node) Error!*Node {
-    var anchors = std.StringHashMap(*Node).init(doc.alloc);
+    var anchors = std.StringHashMap(*Node).init(doc.allocator);
     defer anchors.deinit();
     return cloneNode(doc, root, &anchors);
 }
@@ -1006,8 +1006,8 @@ test "allocation failures in a set+append batch leak nothing" {
     try std.testing.checkAllAllocationFailures(testing.allocator, setAppendBatch, .{});
 }
 
-fn setAppendBatch(alloc: std.mem.Allocator) !void {
-    var doc = try Document.parse(alloc, "a: 1\nb:\n  - x\n");
+fn setAppendBatch(allocator: std.mem.Allocator) !void {
+    var doc = try Document.parse(allocator, "a: 1\nb:\n  - x\n");
     defer doc.deinit();
     var ed = Editor.init(&doc);
     const edits = [_]Edit{
@@ -1015,18 +1015,18 @@ fn setAppendBatch(alloc: std.mem.Allocator) !void {
         .{ .append = .{ .sequence = "$.b", .value = try doc.createScalar("y", .plain) } },
     };
     try ed.apply(&edits);
-    const out = try doc.write(alloc);
-    defer alloc.free(out);
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
     try testing.expectEqualStrings("a: 2\nb:\n  - x\n  - y\n", out);
 }
 
-fn deleteBatch(alloc: std.mem.Allocator) !void {
-    var doc = try Document.parse(alloc, "a: 1\nb: 2\n");
+fn deleteBatch(allocator: std.mem.Allocator) !void {
+    var doc = try Document.parse(allocator, "a: 1\nb: 2\n");
     defer doc.deinit();
     var ed = Editor.init(&doc);
     try ed.apply(&.{.{ .delete = "$.b" }});
-    const out = try doc.write(alloc);
-    defer alloc.free(out);
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
     try std.testing.expectEqualStrings("a: 1\n", out);
 }
 

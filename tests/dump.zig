@@ -8,7 +8,7 @@ const std = @import("std");
 const corpus = @import("corpus_common.zig");
 
 pub fn main(init: std.process.Init) !void {
-    const alloc = init.arena.allocator();
+    const allocator = init.arena.allocator();
     const io = init.io;
 
     var it = std.process.Args.Iterator.init(init.minimal.args);
@@ -17,8 +17,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("usage: dump <file>\n", .{});
         return error.Usage;
     };
-    const input = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 << 20));
-    const tree = try corpus.renderTree(alloc, input, false);
+    const input = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 << 20));
+    const tree = try corpus.renderTree(allocator, input, false);
     var stdout = std.Io.File.stdout();
     try stdout.writeStreamingAll(io, tree);
 }

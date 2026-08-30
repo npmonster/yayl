@@ -54,7 +54,7 @@ pub const State = enum {
 
 /// Event parser: folds the scanner's token stream into events.
 pub const Parser = struct {
-    alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     d: ?*Diag,
     scanner: Scanner,
     state: State = .stream_start,
@@ -69,34 +69,34 @@ pub const Parser = struct {
     temp_bytes: std.ArrayList([]u8) = .empty,
     temp_tags: std.ArrayList([]TagDirective) = .empty,
 
-    pub fn init(alloc: std.mem.Allocator, d: ?*Diag, input: []const u8) !Parser {
+    pub fn init(allocator: std.mem.Allocator, d: ?*Diag, input: []const u8) !Parser {
         return .{
-            .alloc = alloc,
+            .allocator = allocator,
             .d = d,
-            .scanner = try Scanner.init(alloc, d, input),
+            .scanner = try Scanner.init(allocator, d, input),
         };
     }
 
     pub fn deinit(self: *Parser) void {
         self.scanner.deinit();
-        self.states.deinit(self.alloc);
-        self.marks.deinit(self.alloc);
-        self.tag_directives.deinit(self.alloc);
-        for (self.temp_bytes.items) |buf| self.alloc.free(buf);
-        self.temp_bytes.deinit(self.alloc);
-        for (self.temp_tags.items) |t| self.alloc.free(t);
-        self.temp_tags.deinit(self.alloc);
+        self.states.deinit(self.allocator);
+        self.marks.deinit(self.allocator);
+        self.tag_directives.deinit(self.allocator);
+        for (self.temp_bytes.items) |buf| self.allocator.free(buf);
+        self.temp_bytes.deinit(self.allocator);
+        for (self.temp_tags.items) |t| self.allocator.free(t);
+        self.temp_tags.deinit(self.allocator);
     }
 
     fn trackBytes(self: *Parser, s: []u8) ![]u8 {
-        errdefer self.alloc.free(s);
-        try self.temp_bytes.append(self.alloc, s);
+        errdefer self.allocator.free(s);
+        try self.temp_bytes.append(self.allocator, s);
         return s;
     }
 
     fn trackTags(self: *Parser, s: []TagDirective) ![]TagDirective {
-        errdefer self.alloc.free(s);
-        try self.temp_tags.append(self.alloc, s);
+        errdefer self.allocator.free(s);
+        try self.temp_tags.append(self.allocator, s);
         return s;
     }
 
@@ -148,7 +148,7 @@ pub const Parser = struct {
     }
 
     fn pushState(self: *Parser, s: State) !void {
-        try self.states.append(self.alloc, s);
+        try self.states.append(self.allocator, s);
     }
 
     fn popState(self: *Parser) State {
@@ -156,7 +156,7 @@ pub const Parser = struct {
     }
 
     fn pushMark(self: *Parser, m: Mark) !void {
-        try self.marks.append(self.alloc, m);
+        try self.marks.append(self.allocator, m);
     }
 
     fn processEmptyScalar(self: *Parser, mark: Mark) Event {
@@ -214,7 +214,7 @@ pub const Parser = struct {
                 .end = tok.end,
                 .data = .{ .document_start = .{
                     .version = self.version_directive,
-                    .tags = try self.trackTags(try self.alloc.dupe(TagDirective, self.tag_directives.items)),
+                    .tags = try self.trackTags(try self.allocator.dupe(TagDirective, self.tag_directives.items)),
                     .implicit = false,
                 } },
             };
@@ -238,7 +238,7 @@ pub const Parser = struct {
                 .end = tok.start,
                 .data = .{ .document_start = .{
                     .version = self.version_directive,
-                    .tags = try self.trackTags(try self.alloc.dupe(TagDirective, self.tag_directives.items)),
+                    .tags = try self.trackTags(try self.allocator.dupe(TagDirective, self.tag_directives.items)),
                     .implicit = true,
                 } },
             };
@@ -281,7 +281,7 @@ pub const Parser = struct {
     fn prepareDirectives(self: *Parser) !void {
         self.tag_directives.clearRetainingCapacity();
         self.version_directive = null;
-        try self.tag_directives.appendSlice(self.alloc, &.{
+        try self.tag_directives.appendSlice(self.allocator, &.{
             .{ .handle = "!", .prefix = "!" },
             .{ .handle = "!!", .prefix = "tag:yaml.org,2002:" },
         });
@@ -325,7 +325,7 @@ pub const Parser = struct {
                         return self.fail(tok.start, "found duplicate %TAG directive", .{});
                     }
                 }
-                try self.tag_directives.append(self.alloc, .{
+                try self.tag_directives.append(self.allocator, .{
                     .handle = d.params[0],
                     .prefix = d.params[1],
                 });
@@ -344,8 +344,8 @@ pub const Parser = struct {
             if (std.mem.eql(u8, td.handle, "!")) have_bang = true;
             if (std.mem.eql(u8, td.handle, "!!")) have_bangbang = true;
         }
-        if (!have_bang) try self.tag_directives.append(self.alloc, .{ .handle = "!", .prefix = "!" });
-        if (!have_bangbang) try self.tag_directives.append(self.alloc, .{ .handle = "!!", .prefix = "tag:yaml.org,2002:" });
+        if (!have_bang) try self.tag_directives.append(self.allocator, .{ .handle = "!", .prefix = "!" });
+        if (!have_bangbang) try self.tag_directives.append(self.allocator, .{ .handle = "!!", .prefix = "tag:yaml.org,2002:" });
     }
 
     fn failWith(self: *Parser, err: YamlError, mark: Mark, comptime fmt: []const u8, args: anytype) YamlError {
@@ -357,13 +357,13 @@ pub const Parser = struct {
     fn resolveTag(self: *Parser, handle: []const u8, suffix: []const u8) ![]const u8 {
         if (handle.len == 0) {
             // Verbatim tag.
-            return self.trackBytes(try self.alloc.dupe(u8, suffix));
+            return self.trackBytes(try self.allocator.dupe(u8, suffix));
         }
         for (self.tag_directives.items) |td| {
             if (std.mem.eql(u8, td.handle, handle)) {
                 var out: std.ArrayList(u8) = .empty;
-                errdefer out.deinit(self.alloc);
-                try out.appendSlice(self.alloc, td.prefix);
+                errdefer out.deinit(self.allocator);
+                try out.appendSlice(self.allocator, td.prefix);
                 // Tag suffixes are RFC 2396: %XX escapes are unescaped
                 // when the tag is resolved.
                 var i: usize = 0;
@@ -374,14 +374,14 @@ pub const Parser = struct {
                     {
                         const hi = ctype.hexValue(suffix[i + 1]).?;
                         const lo = ctype.hexValue(suffix[i + 2]).?;
-                        try out.append(self.alloc, (hi << 4) | lo);
+                        try out.append(self.allocator, (hi << 4) | lo);
                         i += 3;
                     } else {
-                        try out.append(self.alloc, suffix[i]);
+                        try out.append(self.allocator, suffix[i]);
                         i += 1;
                     }
                 }
-                return self.trackBytes(try out.toOwnedSlice(self.alloc));
+                return self.trackBytes(try out.toOwnedSlice(self.allocator));
             }
         }
         return self.fail(self.scanner.mark, "found undefined tag handle '{s}'", .{handle});
@@ -753,12 +753,12 @@ pub const Parser = struct {
 
 const testing = std.testing;
 
-fn eventTypes(alloc: std.mem.Allocator, input: []const u8) !std.ArrayList(EventKind) {
-    var p = try Parser.init(alloc, null, input);
+fn eventTypes(allocator: std.mem.Allocator, input: []const u8) !std.ArrayList(EventKind) {
+    var p = try Parser.init(allocator, null, input);
     defer p.deinit();
     var out: std.ArrayList(EventKind) = .empty;
-    errdefer out.deinit(alloc);
-    while (try p.nextEvent()) |ev| try out.append(alloc, ev.data);
+    errdefer out.deinit(allocator);
+    while (try p.nextEvent()) |ev| try out.append(allocator, ev.data);
     return out;
 }
 
@@ -826,8 +826,8 @@ test "tag resolution" {
 }
 
 test "tag shorthand unescapes RFC 2396 escapes" {
-    const alloc = testing.allocator;
-    var p = try Parser.init(alloc, null, "%TAG !e! tag:example.com,2000:app/\n---\n- !e!tag%21 baz\n");
+    const allocator = testing.allocator;
+    var p = try Parser.init(allocator, null, "%TAG !e! tag:example.com,2000:app/\n---\n- !e!tag%21 baz\n");
     defer p.deinit();
     var found = false;
     while (try p.nextEvent()) |ev| {
@@ -842,8 +842,8 @@ test "tag shorthand unescapes RFC 2396 escapes" {
 test "unknown directives are ignored with a warning" {
     // YAML 1.2.2 6.8: unknown directives are skipped, not an error
     // (corpus 2LFX).
-    const alloc = testing.allocator;
-    var p = try Parser.init(alloc, null, "%FOO bar baz\n---\nfoo\n");
+    const allocator = testing.allocator;
+    var p = try Parser.init(allocator, null, "%FOO bar baz\n---\nfoo\n");
     defer p.deinit();
     var found = false;
     while (try p.nextEvent()) |ev| {
@@ -877,8 +877,8 @@ test "flow sequence empty-key single-pair mapping" {
 }
 
 test "trailing blanks after top-level flow collection parse" {
-    const alloc = testing.allocator;
-    var p = try Parser.init(alloc, null, "[1, 2, 3]  ");
+    const allocator = testing.allocator;
+    var p = try Parser.init(allocator, null, "[1, 2, 3]  ");
     defer p.deinit();
     var scalars: usize = 0;
     while (try p.nextEvent()) |ev| {
@@ -890,8 +890,8 @@ test "trailing blanks after top-level flow collection parse" {
 test "comma after a tag is rejected in block context" {
     // Corpus U99R: '- !!str, xxx' — the tag stops at the comma and the
     // comma itself is not valid block-context content.
-    const alloc = testing.allocator;
-    var p = try Parser.init(alloc, null, "- !!str, xxx\n");
+    const allocator = testing.allocator;
+    var p = try Parser.init(allocator, null, "- !!str, xxx\n");
     defer p.deinit();
     var outcome: ?anyerror = null;
     while (true) {

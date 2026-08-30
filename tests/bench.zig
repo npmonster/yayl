@@ -8,7 +8,7 @@ const std = @import("std");
 const yaml = @import("yayl");
 
 pub fn main(init: std.process.Init) !void {
-    const alloc = init.arena.allocator();
+    const allocator = init.arena.allocator();
     const io = init.io;
     const clock: std.Io.Clock = .awake;
 
@@ -21,34 +21,34 @@ pub fn main(init: std.process.Init) !void {
     const iterations_text = it.next() orelse "20";
     const iterations: usize = @intCast(try std.fmt.parseInt(usize, iterations_text, 10));
 
-    const input = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(64 << 20));
+    const input = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 << 20));
     std.debug.print("input: {s} ({d} bytes, {d} iterations)\n", .{ path, input.len, iterations });
 
     // Warm up.
     {
-        var doc = try yaml.parse(alloc, input);
+        var doc = try yaml.parse(allocator, input);
         defer doc.deinit();
-        const out = try doc.write(alloc);
-        alloc.free(out);
+        const out = try doc.write(allocator);
+        allocator.free(out);
     }
 
     var total_parsed: usize = 0;
     const t0 = std.Io.Timestamp.now(io, clock);
     for (0..iterations) |_| {
-        var doc = try yaml.parse(alloc, input);
+        var doc = try yaml.parse(allocator, input);
         defer doc.deinit();
         total_parsed += input.len;
     }
     const t1 = std.Io.Timestamp.now(io, clock);
     const parse_ns: u64 = @intCast(@min(t1.nanoseconds - t0.nanoseconds, std.math.maxInt(u64)));
 
-    var doc = try yaml.parse(alloc, input);
+    var doc = try yaml.parse(allocator, input);
     defer doc.deinit();
     const t2 = std.Io.Timestamp.now(io, clock);
     const total_written: usize = input.len * iterations;
     for (0..iterations) |_| {
-        const out = try doc.write(alloc);
-        alloc.free(out);
+        const out = try doc.write(allocator);
+        allocator.free(out);
     }
     const t3 = std.Io.Timestamp.now(io, clock);
     const write_ns: u64 = @intCast(@min(t3.nanoseconds - t2.nanoseconds, std.math.maxInt(u64)));
@@ -56,17 +56,17 @@ pub fn main(init: std.process.Init) !void {
     // Round trip (parse+write) and a targeted edit+write.
     const t4 = std.Io.Timestamp.now(io, clock);
     for (0..iterations) |_| {
-        var d = try yaml.parse(alloc, input);
+        var d = try yaml.parse(allocator, input);
         defer d.deinit();
-        const out = try d.write(alloc);
-        alloc.free(out);
+        const out = try d.write(allocator);
+        allocator.free(out);
     }
     const t5 = std.Io.Timestamp.now(io, clock);
     const roundtrip_ns: u64 = @intCast(@min(t5.nanoseconds - t4.nanoseconds, std.math.maxInt(u64)));
 
     const t6 = std.Io.Timestamp.now(io, clock);
     for (0..iterations) |_| {
-        var d = try yaml.parse(alloc, input);
+        var d = try yaml.parse(allocator, input);
         defer d.deinit();
         var ed = yaml.edit.Editor.init(&d);
         if (d.root) |r| {
@@ -74,8 +74,8 @@ pub fn main(init: std.process.Init) !void {
                 try ed.set("$.zzz_bench", try d.createScalar("1", .plain));
             }
         }
-        const out = try d.write(alloc);
-        alloc.free(out);
+        const out = try d.write(allocator);
+        allocator.free(out);
     }
     const t7 = std.Io.Timestamp.now(io, clock);
     const edit_ns: u64 = @intCast(@min(t7.nanoseconds - t6.nanoseconds, std.math.maxInt(u64)));

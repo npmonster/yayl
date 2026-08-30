@@ -48,30 +48,30 @@ fn lineOf(src: []const u8, off: usize) usize {
     return n;
 }
 
-fn splitLines(alloc: std.mem.Allocator, s: []const u8) ![][]const u8 {
+fn splitLines(allocator: std.mem.Allocator, s: []const u8) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
-    errdefer out.deinit(alloc);
+    errdefer out.deinit(allocator);
     var it = std.mem.splitScalar(u8, s, '\n');
-    while (it.next()) |line| try out.append(alloc, line);
+    while (it.next()) |line| try out.append(allocator, line);
     // A trailing newline produces one empty final element; drop it so
     // both sides compare on content lines only.
     if (out.items.len > 0 and out.items[out.items.len - 1].len == 0) _ = out.pop();
-    return try out.toOwnedSlice(alloc);
+    return try out.toOwnedSlice(allocator);
 }
 
 /// `input` with every occurrence of `byte` replaced by `with` — the
 /// CRLF fixture-variant derivation.
-fn replaceByte(alloc: std.mem.Allocator, input: []const u8, byte: u8, with: []const u8) ![]u8 {
+fn replaceByte(allocator: std.mem.Allocator, input: []const u8, byte: u8, with: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
+    errdefer out.deinit(allocator);
     for (input) |c| {
         if (c == byte) {
-            try out.appendSlice(alloc, with);
+            try out.appendSlice(allocator, with);
         } else {
-            try out.append(alloc, c);
+            try out.append(allocator, c);
         }
     }
-    return try out.toOwnedSlice(alloc);
+    return try out.toOwnedSlice(allocator);
 }
 
 /// `out` is `orig` with exactly one contiguous run of lines removed;
@@ -239,30 +239,30 @@ const Found = struct {
     containers: std.ArrayList(Container) = .empty,
     unaddressable: usize = 0,
 
-    fn deinit(self: *Found, alloc: std.mem.Allocator) void {
+    fn deinit(self: *Found, allocator: std.mem.Allocator) void {
         for (self.targets.items) |t| {
-            alloc.free(t.path);
-            alloc.free(t.key_text);
+            allocator.free(t.path);
+            allocator.free(t.key_text);
         }
-        self.targets.deinit(alloc);
-        for (self.containers.items) |c| alloc.free(c.path);
-        self.containers.deinit(alloc);
+        self.targets.deinit(allocator);
+        for (self.containers.items) |c| allocator.free(c.path);
+        self.containers.deinit(allocator);
     }
 };
 
-fn collectReferencedAnchors(alloc: std.mem.Allocator, node: *const yaml.Node, set: *std.StringHashMap(void)) !void {
+fn collectReferencedAnchors(allocator: std.mem.Allocator, node: *const yaml.Node, set: *std.StringHashMap(void)) !void {
     switch (node.data) {
         .alias => |a| {
             // The same anchor may be referenced many times; the set
             // keeps one owned copy.
-            if (!set.contains(a.name)) try set.put(try alloc.dupe(u8, a.name), {});
+            if (!set.contains(a.name)) try set.put(try allocator.dupe(u8, a.name), {});
         },
         .mapping => |m| for (m.pairs.items) |p| {
-            try collectReferencedAnchors(alloc, p.key, set);
-            try collectReferencedAnchors(alloc, p.value, set);
+            try collectReferencedAnchors(allocator, p.key, set);
+            try collectReferencedAnchors(allocator, p.value, set);
         },
         .sequence => |s| for (s.items.items) |item| {
-            try collectReferencedAnchors(alloc, item, set);
+            try collectReferencedAnchors(allocator, item, set);
         },
         .scalar => {},
     }
@@ -316,15 +316,15 @@ fn subtreeDefinesReferencedAnchor(node: *const yaml.Node, referenced: *const std
     };
 }
 
-fn formatPath(alloc: std.mem.Allocator, comps: []const Comp) ![]const u8 {
+fn formatPath(allocator: std.mem.Allocator, comps: []const Comp) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    try buf.append(alloc, '$');
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '$');
     for (comps) |c| switch (c) {
-        .key => |k| try buf.print(alloc, ".{s}", .{k}),
-        .index => |ix| try buf.print(alloc, "[{d}]", .{ix}),
+        .key => |k| try buf.print(allocator, ".{s}", .{k}),
+        .index => |ix| try buf.print(allocator, "[{d}]", .{ix}),
     };
-    return try buf.toOwnedSlice(alloc);
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// Record a container only when the path grammar can actually address
@@ -332,7 +332,7 @@ fn formatPath(alloc: std.mem.Allocator, comps: []const Comp) ![]const u8 {
 /// `pymdownx.highlight`) formats into a path that parses as something
 /// else. Counted, never silently dropped.
 fn addContainer(
-    alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     ed: *yaml.edit.Editor,
     node: *yaml.Node,
     comps: []const Comp,
@@ -342,12 +342,12 @@ fn addContainer(
     if (comps.len > 0) {
         const resolved = ed.one(c.path) catch null;
         if (resolved == null or resolved.? != node) {
-            alloc.free(c.path);
+            allocator.free(c.path);
             found.unaddressable += 1;
             return;
         }
     }
-    try found.containers.append(alloc, c);
+    try found.containers.append(allocator, c);
 }
 
 /// True when a block container's span opens with bytes that are neither
@@ -426,7 +426,7 @@ fn explicitKeyBytes(src: []const u8, from: usize, to: usize) bool {
 }
 
 fn walkTargets(
-    alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     ed: *yaml.edit.Editor,
     input: []const u8,
     referenced: *std.StringHashMap(void),
@@ -467,8 +467,8 @@ fn walkTargets(
     }
     switch (node.data) {
         .mapping => |m| {
-            try addContainer(alloc, ed, node, comps.items, found, .{
-                .path = try formatPath(alloc, comps.items),
+            try addContainer(allocator, ed, node, comps.items, found, .{
+                .path = try formatPath(allocator, comps.items),
                 .is_mapping = true,
                 .is_flow = m.style == .flow,
                 .non_empty = m.pairs.items.len > 0,
@@ -489,24 +489,24 @@ fn walkTargets(
                     found.unaddressable += 1;
                     continue;
                 }
-                try comps.append(alloc, .{ .key = key_text });
+                try comps.append(allocator, .{ .key = key_text });
                 defer _ = comps.pop();
-                const path = try formatPath(alloc, comps.items);
+                const path = try formatPath(allocator, comps.items);
                 const resolved = ed.one(path) catch null;
                 if (resolved == null or resolved.? != pair.value) {
                     // Key text the path grammar cannot address (dots,
                     // leading dots, ambiguity). Subtree counted as
                     // unaddressable; children are still validated.
-                    alloc.free(path);
+                    allocator.free(path);
                     found.unaddressable += 1;
-                    try walkTargets(alloc, ed, input, referenced, pair.value, comps, found, depth + 1, unsafe, unsupported);
+                    try walkTargets(allocator, ed, input, referenced, pair.value, comps, found, depth + 1, unsafe, unsupported);
                     continue;
                 }
                 const line = if (pair.key.src) |s| lineOf(input, s.entry_start) else 0;
                 const end_line = if (pair.src_end) |e| lineOf(input, e) else line;
                 const ks = pair.key.src;
                 const vs = pair.value.src;
-                try found.targets.append(alloc, .{
+                try found.targets.append(allocator, .{
                     .path = path,
                     .line = line,
                     .multi_line = end_line != line,
@@ -522,14 +522,14 @@ fn walkTargets(
                     .in_flow = m.style == .flow,
                     .tab_span = spanHasTab(input, if (ks) |s| s.entry_start else 0, pair.src_end orelse (if (vs) |s| s.end else 0)),
                     .unsupported = unsupported,
-                    .key_text = try alloc.dupe(u8, key_text),
+                    .key_text = try allocator.dupe(u8, key_text),
                 });
-                try walkTargets(alloc, ed, input, referenced, pair.value, comps, found, depth + 1, unsafe, unsupported);
+                try walkTargets(allocator, ed, input, referenced, pair.value, comps, found, depth + 1, unsafe, unsupported);
             }
         },
         .sequence => |s| {
-            try addContainer(alloc, ed, node, comps.items, found, .{
-                .path = try formatPath(alloc, comps.items),
+            try addContainer(allocator, ed, node, comps.items, found, .{
+                .path = try formatPath(allocator, comps.items),
                 .is_mapping = false,
                 .is_flow = s.style == .flow,
                 .non_empty = s.items.items.len > 0,
@@ -538,19 +538,19 @@ fn walkTargets(
                 .unsupported = unsupported,
             });
             for (s.items.items, 0..) |item, i| {
-                try comps.append(alloc, .{ .index = i });
+                try comps.append(allocator, .{ .index = i });
                 defer _ = comps.pop();
-                const path = try formatPath(alloc, comps.items);
+                const path = try formatPath(allocator, comps.items);
                 const resolved = ed.one(path) catch null;
                 if (resolved == null or resolved.? != item) {
-                    alloc.free(path);
+                    allocator.free(path);
                     found.unaddressable += 1;
-                    try walkTargets(alloc, ed, input, referenced, item, comps, found, depth + 1, unsafe, unsupported);
+                    try walkTargets(allocator, ed, input, referenced, item, comps, found, depth + 1, unsafe, unsupported);
                     continue;
                 }
                 const line = if (item.src) |sp| lineOf(input, sp.entry_start) else 0;
                 const end_line = if (item.src) |sp| lineOf(input, sp.end) else line;
-                try found.targets.append(alloc, .{
+                try found.targets.append(allocator, .{
                     .path = path,
                     .line = line,
                     .multi_line = end_line != line,
@@ -566,7 +566,7 @@ fn walkTargets(
                     .unsupported = unsupported or item.anchor != null or item.tag != null,
                     .key_text = "",
                 });
-                try walkTargets(alloc, ed, input, referenced, item, comps, found, depth + 1, unsafe, unsupported);
+                try walkTargets(allocator, ed, input, referenced, item, comps, found, depth + 1, unsafe, unsupported);
             }
         },
         .scalar, .alias => {},
@@ -578,13 +578,13 @@ fn walkTargets(
 // ----------------------------------------------------------------------
 
 const Failures = struct {
-    alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     list: std.ArrayList([]const u8) = .empty,
 
     fn add(self: *Failures, comptime fmt: []const u8, args: anytype) void {
-        const msg = std.fmt.allocPrint(self.alloc, fmt, args) catch return;
-        self.list.append(self.alloc, msg) catch {
-            self.alloc.free(msg);
+        const msg = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
+        self.list.append(self.allocator, msg) catch {
+            self.allocator.free(msg);
             return;
         };
     }
@@ -644,9 +644,9 @@ const SweepLimits = struct {
 /// cannot consume the other's per-document allowance. Positions beyond
 /// a budget are counted into `capped`, never silently dropped.
 /// Mapping entries come first, sequence items after.
-fn selectTargets(alloc: std.mem.Allocator, all: []const Target, limits: SweepLimits, capped: *usize) ![]Target {
+fn selectTargets(allocator: std.mem.Allocator, all: []const Target, limits: SweepLimits, capped: *usize) ![]Target {
     var out: std.ArrayList(Target) = .empty;
-    errdefer out.deinit(alloc);
+    errdefer out.deinit(allocator);
     const kinds = [_]struct { want_item: bool, budget: usize }{
         .{ .want_item = false, .budget = @min(limits.max_targets, limits.max_mappings) },
         .{ .want_item = true, .budget = @min(limits.max_targets, limits.max_sequences) },
@@ -660,10 +660,10 @@ fn selectTargets(alloc: std.mem.Allocator, all: []const Target, limits: SweepLim
                 continue;
             }
             budget -= 1;
-            try out.append(alloc, t);
+            try out.append(allocator, t);
         }
     }
-    return try out.toOwnedSlice(alloc);
+    return try out.toOwnedSlice(allocator);
 }
 
 /// The parent sequence path of a sequence item path: item paths end
@@ -703,7 +703,7 @@ fn pureInsertionReframed(orig: [][]const u8, out: [][]const u8) ?usize {
 /// alone cannot see "valid YAML that lost data" (a sequence silently
 /// replaced by an empty mapping still parses); this can.
 fn assertsSemanticRoundTrip(
-    alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     name: []const u8,
     comptime what: []const u8,
     path: []const u8,
@@ -711,15 +711,15 @@ fn assertsSemanticRoundTrip(
     out: []const u8,
     failures: *Failures,
 ) void {
-    var re = yaml.parse(alloc, out) catch {
+    var re = yaml.parse(allocator, out) catch {
         failures.add("{s}: " ++ what ++ " {s}: emitted output is not valid YAML", .{ name, path });
         return;
     };
     defer re.deinit();
-    const v_edited = yaml.value.nodeToValue(alloc, edited.root orelse return) catch return;
-    defer yaml.value.freeValue(alloc, v_edited);
-    const v_out = yaml.value.nodeToValue(alloc, re.root orelse return) catch return;
-    defer yaml.value.freeValue(alloc, v_out);
+    const v_edited = yaml.value.nodeToValue(allocator, edited.root orelse return) catch return;
+    defer yaml.value.freeValue(allocator, v_edited);
+    const v_out = yaml.value.nodeToValue(allocator, re.root orelse return) catch return;
+    defer yaml.value.freeValue(allocator, v_out);
     if (!valueEql(v_edited, v_out)) {
         failures.add("{s}: " ++ what ++ " {s}: re-parsed output does not match the edited document", .{ name, path });
     }
@@ -778,16 +778,16 @@ fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats)
 // The sweeps over one fixture
 // ----------------------------------------------------------------------
 
-fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u8, failures: *Failures, stats: *Stats, limits: SweepLimits) !void {
+fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []const u8, failures: *Failures, stats: *Stats, limits: SweepLimits) !void {
     // A multi-document stream: `parse` covers only the FIRST document,
     // so sweep exactly its region — the byte-level assertions must
     // compare like with like. Single documents are swept whole.
     var input = raw_input;
     {
-        var docs = try yaml.parseAll(alloc, raw_input);
+        var docs = try yaml.parseAll(allocator, raw_input);
         defer {
             for (docs.items) |*d| d.deinit();
-            docs.deinit(alloc);
+            docs.deinit(allocator);
         }
         if (docs.items.len == 0) {
             stats.skipped_no_root += 1;
@@ -798,9 +798,9 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
     // Discovery on a pristine parse. The generation document is freed
     // before sweeping; targets own their strings.
     var found: Found = .{};
-    defer found.deinit(alloc);
+    defer found.deinit(allocator);
     {
-        var gen = try yaml.parse(alloc, input);
+        var gen = try yaml.parse(allocator, input);
         defer gen.deinit();
         const root = gen.root orelse {
             stats.skipped_no_root += 1;
@@ -810,8 +810,8 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
         // roundtrip gate's four skips): their plain parse -> write
         // already normalizes bytes, so byte-level assertions cannot
         // apply to them. Counted, never silent.
-        const plain = try gen.write(alloc);
-        defer alloc.free(plain);
+        const plain = try gen.write(allocator);
+        defer allocator.free(plain);
         if (!std.mem.eql(u8, plain, input)) {
             stats.skipped_roundtrip_unstable += 1;
             return;
@@ -825,26 +825,26 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
             return;
         }
         stats.documents += 1;
-        var referenced: std.StringHashMap(void) = .init(alloc);
+        var referenced: std.StringHashMap(void) = .init(allocator);
         defer {
             var kit = referenced.keyIterator();
-            while (kit.next()) |k| alloc.free(k.*);
+            while (kit.next()) |k| allocator.free(k.*);
             referenced.deinit();
         }
-        try collectReferencedAnchors(alloc, root, &referenced);
+        try collectReferencedAnchors(allocator, root, &referenced);
         var ed = yaml.edit.Editor.init(&gen);
         var comps: std.ArrayList(Comp) = .empty;
-        defer comps.deinit(alloc);
-        try walkTargets(alloc, &ed, input, &referenced, root, &comps, &found, 0, false, false);
+        defer comps.deinit(allocator);
+        try walkTargets(allocator, &ed, input, &referenced, root, &comps, &found, 0, false, false);
     }
     stats.unaddressable += found.unaddressable;
     var capped_targets: usize = 0;
-    const targets = try selectTargets(alloc, found.targets.items, limits, &capped_targets);
-    defer alloc.free(targets);
+    const targets = try selectTargets(allocator, found.targets.items, limits, &capped_targets);
+    defer allocator.free(targets);
     stats.capped_targets += capped_targets;
 
-    const orig_lines = try splitLines(alloc, input);
-    defer alloc.free(orig_lines);
+    const orig_lines = try splitLines(allocator, input);
+    defer allocator.free(orig_lines);
     // An input without a final newline: an edit that touches the last
     // line legitimately terminates it, so line-shape assertions do not
     // apply and the weak ones run instead.
@@ -894,36 +894,36 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
             // not re-parse.)
             stats.skipped_sole_child += @intFromBool(t.sole_child);
             stats.skipped_no_final_newline += @intFromBool(no_final);
-            var doc = try yaml.parse(alloc, input);
+            var doc = try yaml.parse(allocator, input);
             defer doc.deinit();
             var ed = yaml.edit.Editor.init(&doc);
             ed.apply(&.{.{ .delete = t.path }}) catch |err| {
                 failures.add("{s}: delete {s} failed: {s}", .{ name, t.path, @errorName(err) });
                 continue;
             };
-            const out = try doc.write(alloc);
-            defer alloc.free(out);
-            assertsReparse(alloc, name, t.path, out, failures);
+            const out = try doc.write(allocator);
+            defer allocator.free(out);
+            assertsReparse(allocator, name, t.path, out, failures);
             // Semantic: output value tree == input minus the entry. A
             // re-parse cannot see "valid YAML that lost an item" (e.g.
             // a sequence silently replaced by an empty mapping).
             {
-                var vin_d = yaml.parse(alloc, input) catch continue;
+                var vin_d = yaml.parse(allocator, input) catch continue;
                 defer vin_d.deinit();
-                var vout_d = yaml.parse(alloc, out) catch continue;
+                var vout_d = yaml.parse(allocator, out) catch continue;
                 defer vout_d.deinit();
-                const vin = yaml.value.nodeToValue(alloc, vin_d.root.?) catch continue;
-                defer yaml.value.freeValue(alloc, vin);
-                const vout = yaml.value.nodeToValue(alloc, vout_d.root.?) catch continue;
-                defer yaml.value.freeValue(alloc, vout);
-                var p = yaml.edit.Path.parse(alloc, t.path) catch continue;
-                defer p.deinit(alloc);
+                const vin = yaml.value.nodeToValue(allocator, vin_d.root.?) catch continue;
+                defer yaml.value.freeValue(allocator, vin);
+                const vout = yaml.value.nodeToValue(allocator, vout_d.root.?) catch continue;
+                defer yaml.value.freeValue(allocator, vout);
+                var p = yaml.edit.Path.parse(allocator, t.path) catch continue;
+                defer p.deinit(allocator);
                 if (!valueMinusEql(vin, vout, p.segments)) {
                     failures.add("{s}: delete {s}: output value tree is not the input minus the entry", .{ name, t.path });
                 }
             }
             if (t.key_text.len > 0) {
-                var re = yaml.parse(alloc, out) catch continue;
+                var re = yaml.parse(allocator, out) catch continue;
                 defer re.deinit();
                 var re_ed = yaml.edit.Editor.init(&re);
                 if (re_ed.one(t.path)) |_| {
@@ -933,21 +933,21 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
             continue;
         }
         stats.deletes += 1;
-        var doc = try yaml.parse(alloc, input);
+        var doc = try yaml.parse(allocator, input);
         defer doc.deinit();
         var ed = yaml.edit.Editor.init(&doc);
         ed.apply(&.{.{ .delete = t.path }}) catch |err| {
             failures.add("{s}: delete {s} failed: {s}", .{ name, t.path, @errorName(err) });
             continue;
         };
-        const out = try doc.write(alloc);
-        defer alloc.free(out);
-        const out_lines = try splitLines(alloc, out);
-        defer alloc.free(out_lines);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        const out_lines = try splitLines(allocator, out);
+        defer allocator.free(out_lines);
         // Whatever the shape, the result must still be YAML and must no
         // longer resolve the deleted path.
         {
-            var re = yaml.parse(alloc, out) catch {
+            var re = yaml.parse(allocator, out) catch {
                 failures.add("{s}: delete {s}: output does not re-parse", .{ name, t.path });
                 continue;
             };
@@ -1044,34 +1044,34 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
             // tree.
             stats.skipped_multiline += @intFromBool(t.multi_line);
             stats.skipped_no_final_newline += @intFromBool(no_final);
-            var doc = try yaml.parse(alloc, input);
+            var doc = try yaml.parse(allocator, input);
             defer doc.deinit();
             var ed = yaml.edit.Editor.init(&doc);
             ed.apply(&.{.{ .set = .{ .path = t.path, .value = try doc.createScalar(sentinel, .plain) } }}) catch |err| {
                 failures.add("{s}: set {s} failed: {s}", .{ name, t.path, @errorName(err) });
                 continue;
             };
-            const out = try doc.write(alloc);
-            defer alloc.free(out);
-            assertsReparse(alloc, name, t.path, out, failures);
+            const out = try doc.write(allocator);
+            defer allocator.free(out);
+            assertsReparse(allocator, name, t.path, out, failures);
             // Semantic: output value tree == input with exactly the
             // target set to the sentinel — nothing lost, nothing added.
             {
-                var vin_d = yaml.parse(alloc, input) catch continue;
+                var vin_d = yaml.parse(allocator, input) catch continue;
                 defer vin_d.deinit();
-                var vout_d = yaml.parse(alloc, out) catch continue;
+                var vout_d = yaml.parse(allocator, out) catch continue;
                 defer vout_d.deinit();
-                const vin = yaml.value.nodeToValue(alloc, vin_d.root.?) catch continue;
-                defer yaml.value.freeValue(alloc, vin);
-                const vout = yaml.value.nodeToValue(alloc, vout_d.root.?) catch continue;
-                defer yaml.value.freeValue(alloc, vout);
-                var p = yaml.edit.Path.parse(alloc, t.path) catch continue;
-                defer p.deinit(alloc);
+                const vin = yaml.value.nodeToValue(allocator, vin_d.root.?) catch continue;
+                defer yaml.value.freeValue(allocator, vin);
+                const vout = yaml.value.nodeToValue(allocator, vout_d.root.?) catch continue;
+                defer yaml.value.freeValue(allocator, vout);
+                var p = yaml.edit.Path.parse(allocator, t.path) catch continue;
+                defer p.deinit(allocator);
                 if (!valueSetEql(vin, vout, p.segments, sentinel)) {
                     failures.add("{s}: set {s}: output value tree is not the input with the target set", .{ name, t.path });
                 }
             }
-            var re = yaml.parse(alloc, out) catch continue;
+            var re = yaml.parse(allocator, out) catch continue;
             defer re.deinit();
             var re_ed = yaml.edit.Editor.init(&re);
             if (re_ed.one(t.path)) |got| {
@@ -1089,17 +1089,17 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
             continue;
         }
         stats.sets += 1;
-        var doc = try yaml.parse(alloc, input);
+        var doc = try yaml.parse(allocator, input);
         defer doc.deinit();
         var ed = yaml.edit.Editor.init(&doc);
         ed.apply(&.{.{ .set = .{ .path = t.path, .value = try doc.createScalar(sentinel, .plain) } }}) catch |err| {
             failures.add("{s}: set {s} failed: {s}", .{ name, t.path, @errorName(err) });
             continue;
         };
-        const out = try doc.write(alloc);
-        defer alloc.free(out);
-        const out_lines = try splitLines(alloc, out);
-        defer alloc.free(out_lines);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        const out_lines = try splitLines(allocator, out);
+        defer allocator.free(out_lines);
         const idx = oneLineChanged(orig_lines, out_lines) orelse {
             failures.add("{s}: set {s}: more than one line changed", .{ name, t.path });
             continue;
@@ -1112,7 +1112,7 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
             failures.add("{s}: set {s}: changed line does not carry the sentinel", .{ name, t.path });
             continue;
         }
-        var doc2 = yaml.parse(alloc, out) catch {
+        var doc2 = yaml.parse(allocator, out) catch {
             failures.add("{s}: set {s}: output does not re-parse", .{ name, t.path });
             continue;
         };
@@ -1139,7 +1139,7 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
             stats.skipped_alias += 1;
             continue;
         }
-        var doc = try yaml.parse(alloc, input);
+        var doc = try yaml.parse(allocator, input);
         defer doc.deinit();
         var ed = yaml.edit.Editor.init(&doc);
         const existing = ed.one(t.path) catch continue;
@@ -1155,8 +1155,8 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
             failures.add("{s}: same-value set {s} failed: {s}", .{ name, t.path, @errorName(err) });
             continue;
         };
-        const out = try doc.write(alloc);
-        defer alloc.free(out);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
         if (!std.mem.eql(u8, input, out)) {
             failures.add("{s}: same-value set {s} was not byte-identical", .{ name, t.path });
         }
@@ -1197,19 +1197,19 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
             }
             map_budget -= 1;
             stats.map_adds += 1;
-            var doc = try yaml.parse(alloc, input);
+            var doc = try yaml.parse(allocator, input);
             defer doc.deinit();
             var ed = yaml.edit.Editor.init(&doc);
-            const new_path = try std.fmt.allocPrint(alloc, "{s}.zz_added", .{c.path});
-            defer alloc.free(new_path);
+            const new_path = try std.fmt.allocPrint(allocator, "{s}.zz_added", .{c.path});
+            defer allocator.free(new_path);
             ed.apply(&.{.{ .set = .{ .path = new_path, .value = try doc.createScalar("added", .plain) } }}) catch |err| {
                 failures.add("{s}: map add under {s} failed: {s}", .{ name, c.path, @errorName(err) });
                 continue;
             };
-            const out = try doc.write(alloc);
-            defer alloc.free(out);
-            const out_lines = try splitLines(alloc, out);
-            defer alloc.free(out_lines);
+            const out = try doc.write(allocator);
+            defer allocator.free(out);
+            const out_lines = try splitLines(allocator, out);
+            defer allocator.free(out_lines);
             const at = pureInsertion(orig_lines, out_lines) orelse {
                 failures.add("{s}: map add under {s}: not a pure line insertion", .{ name, c.path });
                 continue;
@@ -1219,7 +1219,7 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
                 if (std.mem.indexOf(u8, line, "zz_added") != null) hit = true;
             }
             if (!hit) failures.add("{s}: map add under {s}: inserted lines do not carry the new key", .{ name, c.path });
-            assertsSemanticRoundTrip(alloc, name, "map add under", c.path, &doc, out, failures);
+            assertsSemanticRoundTrip(allocator, name, "map add under", c.path, &doc, out, failures);
         } else {
             if (seq_budget == 0) {
                 stats.capped_containers += 1;
@@ -1227,21 +1227,21 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
             }
             seq_budget -= 1;
             stats.seq_appends += 1;
-            var doc = try yaml.parse(alloc, input);
+            var doc = try yaml.parse(allocator, input);
             defer doc.deinit();
             var ed = yaml.edit.Editor.init(&doc);
             ed.apply(&.{.{ .append = .{ .sequence = c.path, .value = try doc.createScalar("added", .plain) } }}) catch |err| {
                 failures.add("{s}: seq append to {s} failed: {s}", .{ name, c.path, @errorName(err) });
                 continue;
             };
-            const out = try doc.write(alloc);
-            defer alloc.free(out);
-            const out_lines = try splitLines(alloc, out);
-            defer alloc.free(out_lines);
+            const out = try doc.write(allocator);
+            defer allocator.free(out);
+            const out_lines = try splitLines(allocator, out);
+            defer allocator.free(out_lines);
             if (pureInsertion(orig_lines, out_lines) == null) {
                 failures.add("{s}: seq append to {s}: not a pure line insertion", .{ name, c.path });
             }
-            assertsSemanticRoundTrip(alloc, name, "seq append to", c.path, &doc, out, failures);
+            assertsSemanticRoundTrip(allocator, name, "seq append to", c.path, &doc, out, failures);
         }
     }
 
@@ -1289,7 +1289,7 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
             continue;
         }
         stats.inserts += 1;
-        var doc = try yaml.parse(alloc, input);
+        var doc = try yaml.parse(allocator, input);
         defer doc.deinit();
         var ed = yaml.edit.Editor.init(&doc);
         ed.apply(&.{.{ .insert = .{
@@ -1301,10 +1301,10 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
             failures.add("{s}: insert before {s} failed: {s}", .{ name, t.path, @errorName(err) });
             continue;
         };
-        const out = try doc.write(alloc);
-        defer alloc.free(out);
-        const out_lines = try splitLines(alloc, out);
-        defer alloc.free(out_lines);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        const out_lines = try splitLines(allocator, out);
+        defer allocator.free(out_lines);
         const at = pureInsertionReframed(orig_lines, out_lines) orelse {
             failures.add("{s}: insert before {s}: not a pure line insertion", .{ name, t.path });
             continue;
@@ -1313,8 +1313,8 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
             failures.add("{s}: insert before {s}: the inserted lines do not carry the new item", .{ name, t.path });
             continue;
         }
-        assertsSemanticRoundTrip(alloc, name, "insert before", t.path, &doc, out, failures);
-        var re = yaml.parse(alloc, out) catch continue;
+        assertsSemanticRoundTrip(allocator, name, "insert before", t.path, &doc, out, failures);
+        var re = yaml.parse(allocator, out) catch continue;
         defer re.deinit();
         var re_ed = yaml.edit.Editor.init(&re);
         const inserted = re_ed.one(t.path) catch {
@@ -1382,43 +1382,43 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
                 // document itself is the semantic oracle: comparing the
                 // re-parsed output with it proves the exact move without
                 // assuming aliases leave the document's leaf count fixed.
-                var doc = try yaml.parse(alloc, input);
+                var doc = try yaml.parse(allocator, input);
                 defer doc.deinit();
                 var ed = yaml.edit.Editor.init(&doc);
                 const src_node = ed.one(t.path) catch continue;
-                const v_src = yaml.value.nodeToValue(alloc, src_node) catch continue;
-                defer yaml.value.freeValue(alloc, v_src);
+                const v_src = yaml.value.nodeToValue(allocator, src_node) catch continue;
+                defer yaml.value.freeValue(allocator, v_src);
                 ed.apply(&.{.{ .move = .{ .from = t.path, .to = c.path, .key = "zz_moved" } }}) catch |err| {
                     failures.add("{s}: move {s} -> {s} failed: {s}", .{ name, t.path, c.path, @errorName(err) });
                     continue;
                 };
-                const v_expected = yaml.value.nodeToValue(alloc, doc.root.?) catch continue;
-                defer yaml.value.freeValue(alloc, v_expected);
-                const out = try doc.write(alloc);
-                defer alloc.free(out);
+                const v_expected = yaml.value.nodeToValue(allocator, doc.root.?) catch continue;
+                defer yaml.value.freeValue(allocator, v_expected);
+                const out = try doc.write(allocator);
+                defer allocator.free(out);
 
-                var after = yaml.parse(alloc, out) catch {
+                var after = yaml.parse(allocator, out) catch {
                     failures.add("{s}: move {s} -> {s}: emitted output is not valid YAML", .{ name, t.path, c.path });
                     continue;
                 };
                 defer after.deinit();
-                const v_after = yaml.value.nodeToValue(alloc, after.root.?) catch continue;
-                defer yaml.value.freeValue(alloc, v_after);
+                const v_after = yaml.value.nodeToValue(allocator, after.root.?) catch continue;
+                defer yaml.value.freeValue(allocator, v_after);
                 if (!valueEql(v_expected, v_after)) {
                     failures.add("{s}: move {s} -> {s}: output value tree differs from the edited document", .{ name, t.path, c.path });
                 }
 
                 var ed_after = yaml.edit.Editor.init(&after);
-                const adjusted_dest = try moveDestinationAfterDetach(alloc, t.path, c.path);
-                defer alloc.free(adjusted_dest);
-                const dest_path = try std.fmt.allocPrint(alloc, "{s}.zz_moved", .{adjusted_dest});
-                defer alloc.free(dest_path);
+                const adjusted_dest = try moveDestinationAfterDetach(allocator, t.path, c.path);
+                defer allocator.free(adjusted_dest);
+                const dest_path = try std.fmt.allocPrint(allocator, "{s}.zz_moved", .{adjusted_dest});
+                defer allocator.free(dest_path);
                 const moved = ed_after.one(dest_path) catch {
                     failures.add("{s}: move {s} -> {s}: the moved node is not at its destination", .{ name, t.path, c.path });
                     continue;
                 };
-                const v_moved = yaml.value.nodeToValue(alloc, moved) catch continue;
-                defer yaml.value.freeValue(alloc, v_moved);
+                const v_moved = yaml.value.nodeToValue(allocator, moved) catch continue;
+                defer yaml.value.freeValue(allocator, v_moved);
                 if (!valueEql(v_src, v_moved)) {
                     failures.add("{s}: move {s} -> {s}: the subtree's value changed in transit", .{ name, t.path, c.path });
                 }
@@ -1437,7 +1437,7 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
     // byte-identical.
     {
         stats.rollbacks += 1;
-        var doc = try yaml.parse(alloc, input);
+        var doc = try yaml.parse(allocator, input);
         defer doc.deinit();
         var ed = yaml.edit.Editor.init(&doc);
         const batch = [_]yaml.edit.Edit{
@@ -1447,8 +1447,8 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
         if (ed.apply(&batch)) |_| {
             failures.add("{s}: an invalid batch unexpectedly succeeded", .{name});
         } else |_| {}
-        const out = try doc.write(alloc);
-        defer alloc.free(out);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
         if (!std.mem.eql(u8, out, input)) {
             failures.add("{s}: failed batch did not roll back byte-identically", .{name});
         }
@@ -1457,8 +1457,8 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u
 
 /// Weak invariant for every edit, regardless of documented
 /// normalizations: the emitter must not emit invalid YAML.
-fn assertsReparse(alloc: std.mem.Allocator, name: []const u8, what: []const u8, out: []const u8, failures: *Failures) void {
-    var re = yaml.parse(alloc, out) catch {
+fn assertsReparse(allocator: std.mem.Allocator, name: []const u8, what: []const u8, out: []const u8, failures: *Failures) void {
+    var re = yaml.parse(allocator, out) catch {
         failures.add("{s}: {s}: emitted output is not valid YAML", .{ name, what });
         return;
     };
@@ -1524,18 +1524,18 @@ fn pathRelated(outer: []const u8, inner: []const u8) bool {
 /// inserted key after re-parsing; the editor resolved the destination
 /// pointer before detaching, so the operation itself already hit the
 /// intended container.
-fn moveDestinationAfterDetach(alloc: std.mem.Allocator, from: []const u8, to: []const u8) ![]const u8 {
-    const source_open = std.mem.lastIndexOfScalar(u8, from, '[') orelse return alloc.dupe(u8, to);
-    if (from.len == 0 or from[from.len - 1] != ']') return alloc.dupe(u8, to);
-    const source_index = std.fmt.parseInt(usize, from[source_open + 1 .. from.len - 1], 10) catch return alloc.dupe(u8, to);
+fn moveDestinationAfterDetach(allocator: std.mem.Allocator, from: []const u8, to: []const u8) ![]const u8 {
+    const source_open = std.mem.lastIndexOfScalar(u8, from, '[') orelse return allocator.dupe(u8, to);
+    if (from.len == 0 or from[from.len - 1] != ']') return allocator.dupe(u8, to);
+    const source_index = std.fmt.parseInt(usize, from[source_open + 1 .. from.len - 1], 10) catch return allocator.dupe(u8, to);
     const parent = from[0..source_open];
-    if (!std.mem.startsWith(u8, to, parent)) return alloc.dupe(u8, to);
+    if (!std.mem.startsWith(u8, to, parent)) return allocator.dupe(u8, to);
     const rest = to[parent.len..];
-    if (rest.len < 3 or rest[0] != '[') return alloc.dupe(u8, to);
-    const dest_close = std.mem.indexOfScalar(u8, rest, ']') orelse return alloc.dupe(u8, to);
-    const dest_index = std.fmt.parseInt(usize, rest[1..dest_close], 10) catch return alloc.dupe(u8, to);
-    if (dest_index <= source_index) return alloc.dupe(u8, to);
-    return std.fmt.allocPrint(alloc, "{s}[{d}]{s}", .{ parent, dest_index - 1, rest[dest_close + 1 ..] });
+    if (rest.len < 3 or rest[0] != '[') return allocator.dupe(u8, to);
+    const dest_close = std.mem.indexOfScalar(u8, rest, ']') orelse return allocator.dupe(u8, to);
+    const dest_index = std.fmt.parseInt(usize, rest[1..dest_close], 10) catch return allocator.dupe(u8, to);
+    if (dest_index <= source_index) return allocator.dupe(u8, to);
+    return std.fmt.allocPrint(allocator, "{s}[{d}]{s}", .{ parent, dest_index - 1, rest[dest_close + 1 ..] });
 }
 
 fn valueIsEmptySlot(v: yaml.value.Value) bool {
@@ -1654,42 +1654,42 @@ test "preservation: emptying a container and moving a nested first child emit va
     // get the allocating call site in the report.
     var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer std.debug.assert(da.deinit() == .ok);
-    const alloc = da.allocator();
+    const allocator = da.allocator();
     // The sole-child delete repro: the emptied container normalizes,
     // but the `{}` must stay the VALUE of its key.
     {
-        var doc = try yaml.parse(alloc, "src:\n  item: 1\ndest: 2\n");
+        var doc = try yaml.parse(allocator, "src:\n  item: 1\ndest: 2\n");
         defer doc.deinit();
         var ed = yaml.edit.Editor.init(&doc);
         try ed.apply(&.{.{ .delete = "$.src.item" }});
-        const out = try doc.write(alloc);
-        defer alloc.free(out);
-        var re = try yaml.parse(alloc, out); // must re-parse
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        var re = try yaml.parse(allocator, out); // must re-parse
         defer re.deinit();
         try std.testing.expectEqualStrings("2", re.pathGet(&.{"dest"}).?.scalarValue().?);
     }
     // Sole child of a sequence.
     {
-        var doc = try yaml.parse(alloc, "top:\n  - only\ndest: 2\n");
+        var doc = try yaml.parse(allocator, "top:\n  - only\ndest: 2\n");
         defer doc.deinit();
         var ed = yaml.edit.Editor.init(&doc);
         try ed.apply(&.{.{ .delete = "$.top[0]" }});
-        const out = try doc.write(alloc);
-        defer alloc.free(out);
-        var re = try yaml.parse(alloc, out);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        var re = try yaml.parse(allocator, out);
         defer re.deinit();
         try std.testing.expectEqualStrings("2", re.pathGet(&.{"dest"}).?.scalarValue().?);
     }
     // Moving a nested container's first child away must not disturb
     // the surviving sibling's indentation.
     {
-        var doc = try yaml.parse(alloc, "src:\n  item:\n    a: 1\n    b: 2\n  keep: k\ndst: {}\n");
+        var doc = try yaml.parse(allocator, "src:\n  item:\n    a: 1\n    b: 2\n  keep: k\ndst: {}\n");
         defer doc.deinit();
         var ed = yaml.edit.Editor.init(&doc);
         try ed.apply(&.{.{ .move = .{ .from = "$.src.item", .to = "$.dst", .key = "moved" } }});
-        const out = try doc.write(alloc);
-        defer alloc.free(out);
-        var re = try yaml.parse(alloc, out);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        var re = try yaml.parse(allocator, out);
         defer re.deinit();
         try std.testing.expectEqualStrings("1", re.pathGet(&.{ "dst", "moved", "a" }).?.scalarValue().?);
         try std.testing.expectEqualStrings("k", re.pathGet(&.{ "src", "keep" }).?.scalarValue().?);
@@ -1711,15 +1711,15 @@ test "preservation sweep: every edit position in every single-document fixture" 
     // get the allocating call site in the report.
     var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer std.debug.assert(da.deinit() == .ok);
-    const alloc = da.allocator();
-    var threaded: std.Io.Threaded = .init(alloc, .{});
+    const allocator = da.allocator();
+    var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
     var names: std.ArrayList([]const u8) = .empty;
     defer {
-        for (names.items) |n| alloc.free(n);
-        names.deinit(alloc);
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
     }
     {
         var dir = try std.Io.Dir.cwd().openDir(io, fixtures_dir, .{ .iterate = true });
@@ -1729,7 +1729,7 @@ test "preservation sweep: every edit position in every single-document fixture" 
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, ".yaml") and !std.mem.endsWith(u8, entry.name, ".yml")) continue;
             if (std.mem.eql(u8, entry.name, multidoc_fixture)) continue; // own test below
-            try names.append(alloc, try alloc.dupe(u8, entry.name));
+            try names.append(allocator, try allocator.dupe(u8, entry.name));
         }
     }
     std.mem.sort([]const u8, names.items, {}, struct {
@@ -1739,19 +1739,19 @@ test "preservation sweep: every edit position in every single-document fixture" 
     }.lessThan);
     if (names.items.len < 10) return error.TestUnexpectedResult; // fixtures missing
 
-    var failures: Failures = .{ .alloc = alloc };
+    var failures: Failures = .{ .allocator = allocator };
     defer {
-        for (failures.list.items) |f| alloc.free(f);
-        failures.list.deinit(alloc);
+        for (failures.list.items) |f| allocator.free(f);
+        failures.list.deinit(allocator);
     }
     var stats: Stats = .{};
 
     var dir = try std.Io.Dir.cwd().openDir(io, fixtures_dir, .{});
     defer dir.close(io);
     for (names.items) |name| {
-        const input = try dir.readFileAlloc(io, name, alloc, .limited(4 << 20));
-        defer alloc.free(input);
-        try sweepFixture(alloc, name, input, &failures, &stats, .{});
+        const input = try dir.readFileAlloc(io, name, allocator, .limited(4 << 20));
+        defer allocator.free(input);
+        try sweepFixture(allocator, name, input, &failures, &stats, .{});
     }
 
     printSummary("fixtures", "fixtures", names.items.len, stats);
@@ -1776,18 +1776,18 @@ test "preservation: editing one document of a real multi-document stream leaves 
     // get the allocating call site in the report.
     var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer std.debug.assert(da.deinit() == .ok);
-    const alloc = da.allocator();
-    var threaded: std.Io.Threaded = .init(alloc, .{});
+    const allocator = da.allocator();
+    var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const input = try std.Io.Dir.cwd().readFileAlloc(io, fixtures_dir ++ "/" ++ multidoc_fixture, alloc, .limited(4 << 20));
-    defer alloc.free(input);
+    const input = try std.Io.Dir.cwd().readFileAlloc(io, fixtures_dir ++ "/" ++ multidoc_fixture, allocator, .limited(4 << 20));
+    defer allocator.free(input);
 
-    var docs = try yaml.parseAll(alloc, input);
+    var docs = try yaml.parseAll(allocator, input);
     defer {
         for (docs.items) |*d| d.deinit();
-        docs.deinit(alloc);
+        docs.deinit(allocator);
     }
     if (docs.items.len < 2) return error.TestUnexpectedResult;
     const mid = docs.items.len / 2;
@@ -1796,22 +1796,22 @@ test "preservation: editing one document of a real multi-document stream leaves 
     // First addressable scalar leaf of the middle document.
     var ed = yaml.edit.Editor.init(doc_mid);
     var comps: std.ArrayList(Comp) = .empty;
-    defer comps.deinit(alloc);
+    defer comps.deinit(allocator);
     var path: ?[]const u8 = null;
     findFirstScalar(&ed, doc_mid.root.?, &comps, &path, 0);
     const edit_path = path orelse return error.TestUnexpectedResult;
-    defer alloc.free(edit_path);
+    defer allocator.free(edit_path);
 
     try ed.set(edit_path, try doc_mid.createScalar(sentinel, .plain));
 
     // Concatenate every document's bytes; only the middle document's
     // region may differ.
     var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
+    defer out.deinit(allocator);
     for (docs.items) |*d| {
-        const text = try d.write(alloc);
-        defer alloc.free(text);
-        try out.appendSlice(alloc, text);
+        const text = try d.write(allocator);
+        defer allocator.free(text);
+        try out.appendSlice(allocator, text);
     }
 
     const region = docs.items[mid];
@@ -1819,17 +1819,17 @@ test "preservation: editing one document of a real multi-document stream leaves 
     try std.testing.expect(std.mem.endsWith(u8, out.items, input[region.region_end..]));
 
     // The other documents re-emit to exactly their original bytes.
-    var fresh = try yaml.parseAll(alloc, input);
+    var fresh = try yaml.parseAll(allocator, input);
     defer {
         for (fresh.items) |*d| d.deinit();
-        fresh.deinit(alloc);
+        fresh.deinit(allocator);
     }
     for (docs.items, fresh.items, 0..) |*d, *f, i| {
         if (i == mid) continue;
-        const a = try d.write(alloc);
-        defer alloc.free(a);
-        const b = try f.write(alloc);
-        defer alloc.free(b);
+        const a = try d.write(allocator);
+        defer allocator.free(a);
+        const b = try f.write(allocator);
+        defer allocator.free(b);
         try std.testing.expectEqualStrings(b, a);
     }
 }
@@ -1838,19 +1838,19 @@ fn findFirstScalar(ed: *yaml.edit.Editor, node: *yaml.Node, comps: *std.ArrayLis
     if (out.* != null or depth > 24) return;
     switch (node.data) {
         .scalar => {
-            const p = formatPath(ed.doc.alloc, comps.items) catch return;
+            const p = formatPath(ed.doc.allocator, comps.items) catch return;
             // Keep it only if the editor can resolve it back.
             if (ed.one(p)) |_| {
                 out.* = p;
             } else |_| {
-                ed.doc.alloc.free(p);
+                ed.doc.allocator.free(p);
             }
         },
         .mapping => |m| {
             for (m.pairs.items) |pair| {
                 if (out.* != null) return;
                 const key = pair.key.scalarValue() orelse continue;
-                comps.append(ed.doc.alloc, .{ .key = key }) catch return;
+                comps.append(ed.doc.allocator, .{ .key = key }) catch return;
                 findFirstScalar(ed, pair.value, comps, out, depth + 1);
                 _ = comps.pop();
             }
@@ -1858,7 +1858,7 @@ fn findFirstScalar(ed: *yaml.edit.Editor, node: *yaml.Node, comps: *std.ArrayLis
         .sequence => |s| {
             for (s.items.items, 0..) |item, i| {
                 if (out.* != null) return;
-                comps.append(ed.doc.alloc, .{ .index = i }) catch return;
+                comps.append(ed.doc.allocator, .{ .index = i }) catch return;
                 findFirstScalar(ed, item, comps, out, depth + 1);
                 _ = comps.pop();
             }
@@ -1872,17 +1872,17 @@ test "preservation sweep: bounded edits over every valid corpus document" {
     // the fixture sweep above for the cost arithmetic).
     var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer std.debug.assert(da.deinit() == .ok);
-    const alloc = da.allocator();
-    var threaded: std.Io.Threaded = .init(alloc, .{});
+    const allocator = da.allocator();
+    var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
     var cases: std.ArrayList(corpus.Case) = .empty;
     defer {
-        for (cases.items) |*c| corpus.freeCase(alloc, c);
-        cases.deinit(alloc);
+        for (cases.items) |*c| corpus.freeCase(allocator, c);
+        cases.deinit(allocator);
     }
-    try corpus.loadCases(alloc, io, &cases);
+    try corpus.loadCases(allocator, io, &cases);
 
     var valid: usize = 0;
     for (cases.items) |*c| {
@@ -1892,10 +1892,10 @@ test "preservation sweep: bounded edits over every valid corpus document" {
     // round-trip and conformance gates cover — here under edits.
     try std.testing.expectEqual(@as(usize, 269), valid);
 
-    var failures: Failures = .{ .alloc = alloc };
+    var failures: Failures = .{ .allocator = allocator };
     defer {
-        for (failures.list.items) |f| alloc.free(f);
-        failures.list.deinit(alloc);
+        for (failures.list.items) |f| allocator.free(f);
+        failures.list.deinit(allocator);
     }
     var stats: Stats = .{};
 
@@ -1912,7 +1912,7 @@ test "preservation sweep: bounded edits over every valid corpus document" {
     };
     for (cases.items) |*c| {
         if (c.fail) continue;
-        try sweepFixture(alloc, c.id, c.input, &failures, &stats, smoke);
+        try sweepFixture(allocator, c.id, c.input, &failures, &stats, smoke);
     }
 
     // Every valid document accounted for: edited, root-less, or one of
@@ -1934,16 +1934,16 @@ test "preservation sweep: bounded edits over every valid corpus document" {
 test "preservation sweep: CRLF, BOM and no-final-newline fixture variants" {
     var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer std.debug.assert(da.deinit() == .ok);
-    const alloc = da.allocator();
-    var threaded: std.Io.Threaded = .init(alloc, .{});
+    const allocator = da.allocator();
+    var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
     // Every fixture filename, INCLUDING the multi-document stream.
     var names: std.ArrayList([]const u8) = .empty;
     defer {
-        for (names.items) |n| alloc.free(n);
-        names.deinit(alloc);
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
     }
     {
         var dir = try std.Io.Dir.cwd().openDir(io, fixtures_dir, .{ .iterate = true });
@@ -1952,7 +1952,7 @@ test "preservation sweep: CRLF, BOM and no-final-newline fixture variants" {
         while (try it.next(io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, ".yaml") and !std.mem.endsWith(u8, entry.name, ".yml")) continue;
-            try names.append(alloc, try alloc.dupe(u8, entry.name));
+            try names.append(allocator, try allocator.dupe(u8, entry.name));
         }
     }
     std.mem.sort([]const u8, names.items, {}, struct {
@@ -1962,10 +1962,10 @@ test "preservation sweep: CRLF, BOM and no-final-newline fixture variants" {
     }.lessThan);
     if (names.items.len < 10) return error.TestUnexpectedResult; // fixtures missing
 
-    var failures: Failures = .{ .alloc = alloc };
+    var failures: Failures = .{ .allocator = allocator };
     defer {
-        for (failures.list.items) |f| alloc.free(f);
-        failures.list.deinit(alloc);
+        for (failures.list.items) |f| allocator.free(f);
+        failures.list.deinit(allocator);
     }
     var stats: Stats = .{};
     const smoke: SweepLimits = .{
@@ -1979,21 +1979,21 @@ test "preservation sweep: CRLF, BOM and no-final-newline fixture variants" {
     var dir = try std.Io.Dir.cwd().openDir(io, fixtures_dir, .{});
     defer dir.close(io);
     for (names.items) |name| {
-        const raw = try dir.readFileAlloc(io, name, alloc, .limited(4 << 20));
-        defer alloc.free(raw);
+        const raw = try dir.readFileAlloc(io, name, allocator, .limited(4 << 20));
+        defer allocator.free(raw);
         // sweepFixture restricts a multi-document stream to its first
         // document's region itself; every fixture is passed whole.
         const input = raw;
         // Three variants derived in memory — no new fixture files.
-        const crlf = try replaceByte(alloc, input, '\n', "\r\n");
-        defer alloc.free(crlf);
-        const bom = try std.fmt.allocPrint(alloc, "\xEF\xBB\xBF{s}", .{input});
-        defer alloc.free(bom);
+        const crlf = try replaceByte(allocator, input, '\n', "\r\n");
+        defer allocator.free(crlf);
+        const bom = try std.fmt.allocPrint(allocator, "\xEF\xBB\xBF{s}", .{input});
+        defer allocator.free(bom);
         const nofinal = if (std.mem.endsWith(u8, input, "\n"))
-            try alloc.dupe(u8, input[0 .. input.len - 1])
+            try allocator.dupe(u8, input[0 .. input.len - 1])
         else
-            try alloc.dupe(u8, input);
-        defer alloc.free(nofinal);
+            try allocator.dupe(u8, input);
+        defer allocator.free(nofinal);
         const variants = [_]struct { label: []const u8, bytes: []const u8 }{
             .{ .label = "crlf", .bytes = crlf },
             .{ .label = "bom", .bytes = bom },
@@ -2001,9 +2001,9 @@ test "preservation sweep: CRLF, BOM and no-final-newline fixture variants" {
         };
         for (variants) |v| {
             attempted += 1;
-            const label = try std.fmt.allocPrint(alloc, "{s}[{s}]", .{ name, v.label });
-            defer alloc.free(label);
-            try sweepFixture(alloc, label, v.bytes, &failures, &stats, smoke);
+            const label = try std.fmt.allocPrint(allocator, "{s}[{s}]", .{ name, v.label });
+            defer allocator.free(label);
+            try sweepFixture(allocator, label, v.bytes, &failures, &stats, smoke);
         }
     }
 
@@ -2026,7 +2026,7 @@ test "preservation sweep: CRLF, BOM and no-final-newline fixture variants" {
 test "preservation: deleting two siblings composes identically in either order" {
     var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer std.debug.assert(da.deinit() == .ok);
-    const alloc = da.allocator();
+    const allocator = da.allocator();
 
     const input = "a: 1\nb: 2\nc: 3\n";
     const orders = [_][2][]const u8{
@@ -2035,15 +2035,15 @@ test "preservation: deleting two siblings composes identically in either order" 
     };
     var outs: std.ArrayList([]u8) = .empty;
     defer {
-        for (outs.items) |o| alloc.free(o);
-        outs.deinit(alloc);
+        for (outs.items) |o| allocator.free(o);
+        outs.deinit(allocator);
     }
     for (orders) |order| {
-        var doc = try yaml.parse(alloc, input);
+        var doc = try yaml.parse(allocator, input);
         defer doc.deinit();
         var ed = yaml.edit.Editor.init(&doc);
         try ed.apply(&.{ .{ .delete = order[0] }, .{ .delete = order[1] } });
-        try outs.append(alloc, try doc.write(alloc));
+        try outs.append(allocator, try doc.write(allocator));
     }
     // Order-independent bytes.
     try std.testing.expectEqualStrings(outs.items[0], outs.items[1]);
@@ -2053,10 +2053,10 @@ test "preservation: deleting two siblings composes identically in either order" 
         .{ .key = "c", .value = .{ .int = 3 } },
     } };
     for (outs.items) |o| {
-        var re = try yaml.parse(alloc, o);
+        var re = try yaml.parse(allocator, o);
         defer re.deinit();
-        const v = try yaml.value.nodeToValue(alloc, re.root.?);
-        defer yaml.value.freeValue(alloc, v);
+        const v = try yaml.value.nodeToValue(allocator, re.root.?);
+        defer yaml.value.freeValue(allocator, v);
         try std.testing.expect(valueEql(expected, v));
     }
 
@@ -2077,16 +2077,16 @@ test "preservation: deleting two siblings composes identically in either order" 
             order[i] = keys[i + pick];
             keys[i + pick] = keys[i];
         }
-        var doc = try yaml.parse(alloc, eight);
+        var doc = try yaml.parse(allocator, eight);
         defer doc.deinit();
         var ed = yaml.edit.Editor.init(&doc);
         try ed.apply(&.{
             .{ .delete = order[0] }, .{ .delete = order[1] }, .{ .delete = order[2] },
             .{ .delete = order[3] }, .{ .delete = order[4] }, .{ .delete = order[5] },
         });
-        const out = try doc.write(alloc);
-        defer alloc.free(out);
-        var re = try yaml.parse(alloc, out);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        var re = try yaml.parse(allocator, out);
         defer re.deinit();
         try std.testing.expectEqual(@as(usize, 2), re.root.?.pairs().?.len);
         try std.testing.expectEqualStrings("7", re.pathGet(&.{"k7"}).?.scalarValue().?);

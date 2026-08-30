@@ -278,7 +278,7 @@ fn looksLikeFloat(value: []const u8) bool {
 /// A parsed YAML document. All nodes live in `pool`; `deinit` releases
 /// everything in one go.
 pub const Document = struct {
-    alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     pool: Pool,
     root: ?*Node = null,
     version: ?VersionDirective = null,
@@ -309,11 +309,11 @@ pub const Document = struct {
     region_end: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Document {
-        return .{ .alloc = allocator, .pool = Pool.init(allocator) };
+        return .{ .allocator = allocator, .pool = Pool.init(allocator) };
     }
 
     pub fn deinit(self: *Document) void {
-        self.tag_directives.deinit(self.alloc);
+        self.tag_directives.deinit(self.allocator);
         self.pool.deinit();
         self.* = undefined;
     }
@@ -860,12 +860,12 @@ const Builder = struct {
             .doc = doc,
             .source = doc.source orelse "",
             .stack = .empty,
-            .anchors = std.StringHashMap(*Node).init(doc.alloc),
+            .anchors = std.StringHashMap(*Node).init(doc.allocator),
         };
     }
 
     fn deinit(self: *Builder) void {
-        self.stack.deinit(self.doc.alloc);
+        self.stack.deinit(self.doc.allocator);
         self.anchors.deinit();
     }
 
@@ -996,7 +996,7 @@ const Builder = struct {
         }
         try self.registerAnchor(n.anchor, n);
         try self.attach(n);
-        try self.stack.append(self.doc.alloc, .{ .node = n });
+        try self.stack.append(self.doc.allocator, .{ .node = n });
     }
 
     /// Copy an optional parser-owned string into the document pool.
@@ -1417,12 +1417,12 @@ test "allocation failures in edit+write leak nothing" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, editWrite, .{});
 }
 
-fn editWrite(alloc: std.mem.Allocator) !void {
-    var doc = try Document.parse(alloc, "a: 1\nb:\n  - x  # keep\n  - y\n");
+fn editWrite(allocator: std.mem.Allocator) !void {
+    var doc = try Document.parse(allocator, "a: 1\nb:\n  - x  # keep\n  - y\n");
     defer doc.deinit();
     try doc.pathSet(&.{"a"}, try doc.createScalar("2", .plain));
     const items = doc.pathGet(&.{"b"}).?;
     try doc.sequenceAppend(items, try doc.createScalar("z", .plain));
-    const out = try doc.write(alloc);
-    defer alloc.free(out);
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
 }

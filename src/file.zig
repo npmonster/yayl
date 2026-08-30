@@ -63,34 +63,34 @@ pub const Error = error{ StreamTooLong, FileNotFound, AccessDenied, OutOfMemory 
 
 /// Parse the first document of the file at `path`.
 pub fn parseFile(
-    alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
     max_bytes: usize,
 ) !Document {
-    const input = try readFile(alloc, io, path, max_bytes);
-    defer alloc.free(input);
-    return Document.parse(alloc, input);
+    const input = try readFile(allocator, io, path, max_bytes);
+    defer allocator.free(input);
+    return Document.parse(allocator, input);
 }
 
 /// Parse every document in the file at `path`.
 pub fn parseAllFile(
-    alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
     max_bytes: usize,
 ) !std.ArrayList(Document) {
-    const input = try readFile(alloc, io, path, max_bytes);
-    defer alloc.free(input);
-    return Document.parseAll(alloc, input);
+    const input = try readFile(allocator, io, path, max_bytes);
+    defer allocator.free(input);
+    return Document.parseAll(allocator, input);
 }
 
 /// Render `doc` and write it to `path` atomically: the bytes land in
 /// a sibling temp file that is renamed over `path` only after a
 /// successful write. On error, `path` is untouched.
-pub fn writeFile(doc: *const Document, alloc: std.mem.Allocator, io: std.Io, path: []const u8) !void {
-    const bytes = try doc.write(alloc);
-    defer alloc.free(bytes);
+pub fn writeFile(doc: *const Document, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const bytes = try doc.write(allocator);
+    defer allocator.free(bytes);
     return writeBytesAtomic(io, path, bytes);
 }
 
@@ -131,8 +131,8 @@ pub fn writeBytesAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
 
 /// Read a whole file, bounded. Returns `error.StreamTooLong` past
 /// `max_bytes`.
-pub fn readFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8, max_bytes: usize) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_bytes)) catch |err| switch (err) {
+pub fn readFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_bytes: usize) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes)) catch |err| switch (err) {
         error.StreamTooLong => error.StreamTooLong,
         else => err,
     };
@@ -145,8 +145,8 @@ pub fn readFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8, max_byte
 const testing = std.testing;
 
 test "parse and atomically rewrite a file" {
-    const alloc = testing.allocator;
-    var threaded: std.Io.Threaded = .init(alloc, .{});
+    const allocator = testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -154,23 +154,23 @@ test "parse and atomically rewrite a file" {
     try writeBytesAtomic(io, path, "# comment\na: 1\nb: 2\n");
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    var doc = try parseFile(alloc, io, path, max_bytes_default);
+    var doc = try parseFile(allocator, io, path, max_bytes_default);
     defer doc.deinit();
     try testing.expectEqualStrings("1", doc.pathGet(&.{"a"}).?.scalarValue().?);
 
     // Edit and rewrite: byte-faithful for untouched parts.
     try doc.pathSet(&.{"b"}, try doc.createScalar("TWO", .plain));
-    try writeFile(&doc, alloc, io, path);
-    const round = try readFile(alloc, io, path, max_bytes_default);
-    defer alloc.free(round);
+    try writeFile(&doc, allocator, io, path);
+    const round = try readFile(allocator, io, path, max_bytes_default);
+    defer allocator.free(round);
     try testing.expectEqualStrings("# comment\na: 1\nb: TWO\n", round);
 
     try expectNoTempFiles(io, path);
 }
 
 test "atomic write removes its temp file when rename fails" {
-    const alloc = testing.allocator;
-    var threaded: std.Io.Threaded = .init(alloc, .{});
+    const allocator = testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const cwd = std.Io.Dir.cwd();
@@ -188,20 +188,20 @@ test "atomic write removes its temp file when rename fails" {
 }
 
 test "bounded read rejects oversized input" {
-    const alloc = testing.allocator;
-    var threaded: std.Io.Threaded = .init(alloc, .{});
+    const allocator = testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
     const path = "zig-out-test-big.yaml";
     try writeBytesAtomic(io, path, "a: 1\n" ** 4);
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    try testing.expectError(error.StreamTooLong, readFile(alloc, io, path, 4));
+    try testing.expectError(error.StreamTooLong, readFile(allocator, io, path, 4));
 }
 
 test "parseAllFile reads every document" {
-    const alloc = testing.allocator;
-    var threaded: std.Io.Threaded = .init(alloc, .{});
+    const allocator = testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -209,32 +209,32 @@ test "parseAllFile reads every document" {
     try writeBytesAtomic(io, path, "---\na: 1\n---\na: 2\n");
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    var docs = try parseAllFile(alloc, io, path, max_bytes_default);
+    var docs = try parseAllFile(allocator, io, path, max_bytes_default);
     defer {
         for (docs.items) |*d| d.deinit();
-        docs.deinit(alloc);
+        docs.deinit(allocator);
     }
     try testing.expectEqual(@as(usize, 2), docs.items.len);
     try testing.expectEqualStrings("1", docs.items[0].pathGet(&.{"a"}).?.scalarValue().?);
     try testing.expectEqualStrings("2", docs.items[1].pathGet(&.{"a"}).?.scalarValue().?);
 
     // A missing file is a clean error.
-    try testing.expectError(error.FileNotFound, parseFile(alloc, io, "zig-out-test-nope.yaml", max_bytes_default));
+    try testing.expectError(error.FileNotFound, parseFile(allocator, io, "zig-out-test-nope.yaml", max_bytes_default));
 }
 
 test "allocation failures in a bounded read leak nothing" {
     try std.testing.checkAllAllocationFailures(testing.allocator, boundedRead, .{});
 }
 
-fn boundedRead(alloc: std.mem.Allocator) !void {
-    var threaded: std.Io.Threaded = .init(alloc, .{});
+fn boundedRead(allocator: std.mem.Allocator) !void {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const path = "zig-out-test-bounded.yaml";
     try writeBytesAtomic(io, path, "# comment\na: 1\n");
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    const data = try readFile(alloc, io, path, max_bytes_default);
-    defer alloc.free(data);
+    const data = try readFile(allocator, io, path, max_bytes_default);
+    defer allocator.free(data);
     try testing.expectEqualStrings("# comment\na: 1\n", data);
 }
 

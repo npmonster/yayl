@@ -54,8 +54,8 @@ pub const Pool = struct {
 };
 
 test "create, dupe and reset" {
-    const alloc = std.testing.allocator;
-    var p = Pool.init(alloc);
+    const allocator = std.testing.allocator;
+    var p = Pool.init(allocator);
     defer p.deinit();
 
     const a = try p.create(u32);
@@ -72,8 +72,8 @@ test "create, dupe and reset" {
 }
 
 test "repeated reset and deinit are leak-free" {
-    const alloc = std.testing.allocator;
-    var p = Pool.init(alloc);
+    const allocator = std.testing.allocator;
+    var p = Pool.init(allocator);
     defer p.deinit();
 
     var round: usize = 0;
@@ -85,8 +85,8 @@ test "repeated reset and deinit are leak-free" {
     }
 }
 
-fn allocatingOperations(alloc: std.mem.Allocator) !void {
-    var p = Pool.init(alloc);
+fn allocatingOperations(allocator: std.mem.Allocator) !void {
+    var p = Pool.init(allocator);
     defer p.deinit();
 
     const a = try p.create(u32);

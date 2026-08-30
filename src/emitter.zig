@@ -44,7 +44,7 @@ const yaml_tag_prefix = "tag:yaml.org,2002:";
 
 /// Serializes a document node tree to YAML text (fy-emit port).
 pub const Emitter = struct {
-    alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     out: *std.ArrayList(u8),
     /// Anchored nodes already emitted: re-emission becomes an alias.
     seen: std.AutoHashMap(*const Node, []const u8),
@@ -59,12 +59,12 @@ pub const Emitter = struct {
     /// graph that cannot be serialized (unanchored cycle).
     pub const Error = std.mem.Allocator.Error || diag.YamlError;
 
-    pub fn init(alloc: std.mem.Allocator, out: *std.ArrayList(u8)) Emitter {
+    pub fn init(allocator: std.mem.Allocator, out: *std.ArrayList(u8)) Emitter {
         return .{
-            .alloc = alloc,
+            .allocator = allocator,
             .out = out,
-            .seen = std.AutoHashMap(*const Node, []const u8).init(alloc),
-            .emitted = std.AutoHashMap(*const Node, void).init(alloc),
+            .seen = std.AutoHashMap(*const Node, []const u8).init(allocator),
+            .emitted = std.AutoHashMap(*const Node, void).init(allocator),
         };
     }
 
@@ -78,11 +78,11 @@ pub const Emitter = struct {
     // ------------------------------------------------------------------
 
     fn write(self: *Emitter, bytes: []const u8) Error!void {
-        try self.out.appendSlice(self.alloc, bytes);
+        try self.out.appendSlice(self.allocator, bytes);
     }
 
     fn writeByte(self: *Emitter, b: u8) Error!void {
-        try self.out.append(self.alloc, b);
+        try self.out.append(self.allocator, b);
     }
 
     fn writeIndent(self: *Emitter, indent: usize) Error!void {
@@ -192,7 +192,7 @@ pub const Emitter = struct {
             try self.writeByte('\n');
             return self.writeIndent(col);
         }
-        try self.out.insert(self.alloc, self.out.items.len - (pending.len - k), '\n');
+        try self.out.insert(self.allocator, self.out.items.len - (pending.len - k), '\n');
     }
 
     // ------------------------------------------------------------------
@@ -1445,19 +1445,19 @@ pub const Emitter = struct {
 
 const testing = std.testing;
 
-fn roundTrip(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
-    var doc = try Document.parse(alloc, input);
+fn roundTrip(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var doc = try Document.parse(allocator, input);
     defer doc.deinit();
-    return doc.write(alloc);
+    return doc.write(allocator);
 }
 
 test "emitDocument writes into the caller's list" {
-    const alloc = testing.allocator;
-    var doc = try Document.parse(alloc, "a: 1\nb: [x, y]\n");
+    const allocator = testing.allocator;
+    var doc = try Document.parse(allocator, "a: 1\nb: [x, y]\n");
     defer doc.deinit();
     var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-    var em = Emitter.init(alloc, &out);
+    defer out.deinit(allocator);
+    var em = Emitter.init(allocator, &out);
     defer em.deinit();
     try em.emitDocument(&doc);
     try testing.expectEqualStrings("a: 1\nb: [x, y]\n", out.items);

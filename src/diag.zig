@@ -84,19 +84,19 @@ pub const YamlError = error{
 /// Diagnostic collector — the fy_diag equivalent.
 ///
 /// Ownership: the collector owns every message it emits, allocated
-/// through `alloc` (which may itself be arena-backed; freeing into an
+/// through `allocator` (which may itself be arena-backed; freeing into an
 /// arena is then a harmless no-op). `deinit` frees every message and the
 /// list storage; there is no per-message free because diagnostics share
 /// one lifetime in practice. Rendering allocates through a caller
 /// supplied allocator and never touches collector storage, so a `Diag`
 /// can be rendered while other code keeps emitting.
 pub const Diag = struct {
-    alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     list: std.ArrayList(Diagnostic) = .empty,
 
     pub fn deinit(self: *Diag) void {
-        for (self.list.items) |d| self.alloc.free(d.message);
-        self.list.deinit(self.alloc);
+        for (self.list.items) |d| self.allocator.free(d.message);
+        self.list.deinit(self.allocator);
     }
 
     /// Format one message and append it to the collector. The message
@@ -104,9 +104,9 @@ pub const Diag = struct {
     /// `deinit`; on append failure the message is released and the
     /// error propagates.
     pub fn emit(self: *Diag, level: Level, mark: Mark, comptime fmt: []const u8, args: anytype) !void {
-        const msg = try std.fmt.allocPrint(self.alloc, fmt, args);
-        errdefer self.alloc.free(msg);
-        try self.list.append(self.alloc, .{ .level = level, .mark = mark, .message = msg });
+        const msg = try std.fmt.allocPrint(self.allocator, fmt, args);
+        errdefer self.allocator.free(msg);
+        try self.list.append(self.allocator, .{ .level = level, .mark = mark, .message = msg });
     }
 
     /// Render all diagnostics into a freshly allocated string, one line
@@ -133,38 +133,38 @@ pub fn emitBestEffort(d: ?*Diag, level: Level, mark: Mark, comptime fmt: []const
 }
 
 test "diag render" {
-    const alloc = std.testing.allocator;
-    var d: Diag = .{ .alloc = alloc };
+    const allocator = std.testing.allocator;
+    var d: Diag = .{ .allocator = allocator };
     defer d.deinit();
     try d.emit(.err, .{ .line = 2, .column = 5 }, "expected {s}, got {s}", .{ "key", "-" });
-    const text = try d.render(alloc);
-    defer alloc.free(text);
+    const text = try d.render(allocator);
+    defer allocator.free(text);
     try std.testing.expectEqualStrings("2:5: error: expected key, got -\n", text);
 }
 
 test "empty diag renders empty string" {
-    const alloc = std.testing.allocator;
-    var d: Diag = .{ .alloc = alloc };
+    const allocator = std.testing.allocator;
+    var d: Diag = .{ .allocator = allocator };
     defer d.deinit();
-    const text = try d.render(alloc);
-    defer alloc.free(text);
+    const text = try d.render(allocator);
+    defer allocator.free(text);
     try std.testing.expectEqual(@as(usize, 0), text.len);
 }
 
 test "render preserves long and unicode messages in full" {
-    const alloc = std.testing.allocator;
-    var d: Diag = .{ .alloc = alloc };
+    const allocator = std.testing.allocator;
+    var d: Diag = .{ .allocator = allocator };
     defer d.deinit();
 
     // Longer than any historical fixed-size render buffer (was 4096).
-    const long = try alloc.alloc(u8, 10_000);
-    defer alloc.free(long);
+    const long = try allocator.alloc(u8, 10_000);
+    defer allocator.free(long);
     @memset(long, 'x');
     try d.emit(.warning, .{ .line = 1, .column = 1 }, "long: {s}", .{long});
     try d.emit(.notice, .{ .line = 3, .column = 7 }, "unicode: {s}", .{"\u{4E2D}\u{6587}\u{1F600}"});
 
-    const text = try d.render(alloc);
-    defer alloc.free(text);
+    const text = try d.render(allocator);
+    defer allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, long) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "unicode: \u{4E2D}\u{6587}\u{1F600}") != null);
@@ -174,13 +174,13 @@ test "render preserves long and unicode messages in full" {
     try std.testing.expect(std.mem.indexOf(u8, text, "3:7: notice: unicode:") != null);
 }
 
-fn diagAllocatingOperations(alloc: std.mem.Allocator) !void {
-    var d: Diag = .{ .alloc = alloc };
+fn diagAllocatingOperations(allocator: std.mem.Allocator) !void {
+    var d: Diag = .{ .allocator = allocator };
     defer d.deinit();
     try d.emit(.err, Mark.start, "first {d}", .{1});
     try d.emit(.info, .{ .line = 9, .column = 9, .offset = 42 }, "second {s}", .{"two"});
-    const text = try d.render(alloc);
-    defer alloc.free(text);
+    const text = try d.render(allocator);
+    defer allocator.free(text);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "\n"));
 }
 

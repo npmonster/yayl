@@ -10,7 +10,7 @@
 //!         .{ .key = "port", .schema = Schema.intRange(1, 65535), .required = true },
 //!         .{ .key = "tags", .schema = Schema.seq(Schema.str) },
 //!     });
-//!     const violations = try schema.validate(alloc, node, "$");
+//!     const violations = try schema.validate(allocator, node, "$");
 //!     // violations carry path + rule; caller frees with freeViolations.
 //!
 //! Unknown mapping keys are allowed unless `deny_unknown` is set.
@@ -87,17 +87,17 @@ pub const Schema = struct {
     /// valid). `path` is the logical path reported in violations.
     pub fn validate(
         self: *const Schema,
-        alloc: std.mem.Allocator,
+        allocator: std.mem.Allocator,
         node: *const Node,
         path: []const u8,
     ) Error![]Violation {
         var violations: std.ArrayList(Violation) = .empty;
         errdefer {
-            for (violations.items) |*v| v.deinitSelf(alloc);
-            violations.deinit(alloc);
+            for (violations.items) |*v| v.deinitSelf(allocator);
+            violations.deinit(allocator);
         }
-        try checkSchema(self, alloc, node, path, &violations);
-        return violations.toOwnedSlice(alloc);
+        try checkSchema(self, allocator, node, path, &violations);
+        return violations.toOwnedSlice(allocator);
     }
 };
 
@@ -109,32 +109,32 @@ pub const Violation = struct {
     /// Human-readable detail.
     detail: []const u8,
 
-    pub fn deinitSelf(self: *Violation, alloc: std.mem.Allocator) void {
-        alloc.free(self.path);
-        alloc.free(self.detail);
+    pub fn deinitSelf(self: *Violation, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.detail);
     }
 };
 
-pub fn freeViolations(alloc: std.mem.Allocator, violations: []Violation) void {
+pub fn freeViolations(allocator: std.mem.Allocator, violations: []Violation) void {
     for (violations) |v| {
-        alloc.free(v.path);
-        alloc.free(v.detail);
+        allocator.free(v.path);
+        allocator.free(v.detail);
     }
-    alloc.free(violations);
+    allocator.free(violations);
 }
 
 /// Append one violation, owning its path and detail strings: a
 /// failure while building or appending releases the partial pair.
-fn appendViolation(alloc: std.mem.Allocator, out: *std.ArrayList(Violation), path: []const u8, rule: []const u8, comptime fmt: []const u8, args: anytype) Error!void {
-    const path_copy = try alloc.dupe(u8, path);
-    errdefer alloc.free(path_copy);
-    const detail = try std.fmt.allocPrint(alloc, fmt, args);
-    errdefer alloc.free(detail);
-    try out.append(alloc, .{ .path = path_copy, .rule = rule, .detail = detail });
+fn appendViolation(allocator: std.mem.Allocator, out: *std.ArrayList(Violation), path: []const u8, rule: []const u8, comptime fmt: []const u8, args: anytype) Error!void {
+    const path_copy = try allocator.dupe(u8, path);
+    errdefer allocator.free(path_copy);
+    const detail = try std.fmt.allocPrint(allocator, fmt, args);
+    errdefer allocator.free(detail);
+    try out.append(allocator, .{ .path = path_copy, .rule = rule, .detail = detail });
 }
 
-fn typeErr(alloc: std.mem.Allocator, path: []const u8, want: []const u8, out: *std.ArrayList(Violation)) Error!void {
-    return appendViolation(alloc, out, path, "type", "expected {s}", .{want});
+fn typeErr(allocator: std.mem.Allocator, path: []const u8, want: []const u8, out: *std.ArrayList(Violation)) Error!void {
+    return appendViolation(allocator, out, path, "type", "expected {s}", .{want});
 }
 
 fn checkNodeCoreTag(node: *const Node) ?document_mod.CoreTag {
@@ -142,59 +142,59 @@ fn checkNodeCoreTag(node: *const Node) ?document_mod.CoreTag {
     return document_mod.resolveCoreTag(s, node.data.scalar.style);
 }
 
-fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Node, path: []const u8, out: *std.ArrayList(Violation)) Error!void {
+fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const Node, path: []const u8, out: *std.ArrayList(Violation)) Error!void {
     const cur = node.resolveAlias();
     switch (schema.kind) {
         .any => {},
         .scalar => {
-            if (!cur.isScalar()) try typeErr(alloc, path, "a scalar", out);
+            if (!cur.isScalar()) try typeErr(allocator, path, "a scalar", out);
         },
         .str => {
-            const s = cur.scalarValue() orelse return typeErr(alloc, path, "a string", out);
+            const s = cur.scalarValue() orelse return typeErr(allocator, path, "a string", out);
             if (document_mod.resolveCoreTag(s, cur.data.scalar.style) != .str) {
-                try typeErr(alloc, path, "a string", out);
+                try typeErr(allocator, path, "a string", out);
             }
         },
         .bool => {
-            if (checkNodeCoreTag(cur) != .bool) try typeErr(alloc, path, "a boolean", out);
+            if (checkNodeCoreTag(cur) != .bool) try typeErr(allocator, path, "a boolean", out);
         },
         .int => {
-            if (checkNodeCoreTag(cur) != .int) try typeErr(alloc, path, "an integer", out);
+            if (checkNodeCoreTag(cur) != .int) try typeErr(allocator, path, "an integer", out);
         },
         .float => {
             const k = checkNodeCoreTag(cur);
-            if (k != .float and k != .int) try typeErr(alloc, path, "a number", out);
+            if (k != .float and k != .int) try typeErr(allocator, path, "a number", out);
         },
         .str_enum => |values| {
-            const s = cur.scalarValue() orelse return typeErr(alloc, path, "a string", out);
+            const s = cur.scalarValue() orelse return typeErr(allocator, path, "a string", out);
             for (values) |v| {
                 if (std.mem.eql(u8, v, s)) return;
             }
-            try appendViolation(alloc, out, path, "enum", "'{s}' is not one of the allowed values", .{s});
+            try appendViolation(allocator, out, path, "enum", "'{s}' is not one of the allowed values", .{s});
         },
         .int_range => |r| {
             const k = checkNodeCoreTag(cur);
-            if (k != .int) return typeErr(alloc, path, "an integer", out);
+            if (k != .int) return typeErr(allocator, path, "an integer", out);
             const text = cur.scalarValue().?;
             const v = std.fmt.parseInt(i64, text, 0) catch {
-                try typeErr(alloc, path, "an integer", out);
+                try typeErr(allocator, path, "an integer", out);
                 return;
             };
             if (v < r.min or v > r.max) {
-                try appendViolation(alloc, out, path, "range", "{d} is outside [{d}, {d}]", .{ v, r.min, r.max });
+                try appendViolation(allocator, out, path, "range", "{d} is outside [{d}, {d}]", .{ v, r.min, r.max });
             }
         },
         .seq => |items| {
-            const list = cur.items() orelse return typeErr(alloc, path, "a sequence", out);
+            const list = cur.items() orelse return typeErr(allocator, path, "a sequence", out);
             for (list, 0..) |item, i| {
-                const child_path = try std.fmt.allocPrint(alloc, "{s}[{d}]", .{ path, i });
-                defer alloc.free(child_path);
-                try checkSchema(items, alloc, item, child_path, out);
+                const child_path = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path, i });
+                defer allocator.free(child_path);
+                try checkSchema(items, allocator, item, child_path, out);
             }
         },
         .map => |map_spec| {
             const fields = map_spec.fields;
-            const pairs = cur.pairs() orelse return typeErr(alloc, path, "a mapping", out);
+            const pairs = cur.pairs() orelse return typeErr(allocator, path, "a mapping", out);
             // Required keys.
             for (fields) |field| {
                 if (!field.required) continue;
@@ -207,28 +207,28 @@ fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Nod
                     }
                 }
                 if (!found) {
-                    const child = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, field.key });
-                    errdefer alloc.free(child);
-                    const detail = try std.fmt.allocPrint(alloc, "required key '{s}' is missing", .{field.key});
-                    errdefer alloc.free(detail);
-                    try out.append(alloc, .{ .path = child, .rule = "required", .detail = detail });
+                    const child = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ path, field.key });
+                    errdefer allocator.free(child);
+                    const detail = try std.fmt.allocPrint(allocator, "required key '{s}' is missing", .{field.key});
+                    errdefer allocator.free(detail);
+                    try out.append(allocator, .{ .path = child, .rule = "required", .detail = detail });
                 }
             }
             // Per-field and unknown-key checks.
             for (pairs) |p| {
                 const kv = p.key.scalarValue() orelse continue;
-                const child_path = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, kv });
-                defer alloc.free(child_path);
+                const child_path = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ path, kv });
+                defer allocator.free(child_path);
                 var matched = false;
                 for (fields) |field| {
                     if (std.mem.eql(u8, field.key, kv)) {
-                        try checkSchema(field.schema, alloc, p.value, child_path, out);
+                        try checkSchema(field.schema, allocator, p.value, child_path, out);
                         matched = true;
                         break;
                     }
                 }
                 if (!matched and map_spec.deny_unknown) {
-                    try appendViolation(alloc, out, child_path, "unknown", "unknown key '{s}'", .{kv});
+                    try appendViolation(allocator, out, child_path, "unknown", "unknown key '{s}'", .{kv});
                 }
             }
         },
@@ -342,15 +342,15 @@ test "allocation failures in validation leak nothing" {
     try std.testing.checkAllAllocationFailures(testing.allocator, validateConfig, .{});
 }
 
-fn validateConfig(alloc: std.mem.Allocator) !void {
+fn validateConfig(allocator: std.mem.Allocator) !void {
     const schema = Schema.map(&.{
         .{ .key = "name", .schema = &Schema.str, .required = true },
         .{ .key = "port", .schema = &Schema.intRange(1, 65535), .required = true },
         .{ .key = "tags", .schema = &Schema.seq(&Schema.str) },
     });
-    var doc = try document_mod.Document.parse(alloc, "name: api\nport: 99999\ntags: [a, b]\n");
+    var doc = try document_mod.Document.parse(allocator, "name: api\nport: 99999\ntags: [a, b]\n");
     defer doc.deinit();
-    const violations = try schema.validate(alloc, doc.root.?, "$");
-    defer freeViolations(alloc, violations);
+    const violations = try schema.validate(allocator, doc.root.?, "$");
+    defer freeViolations(allocator, violations);
     try testing.expectEqual(@as(usize, 1), violations.len);
 }

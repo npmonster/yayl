@@ -54,13 +54,13 @@ fn isDebugId(id: []const u8) bool {
     return false;
 }
 
-fn runCase(alloc: std.mem.Allocator, case: corpus.Case, verbose: bool) !Outcome {
+fn runCase(allocator: std.mem.Allocator, case: corpus.Case, verbose: bool) !Outcome {
     if (case.fail) {
         const ok = blk: {
-            var docs = yaml.parseAll(alloc, case.input) catch break :blk true;
+            var docs = yaml.parseAll(allocator, case.input) catch break :blk true;
             defer {
                 for (docs.items) |*d| d.deinit();
-                docs.deinit(alloc);
+                docs.deinit(allocator);
             }
             break :blk false;
         };
@@ -68,10 +68,10 @@ fn runCase(alloc: std.mem.Allocator, case: corpus.Case, verbose: bool) !Outcome 
         return .{ .status = .fail, .reason = "expected parse error, got success" };
     }
 
-    const actual = corpus.renderTree(alloc, case.input, verbose) catch |err| {
+    const actual = corpus.renderTree(allocator, case.input, verbose) catch |err| {
         return .{ .status = .fail, .reason = if (err == error.OutOfMemory) "oom" else @errorName(err) };
     };
-    defer alloc.free(actual);
+    defer allocator.free(actual);
 
     const expected = std.mem.trimEnd(u8, case.tree orelse "", " \n");
     const actual_trimmed = std.mem.trimEnd(u8, actual, "\n");
@@ -103,31 +103,31 @@ fn firstMismatch(expected: []const u8, actual: []const u8) []const u8 {
     }
 }
 
-fn appendJsonEscaped(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+fn appendJsonEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
     for (s) |c| {
         switch (c) {
-            '"' => try buf.appendSlice(alloc, "\\\""),
-            else => try buf.append(alloc, c),
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            else => try buf.append(allocator, c),
         }
     }
 }
-fn writeReport(alloc: std.mem.Allocator, io: std.Io, results: []const Result) !void {
+fn writeReport(allocator: std.mem.Allocator, io: std.Io, results: []const Result) !void {
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
+    defer buf.deinit(allocator);
 
-    try buf.appendSlice(alloc, "[\n");
+    try buf.appendSlice(allocator, "[\n");
     for (results, 0..) |r, i| {
-        try buf.print(alloc, "  {{\"id\": \"{s}\", \"name\": \"", .{r.id});
-        try appendJsonEscaped(&buf, alloc, r.name);
-        try buf.print(alloc, "\", \"status\": \"{s}\"", .{@tagName(r.status)});
+        try buf.print(allocator, "  {{\"id\": \"{s}\", \"name\": \"", .{r.id});
+        try appendJsonEscaped(&buf, allocator, r.name);
+        try buf.print(allocator, "\", \"status\": \"{s}\"", .{@tagName(r.status)});
         if (r.reason.len > 0) {
-            try buf.appendSlice(alloc, ", \"reason\": \"");
-            try appendJsonEscaped(&buf, alloc, r.reason);
-            try buf.append(alloc, '"');
+            try buf.appendSlice(allocator, ", \"reason\": \"");
+            try appendJsonEscaped(&buf, allocator, r.reason);
+            try buf.append(allocator, '"');
         }
-        try buf.appendSlice(alloc, if (i + 1 < results.len) "},\n" else "}\n");
+        try buf.appendSlice(allocator, if (i + 1 < results.len) "},\n" else "}\n");
     }
-    try buf.appendSlice(alloc, "]\n");
+    try buf.appendSlice(allocator, "]\n");
 
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, "zig-out");
@@ -139,17 +139,17 @@ fn writeReport(alloc: std.mem.Allocator, io: std.Io, results: []const Result) !v
 // ----------------------------------------------------------------------
 
 test "yaml test suite corpus" {
-    const alloc = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(alloc, .{});
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
     var cases: std.ArrayList(corpus.Case) = .empty;
     defer {
-        for (cases.items) |*c| corpus.freeCase(alloc, c);
-        cases.deinit(alloc);
+        for (cases.items) |*c| corpus.freeCase(allocator, c);
+        cases.deinit(allocator);
     }
-    corpus.loadCases(alloc, io, &cases) catch |err| {
+    corpus.loadCases(allocator, io, &cases) catch |err| {
         std.debug.print(
             "conformance: cannot load corpus from {s} ({}); run `make corpus` first\n",
             .{ corpus_dir, err },
@@ -162,35 +162,35 @@ test "yaml test suite corpus" {
     try std.testing.expect(cases.items.len >= 300);
 
     var results: std.ArrayList(Result) = .empty;
-    defer results.deinit(alloc);
+    defer results.deinit(allocator);
 
     var pass: usize = 0;
     var fail: usize = 0;
     var stale: usize = 0;
     for (cases.items) |case| {
         const skip = findSkip(case.id);
-        const outcome = runCase(alloc, case, skip == null) catch |err| {
+        const outcome = runCase(allocator, case, skip == null) catch |err| {
             var reason_buf: [128]u8 = undefined;
             const reason = std.fmt.bufPrint(&reason_buf, "harness error: {}", .{err}) catch "harness error";
-            try results.append(alloc, .{ .id = case.id, .name = case.name, .status = .fail, .reason = reason });
+            try results.append(allocator, .{ .id = case.id, .name = case.name, .status = .fail, .reason = reason });
             continue;
         };
         if (skip) |s| {
             if (outcome.status == .pass) {
                 // A skipped case that now passes means the table is stale.
                 stale += 1;
-                try results.append(alloc, .{ .id = case.id, .name = case.name, .status = .fail, .reason = "stale skip: case passes, remove from skips table" });
+                try results.append(allocator, .{ .id = case.id, .name = case.name, .status = .fail, .reason = "stale skip: case passes, remove from skips table" });
             } else {
-                try results.append(alloc, .{ .id = case.id, .name = case.name, .status = .skip, .reason = s.reason });
+                try results.append(allocator, .{ .id = case.id, .name = case.name, .status = .skip, .reason = s.reason });
             }
             continue;
         }
         if (outcome.status == .pass) pass += 1;
         if (outcome.status == .fail) fail += 1;
-        try results.append(alloc, .{ .id = case.id, .name = case.name, .status = outcome.status, .reason = outcome.reason });
+        try results.append(allocator, .{ .id = case.id, .name = case.name, .status = outcome.status, .reason = outcome.reason });
     }
 
-    try writeReport(alloc, io, results.items);
+    try writeReport(allocator, io, results.items);
 
     std.debug.print("conformance: {d} pass, {d} fail, {d} skip, {d} stale\n", .{ pass, fail, results.items.len - pass - fail, stale });
     for (results.items) |r| {
