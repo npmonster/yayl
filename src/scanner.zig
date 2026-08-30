@@ -77,7 +77,7 @@ pub const Scanner = struct {
         const eff = input[0..end];
 
         if (!utf8.valid(eff)) {
-            if (d) |dd| dd.emit(.err, .{}, "input is not valid UTF-8", .{}) catch {};
+            diag.emitBestEffort(d, .err, .{}, "input is not valid UTF-8", .{});
             return error.InvalidUtf8;
         }
 
@@ -168,7 +168,7 @@ pub const Scanner = struct {
     // ------------------------------------------------------------------
 
     fn failWith(self: *Scanner, err: YamlError, mark: Mark, comptime fmt: []const u8, args: anytype) YamlError {
-        if (self.d) |dd| dd.emit(.err, mark, fmt, args) catch {};
+        diag.emitBestEffort(self.d, .err, mark, fmt, args);
         return err;
     }
 

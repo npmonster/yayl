@@ -200,6 +200,8 @@ fn collectDescend(alloc: std.mem.Allocator, node: *Node, key: []const u8, out: *
     }
 }
 
+pub const Insert = struct { sequence: []const u8, position: []const u8, value: *Node, before: bool };
+
 /// One queued edit. Values are existing nodes (they may be created with
 /// `Document.createScalar`/`createMapping`/...); the batch takes no
 /// ownership, the document pool does as usual.
@@ -212,7 +214,7 @@ pub const Edit = union(enum) {
     delete: []const u8,
     /// Insert `value` into the sequence at `path`, before or after the
     /// (single) node at `position`.
-    insert: struct { sequence: []const u8, position: []const u8, value: *Node, before: bool },
+    insert: Insert,
     /// Append `value` to the sequence at `path`.
     append: struct { sequence: []const u8, value: *Node },
     /// Move the node at `from` into the container at `to` (a mapping
@@ -363,7 +365,7 @@ pub const Editor = struct {
         };
     }
 
-    fn applyInsert(doc: *Document, ins: anytype) Error!void {
+    fn applyInsert(doc: *Document, ins: Insert) Error!void {
         var ed = Editor{ .doc = doc };
         const seq = try ed.one(ins.sequence);
         const items = seq.items() orelse return error.NotASequence;
@@ -394,7 +396,7 @@ pub const Editor = struct {
                 .mapping => |*m| {
                     for (m.pairs.items, 0..) |p, i| {
                         if (p.value == node) {
-                            try self_dropPairSpan(doc, parent, p);
+                            try doc.dropPairSpan(parent, p);
                             _ = m.pairs.orderedRemove(i);
                             parent.modified = true;
                             break;
@@ -428,10 +430,6 @@ pub const Editor = struct {
             },
             else => return error.NotACollection,
         }
-    }
-
-    fn self_dropPairSpan(doc: *Document, parent: *Node, p: document_mod.Pair) !void {
-        try doc.dropPairSpan(parent, p);
     }
 };
 

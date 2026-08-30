@@ -81,10 +81,6 @@ pub const Schema = struct {
 
     /// Validate `node`; returns the list of violations (empty when
     /// valid). `path` is the logical path reported in violations.
-    fn check(self: *const Schema, alloc: std.mem.Allocator, node: *const Node, path: []const u8, out: *std.ArrayList(Violation)) Error!void {
-        try checkSchema(self, alloc, node, path, out);
-    }
-
     pub fn validate(
         self: *const Schema,
         alloc: std.mem.Allocator,
@@ -93,7 +89,7 @@ pub const Schema = struct {
     ) Error![]Violation {
         var violations: std.ArrayList(Violation) = .empty;
         errdefer violations.deinit(alloc);
-        try self.check(alloc, node, path, &violations);
+        try checkSchema(self, alloc, node, path, &violations);
         return violations.toOwnedSlice(alloc);
     }
 };
@@ -188,7 +184,7 @@ fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Nod
             for (list, 0..) |item, i| {
                 const child_path = try std.fmt.allocPrint(alloc, "{s}[{d}]", .{ path, i });
                 defer alloc.free(child_path);
-                try items.check(alloc, item, child_path, out);
+                try checkSchema(items, alloc, item, child_path, out);
             }
         },
         .map => |map_spec| {
@@ -221,7 +217,7 @@ fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Nod
                 var matched = false;
                 for (fields) |field| {
                     if (std.mem.eql(u8, field.key, kv)) {
-                        try field.schema.check(alloc, p.value, child_path, out);
+                        try checkSchema(field.schema, alloc, p.value, child_path, out);
                         matched = true;
                         break;
                     }

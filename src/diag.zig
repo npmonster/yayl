@@ -106,6 +106,10 @@ pub const Diag = struct {
         self.list.deinit(self.alloc);
     }
 
+    /// Format one message and append it to the collector. The message
+    /// is allocated through the collector's allocator and freed in
+    /// `deinit`; on append failure the message is released and the
+    /// error propagates.
     pub fn emit(self: *Diag, level: Level, mark: Mark, comptime fmt: []const u8, args: anytype) !void {
         const msg = try std.fmt.allocPrint(self.alloc, fmt, args);
         errdefer self.alloc.free(msg);
@@ -127,6 +131,13 @@ pub const Diag = struct {
         return buf.toOwnedSlice(allocator);
     }
 };
+
+/// Record a diagnostic when a collector is attached, best-effort: a
+/// lost diagnostic must never mask the real error being returned.
+/// Scanner and parser report through this on every failure path.
+pub fn emitBestEffort(d: ?*Diag, level: Level, mark: Mark, comptime fmt: []const u8, args: anytype) void {
+    if (d) |dd| dd.emit(level, mark, fmt, args) catch {};
+}
 
 test "diag render" {
     const alloc = std.testing.allocator;

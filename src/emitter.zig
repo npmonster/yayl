@@ -94,6 +94,9 @@ pub const Emitter = struct {
     // Document level
     // ------------------------------------------------------------------
 
+    /// Serialize `doc` into the output list. Parsed documents re-emit
+    /// byte-faithfully outside modified slots; programmatic documents
+    /// emit normalized.
     pub fn emitDocument(self: *Emitter, doc: *const Document) Error!void {
         if (doc.source) |src| {
             self.src = src;
@@ -551,12 +554,7 @@ pub const Emitter = struct {
 
         // Value placement: scalars and flow collections stay inline,
         // block collections start on the next, deeper line.
-        const inline_value = switch (value.data) {
-            .scalar, .alias => true,
-            .mapping => |m| m.pairs.items.len == 0 or m.style == .flow,
-            .sequence => |s| s.items.items.len == 0 or s.style == .flow,
-        };
-        if (inline_value) {
+        if (inlineValue(value)) {
             try self.writeByte(' ');
             try self.emitNode(value, indent + self.indent_step);
         } else {
@@ -706,22 +704,35 @@ pub const Emitter = struct {
         try self.writeByte('"');
     }
 
-    fn writeLiteral(self: *Emitter, value: []const u8, indent: usize) Error!void {
+    /// Value with its trailing newlines stripped and counted (block
+    /// scalar chomping).
+    fn stripTrailingNewlines(value: []const u8) struct { core: []const u8, trailing: usize } {
         var core = value;
         var trailing: usize = 0;
         while (core.len > 0 and core[core.len - 1] == '\n') {
             trailing += 1;
             core = core[0 .. core.len - 1];
         }
-        try self.writeByte('|');
+        return .{ .core = core, .trailing = trailing };
+    }
+
+    /// Block scalar header: `|` or `>` plus the chomping indicator
+    /// (`-` strip, `+` keep) computed from the trailing-newline count.
+    fn writeBlockHeader(self: *Emitter, indicator: u8, trailing: usize) Error!void {
+        try self.writeByte(indicator);
         if (trailing == 0) {
             try self.writeByte('-');
         } else if (trailing > 1) {
             try self.writeByte('+');
         }
         try self.writeByte('\n');
+    }
 
-        var it = std.mem.splitScalar(u8, core, '\n');
+    fn writeLiteral(self: *Emitter, value: []const u8, indent: usize) Error!void {
+        const s = stripTrailingNewlines(value);
+        try self.writeBlockHeader('|', s.trailing);
+
+        var it = std.mem.splitScalar(u8, s.core, '\n');
         var first = true;
         while (it.next()) |line| {
             if (!first) try self.writeByte('\n');
@@ -729,7 +740,7 @@ pub const Emitter = struct {
             try self.writeIndent(indent);
             try self.write(line);
         }
-        for (0..trailing) |_| try self.writeByte('\n');
+        for (0..s.trailing) |_| try self.writeByte('\n');
     }
 
     fn chooseScalarStyle(value: []const u8, prefer: ScalarStyle, block_ok: bool) ScalarStyle {
@@ -785,21 +796,10 @@ pub const Emitter = struct {
     /// newline between content lines emits `breaks = newlines + 1`.
     /// Chomping mirrors `writeLiteral`.
     fn writeFolded(self: *Emitter, value: []const u8, indent: usize) Error!void {
-        var core = value;
-        var trailing: usize = 0;
-        while (core.len > 0 and core[core.len - 1] == '\n') {
-            trailing += 1;
-            core = core[0 .. core.len - 1];
-        }
-        try self.writeByte('>');
-        if (trailing == 0) {
-            try self.writeByte('-');
-        } else if (trailing > 1) {
-            try self.writeByte('+');
-        }
-        try self.writeByte('\n');
+        const s = stripTrailingNewlines(value);
+        try self.writeBlockHeader('>', s.trailing);
 
-        var it = std.mem.splitScalar(u8, core, '\n');
+        var it = std.mem.splitScalar(u8, s.core, '\n');
         var have_line = false;
         var blanks: usize = 0; // blank value lines since the last content line
         while (it.next()) |line| {
@@ -818,7 +818,7 @@ pub const Emitter = struct {
             try self.writeIndent(indent);
             try self.write(line);
         }
-        for (0..trailing) |_| try self.writeByte('\n');
+        for (0..s.trailing) |_| try self.writeByte('\n');
     }
 
     fn plainSafe(value: []const u8) bool {

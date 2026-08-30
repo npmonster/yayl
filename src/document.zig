@@ -218,13 +218,28 @@ fn looksLikeInt(value: []const u8) bool {
     return true;
 }
 
+/// YAML 1.2 core-schema non-finite float spellings (`.inf`, `.nan`,
+/// case variants, optional sign) to their Zig float value. Single home
+/// for the table: scalar classification (`looksLikeFloat`) and value
+/// conversion both use it. (std.fmt.parseFloat rejects the leading dot
+/// in `.inf`, hence the table.)
+pub fn floatSpecial(value: []const u8) ?f64 {
+    const inf = std.math.inf(f64);
+    const nan = std.math.nan(f64);
+    const map = [_]struct { t: []const u8, v: f64 }{
+        .{ .t = ".inf", .v = inf },   .{ .t = ".Inf", .v = inf },   .{ .t = ".INF", .v = inf },
+        .{ .t = "+.inf", .v = inf },  .{ .t = "+.Inf", .v = inf },  .{ .t = "+.INF", .v = inf },
+        .{ .t = "-.inf", .v = -inf }, .{ .t = "-.Inf", .v = -inf }, .{ .t = "-.INF", .v = -inf },
+        .{ .t = ".nan", .v = nan },   .{ .t = ".NaN", .v = nan },   .{ .t = ".NAN", .v = nan },
+    };
+    for (map) |e| {
+        if (std.mem.eql(u8, value, e.t)) return e.v;
+    }
+    return null;
+}
+
 fn looksLikeFloat(value: []const u8) bool {
-    if (std.mem.eql(u8, value, ".inf") or std.mem.eql(u8, value, ".Inf") or
-        std.mem.eql(u8, value, ".INF") or std.mem.eql(u8, value, "-.inf") or
-        std.mem.eql(u8, value, "-.Inf") or std.mem.eql(u8, value, "-.INF") or
-        std.mem.eql(u8, value, "+.inf") or std.mem.eql(u8, value, "+.Inf") or
-        std.mem.eql(u8, value, "+.INF") or std.mem.eql(u8, value, ".nan") or
-        std.mem.eql(u8, value, ".NaN") or std.mem.eql(u8, value, ".NAN")) return true;
+    if (floatSpecial(value) != null) return true;
     var has_dot = false;
     var has_exp = false;
     var has_digit = false;
@@ -553,44 +568,56 @@ pub const Document = struct {
         return r.byPath(path);
     }
 
-    /// Set the value at a mapping-key path, creating intermediate mappings
-    /// as needed. The final segment is replaced or appended.
-    pub fn pathSet(self: *Document, path: []const []const u8, value: *Node) !void {
-        if (path.len == 0) return error.InvalidSyntax;
+    /// Walk the mapping-key chain `keys` (the segments ABOVE a final
+    /// key) from the root, creating the root mapping and intermediate
+    /// mappings as needed; returns the container holding the final key.
+    pub fn mappingWalkOrCreate(self: *Document, keys: []const []const u8) !*Node {
         if (self.root == null) {
             self.root = try self.createMapping();
         }
         var cur = self.root.?;
-        for (path[0 .. path.len - 1]) |seg| {
+        for (keys) |seg| {
             if (cur.lookup(seg)) |next| {
+                if (!next.isMapping()) return error.NotAMapping;
                 cur = next;
             } else {
                 const m = try self.createMapping();
-                const k = try self.createScalar(seg, .plain);
-                try self.mappingAppend(cur, k, m);
+                try self.mappingAppend(cur, try self.createScalar(seg, .plain), m);
                 cur = m;
             }
-            if (!cur.isMapping()) return error.InvalidSyntax;
         }
-        const last = path[path.len - 1];
-        const k = try self.createScalar(last, .plain);
-        if (cur.lookup(last)) |existing| {
-            // Replace the existing entry in place to keep ordering.
-            switch (cur.data) {
-                .mapping => |*m| {
-                    for (m.pairs.items) |*p| {
-                        if (p.value == existing) {
-                            value.parent = cur;
-                            p.value = value;
-                            self.markModified(cur);
-                            return;
-                        }
-                    }
-                },
-                else => unreachable,
+        return cur;
+    }
+
+    /// Replace the existing value node `existing` (a value of `map`)
+    /// with `value`, preserving pair order and the key node. Returns
+    /// false when `existing` is not a value of `map`.
+    pub fn mappingReplace(self: *Document, map: *Node, existing: *Node, value: *Node) bool {
+        const pairs = switch (map.data) {
+            .mapping => |*m| m.pairs.items,
+            else => return false,
+        };
+        for (pairs) |*p| {
+            if (p.value == existing) {
+                value.parent = map;
+                p.value = value;
+                self.markModified(map);
+                return true;
             }
         }
-        try self.mappingAppend(cur, k, value);
+        return false;
+    }
+
+    /// Set the value at a mapping-key path, creating intermediate mappings
+    /// as needed. The final segment is replaced or appended.
+    pub fn pathSet(self: *Document, path: []const []const u8, value: *Node) !void {
+        if (path.len == 0) return error.InvalidSyntax;
+        const cur = try self.mappingWalkOrCreate(path[0 .. path.len - 1]);
+        const last = path[path.len - 1];
+        if (cur.lookup(last)) |existing| {
+            if (self.mappingReplace(cur, existing, value)) return;
+        }
+        try self.mappingAppend(cur, try self.createScalar(last, .plain), value);
     }
 
     /// Delete the mapping entry at a mapping-key path. Returns true when

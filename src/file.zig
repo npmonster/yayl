@@ -21,33 +21,22 @@
 //! mtime/hash-keyed cache depends on filesystem semantics this
 //! library does not own; applications that need one can key a cache
 //! on `parseFile`'s inputs trivially.
+//!
+//! PARAMETER ORDER: the allocator comes first (after the document
+//! receiver for write-style functions), then `io`, then `path`, then
+//! options (e.g. `max_bytes`).
 
 const std = @import("std");
+const diag = @import("diag.zig");
 const document_mod = @import("document.zig");
 
 const Document = document_mod.Document;
 
 pub const max_bytes_default: usize = 64 << 20; // 64 MiB
 
-pub const Error = error{
-    StreamTooLong,
-    FileNotFound,
-    AccessDenied,
-    OutOfMemory,
-    InvalidSyntax,
-    InvalidUtf8,
-    InvalidEscape,
-    InvalidIndentation,
-    UnexpectedToken,
-    DuplicateAnchor,
-    UnknownAlias,
-    InvalidDirective,
-    UnsupportedVersion,
-    Unterminated,
-    KeyTooLong,
-    NestingTooDeep,
-    AliasCycle,
-};
+/// I/O failures plus the parse-error vocabulary the document layer
+/// can surface (kept in sync with `diag.YamlError` by construction).
+pub const Error = error{ StreamTooLong, FileNotFound, AccessDenied, OutOfMemory } || diag.YamlError;
 
 /// Parse the first document of the file at `path`.
 pub fn parseFile(

@@ -112,7 +112,7 @@ pub fn scalarToValue(alloc: std.mem.Allocator, text: []const u8, style: ScalarSt
             return .{ .bigint = try alloc.dupe(u8, text) };
         },
         .float => {
-            if (floatSpecial(text)) |f| return .{ .float = f };
+            if (document_mod.floatSpecial(text)) |f| return .{ .float = f };
             const f = std.fmt.parseFloat(f64, text) catch
                 return .{ .string = try alloc.dupe(u8, text) };
             return .{ .float = f };
@@ -233,34 +233,39 @@ pub fn toZig(comptime T: type, alloc: std.mem.Allocator, value: Value) Error!T {
             },
             else => return error.TypeMismatch,
         },
-        .@"struct" => |st| switch (value) {
-            .map => |members| {
-                var out: T = undefined;
-                inline for (st.fields) |field| {
-                    var found = false;
-                    for (members) |m| {
-                        if (std.mem.eql(u8, m.key, field.name)) {
-                            @field(out, field.name) = try toZig(field.type, alloc, m.value);
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        if (field.defaultValue()) |d| {
-                            @field(out, field.name) = d;
-                        } else if (@typeInfo(field.type) == .optional) {
-                            @field(out, field.name) = null;
-                        } else {
-                            return error.TypeMismatch;
-                        }
-                    }
-                }
-                return out;
-            },
+        .@"struct" => switch (value) {
+            .map => |members| return toZigStruct(T, alloc, members),
             else => return error.TypeMismatch,
         },
         else => return error.UnsupportedType,
     }
+}
+
+/// Struct arm of `toZig`: fields matched by name; defaults and
+/// optionals honoured; a missing required field is `TypeMismatch`.
+fn toZigStruct(comptime T: type, alloc: std.mem.Allocator, members: []const Value.Member) Error!T {
+    const st = @typeInfo(T).@"struct";
+    var out: T = undefined;
+    inline for (st.fields) |field| {
+        var found = false;
+        for (members) |m| {
+            if (std.mem.eql(u8, m.key, field.name)) {
+                @field(out, field.name) = try toZig(field.type, alloc, m.value);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (field.defaultValue()) |d| {
+                @field(out, field.name) = d;
+            } else if (@typeInfo(field.type) == .optional) {
+                @field(out, field.name) = null;
+            } else {
+                return error.TypeMismatch;
+            }
+        }
+    }
+    return out;
 }
 
 /// Build a Value from a Zig value. Everything needed for later

@@ -89,6 +89,7 @@ pub const Parser = struct {
     }
 
     fn trackBytes(self: *Parser, s: []u8) ![]u8 {
+        errdefer self.alloc.free(s);
         try self.temp_bytes.append(self.alloc, s);
         return s;
     }
@@ -137,7 +138,7 @@ pub const Parser = struct {
     // ------------------------------------------------------------------
 
     fn fail(self: *Parser, mark: Mark, comptime fmt: []const u8, args: anytype) YamlError {
-        if (self.d) |d| d.emit(.err, mark, fmt, args) catch {};
+        diag.emitBestEffort(self.d, .err, mark, fmt, args);
         return error.InvalidSyntax;
     }
 
@@ -331,7 +332,7 @@ pub const Parser = struct {
             } else {
                 // Unknown directives are ignored; the spec asks for a
                 // warning only (YAML 1.2 6.1).
-                if (self.d) |dd| dd.emit(.warning, tok.start, "found unknown directive name '{s}'", .{d.name}) catch {};
+                diag.emitBestEffort(self.d, .warning, tok.start, "found unknown directive name '{s}'", .{d.name});
             }
             self.scanner.skipToken();
         }
@@ -348,7 +349,7 @@ pub const Parser = struct {
     }
 
     fn failWith(self: *Parser, err: YamlError, mark: Mark, comptime fmt: []const u8, args: anytype) YamlError {
-        if (self.d) |d| d.emit(.err, mark, fmt, args) catch {};
+        diag.emitBestEffort(self.d, .err, mark, fmt, args);
         return err;
     }
 
