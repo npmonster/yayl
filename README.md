@@ -173,16 +173,18 @@ If a batch fails, the original document is left byte-identical.
 
 ## Values, schemas, files
 
-- `yaml.value`: tagged `Value`, lossless parse-to-value and value-to-node, plus Zig-native `toZig` and `fromZig` for structs, optionals, enums, and slices.
-- `yaml.schema`: optional validation descriptors (types, ranges, enums, required keys) with structured violations.
-- `yaml.file`: bounded file reads and atomic writes (temp, fsync, rename).
+- `yaml.value`: tagged semantic `Value` trees, node conversion, and Zig-native `toZig`/`fromZig` for supported scalars, structs, optionals, enums, arrays, and slices. Use `Document` when YAML presentation matters.
+- `yaml.schema`: opt-in validation descriptors (types, ranges, enums, required keys) with structured violations.
+- `yaml.file`: bounded file reads and atomic replacement (sibling temp file, file sync, rename). This prevents torn writes, not every form of power-loss data loss.
 
 ## Ownership
 
-- Pass an allocator to every allocating operation.
-- `Document.deinit()` releases every node, string, anchor, and tag the document owns.
-- Free what `doc.write()` and `Diag.render()` hand back, using the allocator you passed them.
-- `Scanner` and `Parser` own transient token and event data. Copy anything that needs to outlive them into a document.
+- Allocating APIs either accept an allocator directly or use one retained by their owning object.
+- `Document.deinit()` releases all document-owned storage, including nodes, strings, anchors, tags, and copied source bytes.
+- The caller owns buffers returned by `doc.write()`, `Diag.render()`, and `yaml.file.readFile()`; free them with the same allocator.
+- `parseToValue`, `nodeToValue`, and `fromZig` return owned trees; release them with `yaml.value.freeValue()`. Release `toZig` results with `yaml.value.deinitZig()`.
+- Release schema violations with `yaml.schema.freeViolations()`.
+- `Scanner` borrows its input and owns transient token payloads. `Parser` owns its scanner and transient event payloads. Copy data that must outlive them into a document or caller-owned storage.
 
 ## Road to 1.0
 

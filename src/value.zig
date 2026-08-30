@@ -2,18 +2,19 @@
 //!
 //! A schema-free, tagged `Value` for data-oriented YAML work, with
 //! conversions in both directions: `parseToValue` (text → Value),
-//! `Value.toNode` (Value → document tree), `nodeToValue` (tree →
-//! Value), and Zig-native `fromZig`/`toZig` for structs, optionals,
-//! enums, slices and scalars via comptime reflection.
+//! `toNode` (Value → document tree), `nodeToValue` (tree → Value), and
+//! Zig-native `fromZig`/`toZig` for structs, optionals, enums, slices
+//! and scalars via comptime reflection.
 //!
-//! Ownership: `toZig` allocates strings/slices through the caller's
-//! allocator and they stay owned by the caller. `fromZig` copies into
-//! the document pool when materializing nodes, never borrowing.
+//! Ownership: functions returning `Value` allocate a complete owned
+//! tree through the caller's allocator; release it with `freeValue`.
+//! `toZig` results own their slice storage and are released with
+//! `deinitZig`. `toNode` copies all retained data into the document pool.
 //!
-//! Scalar typing follows the YAML 1.2 core schema (see
-//! `document.scalarKind`); conversions never infer lossy types
-//! silently — a quoted "1.0" is a string, and an int field fed
-//! `1.0` is a conversion error.
+//! Plain scalar typing delegates to the library's YAML 1.2 core-schema
+//! resolver (see `document.scalarKind`); quoted scalars remain strings.
+//! Floats are represented as `f64`, so their exact source spelling is
+//! not retained.
 
 const std = @import("std");
 const diag_mod = @import("diag.zig");
@@ -119,7 +120,7 @@ pub fn nodeToValue(alloc: std.mem.Allocator, node: *const Node) Error!Value {
 /// Interpret a scalar's text under its style (core schema: only plain
 /// scalars get typed).
 pub fn scalarToValue(alloc: std.mem.Allocator, text: []const u8, style: ScalarStyle) Error!Value {
-    if (style != .plain and style != .any) return .{ .string = try alloc.dupe(u8, text) };
+    if (style != .plain) return .{ .string = try alloc.dupe(u8, text) };
     switch (document_mod.scalarKind(text, .plain)) {
         .null_ => return .null_,
         .bool_ => return .{ .bool_ = text[0] == 't' or text[0] == 'T' },
@@ -181,8 +182,12 @@ pub fn toNode(doc: *Document, value: Value) Error!*Node {
 
 /// Convert a Value into a Zig value of type `T`, allocating through
 /// `alloc`. Supported: bool, all int/float widths, `?T`, enums
-/// (by name), slices of T, and structs (by field name; missing
+/// (by name), slices of T, arrays, and structs (by field name; missing
 /// non-optional fields are `error.TypeMismatch`).
+///
+/// All slice storage in the returned value is owned by the caller,
+/// including slice-valued struct defaults. Release it with `deinitZig`
+/// using the same allocator.
 pub fn toZig(comptime T: type, alloc: std.mem.Allocator, value: Value) Error!T {
     const info = @typeInfo(T);
     switch (info) {
@@ -228,9 +233,15 @@ pub fn toZig(comptime T: type, alloc: std.mem.Allocator, value: Value) Error!T {
                 }
                 switch (value) {
                     .list => |items| {
-                        var out = try alloc.alloc(ptr.child, items.len);
+                        const out = try alloc.alloc(ptr.child, items.len);
+                        var filled: usize = 0;
+                        errdefer {
+                            for (out[0..filled]) |item| deinitZig(ptr.child, alloc, item);
+                            alloc.free(out);
+                        }
                         for (items, 0..) |item, i| {
                             out[i] = try toZig(ptr.child, alloc, item);
+                            filled = i + 1;
                         }
                         return out;
                     },
@@ -243,8 +254,11 @@ pub fn toZig(comptime T: type, alloc: std.mem.Allocator, value: Value) Error!T {
             .list => |items| {
                 if (items.len != arr.len) return error.TypeMismatch;
                 var out: T = undefined;
+                var filled: usize = 0;
+                errdefer for (out[0..filled]) |item| deinitZig(arr.child, alloc, item);
                 for (items, 0..) |item, i| {
                     out[i] = try toZig(arr.child, alloc, item);
+                    filled = i + 1;
                 }
                 return out;
             },
@@ -258,37 +272,118 @@ pub fn toZig(comptime T: type, alloc: std.mem.Allocator, value: Value) Error!T {
     }
 }
 
+/// Release all allocations produced by `toZig(T, alloc, ...)`.
+pub fn deinitZig(comptime T: type, alloc: std.mem.Allocator, value: T) void {
+    switch (@typeInfo(T)) {
+        .optional => |opt| if (value) |item| deinitZig(opt.child, alloc, item),
+        .pointer => |ptr| {
+            if (ptr.size != .slice) return;
+            if (ptr.child != u8) {
+                for (value) |item| deinitZig(ptr.child, alloc, item);
+            }
+            alloc.free(value);
+        },
+        .array => |arr| {
+            for (value) |item| deinitZig(arr.child, alloc, item);
+        },
+        .@"struct" => |st| {
+            inline for (st.fields) |field| {
+                deinitZig(field.type, alloc, @field(value, field.name));
+            }
+        },
+        else => {},
+    }
+}
+
+/// Duplicate allocation-bearing Zig values so defaults returned by
+/// `toZig` follow the same ownership rule as parsed fields.
+fn cloneZig(comptime T: type, alloc: std.mem.Allocator, value: T) Error!T {
+    switch (@typeInfo(T)) {
+        .optional => |opt| {
+            if (value) |item| return try cloneZig(opt.child, alloc, item);
+            return null;
+        },
+        .pointer => |ptr| {
+            if (ptr.size != .slice) return value;
+            const out = try alloc.alloc(ptr.child, value.len);
+            var filled: usize = 0;
+            errdefer {
+                for (out[0..filled]) |item| deinitZig(ptr.child, alloc, item);
+                alloc.free(out);
+            }
+            for (value, 0..) |item, i| {
+                out[i] = try cloneZig(ptr.child, alloc, item);
+                filled = i + 1;
+            }
+            return out;
+        },
+        .array => |arr| {
+            var out: T = undefined;
+            var filled: usize = 0;
+            errdefer for (out[0..filled]) |item| deinitZig(arr.child, alloc, item);
+            for (value, 0..) |item, i| {
+                out[i] = try cloneZig(arr.child, alloc, item);
+                filled = i + 1;
+            }
+            return out;
+        },
+        .@"struct" => |st| {
+            var out: T = undefined;
+            var initialized = [_]bool{false} ** st.fields.len;
+            errdefer {
+                inline for (st.fields, 0..) |field, i| {
+                    if (initialized[i]) deinitZig(field.type, alloc, @field(out, field.name));
+                }
+            }
+            inline for (st.fields, 0..) |field, i| {
+                @field(out, field.name) = try cloneZig(field.type, alloc, @field(value, field.name));
+                initialized[i] = true;
+            }
+            return out;
+        },
+        else => return value,
+    }
+}
+
 /// Struct arm of `toZig`: fields matched by name; defaults and
 /// optionals honoured; a missing required field is `TypeMismatch`.
 fn toZigStruct(comptime T: type, alloc: std.mem.Allocator, members: []const Value.Member) Error!T {
     const st = @typeInfo(T).@"struct";
     var out: T = undefined;
-    inline for (st.fields) |field| {
+    var initialized = [_]bool{false} ** st.fields.len;
+    errdefer {
+        inline for (st.fields, 0..) |field, i| {
+            if (initialized[i]) deinitZig(field.type, alloc, @field(out, field.name));
+        }
+    }
+
+    inline for (st.fields, 0..) |field, i| {
         var found = false;
         for (members) |m| {
             if (std.mem.eql(u8, m.key, field.name)) {
                 @field(out, field.name) = try toZig(field.type, alloc, m.value);
+                initialized[i] = true;
                 found = true;
                 break;
             }
         }
         if (!found) {
             if (field.defaultValue()) |d| {
-                @field(out, field.name) = d;
+                @field(out, field.name) = try cloneZig(field.type, alloc, d);
             } else if (@typeInfo(field.type) == .optional) {
                 @field(out, field.name) = null;
             } else {
                 return error.TypeMismatch;
             }
+            initialized[i] = true;
         }
     }
     return out;
 }
 
-/// Build a Value from a Zig value. Everything needed for later
-/// `freeValue` (member storage, struct field names) is allocated
-/// through `alloc`; string VALUES are still borrowed from the input
-/// (dupe them first when the backing memory is transient).
+/// Build a fully owned Value from a Zig value. Strings, enum names,
+/// sequence items, member storage, and field names are duplicated through
+/// `alloc`; release the result with `freeValue` using the same allocator.
 pub fn fromZig(alloc: std.mem.Allocator, value: anytype) Error!Value {
     const T = @TypeOf(value);
     const info = @typeInfo(T);
@@ -298,9 +393,22 @@ pub fn fromZig(alloc: std.mem.Allocator, value: anytype) Error!Value {
         .comptime_int => return .{ .int = value },
         .float, .comptime_float => return .{ .float = @floatCast(value) },
         .optional => return if (value) |v| fromZig(alloc, v) else .null_,
-        .@"enum" => return .{ .string = @tagName(value) },
+        .@"enum" => return .{ .string = try alloc.dupe(u8, @tagName(value)) },
         .pointer => |ptr| {
-            if (ptr.size == .slice and ptr.child == u8) return .{ .string = value };
+            if (ptr.size == .slice) {
+                if (ptr.child == u8) return .{ .string = try alloc.dupe(u8, value) };
+                const out = try alloc.alloc(Value, value.len);
+                var filled: usize = 0;
+                errdefer {
+                    for (out[0..filled]) |item| freeValue(alloc, item);
+                    alloc.free(out);
+                }
+                for (value, 0..) |item, i| {
+                    out[i] = try fromZig(alloc, item);
+                    filled = i + 1;
+                }
+                return .{ .list = out };
+            }
             if (ptr.size == .one) return fromZig(alloc, value.*);
             return error.UnsupportedType;
         },
@@ -404,7 +512,7 @@ test "zig struct conversion" {
     defer freeValue(testing.allocator, v);
 
     const cfg = try toZig(Config, testing.allocator, v);
-    defer testing.allocator.free(cfg.name);
+    defer deinitZig(Config, testing.allocator, cfg);
     try testing.expectEqualStrings("api", cfg.name);
     try testing.expectEqual(@as(u8, 1), cfg.replicas); // default applied
     try testing.expect(!cfg.enabled);
@@ -434,6 +542,61 @@ test "fromZig builds values and nodes" {
     const back = try parseToValue(testing.allocator, out);
     defer freeValue(testing.allocator, back);
     try testing.expectEqual(@as(i64, 1), back.get("x").?.int);
+}
+
+test "fromZig owns strings, enum names, and slice elements" {
+    const Mode = enum { fast, slow };
+    const ports_storage = [_]u16{ 80, 443 };
+    const Config = struct {
+        name: []const u8,
+        mode: Mode,
+        ports: []const u16,
+    };
+    const input = Config{
+        .name = "yayl",
+        .mode = .fast,
+        .ports = ports_storage[0..],
+    };
+
+    const v = try fromZig(testing.allocator, input);
+    defer freeValue(testing.allocator, v);
+    try testing.expectEqualStrings("yayl", v.get("name").?.string);
+    try testing.expect(v.get("name").?.string.ptr != input.name.ptr);
+    try testing.expectEqualStrings("fast", v.get("mode").?.string);
+    try testing.expectEqual(@as(i64, 443), v.get("ports").?.at(1).?.int);
+}
+
+test "toZig owns nested allocations and cleans partial failures" {
+    const Config = struct {
+        names: []const []const u8,
+        fallback: []const u8 = "fallback",
+    };
+    const good = try parseToValue(testing.allocator, "names: [one, two]\n");
+    defer freeValue(testing.allocator, good);
+
+    const cfg = try toZig(Config, testing.allocator, good);
+    defer deinitZig(Config, testing.allocator, cfg);
+    try testing.expectEqualStrings("two", cfg.names[1]);
+    try testing.expectEqualStrings("fallback", cfg.fallback);
+
+    const bad = try parseToValue(testing.allocator, "[one, 2]\n");
+    defer freeValue(testing.allocator, bad);
+    try testing.expectError(error.TypeMismatch, toZig([]const []const u8, testing.allocator, bad));
+}
+
+test "Value strings remain strings through document nodes" {
+    const cases = [_][]const u8{ "42", "true", "0x1F", "null" };
+    for (cases) |text| {
+        var doc = Document.init(testing.allocator);
+        defer doc.deinit();
+
+        const node = try toNode(&doc, .{ .string = text });
+        const back = try nodeToValue(testing.allocator, node);
+        defer freeValue(testing.allocator, back);
+
+        try testing.expect(back == .string);
+        try testing.expectEqualStrings(text, back.string);
+    }
 }
 
 test "bigint keeps exact text" {
@@ -468,6 +631,31 @@ test "parseToValue keeps the real parse error" {
     try testing.expectError(error.InvalidSyntax, parseToValue(testing.allocator, "a: b\n  c: d\n"));
 }
 
+test "allocation failures in Zig conversions leak nothing" {
+    try std.testing.checkAllAllocationFailures(testing.allocator, zigConversions, .{});
+}
+
+fn zigConversions(alloc: std.mem.Allocator) !void {
+    const source = try parseToValue(alloc, "names: [one, two]\n");
+    defer freeValue(alloc, source);
+
+    const Output = struct {
+        names: []const []const u8,
+        fallback: []const u8 = "fallback",
+    };
+    const output = try toZig(Output, alloc, source);
+    defer deinitZig(Output, alloc, output);
+
+    const Mode = enum { fast, slow };
+    const names = [_][]const u8{ "api", "worker" };
+    const Input = struct {
+        names: []const []const u8,
+        mode: Mode,
+    };
+    const value = try fromZig(alloc, Input{ .names = names[0..], .mode = .fast });
+    defer freeValue(alloc, value);
+}
+
 test "allocation failures in value round trip leak nothing" {
     try std.testing.checkAllAllocationFailures(testing.allocator, valueRoundTrip, .{});
 }
@@ -491,7 +679,7 @@ fn valueRoundTrip(alloc: std.mem.Allocator) !void {
     // fromZig with a string field: the value must own its bytes for
     // freeValue to release them.
     const label = try alloc.dupe(u8, "hi");
-    errdefer alloc.free(label);
+    defer alloc.free(label);
     const Point = struct { x: i32, label: []const u8 };
     const vp = try fromZig(alloc, Point{ .x = 1, .label = label });
     defer freeValue(alloc, vp);

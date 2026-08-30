@@ -88,18 +88,20 @@ pub fn writeBytesAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
             },
             else => return err,
         };
-        var ok = false;
-        defer if (!ok) {
-            file.close(io);
-            cwd.deleteFile(io, tmp_path) catch {};
-        };
+        var file_open = true;
+        var committed = false;
+        defer {
+            if (file_open) file.close(io);
+            if (!committed) cwd.deleteFile(io, tmp_path) catch {};
+        }
         try file.writeStreamingAll(io, bytes);
         // Flush to stable storage before the rename so the visible
         // file never contains torn content after a crash.
         try file.sync(io);
         file.close(io);
-        ok = true;
+        file_open = false;
         try cwd.rename(tmp_path, cwd, path, io);
+        committed = true;
         return;
     }
 }
@@ -140,13 +142,26 @@ test "parse and atomically rewrite a file" {
     defer alloc.free(round);
     try testing.expectEqualStrings("# comment\na: 1\nb: TWO\n", round);
 
-    // No temp files left behind.
-    var dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
-    defer dir.close(io);
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        try testing.expect(std.mem.indexOf(u8, entry.name, ".yayl-tmp-") == null);
-    }
+    try expectNoTempFiles(io, path);
+}
+
+test "atomic write removes its temp file when rename fails" {
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+
+    const path = "zig-out-test-atomic-target";
+    cwd.deleteDir(io, path) catch {};
+    try cwd.createDir(io, path, .default_dir);
+    defer cwd.deleteDir(io, path) catch {};
+
+    writeBytesAtomic(io, path, "content") catch {
+        try expectNoTempFiles(io, path);
+        return;
+    };
+    return error.TestUnexpectedResult;
 }
 
 test "bounded read rejects oversized input" {
@@ -198,4 +213,17 @@ fn boundedRead(alloc: std.mem.Allocator) !void {
     const data = try readFile(alloc, io, path, max_bytes_default);
     defer alloc.free(data);
     try testing.expectEqualStrings("# comment\na: 1\n", data);
+}
+
+fn expectNoTempFiles(io: std.Io, path: []const u8) !void {
+    var dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, path) and
+            std.mem.indexOf(u8, entry.name, ".yayl-tmp-") != null)
+        {
+            return error.TempFileLeftBehind;
+        }
+    }
 }

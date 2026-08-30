@@ -220,9 +220,12 @@ const count = v.get("count").?.int;      // i64
 const tags  = v.get("tags").?.list;      // []const Value
 ~~~
 
-Typing follows the YAML 1.2 core schema and is never lossy: a quoted
-`"42"` stays a string; integers beyond i64 keep their exact text
+Plain scalars use the library's YAML 1.2 core-schema resolver. Quoted
+`"42"` stays a string, and integers beyond i64 keep their exact text
 (`.bigint`).
+`Value` is a semantic data model; it does not retain presentation,
+tags, anchors, aliases, or exact float spelling. Use `Document` for
+byte-faithful editing.
 
 Convert straight into Zig types and back:
 
@@ -239,10 +242,10 @@ defer doc.deinit();
 const val = try yaml.value.nodeToValue(alloc, doc.root.?);
 defer yaml.value.freeValue(alloc, val);
 const cfg = try yaml.value.toZig(Config, alloc, val);
-defer alloc.free(cfg.name);
+defer yaml.value.deinitZig(Config, alloc, cfg);
 
-// Zig values -> YAML:
-var v = try yaml.value.fromZig(alloc, cfg);
+// Zig values -> YAML. fromZig duplicates all referenced storage:
+const v = try yaml.value.fromZig(alloc, cfg);
 defer yaml.value.freeValue(alloc, v);
 doc.root = try yaml.value.toNode(&doc, v);
 ~~~
@@ -273,10 +276,11 @@ Use `Schema.mapStrict` to also reject undeclared keys.
 
 `yaml.file` wraps parsing and writing with production safeguards:
 reads are bounded (`max_bytes`, so a huge file fails with
-`error.StreamTooLong`, not OOM) and writes are atomic (temp file with
-an exclusive name, `fsync`, then rename): a crash never exposes torn
-content. This is torn-write protection, not a power-loss durability
-guarantee — pair with your own fsync policy if you need one.
+`error.StreamTooLong`, not OOM) and writes use atomic replacement (a
+sibling temp file with an exclusive name, file sync, then rename): a
+crash never exposes torn content. This is torn-write protection, not a
+power-loss durability guarantee; sync the containing directory if your
+application requires that guarantee.
 
 ~~~zig
 var threaded: std.Io.Threaded = .init(alloc, .{});
@@ -307,13 +311,19 @@ The layering mirrors libfyaml and is public:
 
 ## Memory and error model
 
-* Every `Document` owns an arena (`yaml.Pool`); nodes, strings and
-  edits live and die with it. Nothing outlives `deinit`.
-* Values returned by `yaml.value.toZig` are allocated by YOUR
-  allocator and freed by you (`freeValue` for `Value` trees).
-* All fallible operations are allocation-failure tested
-  (`checkAllAllocationFailures`): an OOM mid-operation either
-  completes or leaves the document intact.
+* Every `Document` owns an arena (`yaml.Pool`); nodes, strings,
+  copied source bytes, and edits live until `Document.deinit()`.
+* `parseToValue`, `nodeToValue`, and `fromZig` return fully owned
+  trees. Release them with `freeValue` and the same allocator.
+* `toZig` owns all slice storage in its result, including
+  slice-valued defaults. Release it with `deinitZig(T, alloc, value)`.
+* `Schema.validate` returns an owned violation slice; release it with
+  `freeViolations`. `yaml.file.readFile`, `Document.write`, and
+  `Diag.render` return caller-owned buffers.
+* `Scanner` borrows its input. Token and event payloads remain valid
+  only until their owning scanner or parser is deinitialized.
+* Allocating operations are failure-injection tested: an OOM does not
+  leak partial results or leave a document half-edited.
 
 ## Building and testing from source
 

@@ -3,6 +3,20 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Fixed
+
+- `value.fromZig` now returns uniformly owned value trees, including
+  strings, enum names, and general slices; `value.toZig` cleans up
+  partially built values and exposes `yaml.value.deinitZig` for returned
+  slice storage and slice-valued defaults.
+- `nodeToValue` no longer resolves programmatic strings such as `"42"`
+  into core-schema numbers or booleans after `toNode`; they remain
+  strings.
+- Atomic file writes remove their temporary file when the final rename
+  fails.
+
 ## 0.9.0 — 2026-08-30
 
 First public release. The stack is feature-complete: scanner → parser
