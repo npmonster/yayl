@@ -20,8 +20,9 @@ const TokenType = token_mod.Token.Type;
 const ScalarStyle = token_mod.ScalarStyle;
 const YamlError = diag.YamlError;
 
-/// Maximum number of bytes a simple key may span (YAML 1.2 / libfyaml).
-const max_simple_key_length: usize = 1024;
+/// Maximum number of characters a simple key may span (YAML 1.2.2
+/// 7.4.2 and 8.2.2, which bound it in Unicode characters, not bytes).
+const max_simple_key_chars: usize = 1024;
 
 /// YAML tokenizer: turns input bytes into a token stream (fy-scan port).
 pub const Scanner = struct {
@@ -68,6 +69,10 @@ pub const Scanner = struct {
         required: bool = false,
         token_number: usize = 0,
         mark: Mark = .{},
+        /// Byte index into `input` where the key starts. Distinct from
+        /// `mark.offset`, which trails `pos` by the BOM length (`init`),
+        /// so only this one is safe to slice with.
+        pos: usize = 0,
     };
 
     pub fn init(alloc: std.mem.Allocator, d: ?*Diag, input: []const u8) !Scanner {
@@ -253,15 +258,27 @@ pub const Scanner = struct {
     // Simple keys and indentation (fy_scan.c roll/unroll indent)
     // ------------------------------------------------------------------
 
+    /// Does the simple key starting at byte offset `start` exceed the
+    /// spec's 1024-*character* bound? A span of N characters is at least
+    /// N bytes, so the byte span is a necessary condition: only a span
+    /// that already overflows the bound in bytes pays for a codepoint
+    /// count, keeping the common case a single integer compare.
+    fn simpleKeyTooLong(self: *Scanner, start: usize) bool {
+        if (self.pos <= start) return false;
+        if (self.pos - start <= max_simple_key_chars) return false;
+        const chars = utf8.countCodepoints(self.input[start..self.pos]) catch return true;
+        return chars > max_simple_key_chars;
+    }
+
     fn staleSimpleKeys(self: *Scanner) !void {
         for (self.simple_keys.items, 0..) |*sk, i| {
             // A simple key may span a line only inside a flow *mapping*.
             // Block keys and flow-sequence single-pair keys are single-line
             // (corpus 4MUZ/5MUD/9SA2 valid vs DK4H/ZXT5 invalid). The
-            // 1024-octet bound applies in every context.
+            // 1024-character bound applies in every context.
             const may_span_line = i > 0 and !self.flow_kinds.items[i - 1];
             if (sk.possible and
-                ((!may_span_line and sk.mark.line < self.mark.line) or sk.mark.offset + max_simple_key_length < self.mark.offset))
+                ((!may_span_line and sk.mark.line < self.mark.line) or self.simpleKeyTooLong(sk.pos)))
             {
                 if (sk.required) {
                     return self.fail(self.mark, "simple key was expected", .{});
@@ -279,6 +296,7 @@ pub const Scanner = struct {
                 self.indent == @as(isize, @intCast(self.mark.column)),
             .token_number = self.token_base + self.tokens.items.len,
             .mark = self.mark,
+            .pos = self.pos,
         };
         try self.removeSimpleKey();
         self.simple_keys.items[self.simple_keys.items.len - 1] = sk;
@@ -1728,6 +1746,33 @@ test "block nesting bomb is rejected" {
     }
     const r = scanAll(testing.allocator, input.items);
     try testing.expectError(error.NestingTooDeep, r);
+}
+
+test "a simple key past 1024 characters is rejected" {
+    // YAML 1.2.2 7.4.2 / 8.2.2: a simple key spans at most 1024 characters.
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(testing.allocator);
+    try input.appendNTimes(testing.allocator, 'a', 2000);
+    try input.appendSlice(testing.allocator, ": v\n");
+    const r = scanAll(testing.allocator, input.items);
+    try testing.expectError(error.InvalidSyntax, r);
+}
+
+test "a long non-ASCII simple key within the character bound is accepted" {
+    // 600 CJK characters span 1800 bytes. The spec bounds *characters*,
+    // so this is legal; a byte-counting bound would wrongly reject it.
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(testing.allocator);
+    var i: usize = 0;
+    while (i < 600) : (i += 1) try input.appendSlice(testing.allocator, "\xE4\xB8\x96");
+    try input.appendSlice(testing.allocator, ": v\n");
+    var r = try scanAll(testing.allocator, input.items);
+    defer r.deinit(testing.allocator);
+    // Scanned as a real key/value pair, not silently demoted.
+    const types = try tokenTypes(testing.allocator, r.toks.items);
+    defer testing.allocator.free(types);
+    try testing.expect(std.mem.indexOfScalar(TokenType, types, .key) != null);
+    try testing.expect(std.mem.indexOfScalar(TokenType, types, .value) != null);
 }
 
 test "anchor and alias names are greedy" {
