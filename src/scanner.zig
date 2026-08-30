@@ -16,7 +16,7 @@ const utf8 = @import("utf8.zig");
 const Diag = diag.Diag;
 const Mark = diag.Mark;
 const Token = token_mod.Token;
-const TokenType = token_mod.Token.Type;
+const TokenKind = token_mod.Token.Kind;
 const ScalarStyle = token_mod.ScalarStyle;
 const YamlError = diag.YamlError;
 
@@ -242,18 +242,18 @@ pub const Scanner = struct {
 
     fn appendToken(self: *Scanner, tok: Token) !void {
         try self.tokens.append(self.alloc, tok);
-        self.noteNodeEnd(tok.kind);
+        self.noteNodeEnd(tok.data);
     }
 
     fn insertToken(self: *Scanner, number: usize, tok: Token) !void {
         const index = number - self.token_base;
         try self.tokens.insert(self.alloc, index, tok);
-        self.noteNodeEnd(tok.kind);
+        self.noteNodeEnd(tok.data);
     }
 
     /// True when the most recently emitted token can end a key node:
     /// the basis for flow adjacent values ("key":value, spec 7.18).
-    fn noteNodeEnd(self: *Scanner, kind: Token.Kind) void {
+    fn noteNodeEnd(self: *Scanner, kind: Token.Data) void {
         self.last_node_end = switch (kind) {
             .scalar, .alias, .flow_sequence_end, .flow_mapping_end => true,
             else => false,
@@ -316,7 +316,7 @@ pub const Scanner = struct {
         sk.possible = false;
     }
 
-    fn rollIndent(self: *Scanner, column: usize, number: ?usize, kind: Token.Kind, mark: Mark) !void {
+    fn rollIndent(self: *Scanner, column: usize, number: ?usize, kind: Token.Data, mark: Mark) !void {
         if (self.flow_level > 0) return;
         const col: isize = @intCast(column);
         if (self.indent < col) {
@@ -325,7 +325,7 @@ pub const Scanner = struct {
             }
             try self.indents.append(self.alloc, self.indent);
             self.indent = col;
-            const tok = Token{ .kind = kind, .start = mark, .end = mark };
+            const tok = Token{ .data = kind, .start = mark, .end = mark };
             if (number) |n| {
                 try self.insertToken(n, tok);
             } else {
@@ -337,7 +337,7 @@ pub const Scanner = struct {
     fn unrollIndent(self: *Scanner, column: isize) !void {
         if (self.flow_level > 0) return;
         while (self.indent > column) {
-            try self.appendToken(.{ .kind = .block_end, .start = self.mark, .end = self.mark });
+            try self.appendToken(.{ .data = .block_end, .start = self.mark, .end = self.mark });
             self.indent = self.indents.pop().?;
         }
     }
@@ -509,7 +509,7 @@ pub const Scanner = struct {
 
     fn fetchStreamStart(self: *Scanner) !void {
         self.stream_start_produced = true;
-        try self.appendToken(.{ .kind = .stream_start, .start = self.mark, .end = self.mark });
+        try self.appendToken(.{ .data = .stream_start, .start = self.mark, .end = self.mark });
     }
 
     fn fetchStreamEnd(self: *Scanner) !void {
@@ -522,7 +522,7 @@ pub const Scanner = struct {
         try self.removeSimpleKey();
         self.simple_key_allowed = false;
         self.stream_end_produced = true;
-        try self.appendToken(.{ .kind = .stream_end, .start = self.mark, .end = self.mark });
+        try self.appendToken(.{ .data = .stream_end, .start = self.mark, .end = self.mark });
     }
 
     fn fetchDirective(self: *Scanner) !void {
@@ -533,7 +533,7 @@ pub const Scanner = struct {
         try self.appendToken(tok);
     }
 
-    fn fetchDocumentIndicator(self: *Scanner, tag: Token.Type) !void {
+    fn fetchDocumentIndicator(self: *Scanner, tag: Token.Kind) !void {
         try self.unrollIndent(-1);
         try self.removeSimpleKey();
         self.simple_key_allowed = false;
@@ -550,12 +550,12 @@ pub const Scanner = struct {
                 return self.fail(self.mark, "did not find expected comment or line break after document end marker", .{});
             }
         }
-        const k: Token.Kind = switch (tag) {
+        const k: Token.Data = switch (tag) {
             .document_start => .{ .document_start = .{ .explicit_marker = true } },
             .document_end => .document_end,
             else => unreachable, // only document indicators are passed
         };
-        try self.appendToken(.{ .kind = k, .start = start, .end = self.mark });
+        try self.appendToken(.{ .data = k, .start = start, .end = self.mark });
     }
 
     /// In flow context a flow indicator (`[ { ] } , ? :`) must sit at a
@@ -566,7 +566,7 @@ pub const Scanner = struct {
         return self.flow_level == 0 or @as(isize, @intCast(self.mark.column)) > self.indent;
     }
 
-    fn fetchFlowCollectionStart(self: *Scanner, kind: Token.Kind) !void {
+    fn fetchFlowCollectionStart(self: *Scanner, kind: Token.Data) !void {
         if (!self.flowIndentOk()) {
             return self.failWith(error.InvalidIndentation, self.mark, "wrongly indented flow collection start in flow mode", .{});
         }
@@ -581,10 +581,10 @@ pub const Scanner = struct {
         self.simple_key_allowed = true;
         const start = self.mark;
         self.skipCp();
-        try self.appendToken(.{ .kind = kind, .start = start, .end = self.mark });
+        try self.appendToken(.{ .data = kind, .start = start, .end = self.mark });
     }
 
-    fn fetchFlowCollectionEnd(self: *Scanner, kind: Token.Kind) !void {
+    fn fetchFlowCollectionEnd(self: *Scanner, kind: Token.Data) !void {
         if (!self.flowIndentOk()) {
             return self.failWith(error.InvalidIndentation, self.mark, "wrongly indented flow collection end in flow mode", .{});
         }
@@ -596,7 +596,7 @@ pub const Scanner = struct {
         self.simple_key_allowed = false;
         const start = self.mark;
         self.skipCp();
-        try self.appendToken(.{ .kind = kind, .start = start, .end = self.mark });
+        try self.appendToken(.{ .data = kind, .start = start, .end = self.mark });
     }
 
     fn fetchFlowEntry(self: *Scanner) !void {
@@ -606,7 +606,7 @@ pub const Scanner = struct {
         self.simple_key_allowed = true;
         const start = self.mark;
         self.skipCp();
-        try self.appendToken(.{ .kind = .flow_entry, .start = start, .end = self.mark });
+        try self.appendToken(.{ .data = .flow_entry, .start = start, .end = self.mark });
     }
 
     fn fetchBlockEntry(self: *Scanner) !void {
@@ -619,7 +619,7 @@ pub const Scanner = struct {
         self.simple_key_allowed = self.flow_level == 0;
         const start = self.mark;
         self.skipCp();
-        try self.appendToken(.{ .kind = .block_entry, .start = start, .end = self.mark });
+        try self.appendToken(.{ .data = .block_entry, .start = start, .end = self.mark });
     }
 
     fn fetchKey(self: *Scanner) !void {
@@ -635,7 +635,7 @@ pub const Scanner = struct {
         self.simple_key_allowed = self.flow_level == 0;
         const start = self.mark;
         self.skipCp();
-        try self.appendToken(.{ .kind = .key, .start = start, .end = self.mark });
+        try self.appendToken(.{ .data = .key, .start = start, .end = self.mark });
     }
 
     fn fetchValue(self: *Scanner) !void {
@@ -644,7 +644,7 @@ pub const Scanner = struct {
         }
         const sk = &self.simple_keys.items[self.simple_keys.items.len - 1];
         if (sk.possible) {
-            try self.insertToken(sk.token_number, .{ .kind = .key, .start = sk.mark, .end = sk.mark });
+            try self.insertToken(sk.token_number, .{ .data = .key, .start = sk.mark, .end = sk.mark });
             // A confirmed simple key starts a block mapping at its own
             // position (inserted before the KEY token).
             try self.rollIndent(sk.mark.column, sk.token_number, .block_mapping_start, sk.mark);
@@ -661,10 +661,10 @@ pub const Scanner = struct {
         }
         const start = self.mark;
         self.skipCp();
-        try self.appendToken(.{ .kind = .value, .start = start, .end = self.mark });
+        try self.appendToken(.{ .data = .value, .start = start, .end = self.mark });
     }
 
-    fn fetchAnchor(self: *Scanner, tag: Token.Type) !void {
+    fn fetchAnchor(self: *Scanner, tag: Token.Kind) !void {
         try self.saveSimpleKey();
         self.simple_key_allowed = false;
         const tok = try self.scanAnchor(tag);
@@ -739,13 +739,13 @@ pub const Scanner = struct {
         if (ctype.isBreak(self.at(0))) self.skipLine();
 
         return .{
-            .kind = .{ .directive = .{ .name = name, .params = try self.ownParams(&params) } },
+            .data = .{ .directive = .{ .name = name, .params = try self.ownParams(&params) } },
             .start = start,
             .end = self.mark,
         };
     }
 
-    fn scanAnchor(self: *Scanner, tag: Token.Type) !Token {
+    fn scanAnchor(self: *Scanner, tag: Token.Kind) !Token {
         const start = self.mark;
         self.skipCp(); // '&' or '*'
         const name_start = self.pos;
@@ -763,8 +763,8 @@ pub const Scanner = struct {
         if (name.len == 0) {
             return self.fail(start, "did not find expected alphabetic or numeric character in {s}", .{@tagName(tag)});
         }
-        const k: Token.Kind = if (tag == .anchor) .{ .anchor = name } else .{ .alias = name };
-        return .{ .kind = k, .start = start, .end = self.mark };
+        const k: Token.Data = if (tag == .anchor) .{ .anchor = name } else .{ .alias = name };
+        return .{ .data = k, .start = start, .end = self.mark };
     }
 
     fn scanTag(self: *Scanner) !Token {
@@ -819,7 +819,7 @@ pub const Scanner = struct {
             return self.fail(self.mark, "did not find expected whitespace or line break after tag", .{});
         }
         return .{
-            .kind = .{ .tag = .{ .handle = handle, .suffix = suffix } },
+            .data = .{ .tag = .{ .handle = handle, .suffix = suffix } },
             .start = start,
             .end = self.mark,
         };
@@ -1052,7 +1052,7 @@ pub const Scanner = struct {
         }
 
         return .{
-            .kind = .{ .scalar = .{ .value = try self.ownTemp(&value), .style = style } },
+            .data = .{ .scalar = .{ .value = try self.ownTemp(&value), .style = style } },
             .start = start,
             .end = self.mark,
         };
@@ -1134,7 +1134,7 @@ pub const Scanner = struct {
         }
 
         return .{
-            .kind = .{ .scalar = .{ .value = try self.ownTemp(&value), .style = style } },
+            .data = .{ .scalar = .{ .value = try self.ownTemp(&value), .style = style } },
             .start = start,
             .end = self.mark,
         };
@@ -1310,7 +1310,7 @@ pub const Scanner = struct {
         }
 
         return .{
-            .kind = .{ .scalar = .{ .value = try self.ownTemp(&value), .style = .plain } },
+            .data = .{ .scalar = .{ .value = try self.ownTemp(&value), .style = .plain } },
             .start = start,
             .end = self.mark,
         };
@@ -1347,9 +1347,9 @@ fn scanAll(alloc: std.mem.Allocator, input: []const u8) !ScanResult {
     return .{ .scanner = s, .toks = out };
 }
 
-fn tokenTypes(alloc: std.mem.Allocator, toks: []const Token) ![]const TokenType {
-    var out = try alloc.alloc(TokenType, toks.len);
-    for (toks, 0..) |t, i| out[i] = std.meta.activeTag(t.kind);
+fn tokenTypes(alloc: std.mem.Allocator, toks: []const Token) ![]const TokenKind {
+    var out = try alloc.alloc(TokenKind, toks.len);
+    for (toks, 0..) |t, i| out[i] = std.meta.activeTag(t.data);
     return out;
 }
 
@@ -1358,8 +1358,8 @@ test "empty stream" {
     defer r.deinit(testing.allocator);
     const toks = r.toks;
     try testing.expectEqual(@as(usize, 2), toks.items.len);
-    try testing.expectEqual(TokenType.stream_start, toks.items[0].kind);
-    try testing.expectEqual(TokenType.stream_end, toks.items[1].kind);
+    try testing.expectEqual(TokenKind.stream_start, toks.items[0].data);
+    try testing.expectEqual(TokenKind.stream_end, toks.items[1].data);
 }
 
 test "simple key value" {
@@ -1368,13 +1368,13 @@ test "simple key value" {
     const toks = r.toks;
     const types = try tokenTypes(testing.allocator, toks.items);
     defer testing.allocator.free(types);
-    const want: []const TokenType = &.{
+    const want: []const TokenKind = &.{
         .stream_start, .block_mapping_start, .key,       .scalar,
         .value,        .scalar,              .block_end, .stream_end,
     };
-    try testing.expectEqualSlices(TokenType, want, types);
-    try testing.expectEqualStrings("a", toks.items[3].kind.scalar.value);
-    try testing.expectEqualStrings("b", toks.items[5].kind.scalar.value);
+    try testing.expectEqualSlices(TokenKind, want, types);
+    try testing.expectEqualStrings("a", toks.items[3].data.scalar.value);
+    try testing.expectEqualStrings("b", toks.items[5].data.scalar.value);
 }
 
 test "block sequence" {
@@ -1383,11 +1383,11 @@ test "block sequence" {
     const toks = r.toks;
     const types = try tokenTypes(testing.allocator, toks.items);
     defer testing.allocator.free(types);
-    const want: []const TokenType = &.{
+    const want: []const TokenKind = &.{
         .stream_start, .block_sequence_start, .block_entry, .scalar,
         .block_entry,  .scalar,               .block_end,   .stream_end,
     };
-    try testing.expectEqualSlices(TokenType, want, types);
+    try testing.expectEqualSlices(TokenKind, want, types);
 }
 
 test "nested mapping and sequence" {
@@ -1402,7 +1402,7 @@ test "nested mapping and sequence" {
     const toks = r.toks;
     const types = try tokenTypes(testing.allocator, toks.items);
     defer testing.allocator.free(types);
-    const want: []const TokenType = &.{
+    const want: []const TokenKind = &.{
         .stream_start, .block_mapping_start, .key,
         .scalar, // a
         .value,
@@ -1413,7 +1413,7 @@ test "nested mapping and sequence" {
         .value,     .scalar, // c
         .block_end, .stream_end,
     };
-    try testing.expectEqualSlices(TokenType, want, types);
+    try testing.expectEqualSlices(TokenKind, want, types);
 }
 
 test "flow collections" {
@@ -1422,12 +1422,12 @@ test "flow collections" {
     const toks = r.toks;
     const types = try tokenTypes(testing.allocator, toks.items);
     defer testing.allocator.free(types);
-    const want: []const TokenType = &.{
+    const want: []const TokenKind = &.{
         .stream_start,       .flow_sequence_start, .scalar,            .flow_entry,
         .flow_mapping_start, .key,                 .scalar,            .value,
         .scalar,             .flow_mapping_end,    .flow_sequence_end, .stream_end,
     };
-    try testing.expectEqualSlices(TokenType, want, types);
+    try testing.expectEqualSlices(TokenKind, want, types);
 }
 
 test "flow mapping key and value on separate lines" {
@@ -1437,13 +1437,13 @@ test "flow mapping key and value on separate lines" {
     defer r.deinit(testing.allocator);
     const types = try tokenTypes(testing.allocator, r.toks.items);
     defer testing.allocator.free(types);
-    const want: []const TokenType = &.{
+    const want: []const TokenKind = &.{
         .stream_start, .flow_mapping_start, .key,              .scalar,
         .value,        .scalar,             .flow_mapping_end, .stream_end,
     };
-    try testing.expectEqualSlices(TokenType, want, types);
-    try testing.expectEqualStrings("foo", r.toks.items[3].kind.scalar.value);
-    try testing.expectEqualStrings("bar", r.toks.items[5].kind.scalar.value);
+    try testing.expectEqualSlices(TokenKind, want, types);
+    try testing.expectEqualStrings("foo", r.toks.items[3].data.scalar.value);
+    try testing.expectEqualStrings("bar", r.toks.items[5].data.scalar.value);
 }
 
 test "flow sequence single-pair key cannot span a line" {
@@ -1453,11 +1453,11 @@ test "flow sequence single-pair key cannot span a line" {
     defer r.deinit(testing.allocator);
     const types = try tokenTypes(testing.allocator, r.toks.items);
     defer testing.allocator.free(types);
-    const want: []const TokenType = &.{
+    const want: []const TokenKind = &.{
         .stream_start, .flow_sequence_start, .scalar,     .value,
         .scalar,       .flow_sequence_end,   .stream_end,
     };
-    try testing.expectEqualSlices(TokenType, want, types);
+    try testing.expectEqualSlices(TokenKind, want, types);
 }
 
 test "quoted scalars" {
@@ -1467,7 +1467,7 @@ test "quoted scalars" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqual(@as(usize, 2), scalars.items.len);
     try testing.expectEqualStrings("single 'q' end", scalars.items[0]);
@@ -1481,7 +1481,7 @@ test "block scalar literal and folded" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("lit", scalars.items[0]);
     try testing.expectEqualStrings("line1\nline2\n", scalars.items[1]);
@@ -1496,7 +1496,7 @@ test "block scalar chomping" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("x", scalars.items[1]);
     try testing.expectEqualStrings("y\n\n", scalars.items[3]);
@@ -1512,11 +1512,11 @@ test "block scalar empty chomping" {
 
     var keep_vals: std.ArrayList([]const u8) = .empty;
     defer keep_vals.deinit(testing.allocator);
-    for (keep.toks.items) |t| if (t.kind == .scalar) try keep_vals.append(testing.allocator, t.kind.scalar.value);
+    for (keep.toks.items) |t| if (t.data == .scalar) try keep_vals.append(testing.allocator, t.data.scalar.value);
 
     var clip_vals: std.ArrayList([]const u8) = .empty;
     defer clip_vals.deinit(testing.allocator);
-    for (clip.toks.items) |t| if (t.kind == .scalar) try clip_vals.append(testing.allocator, t.kind.scalar.value);
+    for (clip.toks.items) |t| if (t.data == .scalar) try clip_vals.append(testing.allocator, t.data.scalar.value);
 
     try testing.expectEqual(@as(usize, 1), keep_vals.items.len);
     try testing.expectEqualStrings("\n\n", keep_vals.items[0]);
@@ -1532,7 +1532,7 @@ test "plain scalar never keeps trailing whitespace" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (r.toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("key", scalars.items[0]);
     try testing.expectEqualStrings("value", scalars.items[1]);
@@ -1549,7 +1549,7 @@ test "block scalar keeps '#' lines and leading empty lines" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (r.toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("\n\n# detected\n", scalars.items[0]);
 }
@@ -1562,7 +1562,7 @@ test "flow mapping value may start with ':'" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (r.toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("x", scalars.items[0]);
     try testing.expectEqualStrings(":x", scalars.items[1]);
@@ -1574,12 +1574,12 @@ test "trailing blanks after top-level flow collection" {
     defer r.deinit(testing.allocator);
     const types = try tokenTypes(testing.allocator, r.toks.items);
     defer testing.allocator.free(types);
-    const want: []const TokenType = &.{
+    const want: []const TokenKind = &.{
         .stream_start, .flow_sequence_start, .scalar, .flow_entry,
         .scalar,       .flow_entry,          .scalar, .flow_sequence_end,
         .stream_end,
     };
-    try testing.expectEqualSlices(TokenType, want, types);
+    try testing.expectEqualSlices(TokenKind, want, types);
 }
 
 test "tabs before flow content are allowed, tab block indentation is not" {
@@ -1590,8 +1590,8 @@ test "tabs before flow content are allowed, tab block indentation is not" {
         defer r.deinit(testing.allocator);
         const types = try tokenTypes(testing.allocator, r.toks.items);
         defer testing.allocator.free(types);
-        const want: []const TokenType = &.{ .stream_start, .flow_sequence_start, .flow_sequence_end, .stream_end };
-        try testing.expectEqualSlices(TokenType, want, types);
+        const want: []const TokenKind = &.{ .stream_start, .flow_sequence_start, .flow_sequence_end, .stream_end };
+        try testing.expectEqualSlices(TokenKind, want, types);
     }
     try testing.expectError(error.InvalidIndentation, scanAll(testing.allocator, "\t- item\n"));
     try testing.expectError(error.InvalidIndentation, scanAll(testing.allocator, "\t|literal\n"));
@@ -1603,7 +1603,7 @@ test "tabs before flow content are allowed, tab block indentation is not" {
         var scalars: std.ArrayList([]const u8) = .empty;
         defer scalars.deinit(testing.allocator);
         for (r.toks.items) |t| {
-            if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+            if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
         }
         try testing.expectEqualStrings("key", scalars.items[0]);
         try testing.expectEqualStrings("value", scalars.items[1]);
@@ -1642,7 +1642,7 @@ test "flow adjacent values and '%' as a scalar in flow" {
         var scalars: std.ArrayList([]const u8) = .empty;
         defer scalars.deinit(testing.allocator);
         for (r.toks.items) |t| {
-            if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+            if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
         }
         try testing.expectEqualStrings("adjacent", scalars.items[0]);
         try testing.expectEqualStrings("value", scalars.items[1]);
@@ -1654,7 +1654,7 @@ test "flow adjacent values and '%' as a scalar in flow" {
         var scalars: std.ArrayList([]const u8) = .empty;
         defer scalars.deinit(testing.allocator);
         for (r.toks.items) |t| {
-            if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+            if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
         }
         try testing.expectEqualStrings("%", scalars.items[0]);
         try testing.expectEqualStrings("1", scalars.items[1]);
@@ -1669,7 +1669,7 @@ test "'?' without blank starts a plain scalar" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (r.toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("?foo", scalars.items[0]);
     try testing.expectEqualStrings("bar", scalars.items[1]);
@@ -1683,7 +1683,7 @@ test "literal keeps whitespace-only lines deeper than the strip" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (r.toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("ab\n\n \nend\n", scalars.items[0]);
 }
@@ -1696,7 +1696,7 @@ test "quoted scalar fold before closing quote is content" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (r.toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("a", scalars.items[0]);
     try testing.expectEqualStrings(" ", scalars.items[1]);
@@ -1709,7 +1709,7 @@ test "quoted scalar fold before closing quote is content" {
     var scalars2: std.ArrayList([]const u8) = .empty;
     defer scalars2.deinit(testing.allocator);
     for (r2.toks.items) |t| {
-        if (t.kind == .scalar) try scalars2.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars2.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("x", scalars2.items[0]);
     try testing.expectEqualStrings(" ", scalars2.items[1]);
@@ -1782,8 +1782,8 @@ test "a long non-ASCII simple key within the character bound is accepted" {
     // Scanned as a real key/value pair, not silently demoted.
     const types = try tokenTypes(testing.allocator, r.toks.items);
     defer testing.allocator.free(types);
-    try testing.expect(std.mem.indexOfScalar(TokenType, types, .key) != null);
-    try testing.expect(std.mem.indexOfScalar(TokenType, types, .value) != null);
+    try testing.expect(std.mem.indexOfScalar(TokenKind, types, .key) != null);
+    try testing.expect(std.mem.indexOfScalar(TokenKind, types, .value) != null);
 }
 
 test "anchor and alias names are greedy" {
@@ -1797,7 +1797,7 @@ test "anchor and alias names are greedy" {
     var aliases: std.ArrayList([]const u8) = .empty;
     defer aliases.deinit(testing.allocator);
     for (r.toks.items) |t| {
-        switch (t.kind) {
+        switch (t.data) {
             .anchor => |a| try anchors.append(testing.allocator, a),
             .alias => |a| try aliases.append(testing.allocator, a),
             else => {},
@@ -1813,9 +1813,9 @@ test "tag URI stops before a trailing comma or bracket" {
     // is well-formed and the leftover indicator errors later (U99R).
     var r = try scanAll(testing.allocator, "!!str, xxx\n");
     defer r.deinit(testing.allocator);
-    try testing.expectEqualStrings("!!", r.toks.items[1].kind.tag.handle);
-    try testing.expectEqualStrings("str", r.toks.items[1].kind.tag.suffix);
-    try testing.expectEqual(Token.Type.flow_entry, std.meta.activeTag(r.toks.items[2].kind));
+    try testing.expectEqualStrings("!!", r.toks.items[1].data.tag.handle);
+    try testing.expectEqualStrings("str", r.toks.items[1].data.tag.suffix);
+    try testing.expectEqual(Token.Kind.flow_entry, std.meta.activeTag(r.toks.items[2].data));
 }
 
 test "verbatim tags run to '>'" {
@@ -1823,8 +1823,8 @@ test "verbatim tags run to '>'" {
     // friends included.
     var r = try scanAll(testing.allocator, "!<!bar> baz\n");
     defer r.deinit(testing.allocator);
-    try testing.expectEqualStrings("", r.toks.items[1].kind.tag.handle);
-    try testing.expectEqualStrings("!bar", r.toks.items[1].kind.tag.suffix);
+    try testing.expectEqualStrings("", r.toks.items[1].data.tag.handle);
+    try testing.expectEqualStrings("!bar", r.toks.items[1].data.tag.suffix);
 }
 
 test "document indicator inside a quoted scalar is rejected" {
@@ -1838,7 +1838,7 @@ test "document indicator inside a quoted scalar is rejected" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (r.toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("x y", scalars.items[1]);
 }
@@ -1856,7 +1856,7 @@ test "block scalar leading empty lines must not outdent the content" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (r.toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("\nx\n", scalars.items[1]);
 }
@@ -1869,7 +1869,7 @@ test "quoted scalar keeps trailing whitespace before the closing quote" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (r.toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("a ", scalars.items[0]);
 }
@@ -1880,19 +1880,19 @@ test "anchor alias tag" {
     const toks = r.toks;
     const types = try tokenTypes(testing.allocator, toks.items);
     defer testing.allocator.free(types);
-    const want: []const TokenType = &.{
+    const want: []const TokenKind = &.{
         .stream_start, .block_sequence_start, .block_entry, .anchor,
         .tag,          .scalar,               .block_entry, .alias,
         .block_entry,  .tag,                  .scalar,      .block_end,
         .stream_end,
     };
-    try testing.expectEqualSlices(TokenType, want, types);
-    try testing.expectEqualStrings("a", toks.items[3].kind.anchor);
-    try testing.expectEqualStrings("!!", toks.items[4].kind.tag.handle);
-    try testing.expectEqualStrings("str", toks.items[4].kind.tag.suffix);
-    try testing.expectEqualStrings("a", toks.items[7].kind.alias);
-    try testing.expectEqualStrings("!", toks.items[9].kind.tag.handle);
-    try testing.expectEqualStrings("local", toks.items[9].kind.tag.suffix);
+    try testing.expectEqualSlices(TokenKind, want, types);
+    try testing.expectEqualStrings("a", toks.items[3].data.anchor);
+    try testing.expectEqualStrings("!!", toks.items[4].data.tag.handle);
+    try testing.expectEqualStrings("str", toks.items[4].data.tag.suffix);
+    try testing.expectEqualStrings("a", toks.items[7].data.alias);
+    try testing.expectEqualStrings("!", toks.items[9].data.tag.handle);
+    try testing.expectEqualStrings("local", toks.items[9].data.tag.suffix);
 }
 
 test "document markers and directives" {
@@ -1901,13 +1901,13 @@ test "document markers and directives" {
     const toks = r.toks;
     const types = try tokenTypes(testing.allocator, toks.items);
     defer testing.allocator.free(types);
-    const want: []const TokenType = &.{
+    const want: []const TokenKind = &.{
         .stream_start, .directive,    .document_start, .block_mapping_start,
         .key,          .scalar,       .value,          .scalar,
         .block_end,    .document_end, .stream_end,
     };
-    try testing.expectEqualSlices(TokenType, want, types);
-    const d = toks.items[1].kind.directive;
+    try testing.expectEqualSlices(TokenKind, want, types);
+    const d = toks.items[1].data.directive;
     try testing.expectEqualStrings("YAML", d.name);
     try testing.expectEqual(@as(usize, 1), d.params.len);
     try testing.expectEqualStrings("1.2", d.params[0]);
@@ -1920,7 +1920,7 @@ test "plain scalar folding across lines" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("k", scalars.items[0]);
     try testing.expectEqualStrings("a b", scalars.items[1]);
@@ -1933,7 +1933,7 @@ test "comment termination" {
     var scalars: std.ArrayList([]const u8) = .empty;
     defer scalars.deinit(testing.allocator);
     for (toks.items) |t| {
-        if (t.kind == .scalar) try scalars.append(testing.allocator, t.kind.scalar.value);
+        if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("b", scalars.items[1]);
 }

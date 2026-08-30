@@ -176,7 +176,7 @@ pub fn renderTree(alloc: std.mem.Allocator, input: []const u8, verbose: bool) ![
             return err;
         };
         const ev = next orelse break;
-        switch (ev.kind) {
+        switch (ev.data) {
             .stream_start => {
                 try writeLine(&buf, alloc, depth, "+STR");
                 depth += 1;

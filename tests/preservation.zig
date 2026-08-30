@@ -457,7 +457,7 @@ fn walkTargets(
                 break;
             };
             if (kt.len == 0 or std.mem.indexOfScalar(u8, kt, '\n') != null or
-                p.key.anchor != null or p.key.tag != null or p.key.nodeType() == .alias)
+                p.key.anchor != null or p.key.tag != null or p.key.kind() == .alias)
             {
                 unsupported = true;
                 break;
@@ -511,7 +511,7 @@ fn walkTargets(
                     .line = line,
                     .multi_line = end_line != line,
                     .sole_child = m.pairs.items.len == 1,
-                    .is_alias = pair.value.nodeType() == .alias,
+                    .is_alias = pair.value.kind() == .alias,
                     .anchored_referenced = subtreeDefinesReferencedAnchor(pair.value, referenced, 0),
                     .move_unsafe = subtreeContainsAlias(pair.value, 0) or
                         subtreeDefinesReferencedAnchor(pair.value, referenced, 0),
@@ -555,7 +555,7 @@ fn walkTargets(
                     .line = line,
                     .multi_line = end_line != line,
                     .sole_child = s.items.items.len == 1,
-                    .is_alias = item.nodeType() == .alias,
+                    .is_alias = item.kind() == .alias,
                     .anchored_referenced = subtreeDefinesReferencedAnchor(item, referenced, 0),
                     .move_unsafe = subtreeContainsAlias(item, 0) or
                         subtreeDefinesReferencedAnchor(item, referenced, 0),

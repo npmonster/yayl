@@ -43,7 +43,7 @@ pub const Diag = diag.Diag;
 pub const Diagnostic = diag.Diagnostic;
 pub const YamlError = diag.YamlError;
 pub const ScalarStyle = token.ScalarStyle;
-pub const NodeType = document.NodeType;
+pub const NodeKind = document.NodeKind;
 pub const CoreTag = document.CoreTag;
 pub const resolveCoreTag = document.resolveCoreTag;
 pub const Node = document.Node;
@@ -53,7 +53,8 @@ pub const Parser = parser.Parser;
 pub const Scanner = scanner.Scanner;
 pub const Token = token.Token;
 pub const Event = event.Event;
-pub const EventType = event.Event.Type;
+pub const EventKind = event.Event.Kind;
+pub const TokenKind = token.Token.Kind;
 
 /// Parse the first YAML document in `input`. Additional documents in the
 /// same stream are ignored; use `parseAll` for multi-document streams.

@@ -130,7 +130,7 @@ pub const Emitter = struct {
         const cs = node.src orelse return;
         if (cs.synthetic) return;
         const parent = node.parent orelse return;
-        if (parent.nodeType() != .sequence) return;
+        if (parent.kind() != .sequence) return;
         _ = try self.writeContainerFraming(node, cs.entry_start);
     }
 
@@ -633,7 +633,7 @@ pub const Emitter = struct {
     /// nothing after the colon, or an explicit-key-only pair).
     fn pairEndsAtColon(pair: Pair) bool {
         const v = pair.value;
-        if (v.nodeType() != .scalar) return false;
+        if (v.kind() != .scalar) return false;
         if (v.data.scalar.value.len != 0) return false;
         const vs = v.src orelse return false;
         return vs.synthetic;

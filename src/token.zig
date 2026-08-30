@@ -36,13 +36,13 @@ pub const VersionDirective = struct {
 /// payload slices are pool/arena-owned by the scanner that produced
 /// them and live until its next reset/deinit.
 pub const Token = struct {
-    kind: Kind,
+    data: Data,
     start: Mark,
     end: Mark,
 
     /// FYTT_* token kinds. Payload-less kinds mirror libfyaml's bare
     /// token types; payloaded kinds carry the scanner-produced data.
-    pub const Kind = union(enum) {
+    pub const Data = union(enum) {
         stream_start,
         stream_end,
         document_start: DocumentStart,
@@ -69,7 +69,7 @@ pub const Token = struct {
 
     /// The tag enum of `Kind`, for switches and tests that need the
     /// discriminant without the payload.
-    pub const Type = std.meta.Tag(Kind);
+    pub const Kind = std.meta.Tag(Data);
 
     /// DOCUMENT_START payload; `explicit_marker` is false when the
     /// document started implicitly (no `---`).
@@ -96,19 +96,19 @@ pub const Token = struct {
         params: []const []const u8,
     };
 
-    pub fn typeName(self: Token) []const u8 {
-        return @tagName(self.kind);
+    pub fn kindName(self: Token) []const u8 {
+        return @tagName(self.data);
     }
 };
 
 test "token payload sanity" {
     const t = Token{
-        .kind = .{ .scalar = .{ .value = "x", .style = .plain } },
+        .data = .{ .scalar = .{ .value = "x", .style = .plain } },
         .start = .{},
         .end = .{},
     };
-    try std.testing.expectEqualStrings("x", t.kind.scalar.value);
-    try std.testing.expectEqualStrings("scalar", t.typeName());
-    try std.testing.expect(t.kind == .scalar);
-    try std.testing.expectEqual(Token.Type.scalar, std.meta.activeTag(t.kind));
+    try std.testing.expectEqualStrings("x", t.data.scalar.value);
+    try std.testing.expectEqualStrings("scalar", t.kindName());
+    try std.testing.expect(t.data == .scalar);
+    try std.testing.expectEqual(Token.Kind.scalar, std.meta.activeTag(t.data));
 }

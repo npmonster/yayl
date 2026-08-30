@@ -23,12 +23,12 @@ pub const CollectionStyle = enum { block, flow };
 /// payload slices are arena-owned by the parser that produced them and
 /// live until its deinit.
 pub const Event = struct {
-    kind: Kind,
+    data: Data,
     start: Mark,
     end: Mark,
 
     /// FYET_* event kinds.
-    pub const Kind = union(enum) {
+    pub const Data = union(enum) {
         stream_start,
         stream_end,
         document_start: DocumentStart,
@@ -44,7 +44,7 @@ pub const Event = struct {
 
     /// The tag enum of `Kind`, for switches and tests that need the
     /// discriminant without the payload.
-    pub const Type = std.meta.Tag(Kind);
+    pub const Kind = std.meta.Tag(Data);
 
     pub const DocumentStart = struct {
         version: ?VersionDirective,
@@ -76,11 +76,11 @@ pub const Event = struct {
 
 test "event payload sanity" {
     const e = Event{
-        .kind = .{ .scalar = .{ .value = "v", .style = .plain, .anchor = null, .tag = null } },
+        .data = .{ .scalar = .{ .value = "v", .style = .plain, .anchor = null, .tag = null } },
         .start = .{},
         .end = .{},
     };
-    try std.testing.expectEqualStrings("v", e.kind.scalar.value);
-    try std.testing.expect(e.kind == .scalar);
-    try std.testing.expectEqual(Event.Type.scalar, std.meta.activeTag(e.kind));
+    try std.testing.expectEqualStrings("v", e.data.scalar.value);
+    try std.testing.expect(e.data == .scalar);
+    try std.testing.expectEqual(Event.Kind.scalar, std.meta.activeTag(e.data));
 }

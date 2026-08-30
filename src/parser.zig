@@ -15,12 +15,12 @@ const Diag = diag.Diag;
 const Mark = diag.Mark;
 const YamlError = diag.YamlError;
 const Event = event_mod.Event;
-const EventType = event_mod.Event.Type;
+const EventKind = event_mod.Event.Kind;
 const CollectionStyle = event_mod.CollectionStyle;
 const ScalarStyle = token_mod.ScalarStyle;
 const Scanner = scanner_mod.Scanner;
 const Token = token_mod.Token;
-const TokenType = token_mod.Token.Type;
+const TokenKind = token_mod.Token.Kind;
 const TagDirective = token_mod.TagDirective;
 const VersionDirective = token_mod.VersionDirective;
 
@@ -164,7 +164,7 @@ pub const Parser = struct {
         return .{
             .start = mark,
             .end = mark,
-            .kind = .{ .scalar = .{ .value = "", .style = .plain, .anchor = null, .tag = null, .synthetic = true } },
+            .data = .{ .scalar = .{ .value = "", .style = .plain, .anchor = null, .tag = null, .synthetic = true } },
         };
     }
 
@@ -174,12 +174,12 @@ pub const Parser = struct {
 
     fn parseStreamStart(self: *Parser) !Event {
         const tok = try self.peekToken();
-        if (tok.kind != .stream_start) {
+        if (tok.data != .stream_start) {
             return self.fail(tok.start, "did not find expected <stream-start>", .{});
         }
         self.scanner.skipToken();
         self.state = .implicit_document_start;
-        return .{ .kind = .stream_start, .start = tok.start, .end = tok.end };
+        return .{ .data = .stream_start, .start = tok.start, .end = tok.end };
     }
 
     fn parseDocumentStart(self: *Parser, implicit_allowed: bool) !Event {
@@ -188,22 +188,22 @@ pub const Parser = struct {
         // start; after one was seen the following document is implicit
         // (libfyaml had_doc_end semantics).
         var had_doc_end = false;
-        while (tok.kind == .document_end) {
+        while (tok.data == .document_end) {
             self.scanner.skipToken();
             tok = try self.peekToken();
             had_doc_end = true;
         }
 
         // Explicit document: directives and/or a '---' marker.
-        if (tok.kind == .directive or tok.kind == .document_start) {
+        if (tok.data == .directive or tok.data == .document_start) {
             // Directives are only allowed at the start of the stream or
             // after a '...' marker (corpus EB22/RHX7).
-            if (tok.kind == .directive and !(implicit_allowed or had_doc_end)) {
+            if (tok.data == .directive and !(implicit_allowed or had_doc_end)) {
                 return self.fail(tok.start, "found directive without preceding document end marker", .{});
             }
             try self.processDirectives();
             tok = try self.peekToken();
-            if (tok.kind != .document_start) {
+            if (tok.data != .document_start) {
                 return self.fail(tok.start, "did not find expected <document start>", .{});
             }
             self.scanner.skipToken();
@@ -212,7 +212,7 @@ pub const Parser = struct {
             return .{
                 .start = tok.start,
                 .end = tok.end,
-                .kind = .{ .document_start = .{
+                .data = .{ .document_start = .{
                     .version = self.version_directive,
                     .tags = try self.trackTags(try self.alloc.dupe(TagDirective, self.tag_directives.items)),
                     .implicit = false,
@@ -220,11 +220,11 @@ pub const Parser = struct {
             };
         }
 
-        if (tok.kind == .stream_end) {
+        if (tok.data == .stream_end) {
             // End of stream.
             self.scanner.skipToken();
             self.state = .end;
-            return Event{ .kind = .stream_end, .start = tok.start, .end = tok.end };
+            return Event{ .data = .stream_end, .start = tok.start, .end = tok.end };
         }
 
         // Bare content: an implicit document, either because the stream
@@ -236,7 +236,7 @@ pub const Parser = struct {
             return .{
                 .start = tok.start,
                 .end = tok.start,
-                .kind = .{ .document_start = .{
+                .data = .{ .document_start = .{
                     .version = self.version_directive,
                     .tags = try self.trackTags(try self.alloc.dupe(TagDirective, self.tag_directives.items)),
                     .implicit = true,
@@ -249,7 +249,7 @@ pub const Parser = struct {
 
     fn parseDocumentContent(self: *Parser) !Event {
         const tok = try self.peekToken();
-        switch (tok.kind) {
+        switch (tok.data) {
             .directive, .document_start, .document_end, .stream_end => {
                 self.state = self.popState();
                 return self.processEmptyScalar(tok.start);
@@ -261,7 +261,7 @@ pub const Parser = struct {
     fn parseDocumentEnd(self: *Parser) !Event {
         const tok = try self.peekToken();
         var implicit = true;
-        if (tok.kind == .document_end) {
+        if (tok.data == .document_end) {
             // Do not consume the '...' here: the next document-start
             // skips it and treats the following document as implicit.
             implicit = false;
@@ -273,7 +273,7 @@ pub const Parser = struct {
         return .{
             .start = tok.start,
             .end = tok.start,
-            .kind = .{ .document_end = .{ .implicit = implicit } },
+            .data = .{ .document_end = .{ .implicit = implicit } },
         };
     }
 
@@ -295,8 +295,8 @@ pub const Parser = struct {
 
         while (true) {
             const tok = try self.peekToken();
-            if (tok.kind != .directive) break;
-            const d = tok.kind.directive;
+            if (tok.data != .directive) break;
+            const d = tok.data.directive;
             if (std.mem.eql(u8, d.name, "YAML")) {
                 if (self.version_directive != null) {
                     return self.fail(tok.start, "found duplicate %YAML directive", .{});
@@ -394,13 +394,13 @@ pub const Parser = struct {
     fn parseNode(self: *Parser, block: bool, indentless_sequence: bool) !Event {
         var tok = try self.peekToken();
 
-        if (tok.kind == .alias) {
+        if (tok.data == .alias) {
             self.scanner.skipToken();
             self.state = self.popState();
             return .{
                 .start = tok.start,
                 .end = tok.end,
-                .kind = .{ .alias = tok.kind.alias },
+                .data = .{ .alias = tok.data.alias },
             };
         }
 
@@ -409,21 +409,21 @@ pub const Parser = struct {
         var tag_handle: ?[]const u8 = null;
         var tag_suffix: ?[]const u8 = null;
 
-        if (tok.kind == .anchor) {
-            anchor = tok.kind.anchor;
+        if (tok.data == .anchor) {
+            anchor = tok.data.anchor;
             self.scanner.skipToken();
             tok = try self.peekToken();
         }
-        if (tok.kind == .tag) {
-            tag_handle = tok.kind.tag.handle;
-            tag_suffix = tok.kind.tag.suffix;
+        if (tok.data == .tag) {
+            tag_handle = tok.data.tag.handle;
+            tag_suffix = tok.data.tag.suffix;
             self.scanner.skipToken();
             tok = try self.peekToken();
-            if (tok.kind == .anchor) {
+            if (tok.data == .anchor) {
                 if (anchor != null) {
                     return self.fail(tok.start, "found duplicate anchor", .{});
                 }
-                anchor = tok.kind.anchor;
+                anchor = tok.data.anchor;
                 self.scanner.skipToken();
                 tok = try self.peekToken();
             }
@@ -434,16 +434,16 @@ pub const Parser = struct {
             tag = try self.resolveTag(h, tag_suffix orelse "");
         }
 
-        switch (tok.kind) {
+        switch (tok.data) {
             .scalar => {
                 self.scanner.skipToken();
                 self.state = self.popState();
                 return .{
                     .start = start_mark,
                     .end = tok.end,
-                    .kind = .{ .scalar = .{
-                        .value = tok.kind.scalar.value,
-                        .style = tok.kind.scalar.style,
+                    .data = .{ .scalar = .{
+                        .value = tok.data.scalar.value,
+                        .style = tok.data.scalar.style,
                         .anchor = anchor,
                         .tag = tag,
                     } },
@@ -455,7 +455,7 @@ pub const Parser = struct {
                 return .{
                     .start = start_mark,
                     .end = tok.end,
-                    .kind = .{ .sequence_start = .{ .style = .flow, .anchor = anchor, .tag = tag } },
+                    .data = .{ .sequence_start = .{ .style = .flow, .anchor = anchor, .tag = tag } },
                 };
             },
             .flow_mapping_start => {
@@ -464,36 +464,36 @@ pub const Parser = struct {
                 return .{
                     .start = start_mark,
                     .end = tok.end,
-                    .kind = .{ .mapping_start = .{ .style = .flow, .anchor = anchor, .tag = tag } },
+                    .data = .{ .mapping_start = .{ .style = .flow, .anchor = anchor, .tag = tag } },
                 };
             },
             else => {},
         }
-        if (block and tok.kind == .block_sequence_start) {
+        if (block and tok.data == .block_sequence_start) {
             self.state = .block_sequence_first_entry;
             try self.pushMark(tok.start);
             return .{
                 .start = start_mark,
                 .end = tok.end,
-                .kind = .{ .sequence_start = .{ .style = .block, .anchor = anchor, .tag = tag } },
+                .data = .{ .sequence_start = .{ .style = .block, .anchor = anchor, .tag = tag } },
             };
         }
-        if (block and tok.kind == .block_mapping_start) {
+        if (block and tok.data == .block_mapping_start) {
             self.state = .block_mapping_first_key;
             try self.pushMark(tok.start);
             return .{
                 .start = start_mark,
                 .end = tok.end,
-                .kind = .{ .mapping_start = .{ .style = .block, .anchor = anchor, .tag = tag } },
+                .data = .{ .mapping_start = .{ .style = .block, .anchor = anchor, .tag = tag } },
             };
         }
-        if (block and indentless_sequence and tok.kind == .block_entry) {
+        if (block and indentless_sequence and tok.data == .block_entry) {
             self.state = .indentless_sequence_entry;
             try self.pushMark(tok.start);
             return .{
                 .start = start_mark,
                 .end = tok.end,
-                .kind = .{ .sequence_start = .{ .style = .block, .anchor = anchor, .tag = tag } },
+                .data = .{ .sequence_start = .{ .style = .block, .anchor = anchor, .tag = tag } },
             };
         }
 
@@ -503,7 +503,7 @@ pub const Parser = struct {
             return .{
                 .start = start_mark,
                 .end = tok.start,
-                .kind = .{ .scalar = .{ .value = "", .style = .plain, .anchor = anchor, .tag = tag } },
+                .data = .{ .scalar = .{ .value = "", .style = .plain, .anchor = anchor, .tag = tag } },
             };
         }
 
@@ -516,36 +516,36 @@ pub const Parser = struct {
 
     fn parseBlockSequenceEntry(self: *Parser, first: bool) !Event {
         var tok = try self.peekToken();
-        if (first and tok.kind == .block_sequence_start) {
+        if (first and tok.data == .block_sequence_start) {
             self.scanner.skipToken();
             tok = try self.peekToken();
         }
-        if (tok.kind == .block_entry) {
+        if (tok.data == .block_entry) {
             self.scanner.skipToken();
             tok = try self.peekToken();
-            if (tok.kind != .block_entry and tok.kind != .block_end) {
+            if (tok.data != .block_entry and tok.data != .block_end) {
                 try self.pushState(.block_sequence_entry);
                 return self.parseNode(true, false);
             }
             self.state = .block_sequence_entry;
             return self.processEmptyScalar(tok.start);
         }
-        if (tok.kind == .block_end) {
+        if (tok.data == .block_end) {
             self.scanner.skipToken();
             self.state = self.popState();
             _ = self.marks.pop();
-            return .{ .kind = .sequence_end, .start = tok.start, .end = tok.end };
+            return .{ .data = .sequence_end, .start = tok.start, .end = tok.end };
         }
         return self.fail(tok.start, "did not find expected '-' indicator", .{});
     }
 
     fn parseIndentlessSequenceEntry(self: *Parser) !Event {
         var tok = try self.peekToken();
-        if (tok.kind == .block_entry) {
+        if (tok.data == .block_entry) {
             self.scanner.skipToken();
             tok = try self.peekToken();
-            if (tok.kind != .block_entry and tok.kind != .key and
-                tok.kind != .value and tok.kind != .block_end)
+            if (tok.data != .block_entry and tok.data != .key and
+                tok.data != .value and tok.data != .block_end)
             {
                 try self.pushState(.indentless_sequence_entry);
                 return self.parseNode(true, false);
@@ -555,19 +555,19 @@ pub const Parser = struct {
         }
         self.state = self.popState();
         _ = self.marks.pop();
-        return .{ .kind = .sequence_end, .start = tok.start, .end = tok.start };
+        return .{ .data = .sequence_end, .start = tok.start, .end = tok.start };
     }
 
     fn parseBlockMappingKey(self: *Parser, first: bool) !Event {
         var tok = try self.peekToken();
-        if (first and tok.kind == .block_mapping_start) {
+        if (first and tok.data == .block_mapping_start) {
             self.scanner.skipToken();
             tok = try self.peekToken();
         }
-        if (tok.kind == .key) {
+        if (tok.data == .key) {
             self.scanner.skipToken();
             tok = try self.peekToken();
-            if (tok.kind != .key and tok.kind != .value and tok.kind != .block_end) {
+            if (tok.data != .key and tok.data != .value and tok.data != .block_end) {
                 // Indentless sequences are allowed in key position too
                 // (corpus 6PBE: `?` followed by a zero-indented
                 // sequence), matching libyaml's parse_node(1, 1).
@@ -577,26 +577,26 @@ pub const Parser = struct {
             self.state = .block_mapping_value;
             return self.processEmptyScalar(tok.start);
         }
-        if (tok.kind == .value) {
+        if (tok.data == .value) {
             // Missing (empty) key.
             self.state = .block_mapping_value;
             return self.processEmptyScalar(tok.start);
         }
-        if (tok.kind == .block_end) {
+        if (tok.data == .block_end) {
             self.scanner.skipToken();
             self.state = self.popState();
             _ = self.marks.pop();
-            return .{ .kind = .mapping_end, .start = tok.start, .end = tok.end };
+            return .{ .data = .mapping_end, .start = tok.start, .end = tok.end };
         }
         return self.fail(tok.start, "did not find expected key", .{});
     }
 
     fn parseBlockMappingValue(self: *Parser) !Event {
         var tok = try self.peekToken();
-        if (tok.kind == .value) {
+        if (tok.data == .value) {
             self.scanner.skipToken();
             tok = try self.peekToken();
-            if (tok.kind != .key and tok.kind != .value and tok.kind != .block_end) {
+            if (tok.data != .key and tok.data != .value and tok.data != .block_end) {
                 try self.pushState(.block_mapping_key);
                 return self.parseNode(true, true);
             }
@@ -613,21 +613,21 @@ pub const Parser = struct {
 
     fn parseFlowSequenceEntry(self: *Parser, first: bool) !Event {
         var tok = try self.peekToken();
-        if (first and tok.kind == .flow_sequence_start) {
+        if (first and tok.data == .flow_sequence_start) {
             self.scanner.skipToken();
             tok = try self.peekToken();
         }
-        if (tok.kind != .flow_sequence_end) {
+        if (tok.data != .flow_sequence_end) {
             if (!first) {
-                if (tok.kind == .flow_entry) {
+                if (tok.data == .flow_entry) {
                     self.scanner.skipToken();
                     tok = try self.peekToken();
                 } else {
                     return self.fail(tok.start, "did not find expected ',' or ']'", .{});
                 }
             }
-            if (tok.kind != .flow_sequence_end) {
-                if (tok.kind == .value) {
+            if (tok.data != .flow_sequence_end) {
+                if (tok.data == .value) {
                     // Empty-key single-pair mapping inside a flow sequence:
                     // [: value] (corpus CFD4). The ':' is not consumed here.
                     self.state = .flow_sequence_entry_mapping_key;
@@ -635,10 +635,10 @@ pub const Parser = struct {
                     return .{
                         .start = tok.start,
                         .end = tok.start,
-                        .kind = .{ .mapping_start = .{ .style = .flow, .anchor = null, .tag = null } },
+                        .data = .{ .mapping_start = .{ .style = .flow, .anchor = null, .tag = null } },
                     };
                 }
-                if (tok.kind == .key) {
+                if (tok.data == .key) {
                     // Single-pair mapping inside a flow sequence: [a: b].
                     self.scanner.skipToken();
                     self.state = .flow_sequence_entry_mapping_key;
@@ -646,7 +646,7 @@ pub const Parser = struct {
                     return .{
                         .start = tok.start,
                         .end = tok.start,
-                        .kind = .{ .mapping_start = .{ .style = .flow, .anchor = null, .tag = null } },
+                        .data = .{ .mapping_start = .{ .style = .flow, .anchor = null, .tag = null } },
                     };
                 }
                 try self.pushState(.flow_sequence_entry);
@@ -656,12 +656,12 @@ pub const Parser = struct {
         self.scanner.skipToken();
         self.state = self.popState();
         _ = self.marks.pop();
-        return .{ .kind = .sequence_end, .start = tok.start, .end = tok.end };
+        return .{ .data = .sequence_end, .start = tok.start, .end = tok.end };
     }
 
     fn parseFlowSequenceEntryMappingKey(self: *Parser) !Event {
         const tok = try self.peekToken();
-        if (tok.kind != .value and tok.kind != .flow_entry and tok.kind != .flow_sequence_end) {
+        if (tok.data != .value and tok.data != .flow_entry and tok.data != .flow_sequence_end) {
             try self.pushState(.flow_sequence_entry_mapping_value);
             return self.parseNode(false, false);
         }
@@ -671,10 +671,10 @@ pub const Parser = struct {
 
     fn parseFlowSequenceEntryMappingValue(self: *Parser) !Event {
         var tok = try self.peekToken();
-        if (tok.kind == .value) {
+        if (tok.data == .value) {
             self.scanner.skipToken();
             tok = try self.peekToken();
-            if (tok.kind != .flow_entry and tok.kind != .flow_sequence_end) {
+            if (tok.data != .flow_entry and tok.data != .flow_sequence_end) {
                 try self.pushState(.flow_sequence_entry_mapping_end);
                 return self.parseNode(false, false);
             }
@@ -687,41 +687,41 @@ pub const Parser = struct {
         const tok = try self.peekToken();
         self.state = .flow_sequence_entry;
         _ = self.marks.pop();
-        return .{ .kind = .mapping_end, .start = tok.start, .end = tok.start };
+        return .{ .data = .mapping_end, .start = tok.start, .end = tok.start };
     }
 
     fn parseFlowMappingKey(self: *Parser, first: bool) !Event {
         var tok = try self.peekToken();
-        if (first and tok.kind == .flow_mapping_start) {
+        if (first and tok.data == .flow_mapping_start) {
             self.scanner.skipToken();
             tok = try self.peekToken();
         }
-        if (tok.kind != .flow_mapping_end) {
+        if (tok.data != .flow_mapping_end) {
             if (!first) {
-                if (tok.kind == .flow_entry) {
+                if (tok.data == .flow_entry) {
                     self.scanner.skipToken();
                     tok = try self.peekToken();
                 } else {
                     return self.fail(tok.start, "did not find expected ',' or '}}'", .{});
                 }
             }
-            if (tok.kind == .value) {
+            if (tok.data == .value) {
                 // Empty key: the ':' arrives without a preceding key node
                 // (corpus FRK4/NKF9).
                 self.state = .flow_mapping_value;
                 return self.processEmptyScalar(tok.start);
             }
-            if (tok.kind == .key) {
+            if (tok.data == .key) {
                 self.scanner.skipToken();
                 tok = try self.peekToken();
-                if (tok.kind != .value and tok.kind != .flow_entry and tok.kind != .flow_mapping_end) {
+                if (tok.data != .value and tok.data != .flow_entry and tok.data != .flow_mapping_end) {
                     try self.pushState(.flow_mapping_value);
                     return self.parseNode(false, false);
                 }
                 self.state = .flow_mapping_value;
                 return self.processEmptyScalar(tok.start);
             }
-            if (tok.kind != .flow_mapping_end) {
+            if (tok.data != .flow_mapping_end) {
                 try self.pushState(.flow_mapping_empty_value);
                 return self.parseNode(false, false);
             }
@@ -729,15 +729,15 @@ pub const Parser = struct {
         self.scanner.skipToken();
         self.state = self.popState();
         _ = self.marks.pop();
-        return .{ .kind = .mapping_end, .start = tok.start, .end = tok.end };
+        return .{ .data = .mapping_end, .start = tok.start, .end = tok.end };
     }
 
     fn parseFlowMappingValue(self: *Parser, empty: bool) !Event {
         var tok = try self.peekToken();
-        if (!empty and tok.kind == .value) {
+        if (!empty and tok.data == .value) {
             self.scanner.skipToken();
             tok = try self.peekToken();
-            if (tok.kind != .flow_entry and tok.kind != .flow_mapping_end) {
+            if (tok.data != .flow_entry and tok.data != .flow_mapping_end) {
                 try self.pushState(.flow_mapping_key);
                 return self.parseNode(false, false);
             }
@@ -753,64 +753,64 @@ pub const Parser = struct {
 
 const testing = std.testing;
 
-fn eventTypes(alloc: std.mem.Allocator, input: []const u8) !std.ArrayList(EventType) {
+fn eventTypes(alloc: std.mem.Allocator, input: []const u8) !std.ArrayList(EventKind) {
     var p = try Parser.init(alloc, null, input);
     defer p.deinit();
-    var out: std.ArrayList(EventType) = .empty;
+    var out: std.ArrayList(EventKind) = .empty;
     errdefer out.deinit(alloc);
-    while (try p.nextEvent()) |ev| try out.append(alloc, ev.kind);
+    while (try p.nextEvent()) |ev| try out.append(alloc, ev.data);
     return out;
 }
 
 test "scalar document events" {
     var evs = try eventTypes(testing.allocator, "hello\n");
     defer evs.deinit(testing.allocator);
-    const want: []const EventType = &.{
+    const want: []const EventKind = &.{
         .stream_start, .document_start, .scalar, .document_end, .stream_end,
     };
-    try testing.expectEqualSlices(EventType, want, evs.items);
+    try testing.expectEqualSlices(EventKind, want, evs.items);
 }
 
 test "mapping events" {
     var evs = try eventTypes(testing.allocator, "a: 1\nb: [2, 3]\n");
     defer evs.deinit(testing.allocator);
-    const want: []const EventType = &.{
+    const want: []const EventKind = &.{
         .stream_start, .document_start, .mapping_start,  .scalar,
         .scalar,       .scalar,         .sequence_start, .scalar,
         .scalar,       .sequence_end,   .mapping_end,    .document_end,
         .stream_end,
     };
-    try testing.expectEqualSlices(EventType, want, evs.items);
+    try testing.expectEqualSlices(EventKind, want, evs.items);
 }
 
 test "indentless sequence events" {
     var evs = try eventTypes(testing.allocator, "a:\n- 1\n- 2\n");
     defer evs.deinit(testing.allocator);
-    const want: []const EventType = &.{
+    const want: []const EventKind = &.{
         .stream_start,   .document_start, .mapping_start, .scalar,
         .sequence_start, .scalar,         .scalar,        .sequence_end,
         .mapping_end,    .document_end,   .stream_end,
     };
-    try testing.expectEqualSlices(EventType, want, evs.items);
+    try testing.expectEqualSlices(EventKind, want, evs.items);
 }
 
 test "alias event" {
     var evs = try eventTypes(testing.allocator, "- &x 1\n- *x\n");
     defer evs.deinit(testing.allocator);
-    const want: []const EventType = &.{
+    const want: []const EventKind = &.{
         .stream_start, .document_start, .sequence_start, .scalar,
         .alias,        .sequence_end,   .document_end,   .stream_end,
     };
-    try testing.expectEqualSlices(EventType, want, evs.items);
+    try testing.expectEqualSlices(EventKind, want, evs.items);
 }
 
 test "explicit document events" {
     var evs = try eventTypes(testing.allocator, "%YAML 1.2\n---\nx\n...\n");
     defer evs.deinit(testing.allocator);
-    const want: []const EventType = &.{
+    const want: []const EventKind = &.{
         .stream_start, .document_start, .scalar, .document_end, .stream_end,
     };
-    try testing.expectEqualSlices(EventType, want, evs.items);
+    try testing.expectEqualSlices(EventKind, want, evs.items);
 }
 
 test "tag resolution" {
@@ -819,7 +819,7 @@ test "tag resolution" {
     var tags: std.ArrayList(?[]const u8) = .empty;
     defer tags.deinit(testing.allocator);
     while (try p.nextEvent()) |ev| {
-        if (ev.kind == .scalar) try tags.append(testing.allocator, ev.kind.scalar.tag);
+        if (ev.data == .scalar) try tags.append(testing.allocator, ev.data.scalar.tag);
     }
     try testing.expectEqualStrings("tag:yaml.org,2002:int", tags.items[1].?);
     try testing.expectEqualStrings("tag:example.com:t", tags.items[3].?);
@@ -831,8 +831,8 @@ test "tag shorthand unescapes RFC 2396 escapes" {
     defer p.deinit();
     var found = false;
     while (try p.nextEvent()) |ev| {
-        if (ev.kind == .scalar) {
-            try testing.expectEqualStrings("tag:example.com,2000:app/tag!", ev.kind.scalar.tag.?);
+        if (ev.data == .scalar) {
+            try testing.expectEqualStrings("tag:example.com,2000:app/tag!", ev.data.scalar.tag.?);
             found = true;
         }
     }
@@ -847,8 +847,8 @@ test "unknown directives are ignored with a warning" {
     defer p.deinit();
     var found = false;
     while (try p.nextEvent()) |ev| {
-        if (ev.kind == .scalar) {
-            try testing.expectEqualStrings("foo", ev.kind.scalar.value);
+        if (ev.data == .scalar) {
+            try testing.expectEqualStrings("foo", ev.data.scalar.value);
             found = true;
         }
     }
@@ -858,22 +858,22 @@ test "unknown directives are ignored with a warning" {
 test "flow mapping empty key" {
     var evs = try eventTypes(testing.allocator, "{: empty key}\n");
     defer evs.deinit(testing.allocator);
-    const want: []const EventType = &.{
+    const want: []const EventKind = &.{
         .stream_start, .document_start, .mapping_start, .scalar,
         .scalar,       .mapping_end,    .document_end,  .stream_end,
     };
-    try testing.expectEqualSlices(EventType, want, evs.items);
+    try testing.expectEqualSlices(EventKind, want, evs.items);
 }
 
 test "flow sequence empty-key single-pair mapping" {
     var evs = try eventTypes(testing.allocator, "- [ : empty key ]\n");
     defer evs.deinit(testing.allocator);
-    const want: []const EventType = &.{
+    const want: []const EventKind = &.{
         .stream_start,  .document_start, .sequence_start, .sequence_start,
         .mapping_start, .scalar,         .scalar,         .mapping_end,
         .sequence_end,  .sequence_end,   .document_end,   .stream_end,
     };
-    try testing.expectEqualSlices(EventType, want, evs.items);
+    try testing.expectEqualSlices(EventKind, want, evs.items);
 }
 
 test "trailing blanks after top-level flow collection parse" {
@@ -882,7 +882,7 @@ test "trailing blanks after top-level flow collection parse" {
     defer p.deinit();
     var scalars: usize = 0;
     while (try p.nextEvent()) |ev| {
-        if (ev.kind == .scalar) scalars += 1;
+        if (ev.data == .scalar) scalars += 1;
     }
     try testing.expectEqual(@as(usize, 3), scalars);
 }

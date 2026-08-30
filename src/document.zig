@@ -29,7 +29,7 @@ const VersionDirective = token_mod.VersionDirective;
 /// re-emits verbatim. Aliases are first-class nodes (fy_node
 /// alias semantics): `- *a` occupies its own slot in the tree with its
 /// own source span and formatting, pointing at the anchored target.
-pub const NodeType = enum { scalar, mapping, sequence, alias };
+pub const NodeKind = enum { scalar, mapping, sequence, alias };
 
 /// One mapping entry; both nodes are pool-owned. `src` records where
 /// the pair's bytes end in the original source (see `Node.src`), so
@@ -85,7 +85,7 @@ pub const Node = struct {
     modified: bool = false,
     data: Data = .{ .scalar = .{} },
 
-    pub const Data = union(NodeType) {
+    pub const Data = union(NodeKind) {
         scalar: Scalar,
         mapping: Mapping,
         sequence: Sequence,
@@ -99,7 +99,7 @@ pub const Node = struct {
         target: *Node,
     };
 
-    pub fn nodeType(self: *const Node) NodeType {
+    pub fn kind(self: *const Node) NodeKind {
         return std.meta.activeTag(self.data);
     }
 
@@ -120,13 +120,13 @@ pub const Node = struct {
     }
 
     pub fn isScalar(self: *const Node) bool {
-        return self.resolveAlias().nodeType() == .scalar;
+        return self.resolveAlias().kind() == .scalar;
     }
     pub fn isMapping(self: *const Node) bool {
-        return self.resolveAlias().nodeType() == .mapping;
+        return self.resolveAlias().kind() == .mapping;
     }
     pub fn isSequence(self: *const Node) bool {
-        return self.resolveAlias().nodeType() == .sequence;
+        return self.resolveAlias().kind() == .sequence;
     }
 
     /// Scalar value or null for collections. Alias nodes forward to
@@ -363,11 +363,11 @@ pub const Document = struct {
         }
 
         while (try p.nextEvent()) |ev| {
-            switch (ev.kind) {
+            switch (ev.data) {
                 .document_start => {
                     var d = Document.init(allocator);
-                    d.version = ev.kind.document_start.version;
-                    d.explicit_start = !ev.kind.document_start.implicit;
+                    d.version = ev.data.document_start.version;
+                    d.explicit_start = !ev.data.document_start.implicit;
                     // Copy the stream input into this document's pool so
                     // presentation spans stay valid for the document's
                     // whole lifetime.
@@ -377,7 +377,7 @@ pub const Document = struct {
                     // does not depend on the parser's lifetime. The two
                     // default handles the parser always installs are not
                     // document data and are not re-emitted.
-                    for (ev.kind.document_start.tags) |td| {
+                    for (ev.data.document_start.tags) |td| {
                         if (std.mem.eql(u8, td.handle, "!") and std.mem.eql(u8, td.prefix, "!")) continue;
                         if (std.mem.eql(u8, td.handle, "!!") and std.mem.eql(u8, td.prefix, "tag:yaml.org,2002:")) continue;
                         try d.tag_directives.append(allocator, .{
@@ -393,7 +393,7 @@ pub const Document = struct {
                     if (builder) |*b| b.finish();
                     builder = null;
                     var d = doc orelse return error.InvalidSyntax;
-                    d.explicit_end = !ev.kind.document_end.implicit;
+                    d.explicit_end = !ev.data.document_end.implicit;
                     d.finishRegion(ev.start.offset);
                     // Hand ownership over only once the append succeeds;
                     // on failure the errdefer still sees `doc` and frees it.
@@ -403,7 +403,7 @@ pub const Document = struct {
                     if (limit) |l| if (docs.items.len >= l) break;
                 },
                 .stream_start, .stream_end => {
-                    if (ev.kind == .stream_end) {
+                    if (ev.data == .stream_end) {
                         // The last document owns everything up to EOF, so
                         // trailing comments after its content (or after
                         // its `...`) stay in its region.
@@ -854,7 +854,7 @@ const Builder = struct {
     /// Presentation span for an event: byte offsets into the document
     /// source, with the entry indicator (`-`/`?`) walked backwards.
     fn spanOf(self: *Builder, ev: Event) markup.Src {
-        const synthetic = switch (ev.kind) {
+        const synthetic = switch (ev.data) {
             .scalar => |s| s.synthetic,
             else => false,
         };
@@ -864,7 +864,7 @@ const Builder = struct {
         // structure, not content: trim them off the span so the gap
         // bytes carry them instead. Quoted scalars end at the closing
         // quote and are unaffected.
-        if (ev.kind == .scalar and !synthetic) {
+        if (ev.data == .scalar and !synthetic) {
             const src = self.source;
             while (end > ev.start.offset and end <= src.len and
                 (src[end - 1] == ' ' or src[end - 1] == '\t' or
@@ -882,41 +882,41 @@ const Builder = struct {
     }
 
     fn handle(self: *Builder, ev: Event) !void {
-        switch (ev.kind) {
+        switch (ev.data) {
             .scalar => {
                 const n = try self.doc.pool.create(Node);
                 n.* = .{
                     .mark = ev.start,
-                    .anchor = try self.dupeOptional(ev.kind.scalar.anchor),
-                    .tag = try self.dupeOptional(ev.kind.scalar.tag),
+                    .anchor = try self.dupeOptional(ev.data.scalar.anchor),
+                    .tag = try self.dupeOptional(ev.data.scalar.tag),
                     .src = self.spanOf(ev),
                     .data = .{ .scalar = .{
-                        .value = try self.doc.pool.dupe(ev.kind.scalar.value),
-                        .style = ev.kind.scalar.style,
+                        .value = try self.doc.pool.dupe(ev.data.scalar.value),
+                        .style = ev.data.scalar.style,
                     } },
                 };
                 try self.registerAnchor(n.anchor, n);
                 try self.attach(n);
             },
             .alias => {
-                const target = self.anchors.get(ev.kind.alias) orelse
+                const target = self.anchors.get(ev.data.alias) orelse
                     return error.UnknownAlias;
                 const n = try self.doc.pool.create(Node);
                 n.* = .{
                     .mark = ev.start,
                     .src = self.spanOf(ev),
                     .data = .{ .alias = .{
-                        .name = try self.doc.pool.dupe(ev.kind.alias),
+                        .name = try self.doc.pool.dupe(ev.data.alias),
                         .target = target,
                     } },
                 };
                 try self.attach(n);
             },
-            .sequence_start => try self.startCollection(ev, ev.kind.sequence_start),
-            .mapping_start => try self.startCollection(ev, ev.kind.mapping_start),
+            .sequence_start => try self.startCollection(ev, ev.data.sequence_start),
+            .mapping_start => try self.startCollection(ev, ev.data.mapping_start),
             .sequence_end => {
                 const frame = self.stack.pop().?;
-                if (frame.node.nodeType() != .sequence) return error.InvalidSyntax;
+                if (frame.node.kind() != .sequence) return error.InvalidSyntax;
                 // Flow collections close with a bracket: their span ends
                 // there. Block collections keep the last child's end.
                 if (frame.node.data == .sequence and frame.node.data.sequence.style == .flow) {
@@ -926,7 +926,7 @@ const Builder = struct {
             },
             .mapping_end => {
                 const frame = self.stack.pop().?;
-                if (frame.node.nodeType() != .mapping) return error.InvalidSyntax;
+                if (frame.node.kind() != .mapping) return error.InvalidSyntax;
                 if (frame.node.data == .mapping and frame.node.data.mapping.style == .flow) {
                     if (frame.node.src) |*s| s.end = ev.end.offset;
                 }
@@ -959,7 +959,7 @@ const Builder = struct {
     }
 
     fn startCollection(self: *Builder, ev: Event, cs: Event.CollectionStart) !void {
-        const n = if (ev.kind == .sequence_start)
+        const n = if (ev.data == .sequence_start)
             try self.doc.createSequence()
         else
             try self.doc.createMapping();
