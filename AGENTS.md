@@ -35,7 +35,7 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
   gate is `make verify` (fmt + library compile + Debug and ReleaseSafe tests);
   CI runs the same on Zig 0.16.0.
 - OOM paths are real code: anything that registers a fresh allocation must
-  `errdefer` it (three real leaks were found this way). Public allocating
+  `errdefer` it (seven real leaks were found this way). Public allocating
   operations are covered by `std.testing.checkAllAllocationFailures`.
 - Also verify `-Doptimize=ReleaseSafe` (part of `make verify`); no Debug-only
   assumptions.

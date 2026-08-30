@@ -306,8 +306,9 @@ The layering mirrors libfyaml and is public:
   streams events; the input itself lives in memory.
 * `yaml.markup` — the source-span arithmetic behind round trips.
 * Nesting is capped (`Scanner.max_nesting`, 200) and simple keys are
-  length-capped, so adversarial input fails with structured errors
-  (`error.NestingTooDeep`, `error.KeyTooLong`).
+  length-capped, so adversarial input is rejected rather than run out
+  of memory. Over-deep nesting returns `error.NestingTooDeep`; an
+  over-long simple key returns `error.InvalidSyntax`.
 
 ## Memory and error model
 

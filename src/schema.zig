@@ -13,7 +13,7 @@
 //!     const violations = try schema.validate(alloc, node, "$");
 //!     // violations carry path + rule; caller frees with freeViolations.
 //!
-//! Unknown mapping keys are allowed unless `allow_unknown = false`.
+//! Unknown mapping keys are allowed unless `deny_unknown` is set.
 //! Validation never fails the document: failures are data.
 
 const std = @import("std");

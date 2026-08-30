@@ -211,7 +211,7 @@ zig build examples # compile-checked example programs (zig-out/bin)
 zig build bench    # throughput CLI
 ```
 
-The gates: 351/351 yaml-test-suite conformance with zero skips, 265/265 byte-faithful corpus round trips plus real-world fixtures, 269/269 event-tree parity against vendored libfyaml, allocation-failure injection with zero leaks, in both Debug and ReleaseSafe.
+The gates: 351/351 yaml-test-suite conformance with zero skips, 265/269 byte-faithful corpus round trips (4 skips: streams containing no document, so there is nothing to re-emit) plus real-world fixtures, 269/269 event-tree parity against vendored libfyaml, allocation-failure injection with zero leaks, in both Debug and ReleaseSafe.
 
 ## License
 

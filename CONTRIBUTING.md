@@ -6,7 +6,8 @@ lives in [AGENTS.md](AGENTS.md); read it before touching code.
 
 ## Ground rules
 
-- **Zig 0.16.0**, pinned (see `build.zig.zon`).
+- **Zig 0.16.0**: CI pins this exact version; `build.zig.zon` sets it
+  as `.minimum_zig_version`, so a later 0.16.x also builds.
 - **Conversion first**: yayl ports libfyaml's architecture. When in
   doubt, match its observable behavior, and mark deliberate deviations
   with a `PORT NOTE:` comment.

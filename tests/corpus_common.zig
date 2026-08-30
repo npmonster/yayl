@@ -146,16 +146,17 @@ fn starts(haystack: []const u8, needle: []const u8) bool {
     return haystack.len >= needle.len and std.mem.eql(u8, haystack[0..needle.len], needle);
 }
 
-/// Render the parser's event stream in the corpus tree notation:
-/// `+STR/+DOC/+SEQ/+MAP/...` with one space of indent per open container,
-/// anchors as `&name`, resolved tags as `<uri>`, scalar styles as
-/// `: ' " | >` prefixes, and `\`, `\n`, `\t`, `\r` escaped in values.
+/// Print each collected diagnostic as `line:column: message`.
 pub fn dumpDiags(diag: yaml.Diag) void {
     for (diag.list.items) |d| {
         std.debug.print("    diag {d}:{d}: {s}\n", .{ d.mark.line, d.mark.column, d.message });
     }
 }
 
+/// Render the parser's event stream in the corpus tree notation:
+/// `+STR/+DOC/+SEQ/+MAP/...` with one space of indent per open container,
+/// anchors as `&name`, resolved tags as `<uri>`, scalar styles as
+/// `: ' " | >` prefixes, and `\`, `\n`, `\t`, `\r` escaped in values.
 pub fn renderTree(alloc: std.mem.Allocator, input: []const u8, verbose: bool) ![]u8 {
     var diag: yaml.Diag = .{ .alloc = alloc };
     defer diag.deinit();

@@ -66,18 +66,29 @@ pub const YamlError = error{
     /// Malformed block scalar header or indentation indicator.
     InvalidIndentation,
     /// Token appears where the grammar does not allow it.
+    ///
+    /// Never returned: the parser reports such input as `InvalidSyntax`.
     UnexpectedToken,
-    /// The same anchor name was defined twice in one document.
+    /// Never returned. Re-anchoring is legal and shadows the earlier
+    /// definition for later aliases (corpus 3GZX/PW8X, libyaml
+    /// semantics), so there is no duplicate-anchor error condition.
     DuplicateAnchor,
     /// An alias references an anchor that was never defined.
     UnknownAlias,
     /// Malformed or unsupported directive.
+    ///
+    /// Never returned: malformed `%YAML`/`%TAG` directives are reported
+    /// as `InvalidSyntax`, and unknown directives are ignored per spec 6.8.
     InvalidDirective,
     /// %YAML version directive with an unsupported value.
     UnsupportedVersion,
-    /// Quoted scalar or flow collection was not terminated before EOF.
+    /// Quoted scalar was not terminated before EOF. Unterminated flow
+    /// collections surface as `InvalidSyntax`.
     Unterminated,
     /// A simple key would exceed the maximum allowed length.
+    ///
+    /// Never returned: an over-long simple key is reported as
+    /// `InvalidSyntax` ("simple key was expected").
     KeyTooLong,
     /// Collection nesting exceeds the scanner's `max_nesting` limit.
     NestingTooDeep,
