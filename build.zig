@@ -62,6 +62,21 @@ pub fn build(b: *std.Build) void {
     const roundtrip_step = b.step("roundtrip", "Byte-faithful round trip over corpus and fixtures");
     roundtrip_step.dependOn(&run_roundtrip.step);
 
+    // Edit-preservation sweeps: for every manipulation position in
+    // every real-world fixture, an edit must change only the intended
+    // lines (line-level non-interference assertions).
+    const preservation_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/preservation.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "yayl", .module = module }},
+        }),
+    });
+    const run_preservation = b.addRunArtifact(preservation_tests);
+    const preservation_step = b.step("preservation", "Edit-preservation sweeps over real-world fixtures");
+    preservation_step.dependOn(&run_preservation.step);
+
     // Event-tree dump CLI for the libfyaml differential harness
     // (scripts/differential.sh compiles the C reference with the
     // system compiler and compares its event trees against ours).
