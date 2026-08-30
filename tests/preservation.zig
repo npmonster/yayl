@@ -321,7 +321,27 @@ fn formatPath(allocator: std.mem.Allocator, comps: []const Comp) ![]const u8 {
     errdefer buf.deinit(allocator);
     try buf.append(allocator, '$');
     for (comps) |c| switch (c) {
-        .key => |k| try buf.print(allocator, ".{s}", .{k}),
+        .key => |k| {
+            // A key carrying `.`, `[` or `]`, or an empty key, cannot be
+            // written in the dotted form — it would parse as several
+            // segments, or as nothing. Quote it instead.
+            //
+            // A key containing BOTH quote characters stays unquotable
+            // (the grammar has no escapes); it is emitted bare and the
+            // resolve-back check in the caller then counts it
+            // unaddressable, which is the honest outcome.
+            const needs_quote = k.len == 0 or
+                std.mem.indexOfAny(u8, k, ".[]") != null;
+            if (!needs_quote) {
+                try buf.print(allocator, ".{s}", .{k});
+            } else if (std.mem.indexOfScalar(u8, k, '"') == null) {
+                try buf.print(allocator, "[\"{s}\"]", .{k});
+            } else if (std.mem.indexOfScalar(u8, k, '\'') == null) {
+                try buf.print(allocator, "['{s}']", .{k});
+            } else {
+                try buf.print(allocator, ".{s}", .{k});
+            }
+        },
         .index => |ix| try buf.print(allocator, "[{d}]", .{ix}),
     };
     return try buf.toOwnedSlice(allocator);
@@ -483,12 +503,9 @@ fn walkTargets(
                     found.unaddressable += 1;
                     continue;
                 };
-                // The grammar has no form for an empty key either
-                // (`$.` is degenerate): counted, subtree not swept.
-                if (key_text.len == 0) {
-                    found.unaddressable += 1;
-                    continue;
-                }
+                // An empty key IS addressable now, as `[""]`; formatPath
+                // quotes it. `"": v` is legal YAML, so it is swept like any
+                // other key rather than counted out.
                 try comps.append(allocator, .{ .key = key_text });
                 defer _ = comps.pop();
                 const path = try formatPath(allocator, comps.items);
@@ -654,7 +671,7 @@ fn selectTargets(allocator: std.mem.Allocator, all: []const Target, limits: Swee
     for (kinds) |kind| {
         var budget = kind.budget;
         for (all) |t| {
-            if (std.mem.endsWith(u8, t.path, "]") != kind.want_item) continue;
+            if (endsWithIndex(t.path) != kind.want_item) continue;
             if (budget == 0) {
                 capped.* += 1;
                 continue;
@@ -668,8 +685,23 @@ fn selectTargets(allocator: std.mem.Allocator, all: []const Target, limits: Swee
 
 /// The parent sequence path of a sequence item path: item paths end
 /// in `]`, and the sequence is everything before its last `[`.
+/// True when a path's last segment is a sequence INDEX, i.e. `...[7]`.
+///
+/// Not the same as ending in `]`: a quoted key segment (`["a.b"]`) also ends
+/// in `]` but addresses a mapping entry. Classifying one as a sequence item
+/// budgets it wrongly and feeds it to the insert sweep, which then calls
+/// `.insert` on a mapping parent.
+fn endsWithIndex(path: []const u8) bool {
+    if (!std.mem.endsWith(u8, path, "]")) return false;
+    const open = std.mem.lastIndexOfScalar(u8, path, '[') orelse return false;
+    const inner = path[open + 1 .. path.len - 1];
+    if (inner.len == 0) return false;
+    for (inner) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
 fn sequenceParentOf(path: []const u8) ?[]const u8 {
-    if (!std.mem.endsWith(u8, path, "]")) return null;
+    if (!endsWithIndex(path)) return null;
     const open = std.mem.lastIndexOfScalar(u8, path, '[') orelse return null;
     if (open == 0) return null;
     return path[0..open];
@@ -1016,10 +1048,6 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             // the anchor. Reordering these checks back to shape-first
             // makes this sweep fail with unparseable output and looks
             // like an emitter bug. It is not.
-            stats.skipped_dangling_anchor += 1;
-            continue;
-        }
-        if (t.anchored_referenced) {
             stats.skipped_dangling_anchor += 1;
             continue;
         }
@@ -1424,7 +1452,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
                 }
                 // A key path must disappear. An index can resolve again
                 // because later sequence items shift into the vacant slot.
-                if (!std.mem.endsWith(u8, t.path, "]")) {
+                if (!endsWithIndex(t.path)) {
                     if (ed_after.one(t.path)) |_| {
                         failures.add("{s}: move {s} -> {s}: the source path still resolves", .{ name, t.path, c.path });
                     } else |_| {}

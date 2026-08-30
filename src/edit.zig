@@ -111,6 +111,30 @@ pub const Path = struct {
                     const index = std.fmt.parseInt(usize, input[start..i], 10) catch return error.InvalidPath;
                     i += 1;
                     try segments.append(allocator, .{ .index = index });
+                } else if (input[i] == '"' or input[i] == '\'') {
+                    // Quoted key: `["a.b"]` or `['a.b']`. The dotted form
+                    // splits on `.` and `[`, so a key containing either is
+                    // otherwise unreachable — and those are the common case in
+                    // this library's own target domain (k8s annotations,
+                    // mkdocs `pymdownx.highlight`, GitLab `.defaults`).
+                    //
+                    // No escapes: a key containing BOTH quote characters stays
+                    // unaddressable. Escaping would mean the segment could no
+                    // longer be a slice into the input, which is what lets
+                    // Path.deinit free only the segment array.
+                    const quote = input[i];
+                    i += 1;
+                    const start = i;
+                    while (i < input.len and input[i] != quote) i += 1;
+                    if (i >= input.len) return error.InvalidPath;
+                    const key = input[start..i];
+                    i += 1; // closing quote
+                    if (i >= input.len or input[i] != ']') return error.InvalidPath;
+                    i += 1;
+                    // An empty key is deliberately allowed: `"": v` is legal
+                    // YAML and is one of the shapes the dotted form cannot
+                    // address.
+                    try segments.append(allocator, .{ .key = key });
                 } else {
                     return error.InvalidPath;
                 }
@@ -584,6 +608,42 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node)) Er
 // ----------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "quoted path segments address keys the dotted form cannot" {
+    var doc = try Document.parse(testing.allocator,
+        \\app.kubernetes.io/name: yayl
+        \\pymdownx.highlight:
+        \\  anchor_linenums: true
+        \\weird[key]: bracketed
+        \\"": empty-key
+        \\plain: ordinary
+        \\
+    );
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+
+    // A key containing `.`: unreachable with the dotted form, which would
+    // split it into three segments.
+    try testing.expectEqualStrings("yayl", (try ed.one("$[\"app.kubernetes.io/name\"]")).scalarValue().?);
+    // Single quotes work the same way.
+    try testing.expectEqualStrings("true", (try ed.one("$['pymdownx.highlight'].anchor_linenums")).scalarValue().?);
+    // A key containing brackets.
+    try testing.expectEqualStrings("bracketed", (try ed.one("$[\"weird[key]\"]")).scalarValue().?);
+    // The empty key is legal YAML and deliberately addressable.
+    try testing.expectEqualStrings("empty-key", (try ed.one("$[\"\"]")).scalarValue().?);
+    // Quoting an ordinary key is allowed and means the same thing.
+    try testing.expectEqualStrings("ordinary", (try ed.one("$[\"plain\"]")).scalarValue().?);
+    // A quoted segment is an ordinary key segment, so it composes.
+    try testing.expectEqualStrings("true", (try ed.one("$[\"pymdownx.highlight\"][\"anchor_linenums\"]")).scalarValue().?);
+
+    // The dotted form still cannot reach it.
+    try testing.expectError(error.UnknownPath, ed.one("$.app.kubernetes.io/name"));
+
+    // Malformed quoting is rejected rather than silently treated as a key.
+    try testing.expectError(error.InvalidPath, Path.parse(testing.allocator, "$[\"unterminated"));
+    try testing.expectError(error.InvalidPath, Path.parse(testing.allocator, "$[\"missing-bracket\""));
+    try testing.expectError(error.InvalidPath, Path.parse(testing.allocator, "$[\"trailing\"junk]"));
+}
 
 test "path grammar and queries" {
     var doc = try Document.parse(testing.allocator,
