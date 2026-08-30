@@ -1,4 +1,4 @@
-//! Production I/O — PLAN-8.
+//! File I/O.
 //!
 //! Convenience adapters between files and the document model. All
 //! reads are bounded by `max_bytes` (a malicious or accidental

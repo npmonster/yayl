@@ -331,7 +331,7 @@ pub const Parser = struct {
                 });
             } else {
                 // Unknown directives are ignored; the spec asks for a
-                // warning only (YAML 1.2 6.1).
+                // warning only (YAML 1.2.2 6.8).
                 diag.emitBestEffort(self.d, .warning, tok.start, "found unknown directive name '{s}'", .{d.name});
             }
             self.scanner.skipToken();
@@ -840,7 +840,7 @@ test "tag shorthand unescapes RFC 2396 escapes" {
 }
 
 test "unknown directives are ignored with a warning" {
-    // YAML 1.2 6.1: unknown directives are skipped, not an error
+    // YAML 1.2.2 6.8: unknown directives are skipped, not an error
     // (corpus 2LFX).
     const alloc = testing.allocator;
     var p = try Parser.init(alloc, null, "%FOO bar baz\n---\nfoo\n");

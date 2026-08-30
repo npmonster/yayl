@@ -22,10 +22,10 @@ pub const Pool = struct {
         return self.arena.allocator();
     }
 
-    /// Create an uninitialised value of type `T` inside the pool.
+    /// Create an uninitialized value of type `T` inside the pool.
     ///
     /// The memory content is undefined: assign `ptr.*` before any use.
-    /// Zero-initialisation is deliberately not performed — all-zero bits
+    /// Zero-initialization is deliberately not performed — all-zero bits
     /// fabricate invalid values for types whose valid state is narrower
     /// (tagged unions, enums with no zero member, non-null pointers).
     pub fn create(self: *Pool, comptime T: type) !*T {

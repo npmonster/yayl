@@ -1,4 +1,4 @@
-//! Generic value runtime — PLAN-6.
+//! Generic value runtime.
 //!
 //! A schema-free, tagged `Value` for data-oriented YAML work, with
 //! conversions in both directions: `parseToValue` (text → Value),
@@ -346,7 +346,7 @@ fn cloneZig(comptime T: type, alloc: std.mem.Allocator, value: T) Error!T {
 }
 
 /// Struct arm of `toZig`: fields matched by name; defaults and
-/// optionals honoured; a missing required field is `TypeMismatch`.
+/// optionals honored; a missing required field is `TypeMismatch`.
 fn toZigStruct(comptime T: type, alloc: std.mem.Allocator, members: []const Value.Member) Error!T {
     const st = @typeInfo(T).@"struct";
     var out: T = undefined;

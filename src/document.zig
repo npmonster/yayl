@@ -24,7 +24,9 @@ const CollectionStyle = event_mod.CollectionStyle;
 const TagDirective = token_mod.TagDirective;
 const VersionDirective = token_mod.VersionDirective;
 
-/// The four YAML node shapes. Aliases are first-class nodes (fy_node
+/// The three YAML node kinds (spec 3.2.1.1) plus `alias`, which yayl
+/// models as a node of its own so `*a` keeps its own source span and
+/// re-emits verbatim. Aliases are first-class nodes (fy_node
 /// alias semantics): `- *a` occupies its own slot in the tree with its
 /// own source span and formatting, pointing at the anchored target.
 pub const NodeType = enum { scalar, mapping, sequence, alias };
@@ -65,7 +67,8 @@ pub const Sequence = struct {
     dropped: std.ArrayList([2]usize) = .empty,
 };
 
-/// One YAML node: tagged union over the four shapes plus shared
+/// One YAML node: tagged union over the three node kinds and `alias`,
+/// plus shared
 /// metadata. Pool-owned by the containing document; `parent` is a
 /// borrowed back-pointer.
 pub const Node = struct {
@@ -74,7 +77,7 @@ pub const Node = struct {
     anchor: ?[]const u8 = null,
     /// Fully resolved tag URI (e.g. `tag:yaml.org,2002:int`), or null.
     tag: ?[]const u8 = null,
-    /// Presentation metadata into `Document.source` (PLAN-4 CST). Null
+    /// Presentation metadata into `Document.source` (a CST-style source span). Null
     /// for programmatically created nodes, which re-emit normalized.
     src: ?markup.Src = null,
     /// True once the node's value or child list was modified after
@@ -287,7 +290,7 @@ pub const Document = struct {
     /// programmatically built documents. Every parsed document carries
     /// its own copy (a multi-document stream duplicates once per
     /// document); this is what makes byte-faithful round trips
-    /// possible (PLAN-4).
+    /// possible.
     ///
     /// PORT NOTE: libfyaml borrows the reader's buffer instead; here
     /// the copy keeps the documented ownership model (a Document is
@@ -806,7 +809,7 @@ pub const Document = struct {
 
 /// Builds a node tree out of parser events (fy_docbuilder). While
 /// building, every node records its source span (see `markup.Src`) so
-/// untouched regions re-emit byte-identically (PLAN-4).
+/// untouched regions re-emit byte-identically.
 const Builder = struct {
     doc: *Document,
     source: []const u8,
@@ -1146,7 +1149,7 @@ test "sequence mutation" {
 }
 
 // ----------------------------------------------------------------------
-// Round-trip editing tests (PLAN-4): targeted edits keep untouched
+// Round-trip editing tests: targeted edits keep untouched
 // bytes — comments, blank lines, quoting, key order, indentation.
 // ----------------------------------------------------------------------
 
@@ -1204,7 +1207,7 @@ test "deep edit preserves outer formatting" {
     , out);
 }
 
-test "delete entry removes its line but keeps neighbours" {
+test "delete entry removes its line but keeps neighbors" {
     const src =
         \\keep-a: 1
         \\drop-me: 2 # gone

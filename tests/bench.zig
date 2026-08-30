@@ -1,4 +1,4 @@
-//! Benchmark CLI (PLAN-8): parse / edit / write throughput over a YAML
+//! Benchmark CLI: parse / edit / write throughput over a YAML
 //! file. Reports wall-clock throughput so the docs can quote measured
 //! numbers instead of claims.
 //!

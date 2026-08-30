@@ -1,4 +1,4 @@
-//! Byte-faithful round-trip harness (PLAN-4).
+//! Byte-faithful round-trip harness.
 //!
 //! For every corpus case that is valid YAML, `emit(parseAll(input))`
 //! must reproduce the input byte for byte: comments, blank lines,

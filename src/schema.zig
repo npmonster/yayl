@@ -1,4 +1,4 @@
-//! Schema validation — PLAN-7.
+//! Schema validation.
 //!
 //! A small, opt-in schema descriptor language over the document model.
 //! Nothing here is required for parsing or editing: a schema validates

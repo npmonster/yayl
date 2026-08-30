@@ -150,7 +150,7 @@ test "encode rejects surrogates and out-of-range values" {
 }
 
 test "encode agrees with std.unicode.utf8ValidCodepoint" {
-    // Sample every boundary neighbourhood rather than the full u21 range.
+    // Sample every boundary neighborhood rather than the full u21 range.
     var cp: u21 = 0;
     var buf: [4]u8 = undefined;
     while (cp <= 0x110001) : (cp += 1) {

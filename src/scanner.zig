@@ -3,7 +3,7 @@
 //! Turns the raw UTF-8 input into a queue of tokens. The algorithm mirrors
 //! libfyaml (and its libyaml ancestry): indentation is tracked on a stack,
 //! each flow level owns one pending "simple key", and BLOCK_*_START /
-//! BLOCK_END / KEY tokens are synthesised as the indentation changes.
+//! BLOCK_END / KEY tokens are synthesized as the indentation changes.
 //!
 //! Deviations from the C code are intentional and marked "PORT NOTE".
 
@@ -105,7 +105,7 @@ pub const Scanner = struct {
         self.temp_params.deinit(self.alloc);
     }
 
-    /// Finalise a byte scratch buffer and register it for cleanup.
+    /// Finalize a byte scratch buffer and register it for cleanup.
     fn ownTemp(self: *Scanner, buf: *std.ArrayList(u8)) ![]u8 {
         const s = try buf.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(s);
@@ -113,7 +113,7 @@ pub const Scanner = struct {
         return s;
     }
 
-    /// Finalise a directive parameter list and register it for cleanup.
+    /// Finalize a directive parameter list and register it for cleanup.
     fn ownParams(self: *Scanner, buf: *std.ArrayList([]const u8)) ![]const []const u8 {
         const s = try buf.toOwnedSlice(self.alloc);
         errdefer self.alloc.free(s);
@@ -1610,7 +1610,7 @@ test "rejections required by the corpus" {
     try testing.expectError(error.InvalidSyntax, scanAll(testing.allocator, "[-, a]\n"));
     // Block scalar header comments need whitespace (X4QW).
     try testing.expectError(error.InvalidSyntax, scanAll(testing.allocator, "block: ># c\n  x\n"));
-    // Sanity: the valid neighbours still parse.
+    // Sanity: the valid neighbors still parse.
     {
         var r = try scanAll(testing.allocator, "key: \"value\" # c\n");
         defer r.deinit(testing.allocator);

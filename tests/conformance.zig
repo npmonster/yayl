@@ -1,4 +1,4 @@
-//! YAML Test Suite conformance harness (PLAN-2).
+//! YAML Test Suite conformance harness.
 //!
 //! Runs the pinned upstream corpus (vendor/yaml-test-suite, fetched by
 //! `make corpus`) through yayl's parser and compares a rendered event
@@ -15,7 +15,7 @@ const corpus_dir = corpus.corpus_dir;
 const report_path = "zig-out/conformance-report.json";
 
 /// Cases yayl does not handle yet. Each entry records why and where the
-/// fix is tracked, per PLAN-2's skip policy.
+/// fix is tracked, per the skip policy in tests/README.md.
 const Skip = struct {
     id: []const u8,
     reason: []const u8,
