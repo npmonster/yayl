@@ -107,6 +107,16 @@ pub fn colonEnd(source: []const u8, after: usize) usize {
     return after;
 }
 
+/// Skip blanks forward from `offset`, returning the first offset that
+/// is not a space or tab. Used to keep the author's spacing after a
+/// `:` when the value it introduced has been replaced and its own span
+/// is gone.
+pub fn spaceEnd(source: []const u8, offset: usize) usize {
+    var i = offset;
+    while (i < source.len and (source[i] == ' ' or source[i] == '\t')) i += 1;
+    return i;
+}
+
 /// True when the rest of the line at/after `offset` (before the line
 /// terminator) contains a `#` comment. Everything between a node's
 /// content end and its line terminator can only be blanks and a comment

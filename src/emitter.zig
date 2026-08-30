@@ -15,9 +15,12 @@
 //! value is identical.
 //!
 //! PORT NOTE: libfyaml's CST covers every byte including intra-node
-//! layout; this port keeps per-node/entry spans, so re-emitted
-//! subtrees normalize their internal layout (e.g. multi-line flow
-//! collapses to one line). Untouched bytes are exact.
+//! layout; this port keeps per-node/entry spans, so some re-emitted
+//! subtrees normalize their internal layout. Untouched bytes are
+//! exact. A multi-line flow mapping now survives a value change (see
+//! `flowLayoutRecoverable`); adding or removing a flow entry, or
+//! replacing a flow sequence item, still collapses the collection,
+//! because there is no original slot left to write the entry into.
 //!
 //! A subtree with no span at all -- brand-new, or moved, since `move`
 //! clears the span that described the old location -- has no layout to
@@ -541,6 +544,10 @@ pub const Emitter = struct {
                     // Flow-styled in the source, or emptied in place:
                     // block layout cannot express an empty mapping.
                     if (m.pairs.items.len == 0) try self.writeEmptiedFraming(node);
+                    if (self.flowLayoutRecoverable(node)) {
+                        try self.emitFlowFaithful(node);
+                        return node.src.?.end;
+                    }
                     try self.emitFlowNode(node);
                     // The line terminator was not consumed.
                     return if (node.src) |sn| sn.end else 0;
@@ -569,6 +576,10 @@ pub const Emitter = struct {
             .sequence => |*sq| {
                 if (sq.style == .flow or sq.items.items.len == 0) {
                     if (sq.items.items.len == 0) try self.writeEmptiedFraming(node);
+                    if (self.flowLayoutRecoverable(node)) {
+                        try self.emitFlowFaithful(node);
+                        return node.src.?.end;
+                    }
                     try self.emitFlowNode(node);
                     // The line terminator was not consumed.
                     return if (node.src) |sn| sn.end else 0;
@@ -881,6 +892,183 @@ pub const Emitter = struct {
     // ------------------------------------------------------------------
     // Flow style
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Faithful flow emission.
+    //
+    // A flow collection can be written across several lines, with its
+    // own indentation and comments:
+    //
+    //     matrix: [
+    //       alpha,   # the good one
+    //       beta,
+    //       ]
+    //
+    // Re-emitting that from the tree collapses it to one line and drops
+    // the comment. The bytes between entries are a gap in exactly the
+    // sense block containers already use -- commas and layout instead of
+    // newlines and indentation -- so the same walk applies: copy the
+    // gaps, re-emit only the entries that changed.
+    //
+    // Scope: MODIFICATION only. Adding or removing a flow entry means
+    // rewriting separators (dropping one from `[a, b, c]` must not leave
+    // `a, , c`), and there is no original layout for a new entry to sit
+    // in. Those still normalize, and `flowLayoutRecoverable` is what
+    // draws the line -- checked in full before anything is written, so
+    // the fallback stays all-or-nothing.
+    // ------------------------------------------------------------------
+
+    /// Scan `src[from..to]` accepting only inter-entry filler -- blanks,
+    /// line breaks, `#` comments -- and report how many `,` separators it
+    /// held. Null when anything else turns up.
+    ///
+    /// This is what distinguishes a MODIFIED flow collection from one an
+    /// entry was REMOVED from. Flow containers deliberately record no
+    /// tombstones (their entries share a line with the parent's `key:`,
+    /// so a line-range tombstone would swallow those bytes), which
+    /// leaves the emitter no other way to notice a deletion: the entry
+    /// list is simply shorter and the departed entry's text is still
+    /// sitting in the gap. When it is, this returns null and the
+    /// collection normalizes -- re-flowing separators around a hole is a
+    /// different job from preserving layout, and not this one.
+    fn flowFillerCommas(src: []const u8, from: usize, to: usize) ?usize {
+        var i = from;
+        var commas: usize = 0;
+        while (i < to) : (i += 1) {
+            switch (src[i]) {
+                ' ', '\t', '\n', '\r' => {},
+                ',' => commas += 1,
+                '#' => while (i + 1 < to and src[i + 1] != '\n') : (i += 1) {},
+                else => return null,
+            }
+        }
+        return commas;
+    }
+
+    /// True when `node`'s original flow bytes can still carry its current
+    /// contents: nothing added or removed, every entry still spanned or
+    /// bounded, keys untouched, and every changed value a plain scalar or
+    /// alias we can write back into its slot.
+    fn flowLayoutRecoverable(self: *Emitter, node: *Node) bool {
+        const src = self.src;
+        const cs = node.src orelse return false;
+        if (cs.synthetic or cs.end <= cs.start) return false;
+        // Anchors and tags are written ahead of the bracket; re-emitting
+        // them is `writeProperties`' job and not worth entangling here.
+        if (node.anchor != null or node.tag != null) return false;
+        if (Document.droppedOf(node).len != 0) return false;
+
+        // Walk the entries and the gaps between them together: the gaps
+        // are what prove no entry went missing.
+        var prev_end = cs.start + 1; // just past `[` / `{`
+        var first = true;
+        switch (node.data) {
+            .mapping => |*m| {
+                if (m.pairs.items.len == 0) return false;
+                for (m.pairs.items) |pair| {
+                    const pend = pair.src_end orelse return false;
+                    // A changed KEY would need its bytes rewritten in
+                    // place, and a flow key can be a whole collection.
+                    // Values are the case worth having.
+                    const ks = pair.key.src orelse return false;
+                    if (ks.synthetic or !self.nodeClean(pair.key)) return false;
+                    // The value may have lost its span entirely --
+                    // `mappingReplace` swaps the node out -- and that is
+                    // the case this exists for. The key's colon and the
+                    // pair's own end still bound the slot.
+                    if (pair.value.src) |vs| {
+                        if (vs.synthetic) return false;
+                        if (!self.nodeClean(pair.value) and !rewritableInFlow(pair.value)) return false;
+                    } else if (!rewritableInFlow(pair.value)) return false;
+
+                    const commas = flowFillerCommas(src, prev_end, ks.entry_start) orelse return false;
+                    if (commas != @intFromBool(!first)) return false;
+                    first = false;
+                    prev_end = pend;
+                }
+            },
+            .sequence => |*sq| {
+                if (sq.items.items.len == 0) return false;
+                for (sq.items.items) |item| {
+                    // A replaced sequence item keeps no span, and a flow
+                    // container records no tombstone to recover the slot
+                    // from, so there is nothing left to write into.
+                    const is = item.src orelse return false;
+                    if (is.synthetic) return false;
+                    if (!self.nodeClean(item) and !rewritableInFlow(item)) return false;
+
+                    const commas = flowFillerCommas(src, prev_end, is.entry_start) orelse return false;
+                    if (commas != @intFromBool(!first)) return false;
+                    first = false;
+                    prev_end = is.end;
+                }
+            },
+            else => return false,
+        }
+        // Tail: layout, an optional trailing comma, then the bracket.
+        const tail = flowFillerCommas(src, prev_end, cs.end - 1) orelse return false;
+        return tail <= 1;
+    }
+
+    /// A changed entry we can write back into a flow slot: a scalar or
+    /// an alias, carrying no properties of its own.
+    fn rewritableInFlow(node: *Node) bool {
+        if (node.anchor != null or node.tag != null) return false;
+        return switch (node.data) {
+            .scalar, .alias => true,
+            else => false,
+        };
+    }
+
+    /// Re-emit a modified flow collection over its original bytes.
+    /// Only call when `flowLayoutRecoverable` said yes.
+    fn emitFlowFaithful(self: *Emitter, node: *Node) Error!void {
+        const src = self.src;
+        const cs = node.src.?;
+        var gap = cs.start;
+        switch (node.data) {
+            .mapping => |*m| {
+                for (m.pairs.items) |pair| {
+                    const ks = pair.key.src.?;
+                    const pend = pair.src_end.?;
+                    // Opening bracket, or the comma and layout since the
+                    // previous entry -- comments included.
+                    try self.write(src[gap..ks.entry_start]);
+                    if (pair.value.src != null and self.nodeClean(pair.value)) {
+                        try self.write(src[ks.entry_start..pend]);
+                    } else {
+                        // Key, colon and the spacing after it are the
+                        // author's; only the value is ours to rewrite.
+                        // A replaced value has no span left, so the slot
+                        // is bounded by the colon and the pair's end.
+                        const vstart = if (pair.value.src) |vs|
+                            vs.start
+                        else
+                            markup.spaceEnd(src, markup.colonEnd(src, ks.end));
+                        try self.write(src[ks.entry_start..vstart]);
+                        try self.emitFlowBody(pair.value);
+                    }
+                    gap = pend;
+                }
+            },
+            .sequence => |*sq| {
+                for (sq.items.items) |item| {
+                    const is = item.src.?;
+                    try self.write(src[gap..is.entry_start]);
+                    if (self.nodeClean(item)) {
+                        try self.write(src[is.entry_start..is.end]);
+                    } else {
+                        try self.write(src[is.entry_start..is.start]);
+                        try self.emitFlowBody(item);
+                    }
+                    gap = is.end;
+                }
+            },
+            else => unreachable,
+        }
+        // Trailing layout and the closing bracket.
+        try self.write(src[gap..cs.end]);
+    }
 
     /// Emit a node in flow style, registering it for alias tracking.
     fn emitFlowNode(self: *Emitter, node: *Node) Error!void {
@@ -1352,4 +1540,80 @@ test "a document with nothing to measure keeps the two-space default" {
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("a: 1\nb: 2\nc:\n  x: 1\n", out);
+}
+
+test "a modified multi-line flow mapping keeps its layout" {
+    // The bytes between flow entries are a gap in exactly the sense
+    // block containers already use -- commas and line breaks instead of
+    // newlines and indentation -- so only the changed value is rewritten
+    // and everything else, comments included, is copied.
+    const cases = [_]struct { src: []const u8, path: []const u8, want: []const u8 }{
+        .{
+            .src = "m: {\n  a: 1,\n  b: 2,\n  }\nafter: 1\n",
+            .path = "b",
+            .want = "m: {\n  a: 1,\n  b: Z,\n  }\nafter: 1\n",
+        },
+        // A comment between entries is layout, and survives.
+        .{
+            .src = "m: {\n  a: 1,   # keep me\n  b: 2,\n  }\n",
+            .path = "b",
+            .want = "m: {\n  a: 1,   # keep me\n  b: Z,\n  }\n",
+        },
+        // The first entry, so the opening-bracket gap is exercised too.
+        .{
+            .src = "m: {\n  a: 1,\n  b: 2,\n  }\n",
+            .path = "a",
+            .want = "m: {\n  a: Z,\n  b: 2,\n  }\n",
+        },
+        // Single-line flow keeps working; it is the same walk.
+        .{
+            .src = "m: {a: 1, b: 2}\n",
+            .path = "b",
+            .want = "m: {a: 1, b: Z}\n",
+        },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.src);
+        defer doc.deinit();
+        try doc.pathSet(&.{ "m", c.path }, try doc.createScalar("Z", .plain));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        try testing.expectEqualStrings("Z", again.pathGet(&.{ "m", c.path }).?.scalarValue().?);
+    }
+}
+
+test "flow collections normalize when the layout cannot carry the change" {
+    // The boundary, pinned deliberately. Preserving layout means writing
+    // each surviving entry back into its own slot; when an entry is
+    // added or removed there is no slot to write into, and separators
+    // would have to be re-flowed around the hole. That is a different
+    // job, so those still collapse to one line -- correct, just not
+    // layout-preserving.
+    {
+        // Deleting an entry: the gap between survivors would still hold
+        // the departed entry's bytes, which `flowFillerCommas` detects.
+        var doc = try Document.parse(testing.allocator, "m: {\n  a: 1,\n  b: 2,\n  }\n");
+        defer doc.deinit();
+        try testing.expect(try doc.pathDelete(&.{ "m", "a" }));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("m: {b: 2}\n", out);
+    }
+    {
+        // A replaced SEQUENCE item keeps no span, and a flow container
+        // records no tombstone, so its slot is unrecoverable.
+        var doc = try Document.parse(testing.allocator, "s: [\n  alpha,\n  beta,\n  ]\n");
+        defer doc.deinit();
+        // What `Editor.set` on an index does underneath: drop the item
+        // and splice a replacement in at the same position.
+        const seq = doc.pathGet(&.{"s"}).?;
+        _ = (try doc.sequenceRemove(seq, 1)).?;
+        try doc.sequenceInsert(seq, 1, try doc.createScalar("Z", .plain));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("s: [alpha, Z]\n", out);
+    }
 }

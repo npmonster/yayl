@@ -3,6 +3,18 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Changed
+
+- A multi-line flow mapping keeps its layout when one of its values is
+  changed, instead of collapsing to a single line and dropping any
+  comments inside it. The bytes between flow entries are now treated as
+  a gap in the same sense block containers already use. Adding or
+  removing a flow entry, and replacing an item of a flow sequence, still
+  normalize: there is no original slot left to write the entry into, and
+  re-flowing separators around a hole is a different job.
+
 ## 0.10.0 — 2026-08-30
 
 ### Fixed

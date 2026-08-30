@@ -195,7 +195,7 @@ If a batch fails, the original document is left byte-identical.
 Deliberate for v1:
 
 - Input has to fit in memory. Byte-faithful re-emission works by slicing the original bytes, so a document keeps a copy of its whole source; chunked input would trade that guarantee away rather than merely complicate it. The parser streams *events* (pull-based), and that layer is chunk-ready. See the note in `src/file.zig`.
-- Modified subtrees normalize their internal layout when they re-emit. Multi-line flow collapses to one line, for example. Untouched bytes are still exact.
+- Modified subtrees normalize their internal layout when they re-emit. A multi-line flow *mapping* keeps its layout when you change a value, but adding or removing a flow entry, or replacing an item of a flow *sequence*, still collapses the collection to one line. Untouched bytes are always exact.
 - Subtrees the emitter owns — brand-new ones, and moved ones — get block layout at the file's own indent width, but not the original's internal detail: a moved subtree keeps its structure and values, not the comments and blank lines that were inside it.
 - No parse cache. A `Document` is mutable, so a cache would have to hand out deep clones, which is not clearly cheaper than re-parsing. See the note in `src/file.zig`.
 
