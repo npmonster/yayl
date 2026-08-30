@@ -92,8 +92,9 @@ Nested lookup by key path (`pathGet`), or `node.lookup` for one key:
 const port = doc.pathGet(&.{ "server", "port" }) orelse return error.Missing;
 ~~~
 
-`yaml.scalarKind(value, style)` classifies a scalar per the YAML core
-schema; quoted values are always strings.
+`yaml.resolveCoreTag(value, style)` resolves a plain scalar to its YAML
+1.2.2 Core Schema tag (spec 10.3.2). Quoted scalars always resolve to
+`str`.
 
 Anchors and aliases are first-class nodes: `- &v 42` followed by
 `- *v` produces a distinct alias node resolving to the anchor target

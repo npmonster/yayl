@@ -120,7 +120,7 @@ The node APIs you'll reach for most:
 
 - `scalarValue()`, `pairs()`, `items()`
 - `lookup(key)` and `byPath(path)`
-- `yaml.scalarKind(value, style)` for YAML core-schema classification
+- `yaml.resolveCoreTag(value, style)` resolves a plain scalar to its core-schema tag
 
 ## Build and modify documents
 

@@ -12,7 +12,7 @@
 //! `deinitZig`. `toNode` copies all retained data into the document pool.
 //!
 //! Plain scalar typing delegates to the library's YAML 1.2 core-schema
-//! resolver (see `document.scalarKind`); quoted scalars remain strings.
+//! resolver (see `document.resolveCoreTag`); quoted scalars remain strings.
 //! Floats are represented as `f64`, so their exact source spelling is
 //! not retained.
 
@@ -121,7 +121,7 @@ pub fn nodeToValue(alloc: std.mem.Allocator, node: *const Node) Error!Value {
 /// scalars get typed).
 pub fn scalarToValue(alloc: std.mem.Allocator, text: []const u8, style: ScalarStyle) Error!Value {
     if (style != .plain) return .{ .string = try alloc.dupe(u8, text) };
-    switch (document_mod.scalarKind(text, .plain)) {
+    switch (document_mod.resolveCoreTag(text, .plain)) {
         .null_ => return .null_,
         .bool_ => return .{ .bool_ = text[0] == 't' or text[0] == 'T' },
         .int => {

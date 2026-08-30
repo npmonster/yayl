@@ -175,12 +175,14 @@ pub const Node = struct {
     pub const max_alias_depth: usize = 100;
 };
 
-/// The resolved data kind of a plain scalar (fy_node scalar typing).
-pub const ScalarKind = enum { null_, bool_, int, float, str };
+/// The Core Schema tag a plain scalar resolves to, in the spec's
+/// shorthand form (`tag:yaml.org,2002:int` is `.int`). Distinct from
+/// `Node.tag`, which holds a fully resolved tag URI.
+pub const CoreTag = enum { null_, bool_, int, float, str };
 
-/// Classify a scalar value the way YAML 1.2 core schema resolves plain
-/// scalars. Non-plain styles are always strings.
-pub fn scalarKind(value: []const u8, style: ScalarStyle) ScalarKind {
+/// Resolve a plain scalar to its YAML 1.2.2 Core Schema tag (spec
+/// 10.3.2). Non-plain styles always resolve to `str`.
+pub fn resolveCoreTag(value: []const u8, style: ScalarStyle) CoreTag {
     if (style != .plain) return .str;
     if (value.len == 0 or std.mem.eql(u8, value, "~") or
         std.mem.eql(u8, value, "null") or std.mem.eql(u8, value, "Null") or
@@ -1061,16 +1063,16 @@ test "unknown alias fails" {
 }
 
 test "scalar kind classification" {
-    try testing.expectEqual(ScalarKind.null_, scalarKind("~", .plain));
-    try testing.expectEqual(ScalarKind.null_, scalarKind("", .plain));
-    try testing.expectEqual(ScalarKind.bool_, scalarKind("true", .plain));
-    try testing.expectEqual(ScalarKind.int, scalarKind("-42", .plain));
-    try testing.expectEqual(ScalarKind.int, scalarKind("0x1F", .plain));
-    try testing.expectEqual(ScalarKind.float, scalarKind("1.5e3", .plain));
-    try testing.expectEqual(ScalarKind.float, scalarKind(".inf", .plain));
-    try testing.expectEqual(ScalarKind.str, scalarKind("true", .single_quoted));
-    try testing.expectEqual(ScalarKind.str, scalarKind("0x1F", .double_quoted));
-    try testing.expectEqual(ScalarKind.str, scalarKind("hello", .plain));
+    try testing.expectEqual(CoreTag.null_, resolveCoreTag("~", .plain));
+    try testing.expectEqual(CoreTag.null_, resolveCoreTag("", .plain));
+    try testing.expectEqual(CoreTag.bool_, resolveCoreTag("true", .plain));
+    try testing.expectEqual(CoreTag.int, resolveCoreTag("-42", .plain));
+    try testing.expectEqual(CoreTag.int, resolveCoreTag("0x1F", .plain));
+    try testing.expectEqual(CoreTag.float, resolveCoreTag("1.5e3", .plain));
+    try testing.expectEqual(CoreTag.float, resolveCoreTag(".inf", .plain));
+    try testing.expectEqual(CoreTag.str, resolveCoreTag("true", .single_quoted));
+    try testing.expectEqual(CoreTag.str, resolveCoreTag("0x1F", .double_quoted));
+    try testing.expectEqual(CoreTag.str, resolveCoreTag("hello", .plain));
 }
 
 test "core schema tag resolution rejects near-miss int and float forms" {
@@ -1085,24 +1087,24 @@ test "core schema tag resolution rejects near-miss int and float forms" {
         "1e+",   ".",       "+",    "-",
     };
     for (str_cases) |c| {
-        testing.expectEqual(ScalarKind.str, scalarKind(c, .plain)) catch |err| {
-            std.debug.print("expected str for \"{s}\", got {s}\n", .{ c, @tagName(scalarKind(c, .plain)) });
+        testing.expectEqual(CoreTag.str, resolveCoreTag(c, .plain)) catch |err| {
+            std.debug.print("expected str for \"{s}\", got {s}\n", .{ c, @tagName(resolveCoreTag(c, .plain)) });
             return err;
         };
     }
 
     // The forms the spec does accept must keep resolving.
-    try testing.expectEqual(ScalarKind.int, scalarKind("0x1F", .plain));
-    try testing.expectEqual(ScalarKind.int, scalarKind("0o7", .plain));
-    try testing.expectEqual(ScalarKind.int, scalarKind("-42", .plain));
-    try testing.expectEqual(ScalarKind.int, scalarKind("+42", .plain));
-    try testing.expectEqual(ScalarKind.float, scalarKind("1.5e3", .plain));
-    try testing.expectEqual(ScalarKind.float, scalarKind("-1.5E-3", .plain));
-    try testing.expectEqual(ScalarKind.float, scalarKind(".5", .plain));
-    try testing.expectEqual(ScalarKind.float, scalarKind("1.", .plain));
-    try testing.expectEqual(ScalarKind.float, scalarKind(".inf", .plain));
-    try testing.expectEqual(ScalarKind.float, scalarKind("-.INF", .plain));
-    try testing.expectEqual(ScalarKind.float, scalarKind(".nan", .plain));
+    try testing.expectEqual(CoreTag.int, resolveCoreTag("0x1F", .plain));
+    try testing.expectEqual(CoreTag.int, resolveCoreTag("0o7", .plain));
+    try testing.expectEqual(CoreTag.int, resolveCoreTag("-42", .plain));
+    try testing.expectEqual(CoreTag.int, resolveCoreTag("+42", .plain));
+    try testing.expectEqual(CoreTag.float, resolveCoreTag("1.5e3", .plain));
+    try testing.expectEqual(CoreTag.float, resolveCoreTag("-1.5E-3", .plain));
+    try testing.expectEqual(CoreTag.float, resolveCoreTag(".5", .plain));
+    try testing.expectEqual(CoreTag.float, resolveCoreTag("1.", .plain));
+    try testing.expectEqual(CoreTag.float, resolveCoreTag(".inf", .plain));
+    try testing.expectEqual(CoreTag.float, resolveCoreTag("-.INF", .plain));
+    try testing.expectEqual(CoreTag.float, resolveCoreTag(".nan", .plain));
 }
 
 test "builder API and path API" {

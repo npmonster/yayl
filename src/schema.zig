@@ -137,9 +137,9 @@ fn typeErr(alloc: std.mem.Allocator, path: []const u8, want: []const u8, out: *s
     return appendViolation(alloc, out, path, "type", "expected {s}", .{want});
 }
 
-fn checkNodeScalarKind(node: *const Node) ?document_mod.ScalarKind {
+fn checkNodeCoreTag(node: *const Node) ?document_mod.CoreTag {
     const s = node.scalarValue() orelse return null;
-    return document_mod.scalarKind(s, node.data.scalar.style);
+    return document_mod.resolveCoreTag(s, node.data.scalar.style);
 }
 
 fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Node, path: []const u8, out: *std.ArrayList(Violation)) Error!void {
@@ -151,18 +151,18 @@ fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Nod
         },
         .str => {
             const s = cur.scalarValue() orelse return typeErr(alloc, path, "a string", out);
-            if (document_mod.scalarKind(s, cur.data.scalar.style) != .str) {
+            if (document_mod.resolveCoreTag(s, cur.data.scalar.style) != .str) {
                 try typeErr(alloc, path, "a string", out);
             }
         },
         .bool_ => {
-            if (checkNodeScalarKind(cur) != .bool_) try typeErr(alloc, path, "a boolean", out);
+            if (checkNodeCoreTag(cur) != .bool_) try typeErr(alloc, path, "a boolean", out);
         },
         .int => {
-            if (checkNodeScalarKind(cur) != .int) try typeErr(alloc, path, "an integer", out);
+            if (checkNodeCoreTag(cur) != .int) try typeErr(alloc, path, "an integer", out);
         },
         .float => {
-            const k = checkNodeScalarKind(cur);
+            const k = checkNodeCoreTag(cur);
             if (k != .float and k != .int) try typeErr(alloc, path, "a number", out);
         },
         .str_enum => |values| {
@@ -173,7 +173,7 @@ fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Nod
             try appendViolation(alloc, out, path, "enum", "'{s}' is not one of the allowed values", .{s});
         },
         .int_range => |r| {
-            const k = checkNodeScalarKind(cur);
+            const k = checkNodeCoreTag(cur);
             if (k != .int) return typeErr(alloc, path, "an integer", out);
             const text = cur.scalarValue().?;
             const v = std.fmt.parseInt(i64, text, 0) catch {
