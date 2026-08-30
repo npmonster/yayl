@@ -142,7 +142,11 @@ struct blake3_hasher_ops { void (*f[8])(void); };
 const struct blake3_hasher_ops blake3_hasher_op_portable;
 const struct blake3_hasher_ops blake3_hasher_op_cpusimd;
 EOF
-    $CC $INC "$WORK/fydump_main.c" "$WORK/fydump_stub.c" $SRC -o "$WORK/fydump" \
+    # -lm: glibc keeps the math functions (fy-walk.c calls trunc) in a
+    # separate library; on macOS they live in libSystem, so a missing -lm
+    # only shows up on Linux. -D_GNU_SOURCE: fy-utils.c calls
+    # pthread_getattr_np, which glibc hides behind it.
+    $CC $INC -D_GNU_SOURCE "$WORK/fydump_main.c" "$WORK/fydump_stub.c" $SRC -o "$WORK/fydump" -lm \
         || { echo "differential: FAILED to build libfyaml reference" >&2; exit 1; }
 fi
 
