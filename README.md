@@ -2,9 +2,9 @@
 
 A YAML parser, document model, and emitter for Zig. Parse a config, change one value, write it back, and every byte you didn't touch comes out exactly as it went in: comments, blank lines, quoting, key order, indentation.
 
-That last part is the point. Most YAML libraries parse into a plain map and drop everything else, so writing the file back reformats it and your comments are gone. yayl keeps the source layout in the tree and re-emits from it.
+Most YAML libraries parse into a plain map and drop everything else, so writing the file back reformats it and your comments are gone. yayl keeps the source layout in the tree and re-emits from it.
 
-> **Status: 0.9, feature complete.** Scanner, parser, CST-backed document model, and emitter. Passes the full yaml-test-suite corpus (351/351), does byte-faithful round trips, and ships an editing API, a value runtime, optional schema validation, and bounded file I/O. `make verify` gates all of it.
+> **Status: feature complete.** Scanner, parser, a document model that keeps source spans, and an emitter. Passes the full yaml-test-suite corpus, does byte-faithful round trips, and ships an editing API, a value runtime, optional schema validation, and bounded file I/O. `make verify` gates all of it; the numbers are under [Development](#development).
 
 > **Written by AI agents** under human direction. See the [disclosure](#ai-development-disclosure) below.
 
@@ -33,10 +33,10 @@ Zig 0.16.0 or later in the 0.16 series.
 Add the package, pinned to a release:
 
 ```sh
-zig fetch --save git+https://github.com/npmonster/yayl#v0.10.0
+zig fetch --save git+https://github.com/npmonster/yayl#v0.11.0
 ```
 
-That records the resolved commit and a content hash in your `build.zig.zon`, so your build stays reproducible even if the tag later moves or disappears. Leave off `#v0.10.0` and you pin whatever `main` happens to be at that moment, which is rarely what you want.
+That records the resolved commit and a content hash in your `build.zig.zon`, so your build stays reproducible even if the tag later moves or disappears. Leave off `#v0.11.0` and you pin whatever `main` happens to be at that moment, which is rarely what you want.
 
 Wire the module into your `build.zig`:
 
@@ -89,7 +89,7 @@ defer {
 }
 ```
 
-Want positioned error messages? Attach a `Diag` and use `yaml.parseDiag`:
+For positioned error messages, attach a `Diag` and use `yaml.parseDiag`:
 
 ```zig
 var d: yaml.Diag = .{ .allocator = alloc };
@@ -188,7 +188,7 @@ If a batch fails, the original document is left byte-identical.
 
 ## Road to 1.0
 
-0.9 is the hardening release: the feature set is complete and gated (conformance, byte-faithful round trips, differential parity, allocation-failure injection). 1.0 waits on real-world use, so run your workload against it and tell us what breaks. Streaming input chunking and a parse cache are deliberate non-goals for now.
+The feature set is complete and gated. 1.0 waits on real-world use: run your workload against it and tell us what breaks. Streaming input chunking and a parse cache are deliberate non-goals for now.
 
 ## Current limitations
 
@@ -202,16 +202,24 @@ Deliberate for v1:
 ## Development
 
 ```sh
-make verify        # fmt + compile + tests (Debug & ReleaseSafe)
-                   #   + corpus conformance (351/351)
-                   #   + byte-faithful round-trip gate
+make verify        # everything below except differential
+make conformance   # yaml-test-suite corpus
 make roundtrip     # emit(parse(x)) == x over corpus + fixtures
+make preservation  # an edit changes only the lines it should (fixtures only)
 make differential  # event-stream parity vs libfyaml (needs a C compiler)
 zig build examples # compile-checked example programs (zig-out/bin)
 zig build bench    # throughput CLI
 ```
 
-The gates: 351/351 yaml-test-suite conformance with zero skips, 265/269 byte-faithful corpus round trips (4 skips: streams containing no document, so there is nothing to re-emit) plus real-world fixtures, 269/269 event-tree parity against vendored libfyaml, allocation-failure injection with zero leaks, in both Debug and ReleaseSafe.
+The gates, in both Debug and ReleaseSafe:
+
+| Gate | Result |
+| --- | --- |
+| yaml-test-suite conformance | 351/351, zero skips |
+| byte-faithful round trips | 265/269 (4 skips: streams containing no document, so there is nothing to re-emit) plus real-world fixtures |
+| edit preservation | every addressable edit position across the real-world fixtures |
+| event-tree parity vs libfyaml | 269/269 compared, zero mismatches |
+| allocation-failure injection | zero leaks |
 
 ## License
 

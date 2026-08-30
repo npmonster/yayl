@@ -5,6 +5,69 @@ series; APIs may still move, and anything that does is listed here.
 
 ## Unreleased
 
+### Changed
+
+Terminology alignment with the YAML 1.2.2 spec and the Zig style guide.
+Every rename below is compiler-caught; nothing fails silently.
+
+| Old | New |
+| --- | --- |
+| `ScalarKind` | `CoreTag` |
+| `scalarKind()` | `resolveCoreTag()` |
+| `NodeType` | `NodeKind` |
+| `Node.nodeType()` | `Node.kind()` |
+| `Token.Kind` (union) | `Token.Data` |
+| `Token.Type` (discriminant) | `Token.Kind` |
+| `Token.typeName()` | `Token.kindName()` |
+| `token.kind` (field) | `token.data` |
+| `Event.Kind` (union) | `Event.Data` |
+| `Event.Type` (discriminant) | `Event.Kind` |
+| `event.kind` (field) | `event.data` |
+| `yaml.NodeType` | `yaml.NodeKind` |
+| `yaml.EventType` | `yaml.EventKind` |
+| — | `yaml.TokenKind` (was missing) |
+| `Value.list` | `Value.sequence` |
+| `Value.map` | `Value.mapping` |
+| `Value.Member` | `Value.Pair` |
+| `Value.null_` / `.bool_` | `Value.null` / `.bool` |
+| `CoreTag.null_` / `.bool_` | `CoreTag.null` / `.bool` |
+| `Schema.bool_` | `Schema.boolean` |
+| `Diag.alloc` (field) | `Diag.allocator` |
+| `alloc:` parameters | `allocator:` |
+
+The spec reserves "kind" for the three node kinds — scalar, sequence and
+mapping (3.2.1.1) — and calls the mapping's content key/value pairs. It
+uses "sequence" and "mapping" in prose; `seq`/`map` are tag spellings.
+`CoreTag` names what the enum holds without colliding with `Node.tag`,
+which is a fully resolved tag URI. Trailing underscores are gone because
+bare `null` and `bool` are legal Zig field names; `Schema.boolean` is the
+one that cannot follow, being a declaration rather than a field.
+
+### Removed
+
+- `UnexpectedToken`, `DuplicateAnchor`, `InvalidDirective` and
+  `KeyTooLong` from the public `YamlError` set. None was returned from
+  anywhere: a grammar violation, a malformed directive and an over-long
+  simple key all surface as `InvalidSyntax`, and re-anchoring is legal
+  and shadows, so there was no duplicate-anchor condition to report.
+  The error vocabulary is now 14 names down to 10, all reachable.
+
+### Fixed
+
+- The `[?key=value]` path filter was documented as matching "mapping
+  items". It matches every child that is a mapping, whether that child
+  is a sequence entry or a mapping value.
+- `attachPair`, `attachItem`, `dropPairSpan` and `dropItemSpan` now
+  document why calling them from outside the library corrupts a
+  document: the two `drop*` functions must run before an entry is
+  detached, because the span is derived from where the next entry
+  starts. They stay `pub` because `edit.zig` needs them and Zig has no
+  module-internal visibility.
+- The path grammar's inability to address a key containing `.`, `[` or
+  `]` is documented in the usage guide rather than only counted inside
+  the preservation harness.
+
+
 ### Fixed
 
 - A byte-order mark shifted every span of the documents it prefixed
