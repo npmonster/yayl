@@ -520,9 +520,16 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
         if (t.anchored_referenced) {
             // Replacing an anchored node drops the anchor and leaves
             // every alias to it dangling — no valid edit exists, so
-            // this skip must come BEFORE the multi_line branch: an
-            // anchored node is often also multi-line, and performing
-            // the edit there emits unparseable output.
+            // this skip must come BEFORE the multi_line branch.
+            //
+            // The order is semantic, not stylistic: every OTHER skip
+            // category can still assert "the emitter did not produce
+            // invalid YAML", but this one cannot — a dangling alias is
+            // the expected outcome, not a defect. A target that is both
+            // multi-line and a referenced anchor must be classified by
+            // the anchor. Reordering these checks back to shape-first
+            // makes this sweep fail with unparseable output and looks
+            // like an emitter bug. It is not.
             stats.skipped_dangling_anchor += 1;
             continue;
         }

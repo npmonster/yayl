@@ -54,6 +54,9 @@ jobs:
       - name: Round-trip gate (byte-faithful emit(parse(x)) == x)
         run: zig build roundtrip --summary all
 
+      - name: Edit-preservation sweeps (edits change only what they should)
+        run: zig build preservation --summary all
+
       - name: Differential gate (event parity vs libfyaml)
         run: make differential
 
@@ -180,3 +183,6 @@ jobs:
 
       - name: Round-trip gate (byte-faithful emit(parse(x)) == x)
         run: zig build roundtrip --summary all
+
+      - name: Edit-preservation sweeps (edits change only what they should)
+        run: zig build preservation --summary all

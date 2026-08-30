@@ -59,12 +59,11 @@ preservation: ## Edit-preservation sweeps over tests/fixtures (edits change only
 differential: corpus libfyaml ## Compare yayl vs libfyaml event streams over the corpus (needs a C compiler)
 	sh scripts/differential.sh
 
-# NOTE: `preservation` is intentionally NOT in this list yet. The sweep is
-# currently red on the working tree (emitter fixes in flight); adding it now
-# would leave every session without a usable gate. Re-add `preservation`
-# here, and the matching step in .github/workflows/ci.yml, the moment the
-# emitter work lands. Run it standalone with `make preservation`.
-verify: fmt check test test-release conformance roundtrip ## Full quality gate: fmt, compile, tests (Debug + ReleaseSafe), corpus, round trip
+# NOTE: the sweep asserts line-level non-interference on every edit
+# position in every fixture, plus weak invariants (re-parse, entry gone,
+# sentinel present) and semantic value-tree equality on the skip
+# categories — a skip is never silent.
+verify: fmt check test test-release conformance roundtrip preservation ## Full quality gate: fmt, compile, tests (Debug + ReleaseSafe), corpus, round trip, edit preservation
 
 clean: ## Remove build artifacts (zig-out/) and the incremental cache
 	rm -rf zig-cache .zig-cache-global zig-out
