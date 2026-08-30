@@ -3,7 +3,7 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
-## Unreleased
+## 0.11.0 — 2026-08-31
 
 ### Changed
 
