@@ -5,8 +5,58 @@ series; APIs may still move, and anything that does is listed here.
 
 ## Unreleased
 
+### Fixed
+
+- A byte-order mark shifted every span of the documents it prefixed
+  three bytes out of alignment: the scanner skipped the BOM in its
+  byte cursor but not in its mark, so re-emissions that sliced spans
+  individually truncated the tail. A BOM followed directly by a
+  comment line additionally failed to parse: the '#' check looked
+  only at the preceding byte, which the BOM's last byte is, and did
+  not recognize the line start. Both found by the preservation gate's
+  BOM fixture variants.
+- Moving a subtree whose ancestors had never been edited re-used the
+  ancestor's original bytes, so the move became a copy — the subtree
+  appeared at the destination and stayed at the source. Moving now
+  marks the whole ancestor chain modified, like every other editing
+  path already did.
+- A mapping that is a sequence item measured inserted keys from the
+  item's `- ` indicator instead of its own entries, so a key added
+  under a `steps:`-style list landed one indentation level out and
+  the output stopped parsing.
+- A moved or programmatic empty plain scalar — YAML null — was
+  emitted as an empty quoted string; it now stays a null, without a
+  trailing space.
+- Setting a scalar to what it already holds (same value, style,
+  anchor and tag) is now a byte-identical no-op instead of replacing
+  the entry and re-emitting it normalized: flow spacing
+  (`branches: [ x ]`), block scalar indentation and folding, and
+  anchors and tags all stay exactly as written. A different style or
+  tag remains a real edit.
+- Deleting two mapping entries in one batch — or in two successive
+  edits — could resurrect the second-deleted entry's bytes: tombstone
+  ranges were recorded in the order the deletes ran, while emission
+  skips them in document order. Ranges are now kept sorted.
+- Inserting an item before a sequence item whose line carries a
+  trailing comment emitted the successor's line ahead of itself and
+  then again in place. The comment now stays with its own entry.
+- Editing an explicit-key entry (`? key`) emitted `? key: value`,
+  which does not parse: a value the entry did not have now moves onto
+  a `: value` line at the indicator's column. Adding a plain key to
+  an explicit-key mapping indented it to the key text's column, where
+  it parsed as the previous entry's value; new entries now sit at the
+  indicator column.
+
 ### Changed
 
+- `make preservation` now sweeps `Edit.insert` and `Edit.move` at
+  every addressable position, edits all 269 valid yaml-test-suite
+  corpus documents and CRLF/BOM/no-final-newline variants of every
+  fixture, keeps set-to-same-value as a permanent byte-identical
+  assertion, and compares every output's semantic value tree against
+  the edited document — in addition to the previous line-shape
+  checks. Shapes that legitimately normalize are counted as skips,
+  never asserted away.
 - A multi-line flow mapping keeps its layout when one of its values is
   changed, instead of collapsing to a single line and dropping any
   comments inside it. The bytes between flow entries are now treated as

@@ -217,6 +217,11 @@ pub const Edit = union(enum) {
     /// final segment addresses the entry to set: a mapping key
     /// (replaced in place, or appended when new) or a sequence index
     /// (the item at that position is replaced in place).
+    ///
+    /// Replacing a scalar with one of identical presentation — same
+    /// value, style, anchor and tag — is a no-op: the original node
+    /// keeps its place and source span, and emitted output stays
+    /// byte-identical. A different style or tag is a real edit.
     set: struct { path: []const u8, value: *Node },
     /// Delete the (single) node at `path`. No match is not an error.
     delete: []const u8,
@@ -334,6 +339,9 @@ pub const Editor = struct {
         var p = try Path.parse(doc.alloc, path);
         defer p.deinit(doc.alloc);
         if (p.segments.len == 0) {
+            if (doc.root) |root| {
+                if (sameScalarPresentation(root, value)) return;
+            }
             doc.root = value;
             return;
         }
@@ -345,6 +353,11 @@ pub const Editor = struct {
                 const cur = try setContainer(doc, parent, true);
                 if (!cur.isMapping()) return error.NotAMapping;
                 if (cur.lookup(last)) |existing| {
+                    // An exact scalar-presentation match is a no-op:
+                    // replacing would drop the entry's source span and
+                    // re-emit the value normalized (flow spacing, block
+                    // scalar indentation) although nothing changed.
+                    if (sameScalarPresentation(existing, value)) return;
                     // `lookup` only matches values of the mapping `cur`,
                     // so the in-place replace must succeed; falling
                     // through would append a duplicate key.
@@ -358,6 +371,9 @@ pub const Editor = struct {
             .index => |ix| {
                 const cur = try setContainer(doc, parent, false);
                 if (!cur.isSequence()) return error.NotASequence;
+                if (cur.items()) |items| {
+                    if (ix < items.len and sameScalarPresentation(items[ix], value)) return;
+                }
                 // Tombstone the old item's line, drop it, and splice the
                 // replacement in at the same position: untouched
                 // siblings re-emit verbatim, the new item normalizes at
@@ -369,6 +385,23 @@ pub const Editor = struct {
             // number of nodes: not a single deterministic target.
             else => return error.AmbiguousOperation,
         }
+    }
+
+    /// True when `a` and `b` are scalars with identical presentation:
+    /// same value, scalar style, anchor and tag. Setting a node to such
+    /// a replacement changes nothing observable, so the edit is a
+    /// no-op that preserves the original node's source span.
+    fn sameScalarPresentation(a: *Node, b: *Node) bool {
+        if (a.data != .scalar or b.data != .scalar) return false;
+        if (!std.mem.eql(u8, a.data.scalar.value, b.data.scalar.value)) return false;
+        if (a.data.scalar.style != b.data.scalar.style) return false;
+        return sameOptionalText(a.anchor, b.anchor) and sameOptionalText(a.tag, b.tag);
+    }
+
+    fn sameOptionalText(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null and b == null) return true;
+        if (a == null or b == null) return false;
+        return std.mem.eql(u8, a.?, b.?);
     }
 
     fn applyDelete(doc: *Document, path: []const u8) Error!void {
@@ -1274,5 +1307,113 @@ test "emitter-owned subtrees still re-parse to the values they were given" {
         const moved = try ed2.one(path);
         try testing.expectEqualStrings("h", moved.lookup("host").?.scalarValue().?);
         try testing.expectEqualStrings("80", moved.lookup("port").?.scalarValue().?);
+    }
+}
+
+test "setting a scalar to its own presentation is a byte-identical no-op" {
+    // Each input carries presentation the emitter would normalize away
+    // if the node were actually replaced: flow spacing, block-scalar
+    // indentation, folding, anchors, tags, null. An exact
+    // same-presentation set must leave every byte untouched.
+    const Case = struct { input: []const u8, path: []const u8 };
+    const cases = [_]Case{
+        .{ .input = "branches: [ x ]\n", .path = "$.branches[0]" },
+        .{ .input = "run: |-\n  first line\n      deliberately deep\n", .path = "$.run" },
+        .{ .input = "description: >-\n  folded text\n  on two lines\n", .path = "$.description" },
+        .{ .input = "a: &anch !!str hello\n", .path = "$.a" },
+        .{ .input = "db-data:\n", .path = "$.db-data" },
+        .{ .input = "plain root\n", .path = "$" },
+    };
+    for (cases) |case| {
+        var doc = try Document.parse(testing.allocator, case.input);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const existing = try ed.one(case.path);
+        const replacement = try doc.createScalar(existing.data.scalar.value, existing.data.scalar.style);
+        replacement.anchor = if (existing.anchor) |a| try doc.pool.dupe(a) else null;
+        replacement.tag = if (existing.tag) |t| try doc.pool.dupe(t) else null;
+        try ed.set(case.path, replacement);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(case.input, out);
+    }
+
+    // A different value or style is a real edit, not a no-op.
+    {
+        var doc = try Document.parse(testing.allocator, "branches: [ x ]\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.set("$.branches[0]", try doc.createScalar("y", .plain));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("branches: [y]\n", out);
+    }
+    {
+        var doc = try Document.parse(testing.allocator, "key: 5\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.set("$.key", try doc.createScalar("5", .single_quoted));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("key: '5'\n", out);
+    }
+}
+
+test "deleting two siblings in one batch keeps both deletes" {
+    // Tombstones used to be recorded in the order the deletes ran,
+    // while emission skips them in document order: deleting `b` then
+    // `a` resurrected `a`'s bytes.
+    var doc = try Document.parse(testing.allocator, "a: 1\nb: 2\nc: 3\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{ .{ .delete = "$.b" }, .{ .delete = "$.a" } });
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("c: 3\n", out);
+}
+
+test "inserting before a commented item does not duplicate the item" {
+    var doc = try Document.parse(testing.allocator, "before_script:\n  - python --version  # For debugging\n  - pip install virtualenv\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{.{ .insert = .{
+        .sequence = "$.before_script",
+        .position = "$.before_script[0]",
+        .value = try doc.createScalar("added", .plain),
+        .before = true,
+    } }});
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "before_script:\n" ++
+            "  - added\n" ++
+            "  - python --version  # For debugging\n" ++
+            "  - pip install virtualenv\n",
+        out,
+    );
+}
+
+test "editing explicit-key entries emits valid YAML" {
+    // Set: the value moves to a `: value` line instead of producing
+    // the invalid `? key: value`.
+    {
+        var doc = try Document.parse(testing.allocator, "--- !!set\n? Mark McGwire\n? Sammy Sosa\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .set = .{ .path = "$.Mark McGwire", .value = try doc.createScalar("zz-edited", .plain) } }});
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("--- !!set\n? Mark McGwire\n: zz-edited\n? Sammy Sosa\n", out);
+    }
+    // Append: a new plain key sits at the indicator column, where it
+    // is a sibling of the explicit entries.
+    {
+        var doc = try Document.parse(testing.allocator, "? Mark McGwire\n? Sammy Sosa\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .set = .{ .path = "$.zz_added", .value = try doc.createScalar("added", .plain) } }});
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("? Mark McGwire\n? Sammy Sosa\nzz_added: added\n", out);
     }
 }

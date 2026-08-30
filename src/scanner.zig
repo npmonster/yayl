@@ -69,9 +69,7 @@ pub const Scanner = struct {
         required: bool = false,
         token_number: usize = 0,
         mark: Mark = .{},
-        /// Byte index into `input` where the key starts. Distinct from
-        /// `mark.offset`, which trails `pos` by the BOM length (`init`),
-        /// so only this one is safe to slice with.
+        /// Byte index into `input` where the key starts.
         pos: usize = 0,
     };
 
@@ -87,8 +85,16 @@ pub const Scanner = struct {
         }
 
         var self: Scanner = .{ .alloc = alloc, .d = d, .input = eff, .pos = 0, .mark = .{} };
-        // Skip a UTF-8 BOM if present (fy_reader does this too).
-        if (eff.len >= 3 and std.mem.eql(u8, eff[0..3], "\xEF\xBB\xBF")) self.pos = 3;
+        // Skip a UTF-8 BOM if present (fy_reader does this too). The
+        // mark travels with `pos`: every span built from a mark is an
+        // absolute byte offset into `input`, so leaving `mark.offset`
+        // behind would shift all of a BOM document's spans — and every
+        // faithful re-emission that slices them individually — three
+        // bytes short.
+        if (eff.len >= 3 and std.mem.eql(u8, eff[0..3], "\xEF\xBB\xBF")) {
+            self.pos = 3;
+            self.mark.offset = 3;
+        }
         // One simple key slot per flow level; level 0 always exists.
         try self.simple_keys.append(alloc, .{});
         return self;
@@ -395,9 +401,14 @@ pub const Scanner = struct {
             // comment when preceded by whitespace or line start;
             // "foo#bar" is not a comment (corpus 9JBA/CVW2/SU5Z).
             // The separator may have been consumed by the previous
-            // token's scan, so look at the actual preceding byte.
+            // token's scan, so look at the actual preceding byte — but
+            // a multi-byte character there does not mean mid-line: a
+            // BOM at the stream start leaves 0xBF before a '#' that
+            // still opens the line, so column 1 counts as line start
+            // however many bytes the first character had.
             if (self.at(0) == '#') {
-                const preceded = self.pos == 0 or
+                const preceded = self.mark.column == 1 or
+                    self.pos == 0 or
                     self.input[self.pos - 1] == ' ' or
                     self.input[self.pos - 1] == '\t' or
                     ctype.isBreak(self.input[self.pos - 1]);

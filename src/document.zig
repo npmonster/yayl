@@ -573,6 +573,18 @@ pub const Document = struct {
         return std.mem.indexOfNone(u8, s, " \t\r\n") == null;
     }
 
+    /// Record a tombstoned byte range, keeping the list ASCENDING by
+    /// start. Emission walks a container's bytes in document order and
+    /// skips tombstones as it passes them (emitter `writeGap`), so a
+    /// range appended out of order would resurrect the deleted bytes
+    /// it covers — and edits applied after an earlier one can easily
+    /// detach entries in reverse document order.
+    fn dropRange(self: *Document, drops: *std.ArrayList([2]usize), from: usize, to: usize) !void {
+        var i: usize = 0;
+        while (i < drops.items.len and drops.items[i][0] < from) i += 1;
+        try drops.insert(self.pool.allocator(), i, .{ from, to });
+    }
+
     /// Tombstone the source bytes a mapping entry occupied (its whole
     /// line, including the line terminator).
     pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
@@ -628,7 +640,7 @@ pub const Document = struct {
                 if (to <= from) return;
                 // Losing a tombstone to OOM would resurrect the deleted
                 // entry verbatim on the next write: propagate the error.
-                try m.dropped.append(self.pool.allocator(), .{ from, to });
+                try self.dropRange(&m.dropped, from, to);
             },
             else => {},
         }
@@ -660,7 +672,7 @@ pub const Document = struct {
                     }
                 }
                 if (to <= from) return;
-                try s.dropped.append(self.pool.allocator(), .{ from, to });
+                try self.dropRange(&s.dropped, from, to);
             },
             else => {},
         }
@@ -1231,6 +1243,20 @@ test "append entry at end of mapping" {
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("a: 1\nb: 2\nc: 3\n", out);
+}
+
+test "a BOM before a leading comment line still parses" {
+    // The '#' is at line start, but the byte before it is the BOM's
+    // last byte: the comment check used to look only at that byte and
+    // rejected the document. Found by the preservation gate's BOM
+    // fixture variants.
+    const src = "\xEF\xBB\xBF# comment\nkey: value\n";
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try testing.expectEqualStrings("value", doc.pathGet(&.{"key"}).?.scalarValue().?);
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(src, out);
 }
 
 test "append entry uses sibling indentation" {

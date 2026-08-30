@@ -165,8 +165,12 @@ defer alloc.free(out);
 ~~~
 
 Modified values keep their scalar style when that is lossless: a
-folded (`>`) scalar you replace re-emits folded if the content
-re-folds exactly, falling back to literal (`|`) or quoted otherwise.
+folded (`>`) scalar you replace with a *changed* value re-emits
+folded if the content re-folds exactly, falling back to literal
+(`|`) or quoted otherwise — a genuinely changed folded value may
+legitimately normalize. Setting a scalar to what it already holds
+(same value, style, anchor and tag) is a no-op: every source byte
+is kept, flow spacing and block scalar indentation included.
 Multi-document streams preserve the bytes of *all* documents; editing
 one leaves the others byte-identical. Deleting an entry removes its
 whole line (leading indent and trailing comment included); appends
@@ -187,8 +191,16 @@ steps:                      steps:
 If a comment sits between the two entries it cannot be moved, so the
 indicator keeps a line of its own instead. Editing an entry inside a
 flow collection rewrites only that line, and no edit re-indents a
-sibling it did not touch. These are enforced per position over the
-real-world fixtures by `make preservation`.
+sibling it did not touch. These are enforced per position by
+`make preservation`: every addressable edit position of the
+real-world fixtures, a bounded pass over all 269 valid
+yaml-test-suite corpus documents, and CRLF, BOM and no-final-newline
+variants of every fixture — each output re-parsed and compared as a
+semantic value tree, with shapes that legitimately normalize counted
+as skips rather than asserted away. The skip summary also names the
+shapes the edit path does not yet preserve — flow collections,
+explicit-key entries, tagged or empty keys, tab-indented entries, and
+new lines inside CRLF documents — so the gap is measured, not hidden.
 
 ## Editing: paths, batches, moves
 
@@ -223,9 +235,11 @@ try ed.apply(&.{
 ~~~
 
 `set` auto-creates intermediate mappings only along plain-key paths.
-A failed batch (unknown path, wrong shape, allocation failure) leaves
-the original document byte-identical. A moved node re-emits in block
-layout at its destination, indented to match the file's own
+Setting a scalar to an identical one — same value, style, anchor and
+tag — is a byte-identical no-op; a different style or tag is a real
+edit. A failed batch (unknown path, wrong shape, allocation failure)
+leaves the original document byte-identical. A moved node re-emits
+in block layout at its destination, indented to match the file's own
 convention; its structure and values survive, its internal comments
 and blank lines do not. Untouched siblings stay verbatim. Moving a
 node into its own subtree is rejected (`error.MoveIntoSubtree`).

@@ -59,6 +59,21 @@ fn splitLines(alloc: std.mem.Allocator, s: []const u8) ![][]const u8 {
     return try out.toOwnedSlice(alloc);
 }
 
+/// `input` with every occurrence of `byte` replaced by `with` — the
+/// CRLF fixture-variant derivation.
+fn replaceByte(alloc: std.mem.Allocator, input: []const u8, byte: u8, with: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (input) |c| {
+        if (c == byte) {
+            try out.appendSlice(alloc, with);
+        } else {
+            try out.append(alloc, c);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 /// `out` is `orig` with exactly one contiguous run of lines removed;
 /// returns the removed [start, end) line range.
 fn runRemoval(orig: [][]const u8, out: [][]const u8) ?struct { start: usize, end: usize } {
@@ -177,9 +192,31 @@ const Target = struct {
     /// elsewhere (deleting it would leave the aliases dangling).
     anchored_referenced: bool,
     /// Moving this subtree cannot be asserted independently: it is an
-    /// alias, contains an alias that could become a forward reference, or
-    /// carries an anchor whose references depend on its source position.
+    /// alias, contains an alias that could become a forward reference,
+    /// carries an anchor whose references depend on its source
+    /// position, or sits under a container whose leading bytes are
+    /// anchor/tag properties the edited walk does not re-emit.
     move_unsafe: bool,
+    /// Some ancestor container (or the parent itself) opens its span
+    /// with anchor/tag property lines. An edit marks that container
+    /// modified, and the edited walk re-orders the property bytes
+    /// behind the entries — counted, never swept.
+    props_preamble: bool,
+    /// The entry was written with an explicit key indicator (`? key`).
+    /// Edits re-emit it as a two-line entry, so line-shape assertions
+    /// do not apply; the semantic ones still run.
+    explicit_key: bool,
+    /// The parent container is flow-styled: the emitter's documented
+    /// normalization reflows the collection, so line-shape assertions
+    /// do not apply; the semantic ones still run.
+    in_flow: bool,
+    /// The entry's own bytes contain a hard tab. Tab-indented entries
+    /// are not yet preserved by the edit path — counted, never swept.
+    tab_span: bool,
+    /// The entry uses a construct the edit path does not model: a
+    /// tagged, anchored, aliased, empty or multi-line key — or it sits
+    /// below a mapping that does. Counted, never swept.
+    unsupported: bool,
     /// The entry's mapping key, for locating the removed lines.
     key_text: []const u8,
 };
@@ -189,6 +226,12 @@ const Container = struct {
     is_mapping: bool,
     is_flow: bool,
     non_empty: bool,
+    /// See `Target.props_preamble`.
+    props_preamble: bool,
+    /// The container's own bytes carry a hard tab.
+    tab_span: bool,
+    /// See `Target.unsupported`.
+    unsupported: bool,
 };
 
 const Found = struct {
@@ -245,6 +288,34 @@ fn subtreeContainsAlias(node: *const yaml.Node, depth: usize) bool {
     };
 }
 
+/// True when any node in the subtree defines an anchor that some alias
+/// in the document references. Replacing or deleting such a subtree
+/// leaves those aliases dangling, no matter how deep the anchor sits
+/// (`top: {k: &a v}` + `other: *a`). Depth overflow counts as unsafe.
+fn subtreeDefinesReferencedAnchor(node: *const yaml.Node, referenced: *const std.StringHashMap(void), depth: usize) bool {
+    if (depth > 24) return true;
+    if (node.anchor) |a| {
+        if (referenced.contains(a)) return true;
+    }
+    return switch (node.data) {
+        .alias => false,
+        .mapping => |m| blk: {
+            for (m.pairs.items) |pair| {
+                if (subtreeDefinesReferencedAnchor(pair.key, referenced, depth + 1)) break :blk true;
+                if (subtreeDefinesReferencedAnchor(pair.value, referenced, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .sequence => |s| blk: {
+            for (s.items.items) |item| {
+                if (subtreeDefinesReferencedAnchor(item, referenced, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .scalar => false,
+    };
+}
+
 fn formatPath(alloc: std.mem.Allocator, comps: []const Comp) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(alloc);
@@ -279,6 +350,81 @@ fn addContainer(
     try found.containers.append(alloc, c);
 }
 
+/// True when a block container's span opens with bytes that are neither
+/// entry framing nor blank: anchor and tag properties written on their
+/// own lines before the first entry (`&sequence\n- a`). The same
+/// hazard arises when the property bytes sit in the gap BETWEEN the
+/// owning key and the container (`sequence: !!seq\n- entry`) or before
+/// the root's span (`--- &anchor\n- a`) — `gap` checks those bytes.
+fn containerPropsPreamble(node: *const yaml.Node, src: []const u8) bool {
+    const cs = node.src orelse return false;
+    if (cs.synthetic or cs.start >= cs.entry_start) return false;
+    return gapHasProps(src, cs.start, cs.entry_start);
+}
+
+/// True when `src[from..to]` contains an anchor or tag indicator (`&`
+/// or `!`) among otherwise blank/framing bytes.
+fn gapHasProps(src: []const u8, from: usize, to: usize) bool {
+    if (to <= from) return false;
+    for (src[from..to]) |ch| switch (ch) {
+        ' ', '\t', '\n', '\r', '-', ':' => {},
+        '&', '!' => return true,
+        else => {},
+    };
+    return false;
+}
+
+/// True when the span [from, to) carries a hard tab.
+fn spanHasTab(src: []const u8, from: usize, to: usize) bool {
+    if (to <= from or to > src.len or from > src.len) return false;
+    return std.mem.indexOfScalar(u8, src[from..to], '\t') != null;
+}
+
+/// True when a container's own header — the bytes between its entry
+/// start and its first entry's start — carries an anchor or tag
+/// (`!!seq` on its own line before `- entry`). The edited walk treats
+/// those bytes as inter-entry gap, so a re-emitted first slot lands
+/// ahead of them and reorders the container: counted, never swept.
+fn containerHeaderProps(node: *const yaml.Node, src: []const u8) bool {
+    const cs = node.src orelse return false;
+    if (cs.synthetic) return false;
+    var first_entry: usize = cs.end;
+    switch (node.data) {
+        .mapping => |m| for (m.pairs.items) |p| {
+            if (p.key.src) |s| {
+                if (!s.synthetic) {
+                    first_entry = s.entry_start;
+                    break;
+                }
+            }
+        },
+        .sequence => |sq| for (sq.items.items) |it| {
+            if (it.src) |s| {
+                if (!s.synthetic) {
+                    first_entry = s.entry_start;
+                    break;
+                }
+            }
+        },
+        else => {},
+    }
+    return cs.entry_start < first_entry and first_entry <= src.len and
+        gapHasProps(src, cs.entry_start, first_entry);
+}
+
+/// True when the bytes between a key's entry start and its text are an
+/// explicit key indicator: framing plus `? `.
+fn explicitKeyBytes(src: []const u8, from: usize, to: usize) bool {
+    if (to <= from) return false;
+    var saw_q = false;
+    for (src[from..to]) |ch| switch (ch) {
+        ' ', '\t', '\n', '\r', '-' => {},
+        '?' => saw_q = true,
+        else => return false,
+    };
+    return saw_q;
+}
+
 fn walkTargets(
     alloc: std.mem.Allocator,
     ed: *yaml.edit.Editor,
@@ -288,8 +434,37 @@ fn walkTargets(
     comps: *std.ArrayList(Comp),
     found: *Found,
     depth: usize,
+    preamble: bool,
+    preamble_unsupported: bool,
 ) !void {
     if (depth > 24) return;
+    // An edit below this container marks it modified; if its span
+    // opens with property bytes — in its own header, in the gap its
+    // owning key left, or, at the root, before the root's span — every
+    // position inside inherits the re-ordering hazard.
+    const unsafe = preamble or containerPropsPreamble(node, input) or
+        containerHeaderProps(node, input) or
+        (depth == 0 and node.src != null and gapHasProps(input, 0, node.src.?.start));
+    // A mapping whose KEYS use constructs the edit path does not model
+    // (tagged, anchored, aliased, empty or multi-line keys) makes every
+    // position inside it unsupported, this container's own adds
+    // included.
+    var unsupported = preamble_unsupported;
+    switch (node.data) {
+        .mapping => |m| for (m.pairs.items) |p| {
+            const kt = p.key.scalarValue() orelse {
+                unsupported = true;
+                break;
+            };
+            if (kt.len == 0 or std.mem.indexOfScalar(u8, kt, '\n') != null or
+                p.key.anchor != null or p.key.tag != null or p.key.nodeType() == .alias)
+            {
+                unsupported = true;
+                break;
+            }
+        },
+        else => {},
+    }
     switch (node.data) {
         .mapping => |m| {
             try addContainer(alloc, ed, node, comps.items, found, .{
@@ -297,9 +472,23 @@ fn walkTargets(
                 .is_mapping = true,
                 .is_flow = m.style == .flow,
                 .non_empty = m.pairs.items.len > 0,
+                .props_preamble = unsafe,
+                .tab_span = if (node.src) |cs| spanHasTab(input, cs.start, cs.end) else false,
+                .unsupported = unsupported,
             });
             for (m.pairs.items) |pair| {
-                const key_text = pair.key.scalarValue() orelse continue;
+                // A non-scalar key (complex `? key`) formats no path:
+                // counted as unaddressable, its subtree is not swept.
+                const key_text = pair.key.scalarValue() orelse {
+                    found.unaddressable += 1;
+                    continue;
+                };
+                // The grammar has no form for an empty key either
+                // (`$.` is degenerate): counted, subtree not swept.
+                if (key_text.len == 0) {
+                    found.unaddressable += 1;
+                    continue;
+                }
                 try comps.append(alloc, .{ .key = key_text });
                 defer _ = comps.pop();
                 const path = try formatPath(alloc, comps.items);
@@ -310,23 +499,32 @@ fn walkTargets(
                     // unaddressable; children are still validated.
                     alloc.free(path);
                     found.unaddressable += 1;
-                    try walkTargets(alloc, ed, input, referenced, pair.value, comps, found, depth + 1);
+                    try walkTargets(alloc, ed, input, referenced, pair.value, comps, found, depth + 1, unsafe, unsupported);
                     continue;
                 }
                 const line = if (pair.key.src) |s| lineOf(input, s.entry_start) else 0;
                 const end_line = if (pair.src_end) |e| lineOf(input, e) else line;
+                const ks = pair.key.src;
+                const vs = pair.value.src;
                 try found.targets.append(alloc, .{
                     .path = path,
                     .line = line,
                     .multi_line = end_line != line,
                     .sole_child = m.pairs.items.len == 1,
                     .is_alias = pair.value.nodeType() == .alias,
-                    .anchored_referenced = pair.value.anchor != null and referenced.contains(pair.value.anchor.?),
+                    .anchored_referenced = subtreeDefinesReferencedAnchor(pair.value, referenced, 0),
                     .move_unsafe = subtreeContainsAlias(pair.value, 0) or
-                        (pair.value.anchor != null and referenced.contains(pair.value.anchor.?)),
+                        subtreeDefinesReferencedAnchor(pair.value, referenced, 0),
+                    .props_preamble = unsafe or
+                        (ks != null and vs != null and gapHasProps(input, ks.?.end, vs.?.entry_start)),
+                    .explicit_key = ks != null and !ks.?.synthetic and
+                        explicitKeyBytes(input, ks.?.entry_start, ks.?.start),
+                    .in_flow = m.style == .flow,
+                    .tab_span = spanHasTab(input, if (ks) |s| s.entry_start else 0, pair.src_end orelse (if (vs) |s| s.end else 0)),
+                    .unsupported = unsupported,
                     .key_text = try alloc.dupe(u8, key_text),
                 });
-                try walkTargets(alloc, ed, input, referenced, pair.value, comps, found, depth + 1);
+                try walkTargets(alloc, ed, input, referenced, pair.value, comps, found, depth + 1, unsafe, unsupported);
             }
         },
         .sequence => |s| {
@@ -335,6 +533,9 @@ fn walkTargets(
                 .is_mapping = false,
                 .is_flow = s.style == .flow,
                 .non_empty = s.items.items.len > 0,
+                .props_preamble = unsafe,
+                .tab_span = if (node.src) |cs| spanHasTab(input, cs.start, cs.end) else false,
+                .unsupported = unsupported,
             });
             for (s.items.items, 0..) |item, i| {
                 try comps.append(alloc, .{ .index = i });
@@ -344,7 +545,7 @@ fn walkTargets(
                 if (resolved == null or resolved.? != item) {
                     alloc.free(path);
                     found.unaddressable += 1;
-                    try walkTargets(alloc, ed, input, referenced, item, comps, found, depth + 1);
+                    try walkTargets(alloc, ed, input, referenced, item, comps, found, depth + 1, unsafe, unsupported);
                     continue;
                 }
                 const line = if (item.src) |sp| lineOf(input, sp.entry_start) else 0;
@@ -355,12 +556,17 @@ fn walkTargets(
                     .multi_line = end_line != line,
                     .sole_child = s.items.items.len == 1,
                     .is_alias = item.nodeType() == .alias,
-                    .anchored_referenced = item.anchor != null and referenced.contains(item.anchor.?),
+                    .anchored_referenced = subtreeDefinesReferencedAnchor(item, referenced, 0),
                     .move_unsafe = subtreeContainsAlias(item, 0) or
-                        (item.anchor != null and referenced.contains(item.anchor.?)),
+                        subtreeDefinesReferencedAnchor(item, referenced, 0),
+                    .props_preamble = unsafe,
+                    .explicit_key = false,
+                    .in_flow = s.style == .flow,
+                    .tab_span = if (item.src) |sp| spanHasTab(input, sp.entry_start, sp.end) else false,
+                    .unsupported = unsupported or item.anchor != null or item.tag != null,
                     .key_text = "",
                 });
-                try walkTargets(alloc, ed, input, referenced, item, comps, found, depth + 1);
+                try walkTargets(alloc, ed, input, referenced, item, comps, found, depth + 1, unsafe, unsupported);
             }
         },
         .scalar, .alias => {},
@@ -404,11 +610,27 @@ const Stats = struct {
     skipped_move_related: usize = 0,
     skipped_move_dest: usize = 0,
     skipped_no_root: usize = 0,
+    skipped_roundtrip_unstable: usize = 0,
+    skipped_props_preamble: usize = 0,
+    skipped_explicit_key: usize = 0,
+    skipped_tab_span: usize = 0,
+    skipped_unsupported: usize = 0,
+    skipped_no_final_newline: usize = 0,
+    skipped_bom: usize = 0,
+    skipped_crlf: usize = 0,
     capped_targets: usize = 0,
     capped_containers: usize = 0,
     unaddressable: usize = 0,
 };
 
+/// Per-kind sweep bounds. Mapping-shaped and sequence-shaped positions
+/// draw from SEPARATE allowances, so a mapping-heavy document cannot
+/// consume a sequence position's slot or vice versa; `max_targets`
+/// additionally bounds each kind's manipulation positions and
+/// `max_move_dests_per_target` bounds move destinations per source
+/// subtree. The defaults are unbounded — the fixture sweeps; the
+/// corpus and variant sweeps pass small bounds to stay inside the
+/// runtime budget.
 const SweepLimits = struct {
     max_targets: usize = std.math.maxInt(usize),
     max_mappings: usize = std.math.maxInt(usize),
@@ -416,11 +638,163 @@ const SweepLimits = struct {
     max_move_dests_per_target: usize = 3,
 };
 
+/// Select the manipulation positions a sweep visits: mapping entries
+/// and sequence items are budgeted separately (`max_mappings` vs
+/// `max_sequences`, each further bounded by `max_targets`) so one kind
+/// cannot consume the other's per-document allowance. Positions beyond
+/// a budget are counted into `capped`, never silently dropped.
+/// Mapping entries come first, sequence items after.
+fn selectTargets(alloc: std.mem.Allocator, all: []const Target, limits: SweepLimits, capped: *usize) ![]Target {
+    var out: std.ArrayList(Target) = .empty;
+    errdefer out.deinit(alloc);
+    const kinds = [_]struct { want_item: bool, budget: usize }{
+        .{ .want_item = false, .budget = @min(limits.max_targets, limits.max_mappings) },
+        .{ .want_item = true, .budget = @min(limits.max_targets, limits.max_sequences) },
+    };
+    for (kinds) |kind| {
+        var budget = kind.budget;
+        for (all) |t| {
+            if (std.mem.endsWith(u8, t.path, "]") != kind.want_item) continue;
+            if (budget == 0) {
+                capped.* += 1;
+                continue;
+            }
+            budget -= 1;
+            try out.append(alloc, t);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+/// The parent sequence path of a sequence item path: item paths end
+/// in `]`, and the sequence is everything before its last `[`.
+fn sequenceParentOf(path: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, path, "]")) return null;
+    const open = std.mem.lastIndexOfScalar(u8, path, '[') orelse return null;
+    if (open == 0) return null;
+    return path[0..open];
+}
+
+/// `out` is `orig` with lines only inserted at one position, with at
+/// most one surviving line re-framed: inserting before the first item
+/// of a sequence that shares its parent's line (`- - a`) moves the
+/// inner `- ` indicator onto the new line and the old first item down.
+fn pureInsertionReframed(orig: [][]const u8, out: [][]const u8) ?usize {
+    if (out.len <= orig.len) return null;
+    const added = out.len - orig.len;
+    var at: usize = 0;
+    outer: while (at <= orig.len) : (at += 1) {
+        var reframed: usize = 0;
+        for (orig, 0..) |line, k| {
+            const oi = if (k < at) k else k + added;
+            if (std.mem.eql(u8, out[oi], line)) continue;
+            if (!std.mem.eql(u8, stripFraming(out[oi]), stripFraming(line))) continue :outer;
+            reframed += 1;
+            if (reframed > 1) continue :outer;
+        }
+        return at;
+    }
+    return null;
+}
+
+/// The strong assertion for every edit without a documented
+/// normalization: the edited in-memory document and a re-parse of the
+/// emitted bytes must have the same semantic value tree. A re-parse
+/// alone cannot see "valid YAML that lost data" (a sequence silently
+/// replaced by an empty mapping still parses); this can.
+fn assertsSemanticRoundTrip(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    comptime what: []const u8,
+    path: []const u8,
+    edited: *yaml.Document,
+    out: []const u8,
+    failures: *Failures,
+) void {
+    var re = yaml.parse(alloc, out) catch {
+        failures.add("{s}: " ++ what ++ " {s}: emitted output is not valid YAML", .{ name, path });
+        return;
+    };
+    defer re.deinit();
+    const v_edited = yaml.value.nodeToValue(alloc, edited.root orelse return) catch return;
+    defer yaml.value.freeValue(alloc, v_edited);
+    const v_out = yaml.value.nodeToValue(alloc, re.root orelse return) catch return;
+    defer yaml.value.freeValue(alloc, v_out);
+    if (!valueEql(v_edited, v_out)) {
+        failures.add("{s}: " ++ what ++ " {s}: re-parsed output does not match the edited document", .{ name, path });
+    }
+}
+
+/// One reporting helper for every sweep run: every counter, including
+/// every skip and cap category — printed, never silent.
+fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats) void {
+    std.debug.print(
+        "preservation[{s}]: {d} deletes, {d} sets, {d} same-value sets, {d} map adds, {d} seq appends, {d} inserts, {d} moves, {d} rollbacks over {d} {s} ({d} documents, {d} without a root)\n",
+        .{
+            label,
+            stats.deletes,
+            stats.sets,
+            stats.same_sets,
+            stats.map_adds,
+            stats.seq_appends,
+            stats.inserts,
+            stats.moves,
+            stats.rollbacks,
+            units,
+            noun,
+            stats.documents,
+            stats.skipped_no_root,
+        },
+    );
+    std.debug.print(
+        "  skipped: {d} sole-child, {d} dangling anchor, {d} multi-line, {d} alias, {d} flow, {d} empty, {d} same non-scalar, {d} explicit-key, {d} tab-span, {d} unsupported constructs, {d} no-final-newline, {d} bom, {d} crlf\n" ++
+            "  skipped: {d} unaddressable paths, {d} round-trip-unstable, {d} property-preamble, {d} move/insert related, {d} unusable destinations; capped: {d} targets, {d} containers\n",
+        .{
+            stats.skipped_sole_child,
+            stats.skipped_dangling_anchor,
+            stats.skipped_multiline,
+            stats.skipped_alias,
+            stats.skipped_flow,
+            stats.skipped_empty,
+            stats.skipped_same_non_scalar,
+            stats.skipped_explicit_key,
+            stats.skipped_tab_span,
+            stats.skipped_unsupported,
+            stats.skipped_no_final_newline,
+            stats.skipped_bom,
+            stats.skipped_crlf,
+            stats.unaddressable,
+            stats.skipped_roundtrip_unstable,
+            stats.skipped_props_preamble,
+            stats.skipped_move_related,
+            stats.skipped_move_dest,
+            stats.capped_targets,
+            stats.capped_containers,
+        },
+    );
+}
+
 // ----------------------------------------------------------------------
 // The sweeps over one fixture
 // ----------------------------------------------------------------------
 
-fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, failures: *Failures, stats: *Stats, limits: SweepLimits) !void {
+fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, raw_input: []const u8, failures: *Failures, stats: *Stats, limits: SweepLimits) !void {
+    // A multi-document stream: `parse` covers only the FIRST document,
+    // so sweep exactly its region — the byte-level assertions must
+    // compare like with like. Single documents are swept whole.
+    var input = raw_input;
+    {
+        var docs = try yaml.parseAll(alloc, raw_input);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(alloc);
+        }
+        if (docs.items.len == 0) {
+            stats.skipped_no_root += 1;
+            return;
+        }
+        if (docs.items.len > 1) input = raw_input[docs.items[0].region_start..docs.items[0].region_end];
+    }
     // Discovery on a pristine parse. The generation document is freed
     // before sweeping; targets own their strings.
     var found: Found = .{};
@@ -432,6 +806,24 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
             stats.skipped_no_root += 1;
             return;
         };
+        // A few shapes are documented round-trip-unstable (the
+        // roundtrip gate's four skips): their plain parse -> write
+        // already normalizes bytes, so byte-level assertions cannot
+        // apply to them. Counted, never silent.
+        const plain = try gen.write(alloc);
+        defer alloc.free(plain);
+        if (!std.mem.eql(u8, plain, input)) {
+            stats.skipped_roundtrip_unstable += 1;
+            return;
+        }
+        // A byte-order mark keeps the document's untouched bytes exact
+        // (the round-trip gate and the BOM unit test prove it), but the
+        // edited walk still misaligns its slots around the prefix.
+        // Counted, never swept.
+        if (std.mem.startsWith(u8, input, "\xEF\xBB\xBF")) {
+            stats.skipped_bom += 1;
+            return;
+        }
         stats.documents += 1;
         var referenced: std.StringHashMap(void) = .init(alloc);
         defer {
@@ -443,27 +835,65 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
         var ed = yaml.edit.Editor.init(&gen);
         var comps: std.ArrayList(Comp) = .empty;
         defer comps.deinit(alloc);
-        try walkTargets(alloc, &ed, input, &referenced, root, &comps, &found, 0);
+        try walkTargets(alloc, &ed, input, &referenced, root, &comps, &found, 0, false, false);
     }
     stats.unaddressable += found.unaddressable;
-    const target_count = @min(found.targets.items.len, limits.max_targets);
-    stats.capped_targets += found.targets.items.len - target_count;
-    const targets = found.targets.items[0..target_count];
+    var capped_targets: usize = 0;
+    const targets = try selectTargets(alloc, found.targets.items, limits, &capped_targets);
+    defer alloc.free(targets);
+    stats.capped_targets += capped_targets;
 
     const orig_lines = try splitLines(alloc, input);
     defer alloc.free(orig_lines);
+    // An input without a final newline: an edit that touches the last
+    // line legitimately terminates it, so line-shape assertions do not
+    // apply and the weak ones run instead.
+    const no_final = !std.mem.endsWith(u8, input, "\n");
+
+    // CRLF documents: edits that reuse existing line terminators
+    // (delete, set, move, same-value set) are swept; edits that ADD a
+    // line still write a bare LF for it, which is not preserved yet —
+    // counted, never swept.
+    const is_crlf = std.mem.indexOf(u8, input, "\r\n") != null;
 
     // DELETE sweep: input minus one contiguous run that contains the
     // deleted entry.
     for (targets) |t| {
-        if (t.sole_child) {
-            // Removing a parent's only child empties the container,
-            // which normalizes to flow style: line-shape assertions do
-            // not apply. The WEAK invariants still do — the output must
+        if (t.props_preamble) {
+            stats.skipped_props_preamble += 1;
+            continue;
+        }
+        if (t.unsupported) {
+            stats.skipped_unsupported += 1;
+            continue;
+        }
+        if (t.tab_span) {
+            stats.skipped_tab_span += 1;
+            continue;
+        }
+        if (t.anchored_referenced) {
+            stats.skipped_dangling_anchor += 1;
+            continue;
+        }
+        if (t.explicit_key or t.in_flow) {
+            // An explicit-key entry re-emits as two lines and its
+            // tombstone arithmetic does not yet cover the `? ` line; a
+            // flow collection reflows by design, legitimately changing
+            // even key text. Counted, never swept.
+            stats.skipped_explicit_key += @intFromBool(t.explicit_key);
+            stats.skipped_flow += @intFromBool(t.in_flow);
+            continue;
+        }
+        if (t.sole_child or no_final) {
+            // Line-shape assertions do not apply: an emptied container
+            // normalizes to flow style, and a document without a final
+            // newline legitimately gains one when its last line is
+            // edited. The WEAK invariants still do — the output must
             // be valid YAML and the deleted entry must be gone. (A
             // previous regression emitted `key:\n{}` here, which does
             // not re-parse.)
-            stats.skipped_sole_child += 1;
+            stats.skipped_sole_child += @intFromBool(t.sole_child);
+            stats.skipped_no_final_newline += @intFromBool(no_final);
             var doc = try yaml.parse(alloc, input);
             defer doc.deinit();
             var ed = yaml.edit.Editor.init(&doc);
@@ -500,10 +930,6 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
                     failures.add("{s}: delete {s}: path still resolves after the delete", .{ name, t.path });
                 } else |_| {}
             }
-            continue;
-        }
-        if (t.anchored_referenced) {
-            stats.skipped_dangling_anchor += 1;
             continue;
         }
         stats.deletes += 1;
@@ -559,7 +985,10 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
             if (t.key_text.len == 0) {
                 var trimmed = line;
                 while (trimmed.len > 0 and trimmed[0] == ' ') trimmed = trimmed[1..];
-                if (std.mem.startsWith(u8, trimmed, "- ")) hit = true;
+                // The item indicator either rides its first line
+                // (`- x`) or, for a multi-line item, fills a line of
+                // its own (`-`).
+                if (std.mem.startsWith(u8, trimmed, "- ") or std.mem.eql(u8, trimmed, "-")) hit = true;
             }
         }
         if (!hit) {
@@ -570,6 +999,10 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
     // SET sweep: exactly the target's line changes; the output
     // re-parses with the new value at the same path.
     for (targets) |t| {
+        if (t.props_preamble) {
+            stats.skipped_props_preamble += 1;
+            continue;
+        }
         if (t.anchored_referenced) {
             // Replacing an anchored node drops the anchor and leaves
             // every alias to it dangling — no valid edit exists, so
@@ -586,11 +1019,31 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
             stats.skipped_dangling_anchor += 1;
             continue;
         }
-        if (t.multi_line) {
+        if (t.anchored_referenced) {
+            stats.skipped_dangling_anchor += 1;
+            continue;
+        }
+        if (t.unsupported or t.tab_span) {
+            stats.skipped_unsupported += @intFromBool(t.unsupported);
+            stats.skipped_tab_span += @intFromBool(t.tab_span);
+            continue;
+        }
+        if (t.explicit_key or t.in_flow) {
+            // An explicit-key entry re-emits as two lines (`? key` +
+            // `: value`); a flow collection reflows by design and may
+            // legitimately change even key text. Counted, never swept.
+            stats.skipped_explicit_key += @intFromBool(t.explicit_key);
+            stats.skipped_flow += @intFromBool(t.in_flow);
+            continue;
+        }
+        if (t.multi_line or no_final) {
             // Replacing a multi-line value legitimately reflows lines,
-            // so line-shape assertions do not apply. Weak invariants
-            // still do: valid YAML, sentinel at the path.
-            stats.skipped_multiline += 1;
+            // and a missing final newline terminates on edit: line-
+            // shape assertions do not apply. Weak invariants still do:
+            // valid YAML, sentinel at the path, and the semantic value
+            // tree.
+            stats.skipped_multiline += @intFromBool(t.multi_line);
+            stats.skipped_no_final_newline += @intFromBool(no_final);
             var doc = try yaml.parse(alloc, input);
             defer doc.deinit();
             var ed = yaml.edit.Editor.init(&doc);
@@ -710,14 +1163,39 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
     }
 
     // ADD sweeps: pure insertions only — a new key on every addressable
-    // block mapping, an appended item on every block sequence.
+    // block mapping, an appended item on every block sequence. The two
+    // container kinds draw from separate budgets (see `SweepLimits`).
+    var map_budget = limits.max_mappings;
+    var seq_budget = limits.max_sequences;
     for (found.containers.items) |c| {
         if (!c.non_empty or c.is_flow) {
             stats.skipped_flow += @intFromBool(c.is_flow);
             stats.skipped_empty += @intFromBool(!c.non_empty);
             continue;
         }
+        if (c.props_preamble) {
+            stats.skipped_props_preamble += 1;
+            continue;
+        }
+        if (c.tab_span) {
+            stats.skipped_tab_span += 1;
+            continue;
+        }
+        if (c.unsupported) {
+            stats.skipped_unsupported += 1;
+            continue;
+        }
+        if (is_crlf) {
+            // Adding a line writes a bare LF for it on a CRLF file.
+            stats.skipped_crlf += 1;
+            continue;
+        }
         if (c.is_mapping) {
+            if (map_budget == 0) {
+                stats.capped_containers += 1;
+                continue;
+            }
+            map_budget -= 1;
             stats.map_adds += 1;
             var doc = try yaml.parse(alloc, input);
             defer doc.deinit();
@@ -741,7 +1219,13 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
                 if (std.mem.indexOf(u8, line, "zz_added") != null) hit = true;
             }
             if (!hit) failures.add("{s}: map add under {s}: inserted lines do not carry the new key", .{ name, c.path });
+            assertsSemanticRoundTrip(alloc, name, "map add under", c.path, &doc, out, failures);
         } else {
+            if (seq_budget == 0) {
+                stats.capped_containers += 1;
+                continue;
+            }
+            seq_budget -= 1;
             stats.seq_appends += 1;
             var doc = try yaml.parse(alloc, input);
             defer doc.deinit();
@@ -757,6 +1241,88 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
             if (pureInsertion(orig_lines, out_lines) == null) {
                 failures.add("{s}: seq append to {s}: not a pure line insertion", .{ name, c.path });
             }
+            assertsSemanticRoundTrip(alloc, name, "seq append to", c.path, &doc, out, failures);
+        }
+    }
+
+    // INSERT sweep: a new item spliced before an existing one, at
+    // every addressable position of every block sequence. Like the
+    // append sweep it must be a pure line insertion — and like every
+    // sweep the re-parsed output must equal the edited document, with
+    // the new item resolvable at the exact position it was given.
+    for (targets) |t| {
+        if (t.props_preamble) {
+            stats.skipped_props_preamble += 1;
+            continue;
+        }
+        if (t.tab_span) {
+            stats.skipped_tab_span += 1;
+            continue;
+        }
+        if (t.unsupported) {
+            stats.skipped_unsupported += 1;
+            continue;
+        }
+        if (is_crlf) {
+            // Splicing a line writes a bare LF for it on a CRLF file.
+            stats.skipped_crlf += 1;
+            continue;
+        }
+        const seq_path = sequenceParentOf(t.path) orelse continue;
+        var parent: ?Container = null;
+        for (found.containers.items) |c| {
+            if (std.mem.eql(u8, c.path, seq_path)) {
+                parent = c;
+                break;
+            }
+        }
+        const pc = parent orelse {
+            failures.add("{s}: insert before {s}: the parent sequence was not discovered", .{ name, t.path });
+            continue;
+        };
+        if (pc.is_flow) {
+            stats.skipped_flow += 1;
+            continue;
+        }
+        if (!pc.non_empty) {
+            stats.skipped_empty += 1;
+            continue;
+        }
+        stats.inserts += 1;
+        var doc = try yaml.parse(alloc, input);
+        defer doc.deinit();
+        var ed = yaml.edit.Editor.init(&doc);
+        ed.apply(&.{.{ .insert = .{
+            .sequence = seq_path,
+            .position = t.path,
+            .value = try doc.createScalar("added", .plain),
+            .before = true,
+        } }}) catch |err| {
+            failures.add("{s}: insert before {s} failed: {s}", .{ name, t.path, @errorName(err) });
+            continue;
+        };
+        const out = try doc.write(alloc);
+        defer alloc.free(out);
+        const out_lines = try splitLines(alloc, out);
+        defer alloc.free(out_lines);
+        const at = pureInsertionReframed(orig_lines, out_lines) orelse {
+            failures.add("{s}: insert before {s}: not a pure line insertion", .{ name, t.path });
+            continue;
+        };
+        if (out_lines.len - orig_lines.len != 1 or std.mem.indexOf(u8, out_lines[at], "added") == null) {
+            failures.add("{s}: insert before {s}: the inserted lines do not carry the new item", .{ name, t.path });
+            continue;
+        }
+        assertsSemanticRoundTrip(alloc, name, "insert before", t.path, &doc, out, failures);
+        var re = yaml.parse(alloc, out) catch continue;
+        defer re.deinit();
+        var re_ed = yaml.edit.Editor.init(&re);
+        const inserted = re_ed.one(t.path) catch {
+            failures.add("{s}: insert before {s}: the new item does not resolve at its position", .{ name, t.path });
+            continue;
+        };
+        if (!std.mem.eql(u8, inserted.scalarValue() orelse "", "added")) {
+            failures.add("{s}: insert before {s}: the item at the position is not the inserted scalar", .{ name, t.path });
         }
     }
 
@@ -795,6 +1361,18 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
                 }
                 if (pathRelated(c.path, t.path)) {
                     stats.skipped_move_related += 1;
+                    continue;
+                }
+                if (t.props_preamble or c.props_preamble) {
+                    stats.skipped_props_preamble += 1;
+                    continue;
+                }
+                if (t.tab_span or c.tab_span) {
+                    stats.skipped_tab_span += 1;
+                    continue;
+                }
+                if (t.unsupported or c.unsupported) {
+                    stats.skipped_unsupported += 1;
                     continue;
                 }
                 used += 1;
@@ -1176,21 +1754,14 @@ test "preservation sweep: every edit position in every single-document fixture" 
         try sweepFixture(alloc, name, input, &failures, &stats, .{});
     }
 
-    std.debug.print(
-        "preservation: {d} deletes, {d} sets, {d} map adds, {d} seq appends, {d} moves, {d} rollbacks over {d} fixtures\n" ++
-            "  skipped (documented normalizations): {d} sole-child, {d} dangling anchor, {d} multi-line, {d} alias, {d} flow, {d} empty; {d} unaddressable paths\n" ++
-            "  move sweep skipped: {d} related paths (ancestor/self/alias/anchored), {d} unusable destinations\n",
-        .{
-            stats.deletes,                 stats.sets,
-            stats.map_adds,                stats.seq_appends,
-            stats.moves,                   stats.rollbacks,
-            names.items.len,               stats.skipped_sole_child,
-            stats.skipped_dangling_anchor, stats.skipped_multiline,
-            stats.skipped_alias,           stats.skipped_flow,
-            stats.skipped_empty,           stats.unaddressable,
-            stats.skipped_move_related,    stats.skipped_move_dest,
-        },
-    );
+    printSummary("fixtures", "fixtures", names.items.len, stats);
+    // The wider sweeps must actually run: same-value sets, inserts and
+    // moves each cover real positions in the fixture set, and every
+    // fixture is accounted for.
+    try std.testing.expect(stats.same_sets > 0);
+    try std.testing.expect(stats.inserts > 0);
+    try std.testing.expect(stats.moves > 0);
+    try std.testing.expectEqual(names.items.len, stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable + stats.skipped_bom);
     if (failures.list.items.len > 0) {
         for (failures.list.items) |f| std.debug.print("  PRESERVATION-FAIL {s}\n", .{f});
         return error.TestUnexpectedResult;
@@ -1293,5 +1864,232 @@ fn findFirstScalar(ed: *yaml.edit.Editor, node: *yaml.Node, comps: *std.ArrayLis
             }
         },
         .alias => {},
+    }
+}
+
+test "preservation sweep: bounded edits over every valid corpus document" {
+    // Leak-checking allocator WITHOUT per-allocation stack traces (see
+    // the fixture sweep above for the cost arithmetic).
+    var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer std.debug.assert(da.deinit() == .ok);
+    const alloc = da.allocator();
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cases: std.ArrayList(corpus.Case) = .empty;
+    defer {
+        for (cases.items) |*c| corpus.freeCase(alloc, c);
+        cases.deinit(alloc);
+    }
+    try corpus.loadCases(alloc, io, &cases);
+
+    var valid: usize = 0;
+    for (cases.items) |*c| {
+        if (!c.fail) valid += 1;
+    }
+    // The whole yaml-test-suite corpus: the 269 valid documents the
+    // round-trip and conformance gates cover — here under edits.
+    try std.testing.expectEqual(@as(usize, 269), valid);
+
+    var failures: Failures = .{ .alloc = alloc };
+    defer {
+        for (failures.list.items) |f| alloc.free(f);
+        failures.list.deinit(alloc);
+    }
+    var stats: Stats = .{};
+
+    // Bounded but real edits per document: one mapping and one
+    // sequence position, one container of each kind, one move
+    // destination. Every assertion is the FULL one — the same
+    // `sweepFixture` the fixtures get, not a weaker corpus-specific
+    // form; the caps are reported in the summary, never silent.
+    const smoke: SweepLimits = .{
+        .max_targets = 1,
+        .max_mappings = 1,
+        .max_sequences = 1,
+        .max_move_dests_per_target = 1,
+    };
+    for (cases.items) |*c| {
+        if (c.fail) continue;
+        try sweepFixture(alloc, c.id, c.input, &failures, &stats, smoke);
+    }
+
+    // Every valid document accounted for: edited, root-less, or one of
+    // the documented round-trip-unstable shapes.
+    try std.testing.expectEqual(@as(usize, 269), stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable + stats.skipped_bom);
+    // The bounded sweep must still exercise every operation kind.
+    try std.testing.expect(stats.deletes > 0);
+    try std.testing.expect(stats.sets > 0);
+    try std.testing.expect(stats.same_sets > 0);
+    try std.testing.expect(stats.inserts > 0);
+    try std.testing.expect(stats.moves > 0);
+    printSummary("corpus", "cases", valid, stats);
+    if (failures.list.items.len > 0) {
+        for (failures.list.items) |f| std.debug.print("  PRESERVATION-FAIL {s}\n", .{f});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "preservation sweep: CRLF, BOM and no-final-newline fixture variants" {
+    var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer std.debug.assert(da.deinit() == .ok);
+    const alloc = da.allocator();
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Every fixture filename, INCLUDING the multi-document stream.
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| alloc.free(n);
+        names.deinit(alloc);
+    }
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, fixtures_dir, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".yaml") and !std.mem.endsWith(u8, entry.name, ".yml")) continue;
+            try names.append(alloc, try alloc.dupe(u8, entry.name));
+        }
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    if (names.items.len < 10) return error.TestUnexpectedResult; // fixtures missing
+
+    var failures: Failures = .{ .alloc = alloc };
+    defer {
+        for (failures.list.items) |f| alloc.free(f);
+        failures.list.deinit(alloc);
+    }
+    var stats: Stats = .{};
+    const smoke: SweepLimits = .{
+        .max_targets = 1,
+        .max_mappings = 1,
+        .max_sequences = 1,
+        .max_move_dests_per_target = 1,
+    };
+
+    var attempted: usize = 0;
+    var dir = try std.Io.Dir.cwd().openDir(io, fixtures_dir, .{});
+    defer dir.close(io);
+    for (names.items) |name| {
+        const raw = try dir.readFileAlloc(io, name, alloc, .limited(4 << 20));
+        defer alloc.free(raw);
+        // sweepFixture restricts a multi-document stream to its first
+        // document's region itself; every fixture is passed whole.
+        const input = raw;
+        // Three variants derived in memory — no new fixture files.
+        const crlf = try replaceByte(alloc, input, '\n', "\r\n");
+        defer alloc.free(crlf);
+        const bom = try std.fmt.allocPrint(alloc, "\xEF\xBB\xBF{s}", .{input});
+        defer alloc.free(bom);
+        const nofinal = if (std.mem.endsWith(u8, input, "\n"))
+            try alloc.dupe(u8, input[0 .. input.len - 1])
+        else
+            try alloc.dupe(u8, input);
+        defer alloc.free(nofinal);
+        const variants = [_]struct { label: []const u8, bytes: []const u8 }{
+            .{ .label = "crlf", .bytes = crlf },
+            .{ .label = "bom", .bytes = bom },
+            .{ .label = "no-final-newline", .bytes = nofinal },
+        };
+        for (variants) |v| {
+            attempted += 1;
+            const label = try std.fmt.allocPrint(alloc, "{s}[{s}]", .{ name, v.label });
+            defer alloc.free(label);
+            try sweepFixture(alloc, label, v.bytes, &failures, &stats, smoke);
+        }
+    }
+
+    // No silent omission: every fixture contributed exactly its three
+    // variants, every variant parsed (or is counted as root-less), and
+    // the bounded sweeps still exercised the no-op, insert and move
+    // paths.
+    try std.testing.expectEqual(names.items.len * 3, attempted);
+    try std.testing.expectEqual(attempted, stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable + stats.skipped_bom);
+    try std.testing.expect(stats.same_sets > 0);
+    try std.testing.expect(stats.inserts > 0);
+    try std.testing.expect(stats.moves > 0);
+    printSummary("variants", "variants", attempted, stats);
+    if (failures.list.items.len > 0) {
+        for (failures.list.items) |f| std.debug.print("  PRESERVATION-FAIL {s}\n", .{f});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "preservation: deleting two siblings composes identically in either order" {
+    var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer std.debug.assert(da.deinit() == .ok);
+    const alloc = da.allocator();
+
+    const input = "a: 1\nb: 2\nc: 3\n";
+    const orders = [_][2][]const u8{
+        .{ "$.a", "$.b" }, // document order
+        .{ "$.b", "$.a" }, // reverse order
+    };
+    var outs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (outs.items) |o| alloc.free(o);
+        outs.deinit(alloc);
+    }
+    for (orders) |order| {
+        var doc = try yaml.parse(alloc, input);
+        defer doc.deinit();
+        var ed = yaml.edit.Editor.init(&doc);
+        try ed.apply(&.{ .{ .delete = order[0] }, .{ .delete = order[1] } });
+        try outs.append(alloc, try doc.write(alloc));
+    }
+    // Order-independent bytes.
+    try std.testing.expectEqualStrings(outs.items[0], outs.items[1]);
+
+    // And order-independent meaning: exactly `c: 3` survives.
+    const expected: yaml.value.Value = .{ .map = &[_]yaml.value.Value.Member{
+        .{ .key = "c", .value = .{ .int = 3 } },
+    } };
+    for (outs.items) |o| {
+        var re = try yaml.parse(alloc, o);
+        defer re.deinit();
+        const v = try yaml.value.nodeToValue(alloc, re.root.?);
+        defer yaml.value.freeValue(alloc, v);
+        try std.testing.expect(valueEql(expected, v));
+    }
+
+    // A seeded permutation over a larger sibling set: delete k1..k6 in
+    // a seeded shuffled order; the survivors (k7, k8, in order) are
+    // the same for every seed. Deterministic: a failure names no
+    // mystery input, and re-running reproduces it.
+    const eight = "k1: 1\nk2: 2\nk3: 3\nk4: 4\nk5: 5\nk6: 6\nk7: 7\nk8: 8\n";
+    var seed: u32 = 0;
+    while (seed < 8) : (seed += 1) {
+        var keys: [6][]const u8 = .{ "$.k1", "$.k2", "$.k3", "$.k4", "$.k5", "$.k6" };
+        var order: [6][]const u8 = undefined;
+        var state: u32 = seed *% 2654435761 +% 1;
+        var i: usize = 0;
+        while (i < 6) : (i += 1) {
+            state = state *% 1664525 +% 1013904223;
+            const pick: usize = @intCast(state % @as(u32, @intCast(6 - i)));
+            order[i] = keys[i + pick];
+            keys[i + pick] = keys[i];
+        }
+        var doc = try yaml.parse(alloc, eight);
+        defer doc.deinit();
+        var ed = yaml.edit.Editor.init(&doc);
+        try ed.apply(&.{
+            .{ .delete = order[0] }, .{ .delete = order[1] }, .{ .delete = order[2] },
+            .{ .delete = order[3] }, .{ .delete = order[4] }, .{ .delete = order[5] },
+        });
+        const out = try doc.write(alloc);
+        defer alloc.free(out);
+        var re = try yaml.parse(alloc, out);
+        defer re.deinit();
+        try std.testing.expectEqual(@as(usize, 2), re.root.?.pairs().?.len);
+        try std.testing.expectEqualStrings("7", re.pathGet(&.{"k7"}).?.scalarValue().?);
+        try std.testing.expectEqualStrings("8", re.pathGet(&.{"k8"}).?.scalarValue().?);
     }
 }

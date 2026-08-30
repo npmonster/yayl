@@ -373,6 +373,7 @@ pub const Emitter = struct {
         }
 
         // Key.
+        const expl = key_clean and explicitKeySpan(src, ks.?.entry_start, ks.?.start);
         if (key_clean) {
             try self.emitted.put(key, {});
             try self.write(src[ks.?.entry_start..ks.?.end]);
@@ -447,14 +448,25 @@ pub const Emitter = struct {
                 // so the tombstoned tail is not re-emitted.
                 return le;
             }
-            // Replaced by an empty value node: normalized colon.
-            try self.write(": ");
+            // Replaced by an empty value node: normalized colon. An
+            // explicit key needs none — `? key` is already the whole
+            // entry — and `? key: ` would not parse.
+            if (!expl) try self.write(": ");
             _ = try self.emitContent(value, entry_col + self.indent_step);
             if (pair_end) |pe| return self.writeRemainder(pe);
             return gap_start;
         }
         // Brand-new value: layout by its shape.
-        if (inlineValue(value)) {
+        if (expl) {
+            // `? key` gaining a value it did not have: the value
+            // indicator goes on its own line at the indicator column.
+            // Writing ": value" after the key text would emit
+            // `? key: value`, which is not YAML.
+            const icol = markup.columnOf(src, ks.?.entry_start);
+            try self.writeNewlineIndent(icol);
+            try self.write(": ");
+            _ = try self.emitContent(value, icol + self.indent_step);
+        } else if (inlineValue(value)) {
             try self.write(": ");
             _ = try self.emitContent(value, entry_col + self.indent_step);
         } else {
@@ -477,11 +489,28 @@ pub const Emitter = struct {
         const src = self.src;
         const s = item.src orelse {
             // Brand-new or moved item: sibling-local indentation. The
-            // previous item's trailing comment belongs to it (see the
-            // brand-new pair case in `emitPairEdited`).
+            // previous entry's trailing comment belongs to it (see the
+            // brand-new pair case in `emitPairEdited`) — but only an
+            // ORIGINAL sibling BEFORE this one owns the bytes at
+            // `gap_start`. An item spliced ahead of every original
+            // item finds `gap_start` on the SUCCESSOR's line, and
+            // taking its remainder here would emit that line ahead
+            // of itself and duplicate it later.
+            var has_original_prev = false;
+            if (container.data == .sequence) {
+                for (container.data.sequence.items.items) |it| {
+                    if (it == item) break;
+                    if (it.src) |is| {
+                        if (!is.synthetic) {
+                            has_original_prev = true;
+                            break;
+                        }
+                    }
+                }
+            }
             var gap = gap_start;
             var owed_terminator = false;
-            if (!self.endsWithNewline() and markup.remainderHasComment(src, gap)) {
+            if (has_original_prev and !self.endsWithNewline() and markup.remainderHasComment(src, gap)) {
                 const nl = markup.newlineAt(src, gap);
                 gap = try self.writeRemainder(gap);
                 owed_terminator = gap > nl; // see the pair case
@@ -726,6 +755,21 @@ pub const Emitter = struct {
         return null;
     }
 
+    /// True when the bytes between a key's entry start and its text are
+    /// an explicit key indicator: framing plus `? `. For an explicit
+    /// key the span's `entry_start` sits ON the `?` and `start` just
+    /// past it; a plain sequence item's framing (`- `) carries no `?`.
+    fn explicitKeySpan(src: []const u8, from: usize, to: usize) bool {
+        if (to <= from) return false;
+        var saw_q = false;
+        for (src[from..to]) |c| switch (c) {
+            ' ', '\t', '\n', '\r', '-' => {},
+            '?' => saw_q = true,
+            else => return false,
+        };
+        return saw_q;
+    }
+
     fn entryColumn(self: *Emitter, node: *Node, fallback: usize) usize {
         const src = self.src;
         switch (node.data) {
@@ -742,7 +786,19 @@ pub const Emitter = struct {
                         // `steps:` / `  - name: build` / `  shell: bash`
                         // -- which reads as a sibling of the list and
                         // does not parse. Keys sit at `start`.
-                        if (!s.synthetic) return markup.columnOf(src, s.start);
+                        if (!s.synthetic) {
+                            // An EXPLICIT-key entry (`? key`) is the one
+                            // case where the text column is not the entry
+                            // column: its key text sits one step in from
+                            // the line's indentation, and a brand-new
+                            // plain key written there would land inside
+                            // the previous explicit entry's value slot.
+                            // Entries live at the indicator's column.
+                            if (explicitKeySpan(src, s.entry_start, s.start)) {
+                                return markup.columnOf(src, s.entry_start);
+                            }
+                            return markup.columnOf(src, s.start);
+                        }
                     }
                 }
             },
