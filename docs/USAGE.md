@@ -213,12 +213,21 @@ on the document model:
 | `[*]` | every child, in document order |
 | `..name` | recursive descent: every `name` at any depth |
 | `[?key=value]` | every child that is a mapping whose `key` equals `value` |
+| `["a.b"]` / `['a.b']` | a literal key, for keys the dotted form cannot express |
 
-The grammar has no quoting or escaping, so a key containing `.`, `[` or
-`]` cannot be addressed: `pymdownx.highlight` parses as two nested keys,
-and `.defaults` parses as a recursive descent. Reach such entries by
-iterating the container's pairs, or with `Document.pathSet`/`pathDelete`,
-which take key components rather than a path string.
+The dotted form splits on `.` and `[`, so `pymdownx.highlight` reads as
+two nested keys and `.defaults` as a recursive descent. Quote the key to
+address it literally: `$["pymdownx.highlight"]`, `$[".defaults"]`. Either
+quote character works, and a quoted segment is an ordinary key segment,
+so it composes with the rest of the grammar:
+`$["pymdownx.highlight"].anchor_linenums`. The empty key is addressable
+this way too (`$[""]`), since `"": v` is legal YAML.
+
+There is no escaping, so a key containing *both* `"` and `'` still
+cannot be written as a path. Reach it by iterating the container's
+pairs; note that `Document.pathSet`/`pathDelete` take key components but
+walk mapping keys only, so they cannot reach a key nested under a
+sequence item.
 
 ~~~zig
 var ed = yaml.edit.Editor.init(&doc);

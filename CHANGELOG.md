@@ -3,6 +3,26 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Added
+
+- Quoted path segments: `$["a.b"]` and `$['a.b']` address a key
+  literally, for keys the dotted form cannot express. The grammar splits
+  on `.` and `[`, so `pymdownx.highlight` read as two nested keys and
+  `.defaults` as a recursive descent — the normal case in this library's
+  own target domain (Kubernetes annotations, mkdocs, GitLab). The empty
+  key is addressable as `$[""]`, since `"": v` is legal YAML. A quoted
+  segment is an ordinary key segment, so it composes with the rest of
+  the grammar. There is still no escaping, so a key containing both
+  quote characters remains unaddressable.
+
+  This supersedes the 0.11.0 note that the limitation "is documented in
+  the usage guide": it is now fixed rather than documented. The
+  preservation sweep's unaddressable count goes from 25 to 0 on the
+  fixtures and 52 to 0 on the variants; the 21 remaining on the corpus
+  are complex `? key` mappings, which have no path form at all.
+
 ## 0.11.0 — 2026-08-31
 
 ### Changed
