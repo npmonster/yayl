@@ -2,7 +2,9 @@
 
 A native Zig YAML parser, document model, and emitter. yayl follows the architecture and observable behavior of [libfyaml](https://github.com/pantoniou/libfyaml), using Zig allocators, error unions, and tagged unions.
 
-> **Status: v1 feature-complete.** The scanner, parser, CST-backed document model, and emitter pass the full yaml-test-suite corpus (351/351), produce **byte-faithful round trips** — comments, blank lines, quoting, key order, indentation — and ship an editing API, a generic value runtime, optional schema validation, and bounded file I/O. `make verify` gates all of it.
+> **Status: 0.9 — feature-complete, public hardening release.** The scanner, parser, CST-backed document model, and emitter pass the full yaml-test-suite corpus (351/351), produce **byte-faithful round trips** — comments, blank lines, quoting, key order, indentation — and ship an editing API, a generic value runtime, optional schema validation, and bounded file I/O. `make verify` gates all of it.
+
+> **Developed by agents.** yayl is written end-to-end by AI coding agents — planning, implementation, tests, docs, and review — under human direction. The playbook lives in [AGENTS.md](AGENTS.md); the work is tracked as evidence-logged cards on a pauta board.
 
 See the [usage guide](docs/USAGE.md) for library examples and API patterns.
 
@@ -40,10 +42,8 @@ const yaml = @import("yayl");
 const std = @import("std");
 const yaml = @import("yayl");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.arena.allocator();
 
     var doc = try yaml.parse(alloc, "name: yayl\nlang: zig\n");
     defer doc.deinit();
@@ -68,6 +68,23 @@ var docs = try yaml.parseAll(alloc, input);
 defer {
     for (docs.items) |*doc| doc.deinit();
     docs.deinit(alloc);
+}
+```
+
+For positioned error messages, attach a `Diag` with `yaml.parseDiag`:
+
+```zig
+var d: yaml.Diag = .{ .alloc = alloc };
+defer d.deinit();
+if (yaml.parseDiag(alloc, input, &d)) |doc| {
+    var document = doc;
+    defer document.deinit();
+    // ...
+} else |err| {
+    const report = try d.render(alloc); // "2:3: error: ..."
+    defer alloc.free(report);
+    std.debug.print("{s}", .{report});
+    return err;
 }
 ```
 
@@ -151,6 +168,10 @@ A failed batch leaves the original document byte-identical.
 - Values returned by `doc.write()` and `Diag.render()` must be freed with the allocator supplied to those calls.
 - `Scanner` and `Parser` own transient token/event data; copy data that must outlive them into a document.
 
+## Road to 1.0
+
+0.9 is the public hardening release: the feature set is complete and gated (conformance, byte-faithful round trips, differential parity, allocation-failure injection). 1.0 follows real-world use — run your workload against it and tell us what breaks. Streaming input chunking and a parse cache stay deliberate non-goals for now.
+
 ## Current limitations (deliberate v1 scope)
 
 - Input must fit in memory; the parser streams *events* (pull-based), not input chunks (documented decision in `src/file.zig`).
@@ -166,6 +187,7 @@ make verify        # fmt + compile + tests (Debug & ReleaseSafe)
                    #   + byte-faithful round-trip gate
 make roundtrip     # emit(parse(x)) == x over corpus + fixtures
 make differential  # event-stream parity vs libfyaml (needs a C compiler)
+zig build examples # compile-checked example programs (zig-out/bin)
 zig build bench    # throughput CLI
 ```
 

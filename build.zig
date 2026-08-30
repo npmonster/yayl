@@ -91,4 +91,20 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Build the throughput benchmark CLI");
     bench_step.dependOn(&bench_exe.step);
     b.installArtifact(bench_exe);
+
+    // Examples: small compile-checked programs (see examples/).
+    const examples_step = b.step("examples", "Build the example programs");
+    inline for (.{ "parse", "edit" }) |name| {
+        const exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/" ++ name ++ ".zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "yayl", .module = module }},
+            }),
+        });
+        const install = b.addInstallArtifact(exe, .{});
+        examples_step.dependOn(&install.step);
+    }
 }

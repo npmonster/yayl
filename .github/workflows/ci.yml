@@ -24,10 +24,13 @@ jobs:
         run: zig version
 
       - name: Format check
-        run: zig fmt --check build.zig build.zig.zon src tests
+        run: zig fmt --check build.zig build.zig.zon src tests examples
 
       - name: Compile the library (analyse the public root)
         run: zig build check --summary all
+
+      - name: Build examples
+        run: zig build examples
 
       - name: Unit tests (Debug, leak-checked)
         run: zig build test --summary all

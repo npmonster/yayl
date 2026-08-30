@@ -51,6 +51,26 @@ const name = root.lookup("name").?.scalarValue().?;
 const ports = root.lookup("ports").?.items().?;
 ~~~
 
+To learn *where* a parse failed, attach a `Diag`:
+
+~~~zig
+var d: yaml.Diag = .{ .alloc = alloc };
+defer d.deinit();
+if (yaml.parseDiag(alloc, input, &d)) |doc| {
+    var document = doc;
+    defer document.deinit();
+    // ...
+} else |err| {
+    const report = try d.render(alloc); // "2:3: error: bad indentation"
+    defer alloc.free(report);
+    std.debug.print("{s}", .{report});
+    return err;
+}
+~~~
+
+`parseAllDiag` is the multi-document variant. Without a `Diag` only
+the error is returned and nothing is spent on messages.
+
 Nodes are a tagged union (`yaml.Node`): `.scalar`, `.mapping`,
 `.sequence` or `.alias`. Accessors forward through aliases, so a
 `*ref` behaves like its target:

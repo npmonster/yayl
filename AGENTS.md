@@ -62,15 +62,15 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 | `fy-diag.c`           | `src/diag.zig`         | ✅ core — levels/marks/render done; source excerpts not yet        |
 | `fy-utf8.c`           | `src/utf8.zig`         | ✅ done — strict decode/encode/validate                            |
 | `fy-ctype.c`          | `src/ctype.zig`        | ✅ done — byte-level classes (indicators are ASCII)                |
-| `fy-scan.c`           | `src/scanner.zig`      | 🟡 most — see "Scanner gaps"                                       |
-| `fy-parse.c`          | `src/parser.zig`       | 🟡 most — state machine ported; see "Parser gaps"                  |
+| `fy-scan.c`           | `src/scanner.zig`      | ✅ done — full corpus green (351/351, zero skips)                  |
+| `fy-parse.c`          | `src/parser.zig`       | ✅ done — event streams byte-identical to libfyaml (differential)  |
 | `fy-event.c`          | `src/event.zig`        | ✅ done                                                            |
-| `fy-doc.c` `fy-node.c` `fy-docbuilder.c` | `src/document.zig` | 🟡 semantic model done; no CST (markup/comment) yet |
-| `fy-emit.c`           | `src/emitter.zig`      | 🟡 semantic emit done; not byte-identical round trip yet           |
+| `fy-doc.c` `fy-node.c` `fy-docbuilder.c` | `src/document.zig` | ✅ done — semantic model + per-node/entry spans (comments and blank lines round-trip) |
+| `fy-emit.c`           | `src/emitter.zig`      | ✅ done — faithful (untouched bytes exact) + normalized emit; modified subtrees normalize internal layout |
 | `fy-atom.c`           | —                      | ⬜ not ported (atom interning; optional optimization)              |
 | `fy-tag.c`            | in `parser.zig`        | 🟡 shorthand resolution done; no `fy_tag` cache                    |
 | `fy-wpool.c`          | —                      | ⬜ out of scope for v1 (threading)                                 |
-| `fy-markup.c`         | —                      | ⬜ not ported (fy-extension markup)                                |
+| `fy-markup.c`         | `src/markup.zig`       | ✅ done — source-span arithmetic behind byte-faithful round trips  |
 
 ### Scanner status
 

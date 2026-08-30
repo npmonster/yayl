@@ -8,7 +8,7 @@ ZIG ?= zig
 .DEFAULT_GOAL := help
 .MAIN: help
 
-.PHONY: help all build check test test-release fmt fmt-write docs corpus conformance roundtrip differential verify clean
+.PHONY: help all build check test test-release examples fmt fmt-write docs corpus conformance roundtrip differential verify clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' Makefile
@@ -27,11 +27,14 @@ test: ## Run unit tests in Debug (leak-checked via std.testing.allocator)
 test-release: ## Run unit tests under ReleaseSafe (no Debug-only assumptions)
 	$(ZIG) build test -Doptimize=ReleaseSafe
 
-fmt: ## Check formatting of build.zig, build.zig.zon, src/ and tests/ without modifying anything
-	$(ZIG) fmt --check build.zig build.zig.zon src tests
+examples: ## Build the example programs into zig-out/bin
+	$(ZIG) build examples
 
-fmt-write: ## Apply zig fmt to build.zig, build.zig.zon, src/ and tests/
-	$(ZIG) fmt build.zig build.zig.zon src tests
+fmt: ## Check formatting of build.zig, build.zig.zon, src/, tests/ and examples/ without modifying anything
+	$(ZIG) fmt --check build.zig build.zig.zon src tests examples
+
+fmt-write: ## Apply zig fmt to build.zig, build.zig.zon, src/, tests/ and examples/
+	$(ZIG) fmt build.zig build.zig.zon src tests examples
 
 docs: ## Generate HTML documentation into zig-out/docs/
 	@mkdir -p zig-out

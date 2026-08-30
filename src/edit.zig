@@ -22,6 +22,10 @@ const document_mod = @import("document.zig");
 const Document = document_mod.Document;
 const Node = document_mod.Node;
 
+/// Editing failures: `UnknownPath` covers queries that match nothing
+/// (or not exactly once, for `one`); the `NotA*` errors describe a
+/// value whose shape does not fit the edit; `MoveIntoSubtree` rejects
+/// moving a node into its own subtree.
 pub const Error = error{
     InvalidPath,
     InvalidSyntax,
@@ -200,6 +204,8 @@ fn collectDescend(alloc: std.mem.Allocator, node: *Node, key: []const u8, out: *
     }
 }
 
+/// Payload of `Edit.insert`: splice `value` into `sequence`, before or
+/// after the (single) node matching `position`.
 pub const Insert = struct { sequence: []const u8, position: []const u8, value: *Node, before: bool };
 
 /// One queued edit. Values are existing nodes (they may be created with

@@ -1,9 +1,19 @@
 .{
     .name = .yayl,
     .fingerprint = 0xc49f7ed1a8db0b85,
-    .version = "0.1.0",
+    .version = "0.9.0",
     .minimum_zig_version = "0.16.0",
     .description = "YAYL: Yet Another YAML Library for Zig. Comment-preserving, round-trip safe. By Null Pointer Monster.",
     .license = "MIT",
-    .paths = .{ "build.zig", "build.zig.zon", "LICENSE", "README.md", "src" },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "CHANGELOG.md",
+        "CONTRIBUTING.md",
+        "docs/USAGE.md",
+        "examples",
+        "LICENSE",
+        "README.md",
+        "src",
+    },
 }

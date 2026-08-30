@@ -58,18 +58,22 @@ pub const Schema = struct {
     pub const scalar = Schema{ .kind = .scalar };
     pub const any = Schema{ .kind = .any };
 
+    /// A string restricted to one of `values`.
     pub fn strEnum(values: []const []const u8) Schema {
         return .{ .kind = .{ .str_enum = values } };
     }
 
+    /// An integer in the inclusive range `[min, max]`.
     pub fn intRange(min: i64, max: i64) Schema {
         return .{ .kind = .{ .int_range = .{ .min = min, .max = max } } };
     }
 
+    /// A sequence whose items must each match `items`.
     pub fn seq(items: *const Schema) Schema {
         return .{ .kind = .{ .seq = items } };
     }
 
+    /// A mapping with declared `fields`; unknown keys are allowed.
     pub fn map(fields: []const Field) Schema {
         return .{ .kind = .{ .map = .{ .fields = fields } } };
     }
