@@ -8,7 +8,7 @@ ZIG ?= zig
 .DEFAULT_GOAL := help
 .MAIN: help
 
-.PHONY: help all build check test test-release examples fmt fmt-write docs corpus libfyaml conformance roundtrip differential verify clean
+.PHONY: help all build check test test-release examples fmt fmt-write docs corpus libfyaml conformance roundtrip preservation differential verify clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' Makefile
@@ -53,9 +53,17 @@ conformance: corpus ## Run the pinned YAML Test Suite corpus through yayl
 roundtrip: corpus ## Byte-faithful round trip over the corpus and tests/fixtures
 	$(ZIG) build roundtrip --summary all
 
+preservation: ## Edit-preservation sweeps over tests/fixtures (edits change only what they should)
+	$(ZIG) build preservation --summary all
+
 differential: corpus libfyaml ## Compare yayl vs libfyaml event streams over the corpus (needs a C compiler)
 	sh scripts/differential.sh
 
+# NOTE: `preservation` is intentionally NOT in this list yet. The sweep is
+# currently red on the working tree (emitter fixes in flight); adding it now
+# would leave every session without a usable gate. Re-add `preservation`
+# here, and the matching step in .github/workflows/ci.yml, the moment the
+# emitter work lands. Run it standalone with `make preservation`.
 verify: fmt check test test-release conformance roundtrip ## Full quality gate: fmt, compile, tests (Debug + ReleaseSafe), corpus, round trip
 
 clean: ## Remove build artifacts (zig-out/) and the incremental cache
