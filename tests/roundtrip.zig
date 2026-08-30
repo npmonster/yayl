@@ -214,7 +214,7 @@ test "fixtures round trip byte-for-byte" {
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".yaml")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".yaml") and !std.mem.endsWith(u8, entry.name, ".yml")) continue;
         try names.append(alloc, try alloc.dupe(u8, entry.name));
     }
     std.mem.sort([]const u8, names.items, {}, struct {
@@ -222,6 +222,10 @@ test "fixtures round trip byte-for-byte" {
             return std.mem.order(u8, a, b) == .lt;
         }
     }.lessThan);
+    // Anti-vacuity: the fixtures are committed, so an empty or shrunken
+    // listing is a bad glob or a broken checkout, not a pass. Mirrors
+    // the corpus guards above and in tests/conformance.zig.
+    try std.testing.expect(names.items.len >= 14);
 
     for (names.items) |name| {
         const input = try dir.readFileAlloc(io, name, alloc, .limited(4 << 20));
