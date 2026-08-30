@@ -433,7 +433,12 @@ pub const Editor = struct {
         while (anc) |a| : (anc = a.parent) {
             if (a == node) return error.MoveIntoSubtree;
         }
-        // Detach from the current parent.
+        // Detach from the current parent. Marking the parent is not
+        // enough: the flag has to reach the root, or an ANCESTOR still
+        // counts as clean and re-emits this whole subtree verbatim from
+        // the source -- reinstating the node we just detached while it
+        // also appears at its destination, so a move silently becomes a
+        // copy. `markModified` is what walks the chain.
         if (node.parent) |parent| {
             switch (parent.data) {
                 .mapping => |*m| {
@@ -441,7 +446,7 @@ pub const Editor = struct {
                         if (p.value == node) {
                             try doc.dropPairSpan(parent, p);
                             _ = m.pairs.orderedRemove(i);
-                            parent.modified = true;
+                            doc.markModified(parent);
                             break;
                         }
                     }
@@ -451,7 +456,7 @@ pub const Editor = struct {
                         if (item == node) {
                             try doc.dropItemSpan(parent, node);
                             _ = sq.items.orderedRemove(i);
-                            parent.modified = true;
+                            doc.markModified(parent);
                             break;
                         }
                     }

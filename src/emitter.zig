@@ -646,6 +646,16 @@ pub const Emitter = struct {
         };
     }
 
+    /// An empty plain scalar: YAML's null, which is written as the
+    /// absence of a value rather than as any text.
+    fn isNullScalar(node: *const Node) bool {
+        if (node.anchor != null or node.tag != null) return false;
+        return switch (node.data) {
+            .scalar => |s| s.value.len == 0 and s.style == .plain,
+            else => false,
+        };
+    }
+
     /// True when a value can sit on the same line as its key.
     fn inlineValue(value: *const Node) bool {
         return switch (value.data) {
@@ -722,7 +732,17 @@ pub const Emitter = struct {
             .mapping => |m| {
                 for (m.pairs.items) |pair| {
                     if (pair.key.src) |s| {
-                        if (!s.synthetic) return markup.columnOf(src, s.entry_start);
+                        // `start`, not `entry_start`. A mapping that is a
+                        // sequence item carries the `- ` indicator in its
+                        // FIRST pair's leading bytes, so `entry_start`
+                        // there is the indicator's column, one step out
+                        // from where the keys actually sit. Measuring
+                        // from it puts every brand-new key at the
+                        // sequence's column instead of the mapping's --
+                        // `steps:` / `  - name: build` / `  shell: bash`
+                        // -- which reads as a sibling of the list and
+                        // does not parse. Keys sit at `start`.
+                        if (!s.synthetic) return markup.columnOf(src, s.start);
                     }
                 }
             },
@@ -877,6 +897,11 @@ pub const Emitter = struct {
                 try self.writeByte(':');
             },
         }
+
+        // A null value is written by writing nothing at all: `key:`.
+        // Emitting the separating space too would leave the line with
+        // trailing whitespace for no reason.
+        if (isNullScalar(value)) return;
 
         // Value placement: scalars and flow collections stay inline,
         // block collections start on the next, deeper line.
@@ -1247,7 +1272,14 @@ pub const Emitter = struct {
     }
 
     fn chooseScalarStyle(value: []const u8, prefer: ScalarStyle, block_ok: bool) ScalarStyle {
-        if (value.len == 0) return .double_quoted;
+        if (value.len == 0) {
+            // An empty PLAIN scalar is YAML's null -- `key:` with
+            // nothing after it -- and null is not the empty string.
+            // Quoting it would silently turn one into the other, which
+            // is how a moved `push:` came out as `push: ""`. Any other
+            // requested style for an empty value means the string.
+            return if (prefer == .plain) .plain else .double_quoted;
+        }
         const has_break = std.mem.indexOfScalar(u8, value, '\n') != null;
         if (has_break) {
             // Modified scalars keep their parsed block style when the
