@@ -126,6 +126,13 @@ jobs:
   # differential gate needs a C toolchain plus a libfyaml build, so both
   # stay on the Linux job rather than being reproduced badly here.
   #
+  # macos-13 (Intel) was in this matrix and is deliberately not: GitHub is
+  # retiring the Intel macOS runners, and in practice the job sat queued
+  # without ever being scheduled, backing up every subsequent run behind
+  # it. A gate that cannot be scheduled is not a gate. macos-latest
+  # (arm64) covers macOS; the Intel-specific surface is nil for pure Zig
+  # with no SIMD or assembly.
+  #
   # core.autocrlf is forced off BEFORE checkout: git on Windows would
   # otherwise rewrite the fixtures' line endings, and a byte-exact
   # round-trip gate compared against rewritten fixtures tests nothing.
@@ -137,7 +144,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-13, windows-latest, ubuntu-24.04-arm]
+        os: [macos-latest, windows-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     defaults:
