@@ -88,7 +88,10 @@ pub const Schema = struct {
         path: []const u8,
     ) Error![]Violation {
         var violations: std.ArrayList(Violation) = .empty;
-        errdefer violations.deinit(alloc);
+        errdefer {
+            for (violations.items) |*v| v.deinitSelf(alloc);
+            violations.deinit(alloc);
+        }
         try checkSchema(self, alloc, node, path, &violations);
         return violations.toOwnedSlice(alloc);
     }
@@ -116,12 +119,18 @@ pub fn freeViolations(alloc: std.mem.Allocator, violations: []Violation) void {
     alloc.free(violations);
 }
 
+/// Append one violation, owning its path and detail strings: a
+/// failure while building or appending releases the partial pair.
+fn appendViolation(alloc: std.mem.Allocator, out: *std.ArrayList(Violation), path: []const u8, rule: []const u8, comptime fmt: []const u8, args: anytype) Error!void {
+    const path_copy = try alloc.dupe(u8, path);
+    errdefer alloc.free(path_copy);
+    const detail = try std.fmt.allocPrint(alloc, fmt, args);
+    errdefer alloc.free(detail);
+    try out.append(alloc, .{ .path = path_copy, .rule = rule, .detail = detail });
+}
+
 fn typeErr(alloc: std.mem.Allocator, path: []const u8, want: []const u8, out: *std.ArrayList(Violation)) Error!void {
-    try out.append(alloc, .{
-        .path = try alloc.dupe(u8, path),
-        .rule = "type",
-        .detail = try std.fmt.allocPrint(alloc, "expected {s}", .{want}),
-    });
+    return appendViolation(alloc, out, path, "type", "expected {s}", .{want});
 }
 
 fn checkNodeScalarKind(node: *const Node) ?document_mod.ScalarKind {
@@ -157,11 +166,7 @@ fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Nod
             for (values) |v| {
                 if (std.mem.eql(u8, v, s)) return;
             }
-            try out.append(alloc, .{
-                .path = try alloc.dupe(u8, path),
-                .rule = "enum",
-                .detail = try std.fmt.allocPrint(alloc, "'{s}' is not one of the allowed values", .{s}),
-            });
+            try appendViolation(alloc, out, path, "enum", "'{s}' is not one of the allowed values", .{s});
         },
         .int_range => |r| {
             const k = checkNodeScalarKind(cur);
@@ -172,11 +177,7 @@ fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Nod
                 return;
             };
             if (v < r.min or v > r.max) {
-                try out.append(alloc, .{
-                    .path = try alloc.dupe(u8, path),
-                    .rule = "range",
-                    .detail = try std.fmt.allocPrint(alloc, "{d} is outside [{d}, {d}]", .{ v, r.min, r.max }),
-                });
+                try appendViolation(alloc, out, path, "range", "{d} is outside [{d}, {d}]", .{ v, r.min, r.max });
             }
         },
         .seq => |items| {
@@ -202,11 +203,11 @@ fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Nod
                     }
                 }
                 if (!found) {
-                    try out.append(alloc, .{
-                        .path = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, field.key }),
-                        .rule = "required",
-                        .detail = try std.fmt.allocPrint(alloc, "required key '{s}' is missing", .{field.key}),
-                    });
+                    const child = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, field.key });
+                    errdefer alloc.free(child);
+                    const detail = try std.fmt.allocPrint(alloc, "required key '{s}' is missing", .{field.key});
+                    errdefer alloc.free(detail);
+                    try out.append(alloc, .{ .path = child, .rule = "required", .detail = detail });
                 }
             }
             // Per-field and unknown-key checks.
@@ -223,11 +224,7 @@ fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Nod
                     }
                 }
                 if (!matched and map_spec.deny_unknown) {
-                    try out.append(alloc, .{
-                        .path = try alloc.dupe(u8, child_path),
-                        .rule = "unknown",
-                        .detail = try std.fmt.allocPrint(alloc, "unknown key '{s}'", .{kv}),
-                    });
+                    try appendViolation(alloc, out, child_path, "unknown", "unknown key '{s}'", .{kv});
                 }
             }
         },
@@ -307,4 +304,49 @@ test "no schema means no overhead: any passes anything" {
     const violations = try Schema.any.validate(testing.allocator, doc.root.?, "$");
     defer freeViolations(testing.allocator, violations);
     try testing.expectEqual(@as(usize, 0), violations.len);
+}
+
+test "strict mapping rejects unknown keys and scalar accepts any scalar" {
+    const schema = Schema.mapStrict(&.{
+        .{ .key = "name", .schema = &Schema.str, .required = true },
+    });
+    var doc = try document_mod.Document.parse(testing.allocator, "name: api\nextra: 1\n");
+    defer doc.deinit();
+    const violations = try schema.validate(testing.allocator, doc.root.?, "$");
+    defer freeViolations(testing.allocator, violations);
+    try testing.expectEqual(@as(usize, 1), violations.len);
+    try testing.expectEqualStrings("unknown", violations[0].rule);
+    try testing.expectEqualStrings("$.extra", violations[0].path);
+
+    // Schema.scalar: any scalar passes; containers do not.
+    var doc2 = try document_mod.Document.parse(testing.allocator, "a: 1\n");
+    defer doc2.deinit();
+    {
+        const v = try Schema.scalar.validate(testing.allocator, doc2.pathGet(&.{"a"}).?, "$");
+        defer freeViolations(testing.allocator, v);
+        try testing.expectEqual(@as(usize, 0), v.len);
+    }
+    {
+        const v = try Schema.scalar.validate(testing.allocator, doc2.root.?, "$");
+        defer freeViolations(testing.allocator, v);
+        try testing.expectEqual(@as(usize, 1), v.len);
+        try testing.expectEqualStrings("type", v[0].rule);
+    }
+}
+
+test "allocation failures in validation leak nothing" {
+    try std.testing.checkAllAllocationFailures(testing.allocator, validateConfig, .{});
+}
+
+fn validateConfig(alloc: std.mem.Allocator) !void {
+    const schema = Schema.map(&.{
+        .{ .key = "name", .schema = &Schema.str, .required = true },
+        .{ .key = "port", .schema = &Schema.intRange(1, 65535), .required = true },
+        .{ .key = "tags", .schema = &Schema.seq(&Schema.str) },
+    });
+    var doc = try document_mod.Document.parse(alloc, "name: api\nport: 99999\ntags: [a, b]\n");
+    defer doc.deinit();
+    const violations = try schema.validate(alloc, doc.root.?, "$");
+    defer freeViolations(alloc, violations);
+    try testing.expectEqual(@as(usize, 1), violations.len);
 }

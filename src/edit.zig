@@ -680,6 +680,24 @@ test "allocation failures in a delete batch propagate and leak nothing" {
     try std.testing.checkAllAllocationFailures(testing.allocator, deleteBatch, .{});
 }
 
+test "allocation failures in a set+append batch leak nothing" {
+    try std.testing.checkAllAllocationFailures(testing.allocator, setAppendBatch, .{});
+}
+
+fn setAppendBatch(alloc: std.mem.Allocator) !void {
+    var doc = try Document.parse(alloc, "a: 1\nb:\n  - x\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    const edits = [_]Edit{
+        .{ .set = .{ .path = "$.a", .value = try doc.createScalar("2", .plain) } },
+        .{ .append = .{ .sequence = "$.b", .value = try doc.createScalar("y", .plain) } },
+    };
+    try ed.apply(&edits);
+    const out = try doc.write(alloc);
+    defer alloc.free(out);
+    try testing.expectEqualStrings("a: 2\nb:\n  - x\n  - y\n", out);
+}
+
 fn deleteBatch(alloc: std.mem.Allocator) !void {
     var doc = try Document.parse(alloc, "a: 1\nb: 2\n");
     defer doc.deinit();

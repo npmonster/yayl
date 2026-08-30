@@ -209,6 +209,19 @@ test "allocation failures in parse alone leak nothing" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, parseOnly, .{});
 }
 
+test "allocation failures in parseAll leak nothing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseMultiDoc, .{});
+}
+
+fn parseMultiDoc(alloc: std.mem.Allocator) !void {
+    var docs = try parseAll(alloc, "---\nname: first\n---\nname: second\n");
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(usize, 2), docs.items.len);
+}
+
 test "seeded fuzz: random ASCII input never panics or leaks" {
     const alloc = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x5eed); // fixed seed: deterministic
@@ -227,6 +240,63 @@ test "seeded fuzz: random ASCII input never panics or leaks" {
             docs.deinit(alloc);
         }
         // Emission paths (span arithmetic, quoting) get fuzzed too.
+        for (docs.items) |*d| {
+            const out = try d.write(alloc);
+            alloc.free(out);
+        }
+    }
+}
+
+test "seeded fuzz: random multibyte UTF-8 input never panics or leaks" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed0002); // fixed seed: deterministic
+    const random = prng.random();
+    var buf: [256]u8 = undefined;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        // Valid UTF-8: printable ASCII mixed with random non-surrogate
+        // codepoints, exercising the scanner's multibyte paths.
+        var len: usize = 0;
+        while (len < buf.len and random.boolean()) {
+            if (random.boolean()) {
+                buf[len] = random.intRangeAtMost(u8, 0x20, 0x7E);
+                len += 1;
+            } else {
+                var cp = random.intRangeAtMost(u21, 0xA0, 0xFFFF);
+                if (cp >= 0xD800 and cp <= 0xDFFF) cp = 0x2022;
+                var tmp: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cp, &tmp) catch unreachable;
+                if (len + n > buf.len) break;
+                @memcpy(buf[len .. len + n], tmp[0..n]);
+                len += n;
+            }
+        }
+        var docs = parseAll(alloc, buf[0..len]) catch continue;
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(alloc);
+        }
+        for (docs.items) |*d| {
+            const out = try d.write(alloc);
+            alloc.free(out);
+        }
+    }
+}
+
+test "seeded fuzz: arbitrary bytes never panic or leak" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eed0003); // fixed seed: deterministic
+    const random = prng.random();
+    var buf: [256]u8 = undefined;
+    var i: usize = 0;
+    while (i < 400) : (i += 1) {
+        const len = random.uintAtMost(usize, buf.len);
+        random.bytes(buf[0..len]);
+        var docs = parseAll(alloc, buf[0..len]) catch continue;
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(alloc);
+        }
         for (docs.items) |*d| {
             const out = try d.write(alloc);
             alloc.free(out);

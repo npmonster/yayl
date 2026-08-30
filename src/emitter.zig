@@ -860,6 +860,18 @@ fn roundTrip(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     return doc.write(alloc);
 }
 
+test "emitDocument writes into the caller's list" {
+    const alloc = testing.allocator;
+    var doc = try Document.parse(alloc, "a: 1\nb: [x, y]\n");
+    defer doc.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var em = Emitter.init(alloc, &out);
+    defer em.deinit();
+    try em.emitDocument(&doc);
+    try testing.expectEqualStrings("a: 1\nb: [x, y]\n", out.items);
+}
+
 test "emit flat mapping" {
     const out = try roundTrip(testing.allocator, "a: 1\nb: hello\nc: true\n");
     defer testing.allocator.free(out);

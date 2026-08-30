@@ -77,22 +77,39 @@ pub fn nodeToValue(alloc: std.mem.Allocator, node: *const Node) Error!Value {
         .alias => unreachable, // resolveAlias never returns alias
         .sequence => |sq| {
             var out = try alloc.alloc(Value, sq.items.items.len);
+            var filled: usize = 0;
+            errdefer {
+                for (out[0..filled]) |item| freeValue(alloc, item);
+                alloc.free(out);
+            }
             for (sq.items.items, 0..) |item, i| {
                 out[i] = try nodeToValue(alloc, item);
+                filled = i + 1;
             }
             return .{ .list = out };
         },
         .mapping => |m| {
             var out = try alloc.alloc(Value.Member, m.pairs.items.len);
+            var filled: usize = 0;
+            errdefer {
+                for (out[0..filled]) |memb| {
+                    alloc.free(memb.key);
+                    freeValue(alloc, memb.value);
+                }
+                alloc.free(out);
+            }
             for (m.pairs.items, 0..) |p, i| {
                 const k = p.key.resolveAlias();
+                const key_copy = try alloc.dupe(u8, switch (k.data) {
+                    .scalar => |s| s.value,
+                    else => return error.TypeMismatch,
+                });
+                errdefer alloc.free(key_copy);
                 out[i] = .{
-                    .key = switch (k.data) {
-                        .scalar => |s| try alloc.dupe(u8, s.value),
-                        else => return error.TypeMismatch,
-                    },
+                    .key = key_copy,
                     .value = try nodeToValue(alloc, p.value),
                 };
+                filled = i + 1;
             }
             return .{ .map = out };
         },
@@ -289,13 +306,32 @@ pub fn fromZig(alloc: std.mem.Allocator, value: anytype) Error!Value {
         },
         .array => |arr| {
             const out = try alloc.alloc(Value, arr.len);
-            for (value, 0..) |item, i| out[i] = try fromZig(alloc, item);
+            var filled: usize = 0;
+            errdefer {
+                for (out[0..filled]) |item| freeValue(alloc, item);
+                alloc.free(out);
+            }
+            for (value, 0..) |item, i| {
+                out[i] = try fromZig(alloc, item);
+                filled = i + 1;
+            }
             return .{ .list = out };
         },
         .@"struct" => |st| {
             const members = try alloc.alloc(Value.Member, st.fields.len);
+            var filled: usize = 0;
+            errdefer {
+                for (members[0..filled]) |m| {
+                    alloc.free(m.key);
+                    freeValue(alloc, m.value);
+                }
+                alloc.free(members);
+            }
             inline for (st.fields, 0..) |field, i| {
-                members[i] = .{ .key = try alloc.dupe(u8, field.name), .value = try fromZig(alloc, @field(value, field.name)) };
+                const key = try alloc.dupe(u8, field.name);
+                errdefer alloc.free(key);
+                members[i] = .{ .key = key, .value = try fromZig(alloc, @field(value, field.name)) };
+                filled = i + 1;
             }
             return .{ .map = members };
         },
@@ -446,4 +482,33 @@ pub fn freeValue(alloc: std.mem.Allocator, v: Value) void {
 test "parseToValue keeps the real parse error" {
     try testing.expectError(error.InvalidUtf8, parseToValue(testing.allocator, "a: \xff\xfe\n"));
     try testing.expectError(error.InvalidSyntax, parseToValue(testing.allocator, "a: b\n  c: d\n"));
+}
+
+test "allocation failures in value round trip leak nothing" {
+    try std.testing.checkAllAllocationFailures(testing.allocator, valueRoundTrip, .{});
+}
+
+fn valueRoundTrip(alloc: std.mem.Allocator) !void {
+    const v = try parseToValue(alloc,
+        \\server:
+        \\  ports: [80, 443]
+        \\name: yayl
+        \\pi: 3.14
+        \\
+    );
+    defer freeValue(alloc, v);
+
+    var doc = Document.init(alloc);
+    defer doc.deinit();
+    doc.root = try toNode(&doc, v);
+    const back = try nodeToValue(alloc, doc.root.?);
+    defer freeValue(alloc, back);
+
+    // fromZig with a string field: the value must own its bytes for
+    // freeValue to release them.
+    const label = try alloc.dupe(u8, "hi");
+    errdefer alloc.free(label);
+    const Point = struct { x: i32, label: []const u8 };
+    const vp = try fromZig(alloc, Point{ .x = 1, .label = label });
+    defer freeValue(alloc, vp);
 }

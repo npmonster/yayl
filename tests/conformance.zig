@@ -157,6 +157,10 @@ test "yaml test suite corpus" {
         return err;
     };
 
+    // Vacuous-pass guard: a mis-loaded corpus (zero cases parsed) must
+    // fail the gate, not report zero cases as zero failures.
+    try std.testing.expect(cases.items.len >= 300);
+
     var results: std.ArrayList(Result) = .empty;
     defer results.deinit(alloc);
 

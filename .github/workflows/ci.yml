@@ -47,6 +47,18 @@ jobs:
       - name: Conformance corpus
         run: zig build conformance --summary all
 
+      - name: Round-trip gate (byte-faithful emit(parse(x)) == x)
+        run: zig build roundtrip --summary all
+
+      - name: Differential gate (event parity vs libfyaml)
+        run: make differential
+
+      - name: Assert gates are not vacuous
+        run: |
+          passes=$(grep -c '"status": "pass"' zig-out/conformance-report.json)
+          echo "conformance passes: $passes"
+          test "$passes" -ge 300
+
       - name: Upload conformance report
         if: always()
         uses: actions/upload-artifact@v4

@@ -59,6 +59,10 @@ test "corpus round trips byte-for-byte" {
         return err;
     };
 
+    // Vacuous-pass guard: a mis-loaded corpus (zero cases parsed) must
+    // fail the gate, not report zero cases as zero round trips.
+    try std.testing.expect(cases.items.len >= 300);
+
     var results: std.ArrayList(Result) = .empty;
     defer results.deinit(alloc);
 
@@ -197,10 +201,9 @@ test "fixtures round trip byte-for-byte" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var dir = std.Io.Dir.cwd().openDir(io, "tests/fixtures", .{ .iterate = true }) catch |err| {
-        if (err == error.FileNotFound) return; // no fixtures installed yet
-        return err;
-    };
+    // Fixtures are part of the repository; a missing directory is a
+    // checkout problem, not an empty pass.
+    var dir = try std.Io.Dir.cwd().openDir(io, "tests/fixtures", .{ .iterate = true });
     defer dir.close(io);
 
     var names: std.ArrayList([]const u8) = .empty;

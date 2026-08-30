@@ -160,3 +160,42 @@ test "bounded read rejects oversized input" {
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
     try testing.expectError(error.StreamTooLong, readFile(alloc, io, path, 4));
 }
+
+test "parseAllFile reads every document" {
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const path = "zig-out-test-multidoc.yaml";
+    try writeBytesAtomic(io, path, "---\na: 1\n---\na: 2\n");
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var docs = try parseAllFile(alloc, io, path, max_bytes_default);
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(alloc);
+    }
+    try testing.expectEqual(@as(usize, 2), docs.items.len);
+    try testing.expectEqualStrings("1", docs.items[0].pathGet(&.{"a"}).?.scalarValue().?);
+    try testing.expectEqualStrings("2", docs.items[1].pathGet(&.{"a"}).?.scalarValue().?);
+
+    // A missing file is a clean error.
+    try testing.expectError(error.FileNotFound, parseFile(alloc, io, "zig-out-test-nope.yaml", max_bytes_default));
+}
+
+test "allocation failures in a bounded read leak nothing" {
+    try std.testing.checkAllAllocationFailures(testing.allocator, boundedRead, .{});
+}
+
+fn boundedRead(alloc: std.mem.Allocator) !void {
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "zig-out-test-bounded.yaml";
+    try writeBytesAtomic(io, path, "# comment\na: 1\n");
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const data = try readFile(alloc, io, path, max_bytes_default);
+    defer alloc.free(data);
+    try testing.expectEqualStrings("# comment\na: 1\n", data);
+}
