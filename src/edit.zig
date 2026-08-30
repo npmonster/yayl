@@ -308,36 +308,20 @@ pub const Editor = struct {
             return;
         }
         // Only plain-key paths auto-create intermediate mappings.
-        for (p.segments) |seg| {
+        var keys = try doc.alloc.alloc([]const u8, p.segments.len);
+        defer doc.alloc.free(keys);
+        for (p.segments, 0..) |seg, i| {
             if (seg != .key) return error.AmbiguousOperation;
+            keys[i] = seg.key;
         }
-        if (doc.root == null) {
-            doc.root = try doc.createMapping();
-        }
-        var cur = doc.root.?;
-        for (p.segments[0 .. p.segments.len - 1]) |seg| {
-            const k = seg.key;
-            if (cur.lookup(k)) |next| {
-                cur = next;
-            } else {
-                const m = try doc.createMapping();
-                try doc.mappingAppend(cur, try doc.createScalar(k, .plain), m);
-                cur = m;
-            }
-            if (!cur.isMapping()) return error.NotAMapping;
-        }
-        const last = p.segments[p.segments.len - 1].key;
+        const cur = try doc.mappingWalkOrCreate(keys[0 .. keys.len - 1]);
+        const last = keys[keys.len - 1];
         if (cur.lookup(last)) |existing| {
-            // Replace in place, keeping order and the key node.
-            const pairs = cur.data.mapping.pairs.items;
-            for (pairs) |*pair| {
-                if (pair.value == existing) {
-                    value.parent = cur;
-                    pair.value = value;
-                    doc.markModified(cur);
-                    return;
-                }
-            }
+            // `lookup` only matches values of the mapping `cur`, so the
+            // in-place replace must succeed; falling through would
+            // append a duplicate key.
+            if (!doc.mappingReplace(cur, existing, value)) return error.InvalidSyntax;
+            return;
         }
         try doc.mappingAppend(cur, try doc.createScalar(last, .plain), value);
     }

@@ -615,7 +615,11 @@ pub const Document = struct {
         const cur = try self.mappingWalkOrCreate(path[0 .. path.len - 1]);
         const last = path[path.len - 1];
         if (cur.lookup(last)) |existing| {
-            if (self.mappingReplace(cur, existing, value)) return;
+            // `lookup` only matches values of the mapping `cur`, so the
+            // in-place replace must succeed; falling through would
+            // append a duplicate key.
+            if (!self.mappingReplace(cur, existing, value)) return error.InvalidSyntax;
+            return;
         }
         try self.mappingAppend(cur, try self.createScalar(last, .plain), value);
     }

@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     defer d.deinit();
     _ = yaml.parseDiag(alloc, "a: b\n  c: d\n", &d) catch {
         const report = try d.render(alloc);
-        std.debug.print("{s}", .{report}); // "2:3: error: ..."
+        std.debug.print("{s}", .{report}); // "2:4: error: ..."
         return;
     };
 }

@@ -444,22 +444,6 @@ test "bigint keeps exact text" {
     try testing.expectEqualStrings("99999999999999999999", big.bigint);
 }
 
-/// YAML's non-finite float spellings -> Zig floats (Zig's parseFloat
-/// rejects the leading dot in `.inf`).
-fn floatSpecial(text: []const u8) ?f64 {
-    const inf = std.math.inf(f64);
-    const map = [_]struct { t: []const u8, v: f64 }{
-        .{ .t = ".inf", .v = inf },               .{ .t = ".Inf", .v = inf },               .{ .t = ".INF", .v = inf },
-        .{ .t = "+.inf", .v = inf },              .{ .t = "+.Inf", .v = inf },              .{ .t = "+.INF", .v = inf },
-        .{ .t = "-.inf", .v = -inf },             .{ .t = "-.Inf", .v = -inf },             .{ .t = "-.INF", .v = -inf },
-        .{ .t = ".nan", .v = std.math.nan(f64) }, .{ .t = ".NaN", .v = std.math.nan(f64) }, .{ .t = ".NAN", .v = std.math.nan(f64) },
-    };
-    for (map) |e| {
-        if (std.mem.eql(u8, text, e.t)) return e.v;
-    }
-    return null;
-}
-
 pub fn freeValue(alloc: std.mem.Allocator, v: Value) void {
     switch (v) {
         .string => |s| alloc.free(s),

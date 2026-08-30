@@ -81,7 +81,7 @@ if (yaml.parseDiag(alloc, input, &d)) |doc| {
     defer document.deinit();
     // ...
 } else |err| {
-    const report = try d.render(alloc); // "2:3: error: ..."
+    const report = try d.render(alloc); // "2:4: error: ..."
     defer alloc.free(report);
     std.debug.print("{s}", .{report});
     return err;
