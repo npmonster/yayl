@@ -44,8 +44,12 @@ jobs:
 
       # Invoked directly rather than through `make docs` so the workflow does
       # not break when the Makefile is reorganised.
+      # -femit-docs does not create its parent, so mkdir first; this is the
+      # step `make docs` performs and that calling zig directly loses.
       - name: Generate the API reference
-        run: zig build-lib src/yaml.zig -fno-emit-bin -femit-docs=zig-out/docs
+        run: |
+          mkdir -p zig-out
+          zig build-lib src/yaml.zig -fno-emit-bin -femit-docs=zig-out/docs
 
       - name: Fail if autodoc produced nothing
         run: test -f zig-out/docs/index.html
