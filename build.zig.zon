@@ -3,7 +3,7 @@
     .fingerprint = 0xc49f7ed1a8db0b85,
     .version = "0.10.0",
     .minimum_zig_version = "0.16.0",
-    .description = "YAYL: Yet Another YAML Library for Zig. Comment-preserving, round-trip safe. By Null Pointer Monster.",
+    .description = "A YAML 1.2 parser, document model and emitter for Zig. Edits re-emit byte-faithfully: untouched bytes, comments and layout survive.",
     .license = "MIT",
     .paths = .{
         "build.zig",

@@ -1,17 +1,17 @@
 //! Emitter — Zig port of libfyaml's fy-emit.
 //!
-//! Serialises a `Document` back to YAML text. Two modes:
+//! Serializes a `Document` back to YAML text. Two modes:
 //!
-//! *Faithful* (parsed documents, PLAN-4): every node carries a span
+//! *Faithful* (parsed documents): every node carries a span
 //! into the original source; untouched regions re-emit byte for byte
 //! (comments, blank lines, quoting, key order, indentation), and only
 //! modified subtrees are re-emitted, in place, with the surrounding
-//! bytes preserved. This is libfyaml's round-trip behaviour.
+//! bytes preserved. This is libfyaml's round-trip behavior.
 //!
 //! *Normalized* (programmatic documents): emitted from the semantic
 //! tree. Block style is the default; collections parsed from flow style
 //! (and empty collections) are emitted in flow style. Scalar styles are
-//! honoured when safe, with quoting rules that guarantee the re-parsed
+//! honored when safe, with quoting rules that guarantee the re-parsed
 //! value is identical.
 //!
 //! PORT NOTE: libfyaml's CST covers every byte including intra-node
@@ -239,7 +239,7 @@ pub const Emitter = struct {
     }
 
     // ------------------------------------------------------------------
-    // Faithful emission (PLAN-4): unmodified subtrees re-emit verbatim.
+    // Faithful emission: unmodified subtrees re-emit verbatim.
     //
     // Contract: slot emitters (`emitPair`, `emitItem`) receive the
     // source offset where the *gap* into their entry begins (just past
@@ -399,7 +399,7 @@ pub const Emitter = struct {
             if (!vs.synthetic) {
                 // Original layout (": " or a block ":\n    "). For a
                 // block value these bytes carry its FIRST entry's
-                // indentation, so they must honour that container's
+                // indentation, so they must honor that container's
                 // tombstones: deleting the first child otherwise leaves
                 // the indent behind for the new first child to add its
                 // own on top of (2 -> 4).
@@ -947,7 +947,7 @@ pub const Emitter = struct {
                 try self.writeByte(':');
             },
             else => {
-                // Complex key in compact flow form.
+                // Explicit key (spec 7.4.2) in compact flow form.
                 try self.write("? ");
                 try self.emitFlowNode(key);
                 try self.writeByte(':');

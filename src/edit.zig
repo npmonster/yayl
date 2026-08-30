@@ -1,4 +1,4 @@
-//! High-level editing API — PLAN-1/PLAN-5.
+//! High-level editing API.
 //!
 //! A path query engine and atomic edit operations layered on the
 //! document model. Paths use a small, documented grammar (see `Path`):
@@ -49,7 +49,8 @@ pub const Segment = union(enum) {
     /// Every descendant matching `inner`, at every depth (recursive
     /// descent, `..name`).
     descend: []const u8,
-    /// Every mapping item whose `filter_key` equals `filter_value`.
+    /// Every child that is a mapping whose `key` equals `value`. Applies
+    /// to both sequence entries and mapping values.
     filter: struct { key: []const u8, value: []const u8 },
 };
 
@@ -58,7 +59,7 @@ pub const Segment = union(enum) {
 pub const Path = struct {
     segments: []const Segment,
 
-    /// Segment byte length in the source string, for error reporting.
+    /// Parse `input` into a `Path`. Caller owns the result; `deinit` it.
     pub fn parse(allocator: std.mem.Allocator, input: []const u8) Error!Path {
         var segments: std.ArrayList(Segment) = .empty;
         errdefer segments.deinit(allocator);
@@ -1182,7 +1183,7 @@ test "emptying a zero-indent sequence value indents its placeholder" {
 // emitter picks one. It used to pick single-line flow, which is valid
 // YAML but alien to a block-styled file -- and inconsistent, since a
 // brand-new *pair* already went through the block path. These pin the
-// consistent behaviour: block in, block out.
+// consistent behavior: block in, block out.
 // ----------------------------------------------------------------------
 
 /// A fresh two-key mapping, the stand-in for "a subtree the caller built".
@@ -1207,7 +1208,7 @@ test "a new collection replacing a value emits block, not flow" {
             .path = "$.a.server",
             .want = "a:\n  server:\n    host: h\n    port: 80\n  other: 1\n",
         },
-        // Comments on neighbouring lines are untouched.
+        // Comments on neighboring lines are untouched.
         .{
             .src = "# lead\nserver: old\n# trail\nother: 1\n",
             .path = "$.server",

@@ -9,7 +9,7 @@ Contents:
 2. [Parse and inspect](#parse-and-inspect)
 3. [Build a document](#build-a-document)
 4. [Change a parsed document](#change-a-parsed-document)
-5. [Byte-faithful round trips](#byte-faithful-round-trips-the-headline)
+5. [Byte-faithful round trips](#byte-faithful-round-trips)
 6. [Editing: paths, batches, moves](#editing-paths-batches-moves)
 7. [Values: schema-free data and Zig conversion](#values-schema-free-data-and-zig-conversion)
 8. [Validation: optional schemas](#validation-optional-schemas)
@@ -140,7 +140,7 @@ _ = try doc.pathDelete(&.{"legacy"});
 `pathSet` creates missing intermediate mappings; its components are
 mapping keys, not sequence indices.
 
-## Byte-faithful round trips (the headline)
+## Byte-faithful round trips
 
 Documents produced by `parse`/`parseAll` remember where every node
 came from. `doc.write` re-emits the original bytes exactly — comments,
@@ -209,11 +209,16 @@ on the document model:
 
 | Syntax | Meaning |
 | --- | --- |
-| `$.a.b[0]` | map keys and sequence indices (`$` optional) |
-| Keys containing `.` or `[` | not addressable; use `Document.pathSet`/`pathDelete` with key components instead |
+| `$.a.b[0]` | mapping keys and sequence indices (`$` optional) |
 | `[*]` | every child, in document order |
 | `..name` | recursive descent: every `name` at any depth |
-| `[?key=value]` | mapping items whose `key` equals `value` |
+| `[?key=value]` | every child that is a mapping whose `key` equals `value` |
+
+The grammar has no quoting or escaping, so a key containing `.`, `[` or
+`]` cannot be addressed: `pymdownx.highlight` parses as two nested keys,
+and `.defaults` parses as a recursive descent. Reach such entries by
+iterating the container's pairs, or with `Document.pathSet`/`pathDelete`,
+which take key components rather than a path string.
 
 ~~~zig
 var ed = yaml.edit.Editor.init(&doc);
