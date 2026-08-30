@@ -55,6 +55,30 @@ series; APIs may still move, and anything that does is listed here.
   replacement one level too deep.
 - Replacing or emptying a collection placed `{}` / `[]` at column zero
   instead of under its key, which does not re-parse.
+- Emptying a collection in the zero-indent sequence style (`- ` items at
+  their parent key's own column, as Kubernetes and mkdocs write it) put
+  the `{}` / `[]` at the key's column, where a flow node reads as the
+  key's sibling rather than its value, and swallowed the `- ` indicator
+  along with the entry. The conventionally indented form of the same
+  edit re-parsed cleanly while silently dropping a sequence item.
+- The byte-exact round-trip gate only globbed `*.yaml`, so four `.yml`
+  fixtures — 366 of 776 fixture lines — were never checked. They pass;
+  the gate had been reporting on roughly half of what it claimed to
+  cover. A count guard now fails the gate if the glob matches nothing,
+  rather than passing quietly.
+
+### Changed
+
+- Subtrees the emitter owns — brand-new ones, and moved ones — now
+  re-emit in block layout instead of collapsing to single-line flow.
+  Replacing a value with a fresh mapping, appending one to a block
+  sequence, and moving a subtree all now match the document they land
+  in. Flow is still used where it is the right answer: collections
+  written in flow style, and empty ones.
+- The emitter measures a document's indentation convention (the first
+  nested block container's entry column, minus the column of the key
+  owning it) instead of assuming two spaces, so an insert into a
+  four-space file indents by four.
 
 ### Added
 

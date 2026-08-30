@@ -66,7 +66,7 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 | `fy-parse.c`          | `src/parser.zig`       | ✅ done — event streams byte-identical to libfyaml (differential)  |
 | `fy-event.c`          | `src/event.zig`        | ✅ done                                                            |
 | `fy-doc.c` `fy-node.c` `fy-docbuilder.c` | `src/document.zig` | ✅ done — semantic model + per-node/entry spans (comments and blank lines round-trip) |
-| `fy-emit.c`           | `src/emitter.zig`      | ✅ done — faithful (untouched bytes exact) + normalized emit; modified subtrees normalize internal layout |
+| `fy-emit.c`           | `src/emitter.zig`      | ✅ done — faithful (untouched bytes exact) + normalized emit; modified subtrees normalize internal layout, new/moved ones re-emit block at the measured indent |
 | `fy-atom.c`           | —                      | ⬜ not ported (atom interning; optional optimization)              |
 | `fy-tag.c`            | in `parser.zig`        | 🟡 shorthand resolution done; no `fy_tag` cache                    |
 | `fy-wpool.c`          | —                      | ⬜ out of scope for v1 (threading)                                 |
@@ -93,8 +93,10 @@ Two modes: **faithful** (parsed documents: untouched subtrees re-emit
 verbatim via `markup.Src` spans; modified slots re-emit in place with
 sibling bytes preserved; tombstones skip deleted entries; folded
 scalars keep `>` when re-folding is lossless) and **normalized**
-(programmatic documents). Modified/moved subtrees normalize their
-internal layout; untouched bytes are exact.
+(programmatic documents). Modified subtrees normalize their internal
+layout; untouched bytes are exact. New and moved subtrees have no
+layout to preserve, so they re-emit in block style at the document's
+measured indent width.
 
 ## Documented v1 scope decisions
 

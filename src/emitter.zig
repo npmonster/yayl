@@ -18,6 +18,13 @@
 //! layout; this port keeps per-node/entry spans, so re-emitted
 //! subtrees normalize their internal layout (e.g. multi-line flow
 //! collapses to one line). Untouched bytes are exact.
+//!
+//! A subtree with no span at all -- brand-new, or moved, since `move`
+//! clears the span that described the old location -- has no layout to
+//! preserve, so the emitter picks one: BLOCK, at the document's own
+//! indent width (measured, not assumed; see `inferIndentStep`). Flow is
+//! reserved for collections that were written in flow style and for
+//! empty ones, which block layout cannot express.
 
 const std = @import("std");
 const diag = @import("diag.zig");

@@ -222,8 +222,10 @@ try ed.apply(&.{
 
 `set` auto-creates intermediate mappings only along plain-key paths.
 A failed batch (unknown path, wrong shape, allocation failure) leaves
-the original document byte-identical. Moved nodes re-emit normalized
-at their new location; untouched siblings stay verbatim. Moving a
+the original document byte-identical. A moved node re-emits in block
+layout at its destination, indented to match the file's own
+convention; its structure and values survive, its internal comments
+and blank lines do not. Untouched siblings stay verbatim. Moving a
 node into its own subtree is rejected (`error.MoveIntoSubtree`).
 
 ## Values: schema-free data and Zig conversion
