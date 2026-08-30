@@ -371,13 +371,12 @@ The layering mirrors libfyaml and is public:
 
 ~~~sh
 make help         # target list
-make verify       # fmt + compile + tests (Debug & ReleaseSafe)
-                  #   + corpus conformance (351/351)
-                  #   + byte-faithful round-trip gate
-make roundtrip    # emit(parse(x)) == x over corpus + fixtures
-make differential # event-stream parity vs libfyaml (needs a C compiler)
+make verify       # the full gate
 zig-out/bin/bench tests/fixtures/serde-ci.yml 500   # throughput
 ~~~
+
+The individual gates and their current numbers are in the
+[README](../README.md#development).
 
 Measured throughput (ReleaseFast, small fixtures): ~52-55 MiB/s
 parse; writing an unmodified document is a verbatim slice copy.

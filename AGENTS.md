@@ -19,17 +19,8 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 
 ## Ground rules for changes
 
-- **Work through plumb** ([github.com/plumbkit/plumb](https://github.com/plumbkit/plumb)). Agents working in this repository MUST use the
-  plumb MCP tools for code work: `session_start` on arrival,
-  `read_file`/`read_multiple_files` (they return mtime/sha for
-  concurrency-checked edits), `edit_file`/`write_file`/`transaction_apply`
-  for changes, `run_task` (`build`/`test`/`verify` slots) instead of shelling
-  out, `diagnostics` after edits, `topology_affected` to pick tests,
-  `rename_symbol`/`move_symbol`/`safe_delete_symbol` for refactors, and the
-  policy-gated `git` tool for commits. Raw shell (`Bash`) is only for things
-  plumb does not cover (e.g. `make verify`, the differential script). This
-  gives every change per-path locking, LSP diagnostics, and reversibility via
-  `undo_edit`.
+- **Work through plumb**. All code work goes through the plumb MCP
+  daemon; setup and the full tool policy are in [Working with plumb](#working-with-plumb) at the end of this file.
 - Run `zig build test` before and after any change; the suite must stay green
   with **zero leaks** (tests run under `std.testing.allocator`). The canonical
   gate is `make verify` (fmt + library compile + Debug and ReleaseSafe tests);

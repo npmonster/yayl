@@ -20,10 +20,12 @@ lives in [AGENTS.md](AGENTS.md); read it before touching code.
 ## Before you open a PR
 
 ```sh
-make verify        # fmt + compile + Debug & ReleaseSafe tests
-                   # + corpus conformance + byte-faithful round trips
-make differential  # optional: event parity vs libfyaml (C compiler)
+make verify        # the full gate
+make differential  # optional: event parity vs libfyaml (needs a C compiler)
 ```
+
+`make help` lists every target; the gates and their current numbers are
+in the README's Development section.
 
 The suite must stay green with **zero leaks** (tests run under
 `std.testing.allocator`). Public allocating operations need
