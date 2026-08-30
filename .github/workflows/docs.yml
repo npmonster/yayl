@@ -1,0 +1,60 @@
+# Publishes the generated API reference to GitHub Pages.
+#
+# INERT UNTIL PAGES IS ENABLED. This runs on workflow_dispatch only, so it
+# cannot turn CI red before the repository is ready. To finish wiring it up:
+#
+#   1. Settings -> Pages -> Build and deployment -> Source: GitHub Actions
+#   2. Run this workflow once by hand (Actions tab -> Publish API docs -> Run
+#      workflow) and confirm the deployment succeeds
+#   3. Add the tag trigger, so every release publishes its own docs:
+#
+#        push:
+#          tags: ['v*']
+#
+# Kept separate from ci.yml deliberately: a docs deployment failing should
+# never be able to fail the gate that decides whether the library is correct.
+name: docs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a half-finished deployment; let it settle and supersede.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # Invoked directly rather than through `make docs` so the workflow does
+      # not break when the Makefile is reorganised.
+      - name: Generate the API reference
+        run: zig build-lib src/yaml.zig -fno-emit-bin -femit-docs=zig-out/docs
+
+      - name: Fail if autodoc produced nothing
+        run: test -f zig-out/docs/index.html
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: zig-out/docs
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

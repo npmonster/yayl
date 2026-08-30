@@ -14,3 +14,9 @@ vendor/
 .fseventsd/
 .AppleDouble/
 .LSOverride/
+
+# pauta runtime state (the board's markdown cards ARE tracked; these are not)
+.pauta/sync.db
+.pauta/sync.db-shm
+.pauta/sync.db-wal
+.pauta/board/.attention/

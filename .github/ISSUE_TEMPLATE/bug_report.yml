@@ -1,0 +1,73 @@
+name: Bug report
+description: Something yayl parsed, emitted or edited wrongly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The single most useful thing you can give us is the smallest YAML that
+        reproduces the problem. Almost every yayl bug is a few lines of input
+        plus a wrong answer, and a minimal case usually pins it immediately.
+
+  - type: textarea
+    id: input
+    attributes:
+      label: Input YAML
+      description: The smallest document that reproduces it. Paste the exact bytes.
+      render: yaml
+    validations:
+      required: true
+
+  - type: textarea
+    id: code
+    attributes:
+      label: What you called
+      description: The yayl calls you made, ideally a small main() we can run.
+      render: zig
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what you got
+      description: |
+        For round-trip and editing bugs, paste both outputs verbatim. Whitespace
+        matters here more than in most libraries, so avoid retyping or
+        reformatting either one.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: yayl version
+      description: The tag or commit you pinned, from your build.zig.zon.
+      placeholder: v0.10.0
+    validations:
+      required: true
+
+  - type: input
+    id: zig
+    attributes:
+      label: Zig version
+      description: Output of `zig version`.
+      placeholder: 0.16.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Platform
+      options: [Linux, macOS, Windows, Other]
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Optional. What you already tried, or why you think it happens.
+    validations:
+      required: false

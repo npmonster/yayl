@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const yaml = @import("yayl");
+const corpus = @import("corpus_common.zig");
 
 const fixtures_dir = "tests/fixtures";
 const multidoc_fixture = "k8s-multidoc.yaml";
@@ -175,6 +176,10 @@ const Target = struct {
     /// An anchored node whose anchor is referenced by an alias
     /// elsewhere (deleting it would leave the aliases dangling).
     anchored_referenced: bool,
+    /// Moving this subtree cannot be asserted independently: it is an
+    /// alias, contains an alias that could become a forward reference, or
+    /// carries an anchor whose references depend on its source position.
+    move_unsafe: bool,
     /// The entry's mapping key, for locating the removed lines.
     key_text: []const u8,
 };
@@ -218,6 +223,26 @@ fn collectReferencedAnchors(alloc: std.mem.Allocator, node: *const yaml.Node, se
         },
         .scalar => {},
     }
+}
+
+fn subtreeContainsAlias(node: *const yaml.Node, depth: usize) bool {
+    if (depth > 24) return true;
+    return switch (node.data) {
+        .alias => true,
+        .mapping => |m| blk: {
+            for (m.pairs.items) |pair| {
+                if (subtreeContainsAlias(pair.key, depth + 1) or subtreeContainsAlias(pair.value, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .sequence => |s| blk: {
+            for (s.items.items) |item| {
+                if (subtreeContainsAlias(item, depth + 1)) break :blk true;
+            }
+            break :blk false;
+        },
+        .scalar => false,
+    };
 }
 
 fn formatPath(alloc: std.mem.Allocator, comps: []const Comp) ![]const u8 {
@@ -297,6 +322,8 @@ fn walkTargets(
                     .sole_child = m.pairs.items.len == 1,
                     .is_alias = pair.value.nodeType() == .alias,
                     .anchored_referenced = pair.value.anchor != null and referenced.contains(pair.value.anchor.?),
+                    .move_unsafe = subtreeContainsAlias(pair.value, 0) or
+                        (pair.value.anchor != null and referenced.contains(pair.value.anchor.?)),
                     .key_text = try alloc.dupe(u8, key_text),
                 });
                 try walkTargets(alloc, ed, input, referenced, pair.value, comps, found, depth + 1);
@@ -329,6 +356,8 @@ fn walkTargets(
                     .sole_child = s.items.items.len == 1,
                     .is_alias = item.nodeType() == .alias,
                     .anchored_referenced = item.anchor != null and referenced.contains(item.anchor.?),
+                    .move_unsafe = subtreeContainsAlias(item, 0) or
+                        (item.anchor != null and referenced.contains(item.anchor.?)),
                     .key_text = "",
                 });
                 try walkTargets(alloc, ed, input, referenced, item, comps, found, depth + 1);
@@ -356,10 +385,14 @@ const Failures = struct {
 };
 
 const Stats = struct {
+    documents: usize = 0,
     deletes: usize = 0,
     sets: usize = 0,
+    same_sets: usize = 0,
     map_adds: usize = 0,
     seq_appends: usize = 0,
+    inserts: usize = 0,
+    moves: usize = 0,
     rollbacks: usize = 0,
     skipped_sole_child: usize = 0,
     skipped_dangling_anchor: usize = 0,
@@ -367,14 +400,27 @@ const Stats = struct {
     skipped_alias: usize = 0,
     skipped_flow: usize = 0,
     skipped_empty: usize = 0,
+    skipped_same_non_scalar: usize = 0,
+    skipped_move_related: usize = 0,
+    skipped_move_dest: usize = 0,
+    skipped_no_root: usize = 0,
+    capped_targets: usize = 0,
+    capped_containers: usize = 0,
     unaddressable: usize = 0,
+};
+
+const SweepLimits = struct {
+    max_targets: usize = std.math.maxInt(usize),
+    max_mappings: usize = std.math.maxInt(usize),
+    max_sequences: usize = std.math.maxInt(usize),
+    max_move_dests_per_target: usize = 3,
 };
 
 // ----------------------------------------------------------------------
 // The sweeps over one fixture
 // ----------------------------------------------------------------------
 
-fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, failures: *Failures, stats: *Stats) !void {
+fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, failures: *Failures, stats: *Stats, limits: SweepLimits) !void {
     // Discovery on a pristine parse. The generation document is freed
     // before sweeping; targets own their strings.
     var found: Found = .{};
@@ -382,7 +428,11 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
     {
         var gen = try yaml.parse(alloc, input);
         defer gen.deinit();
-        const root = gen.root orelse return;
+        const root = gen.root orelse {
+            stats.skipped_no_root += 1;
+            return;
+        };
+        stats.documents += 1;
         var referenced: std.StringHashMap(void) = .init(alloc);
         defer {
             var kit = referenced.keyIterator();
@@ -396,13 +446,16 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
         try walkTargets(alloc, &ed, input, &referenced, root, &comps, &found, 0);
     }
     stats.unaddressable += found.unaddressable;
+    const target_count = @min(found.targets.items.len, limits.max_targets);
+    stats.capped_targets += found.targets.items.len - target_count;
+    const targets = found.targets.items[0..target_count];
 
     const orig_lines = try splitLines(alloc, input);
     defer alloc.free(orig_lines);
 
     // DELETE sweep: input minus one contiguous run that contains the
     // deleted entry.
-    for (found.targets.items) |t| {
+    for (targets) |t| {
         if (t.sole_child) {
             // Removing a parent's only child empties the container,
             // which normalizes to flow style: line-shape assertions do
@@ -516,7 +569,7 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
 
     // SET sweep: exactly the target's line changes; the output
     // re-parses with the new value at the same path.
-    for (found.targets.items) |t| {
+    for (targets) |t| {
         if (t.anchored_referenced) {
             // Replacing an anchored node drops the anchor and leaves
             // every alias to it dangling — no valid edit exists, so
@@ -625,6 +678,37 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
         }
     }
 
+    // SET-TO-SAME sweep: an exact scalar replacement is a semantic no-op
+    // and must preserve every source byte, including flow spacing and block
+    // scalar indentation/chomping.
+    for (targets) |t| {
+        if (t.is_alias) {
+            stats.skipped_alias += 1;
+            continue;
+        }
+        var doc = try yaml.parse(alloc, input);
+        defer doc.deinit();
+        var ed = yaml.edit.Editor.init(&doc);
+        const existing = ed.one(t.path) catch continue;
+        if (existing.data != .scalar) {
+            stats.skipped_same_non_scalar += 1;
+            continue;
+        }
+        stats.same_sets += 1;
+        const replacement = try doc.createScalar(existing.data.scalar.value, existing.data.scalar.style);
+        replacement.anchor = if (existing.anchor) |anchor| try doc.pool.dupe(anchor) else null;
+        replacement.tag = if (existing.tag) |tag| try doc.pool.dupe(tag) else null;
+        ed.apply(&.{.{ .set = .{ .path = t.path, .value = replacement } }}) catch |err| {
+            failures.add("{s}: same-value set {s} failed: {s}", .{ name, t.path, @errorName(err) });
+            continue;
+        };
+        const out = try doc.write(alloc);
+        defer alloc.free(out);
+        if (!std.mem.eql(u8, input, out)) {
+            failures.add("{s}: same-value set {s} was not byte-identical", .{ name, t.path });
+        }
+    }
+
     // ADD sweeps: pure insertions only — a new key on every addressable
     // block mapping, an appended item on every block sequence.
     for (found.containers.items) |c| {
@@ -672,6 +756,101 @@ fn sweepFixture(alloc: std.mem.Allocator, name: []const u8, input: []const u8, f
             defer alloc.free(out_lines);
             if (pureInsertion(orig_lines, out_lines) == null) {
                 failures.add("{s}: seq append to {s}: not a pure line insertion", .{ name, c.path });
+            }
+        }
+    }
+
+    // MOVE sweep. Moves had almost no coverage: the operation where the
+    // emitter knows LEAST, because `move` clears the node's span and the
+    // destination layout is entirely the emitter's choice.
+    //
+    // Byte-level assertions do not apply. A moved subtree re-emits in
+    // block layout at the destination, so its BYTES legitimately differ
+    // from the source's; what must not differ is its meaning. So the
+    // invariants here are semantic:
+    //   - the output is valid YAML;
+    //   - the subtree's value tree at its new path equals what it was;
+    //   - the old path no longer resolves;
+    //   - the document's total leaf count is unchanged, so nothing was
+    //     lost or duplicated anywhere else.
+    //
+    // The cross product of targets and destinations is quadratic, so it
+    // is capped per fixture. The cap is counted, never silent.
+    {
+        const max_dests_per_target = limits.max_move_dests_per_target;
+        for (targets) |t| {
+            if (t.move_unsafe) {
+                stats.skipped_move_related += 1;
+                continue;
+            }
+            var used: usize = 0;
+            for (found.containers.items) |c| {
+                if (used >= max_dests_per_target) break;
+                // Block mapping destinations only: a flow destination
+                // normalizes by design, and a sequence destination takes
+                // no key so two moves there are indistinguishable.
+                if (!c.is_mapping or c.is_flow or !c.non_empty) {
+                    stats.skipped_move_dest += 1;
+                    continue;
+                }
+                if (pathRelated(c.path, t.path)) {
+                    stats.skipped_move_related += 1;
+                    continue;
+                }
+                used += 1;
+                stats.moves += 1;
+
+                // Parse once before and once after emission. The edited
+                // document itself is the semantic oracle: comparing the
+                // re-parsed output with it proves the exact move without
+                // assuming aliases leave the document's leaf count fixed.
+                var doc = try yaml.parse(alloc, input);
+                defer doc.deinit();
+                var ed = yaml.edit.Editor.init(&doc);
+                const src_node = ed.one(t.path) catch continue;
+                const v_src = yaml.value.nodeToValue(alloc, src_node) catch continue;
+                defer yaml.value.freeValue(alloc, v_src);
+                ed.apply(&.{.{ .move = .{ .from = t.path, .to = c.path, .key = "zz_moved" } }}) catch |err| {
+                    failures.add("{s}: move {s} -> {s} failed: {s}", .{ name, t.path, c.path, @errorName(err) });
+                    continue;
+                };
+                const v_expected = yaml.value.nodeToValue(alloc, doc.root.?) catch continue;
+                defer yaml.value.freeValue(alloc, v_expected);
+                const out = try doc.write(alloc);
+                defer alloc.free(out);
+
+                var after = yaml.parse(alloc, out) catch {
+                    failures.add("{s}: move {s} -> {s}: emitted output is not valid YAML", .{ name, t.path, c.path });
+                    continue;
+                };
+                defer after.deinit();
+                const v_after = yaml.value.nodeToValue(alloc, after.root.?) catch continue;
+                defer yaml.value.freeValue(alloc, v_after);
+                if (!valueEql(v_expected, v_after)) {
+                    failures.add("{s}: move {s} -> {s}: output value tree differs from the edited document", .{ name, t.path, c.path });
+                }
+
+                var ed_after = yaml.edit.Editor.init(&after);
+                const adjusted_dest = try moveDestinationAfterDetach(alloc, t.path, c.path);
+                defer alloc.free(adjusted_dest);
+                const dest_path = try std.fmt.allocPrint(alloc, "{s}.zz_moved", .{adjusted_dest});
+                defer alloc.free(dest_path);
+                const moved = ed_after.one(dest_path) catch {
+                    failures.add("{s}: move {s} -> {s}: the moved node is not at its destination", .{ name, t.path, c.path });
+                    continue;
+                };
+                const v_moved = yaml.value.nodeToValue(alloc, moved) catch continue;
+                defer yaml.value.freeValue(alloc, v_moved);
+                if (!valueEql(v_src, v_moved)) {
+                    failures.add("{s}: move {s} -> {s}: the subtree's value changed in transit", .{ name, t.path, c.path });
+                }
+                // A key path must disappear. An index can resolve again
+                // because later sequence items shift into the vacant slot.
+                if (!std.mem.endsWith(u8, t.path, "]")) {
+                    if (ed_after.one(t.path)) |_| {
+                        failures.add("{s}: move {s} -> {s}: the source path still resolves", .{ name, t.path, c.path });
+                    } else |_| {}
+                }
             }
         }
     }
@@ -743,6 +922,42 @@ fn valueEql(a: yaml.value.Value, b: yaml.value.Value) bool {
             return true;
         },
     }
+}
+
+/// True when `outer` addresses `inner` or an ancestor of it, comparing
+/// the rendered paths segment-wise. Moving a node into its own subtree
+/// is rejected by the editor (`MoveIntoSubtree`); this keeps the sweep
+/// from spending cases on edits that cannot succeed.
+fn pathRelated(outer: []const u8, inner: []const u8) bool {
+    if (std.mem.eql(u8, outer, inner)) return true;
+    if (outer.len < inner.len) {
+        // `$.a` is a prefix of `$.a.b` and of `$.a[0]`, but not of `$.ab`.
+        if (!std.mem.startsWith(u8, inner, outer)) return false;
+        const next = inner[outer.len];
+        return next == '.' or next == '[';
+    }
+    if (!std.mem.startsWith(u8, outer, inner)) return false;
+    const next = outer[inner.len];
+    return next == '.' or next == '[';
+}
+
+/// A move that removes a direct sequence item shifts every later
+/// sibling down by one. Adjust the destination path used to find the
+/// inserted key after re-parsing; the editor resolved the destination
+/// pointer before detaching, so the operation itself already hit the
+/// intended container.
+fn moveDestinationAfterDetach(alloc: std.mem.Allocator, from: []const u8, to: []const u8) ![]const u8 {
+    const source_open = std.mem.lastIndexOfScalar(u8, from, '[') orelse return alloc.dupe(u8, to);
+    if (from.len == 0 or from[from.len - 1] != ']') return alloc.dupe(u8, to);
+    const source_index = std.fmt.parseInt(usize, from[source_open + 1 .. from.len - 1], 10) catch return alloc.dupe(u8, to);
+    const parent = from[0..source_open];
+    if (!std.mem.startsWith(u8, to, parent)) return alloc.dupe(u8, to);
+    const rest = to[parent.len..];
+    if (rest.len < 3 or rest[0] != '[') return alloc.dupe(u8, to);
+    const dest_close = std.mem.indexOfScalar(u8, rest, ']') orelse return alloc.dupe(u8, to);
+    const dest_index = std.fmt.parseInt(usize, rest[1..dest_close], 10) catch return alloc.dupe(u8, to);
+    if (dest_index <= source_index) return alloc.dupe(u8, to);
+    return std.fmt.allocPrint(alloc, "{s}[{d}]{s}", .{ parent, dest_index - 1, rest[dest_close + 1 ..] });
 }
 
 fn valueIsEmptySlot(v: yaml.value.Value) bool {
@@ -958,20 +1173,22 @@ test "preservation sweep: every edit position in every single-document fixture" 
     for (names.items) |name| {
         const input = try dir.readFileAlloc(io, name, alloc, .limited(4 << 20));
         defer alloc.free(input);
-        try sweepFixture(alloc, name, input, &failures, &stats);
+        try sweepFixture(alloc, name, input, &failures, &stats, .{});
     }
 
     std.debug.print(
-        "preservation: {d} deletes, {d} sets, {d} map adds, {d} seq appends, {d} rollbacks over {d} fixtures\n" ++
-            "  skipped (documented normalizations): {d} sole-child, {d} dangling anchor, {d} multi-line, {d} alias, {d} flow, {d} empty; {d} unaddressable paths\n",
+        "preservation: {d} deletes, {d} sets, {d} map adds, {d} seq appends, {d} moves, {d} rollbacks over {d} fixtures\n" ++
+            "  skipped (documented normalizations): {d} sole-child, {d} dangling anchor, {d} multi-line, {d} alias, {d} flow, {d} empty; {d} unaddressable paths\n" ++
+            "  move sweep skipped: {d} related paths (ancestor/self/alias/anchored), {d} unusable destinations\n",
         .{
-            stats.deletes,            stats.sets,
-            stats.map_adds,           stats.seq_appends,
-            stats.rollbacks,          names.items.len,
-            stats.skipped_sole_child, stats.skipped_dangling_anchor,
-            stats.skipped_multiline,  stats.skipped_alias,
-            stats.skipped_flow,       stats.skipped_empty,
-            stats.unaddressable,
+            stats.deletes,                 stats.sets,
+            stats.map_adds,                stats.seq_appends,
+            stats.moves,                   stats.rollbacks,
+            names.items.len,               stats.skipped_sole_child,
+            stats.skipped_dangling_anchor, stats.skipped_multiline,
+            stats.skipped_alias,           stats.skipped_flow,
+            stats.skipped_empty,           stats.unaddressable,
+            stats.skipped_move_related,    stats.skipped_move_dest,
         },
     );
     if (failures.list.items.len > 0) {

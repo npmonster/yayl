@@ -198,6 +198,7 @@ on the document model:
 | Syntax | Meaning |
 | --- | --- |
 | `$.a.b[0]` | map keys and sequence indices (`$` optional) |
+| Keys containing `.` or `[` | not addressable; use `Document.pathSet`/`pathDelete` with key components instead |
 | `[*]` | every child, in document order |
 | `..name` | recursive descent: every `name` at any depth |
 | `[?key=value]` | mapping items whose `key` equals `value` |
