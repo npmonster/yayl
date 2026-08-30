@@ -142,7 +142,7 @@ A failed batch leaves the original document byte-identical.
 
 - `yaml.value` — tagged `Value`, lossless parse-to-value / value-to-node, and Zig-native `toZig`/`fromZig` for structs, optionals, enums, slices.
 - `yaml.schema` — optional validation descriptors (types, ranges, enums, required keys) with structured violations.
-- `yaml.file` — bounded file reads and atomic writes.
+- `yaml.file` — bounded file reads and atomic writes (temp + fsync + rename).
 
 ## Ownership
 

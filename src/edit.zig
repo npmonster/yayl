@@ -381,7 +381,7 @@ pub const Editor = struct {
                 .mapping => |*m| {
                     for (m.pairs.items, 0..) |p, i| {
                         if (p.value == node) {
-                            self_dropPairSpan(doc, parent, p);
+                            try self_dropPairSpan(doc, parent, p);
                             _ = m.pairs.orderedRemove(i);
                             parent.modified = true;
                             break;
@@ -391,7 +391,7 @@ pub const Editor = struct {
                 .sequence => |*sq| {
                     for (sq.items.items, 0..) |item, i| {
                         if (item == node) {
-                            doc.dropItemSpan(parent, node);
+                            try doc.dropItemSpan(parent, node);
                             _ = sq.items.orderedRemove(i);
                             parent.modified = true;
                             break;
@@ -417,8 +417,8 @@ pub const Editor = struct {
         }
     }
 
-    fn self_dropPairSpan(doc: *Document, parent: *Node, p: document_mod.Pair) void {
-        doc.dropPairSpan(parent, p);
+    fn self_dropPairSpan(doc: *Document, parent: *Node, p: document_mod.Pair) !void {
+        try doc.dropPairSpan(parent, p);
     }
 };
 
@@ -432,8 +432,6 @@ fn clearSpans(node: *Node) void {
 /// spans (so a rolled-back-to clone still round-trips untouched parts
 /// byte-identically) and rebuilding alias targets within the clone.
 pub fn cloneTree(doc: *Document, root: *Node) Error!*Node {
-    var arena = std.heap.ArenaAllocator.init(doc.alloc);
-    defer arena.deinit();
     var anchors = std.StringHashMap(*Node).init(doc.alloc);
     defer anchors.deinit();
     return cloneNode(doc, root, &anchors);

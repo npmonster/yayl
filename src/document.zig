@@ -468,7 +468,7 @@ pub const Document = struct {
             .mapping => |*m| {
                 for (m.pairs.items, 0..) |p, i| {
                     if (std.mem.eql(u8, p.key.scalarValue() orelse continue, key)) {
-                        self.dropPairSpan(map, p);
+                        try self.dropPairSpan(map, p);
                         const removed = m.pairs.orderedRemove(i);
                         removed.value.parent = null;
                         removed.key.parent = null;
@@ -488,7 +488,7 @@ pub const Document = struct {
             .sequence => |*s| {
                 if (index >= s.items.items.len) return null;
                 const removed = s.items.orderedRemove(index);
-                self.dropItemSpan(seq, removed);
+                try self.dropItemSpan(seq, removed);
                 removed.parent = null;
                 self.markModified(seq);
                 return removed;
@@ -499,7 +499,7 @@ pub const Document = struct {
 
     /// Tombstone the source bytes a mapping entry occupied (its whole
     /// line, including the line terminator).
-    pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) void {
+    pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
         const src = self.source orelse return;
         const ks = p.key.src orelse return;
         if (ks.synthetic) return;
@@ -507,14 +507,16 @@ pub const Document = struct {
         const to = markup.lineEnd(src, p.src_end orelse ks.end);
         if (to > from) {
             switch (map.data) {
-                .mapping => |*m| m.dropped.append(self.pool.allocator(), .{ from, to }) catch {},
+                // Losing a tombstone to OOM would resurrect the deleted
+                // entry verbatim on the next write: propagate the error.
+                .mapping => |*m| try m.dropped.append(self.pool.allocator(), .{ from, to }),
                 else => {},
             }
         }
     }
 
     /// Tombstone the source bytes a sequence item occupied.
-    pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) void {
+    pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
         const src = self.source orelse return;
         const is = item.src orelse return;
         if (is.synthetic) return;
@@ -522,7 +524,7 @@ pub const Document = struct {
         const to = markup.lineEnd(src, is.end);
         if (to > from) {
             switch (seq.data) {
-                .sequence => |*s| s.dropped.append(self.pool.allocator(), .{ from, to }) catch {},
+                .sequence => |*s| try s.dropped.append(self.pool.allocator(), .{ from, to }),
                 else => {},
             }
         }

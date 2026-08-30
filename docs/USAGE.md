@@ -253,8 +253,10 @@ Use `Schema.mapStrict` to also reject undeclared keys.
 
 `yaml.file` wraps parsing and writing with production safeguards:
 reads are bounded (`max_bytes`, so a huge file fails with
-`error.StreamTooLong`, not OOM) and writes are atomic (temp file +
-rename — a crash never leaves a half-written YAML file).
+`error.StreamTooLong`, not OOM) and writes are atomic (temp file with
+an exclusive name, `fsync`, then rename): a crash never exposes torn
+content. This is torn-write protection, not a power-loss durability
+guarantee — pair with your own fsync policy if you need one.
 
 ~~~zig
 var threaded: std.Io.Threaded = .init(alloc, .{});

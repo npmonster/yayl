@@ -142,8 +142,8 @@ struct blake3_hasher_ops { void (*f[8])(void); };
 const struct blake3_hasher_ops blake3_hasher_op_portable;
 const struct blake3_hasher_ops blake3_hasher_op_cpusimd;
 EOF
-    $CC $INC "$WORK/fydump_main.c" "$WORK/fydump_stub.c" $SRC -o "$WORK/fydump" 2>/dev/null \
-        || { echo "differential: cannot build libfyaml reference; skipping" >&2; exit 0; }
+    $CC $INC "$WORK/fydump_main.c" "$WORK/fydump_stub.c" $SRC -o "$WORK/fydump" \
+        || { echo "differential: FAILED to build libfyaml reference" >&2; exit 1; }
 fi
 
 # --- build the yayl dump tool --------------------------------------------

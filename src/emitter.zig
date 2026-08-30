@@ -109,9 +109,13 @@ pub const Emitter = struct {
             have_directives = true;
         }
         for (doc.tag_directives.items) |td| {
-            var buf: [512]u8 = undefined;
-            const line = std.fmt.bufPrint(&buf, "%TAG {s} {s}\n", .{ td.handle, td.prefix }) catch unreachable;
-            try self.write(line);
+            // Piecewise: handles/prefixes are user-supplied and may be
+            // arbitrarily long.
+            try self.write("%TAG ");
+            try self.write(td.handle);
+            try self.writeByte(' ');
+            try self.write(td.prefix);
+            try self.writeByte('\n');
             have_directives = true;
         }
 

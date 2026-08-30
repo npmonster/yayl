@@ -19,6 +19,17 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 
 ## Ground rules for changes
 
+- **Work through plumb.** Agents working in this repository MUST use the
+  plumb MCP tools for code work: `session_start` on arrival,
+  `read_file`/`read_multiple_files` (they return mtime/sha for
+  concurrency-checked edits), `edit_file`/`write_file`/`transaction_apply`
+  for changes, `run_task` (`build`/`test`/`verify` slots) instead of shelling
+  out, `diagnostics` after edits, `topology_affected` to pick tests,
+  `rename_symbol`/`move_symbol`/`safe_delete_symbol` for refactors, and the
+  policy-gated `git` tool for commits. Raw shell (`Bash`) is only for things
+  plumb does not cover (e.g. `make verify`, the differential script). This
+  gives every change per-path locking, LSP diagnostics, and reversibility via
+  `undo_edit`.
 - Run `zig build test` before and after any change; the suite must stay green
   with **zero leaks** (tests run under `std.testing.allocator`). The canonical
   gate is `make verify` (fmt + library compile + Debug and ReleaseSafe tests);
@@ -144,3 +155,14 @@ README.md                          user-facing docs
 1. Behavior matches libfyaml for the feature in question (test proves it).
 2. Code follows the conventions above; helpers reused, not duplicated.
 3. `zig build test` green, zero leaks; `PORT NOTE` comments updated/removed.
+
+## Working with plumb
+
+Operate this workspace through the plumb MCP daemon, and start with
+`session_start({workspace: <absolute path>})` — passing a stable
+per-conversation `session_id` (mint one shaped like `dsh-yayl-x7q2`; use your
+harness's conversation id if it states one) on every `session_start`. Several
+conversations share one plumb connection, and plumb keeps workspace pins,
+read-tracking and mail apart only per declared identity: an unidentified
+`session_start` re-pins the connection for every conversation on it. Never
+pass `force: true` to move a pin unless your human asked for that exact move.

@@ -116,6 +116,7 @@ pub fn scalarToValue(alloc: std.mem.Allocator, text: []const u8, style: ScalarSt
             return .{ .bigint = try alloc.dupe(u8, text) };
         },
         .float => {
+            if (floatSpecial(text)) |f| return .{ .float = f };
             const f = std.fmt.parseFloat(f64, text) catch
                 return .{ .string = try alloc.dupe(u8, text) };
             return .{ .float = f };
@@ -136,6 +137,9 @@ pub fn toNode(doc: *Document, value: Value) Error!*Node {
         },
         .bigint => |t| return doc.createScalar(t, .plain),
         .float => |f| {
+            if (std.math.isNan(f)) return doc.createScalar(".nan", .plain);
+            if (std.math.isPositiveInf(f)) return doc.createScalar(".inf", .plain);
+            if (std.math.isNegativeInf(f)) return doc.createScalar("-.inf", .plain);
             var buf: [64]u8 = undefined;
             const text = std.fmt.bufPrint(&buf, "{d}", .{f}) catch unreachable;
             return doc.createScalar(text, .plain);
@@ -403,7 +407,23 @@ test "bigint keeps exact text" {
     try testing.expectEqualStrings("99999999999999999999", big.bigint);
 }
 
-fn freeValue(alloc: std.mem.Allocator, v: Value) void {
+/// YAML's non-finite float spellings -> Zig floats (Zig's parseFloat
+/// rejects the leading dot in `.inf`).
+fn floatSpecial(text: []const u8) ?f64 {
+    const inf = std.math.inf(f64);
+    const map = [_]struct { t: []const u8, v: f64 }{
+        .{ .t = ".inf", .v = inf },               .{ .t = ".Inf", .v = inf },               .{ .t = ".INF", .v = inf },
+        .{ .t = "+.inf", .v = inf },              .{ .t = "+.Inf", .v = inf },              .{ .t = "+.INF", .v = inf },
+        .{ .t = "-.inf", .v = -inf },             .{ .t = "-.Inf", .v = -inf },             .{ .t = "-.INF", .v = -inf },
+        .{ .t = ".nan", .v = std.math.nan(f64) }, .{ .t = ".NaN", .v = std.math.nan(f64) }, .{ .t = ".NAN", .v = std.math.nan(f64) },
+    };
+    for (map) |e| {
+        if (std.mem.eql(u8, text, e.t)) return e.v;
+    }
+    return null;
+}
+
+pub fn freeValue(alloc: std.mem.Allocator, v: Value) void {
     switch (v) {
         .string => |s| alloc.free(s),
         .bigint => |s| alloc.free(s),

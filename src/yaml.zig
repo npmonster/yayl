@@ -185,6 +185,11 @@ test "seeded fuzz: random ASCII input never panics or leaks" {
             for (docs.items) |*d| d.deinit();
             docs.deinit(alloc);
         }
+        // Emission paths (span arithmetic, quoting) get fuzzed too.
+        for (docs.items) |*d| {
+            const out = try d.write(alloc);
+            alloc.free(out);
+        }
     }
 }
 

@@ -49,7 +49,6 @@ pub const Schema = struct {
         key: []const u8,
         schema: *const Schema,
         required: bool = false,
-        allow_unknown: bool = true,
     };
 
     pub const str = Schema{ .kind = .str };
@@ -187,8 +186,8 @@ fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Nod
         .seq => |items| {
             const list = cur.items() orelse return typeErr(alloc, path, "a sequence", out);
             for (list, 0..) |item, i| {
-                var buf: [512]u8 = undefined;
-                const child_path = std.fmt.bufPrint(&buf, "{s}[{d}]", .{ path, i }) catch path;
+                const child_path = try std.fmt.allocPrint(alloc, "{s}[{d}]", .{ path, i });
+                defer alloc.free(child_path);
                 try items.check(alloc, item, child_path, out);
             }
         },
@@ -217,8 +216,8 @@ fn checkSchema(schema: *const Schema, alloc: std.mem.Allocator, node: *const Nod
             // Per-field and unknown-key checks.
             for (pairs) |p| {
                 const kv = p.key.scalarValue() orelse continue;
-                var buf: [512]u8 = undefined;
-                const child_path = std.fmt.bufPrint(&buf, "{s}.{s}", .{ path, kv }) catch kv;
+                const child_path = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, kv });
+                defer alloc.free(child_path);
                 var matched = false;
                 for (fields) |field| {
                     if (std.mem.eql(u8, field.key, kv)) {

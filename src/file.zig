@@ -85,20 +85,34 @@ pub fn writeFile(doc: *const Document, alloc: std.mem.Allocator, io: std.Io, pat
 /// Atomically write raw bytes to `path` (temp file + rename).
 pub fn writeBytesAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
     var buf: [512]u8 = undefined;
-    var rand_bytes: [4]u8 = undefined;
-    io.random(&rand_bytes);
-    const tmp_path = try std.fmt.bufPrint(&buf, "{s}.yayl-tmp-{d}", .{ path, std.mem.readInt(u32, &rand_bytes, .little) });
-    var file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
-    var ok = false;
-    defer if (!ok) {
-        file.close(io);
-        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-    };
-    try file.writeStreamingAll(io, bytes);
-    file.close(io);
-    ok = true;
     const cwd = std.Io.Dir.cwd();
-    try cwd.rename(tmp_path, cwd, path, io);
+    var attempt: usize = 0;
+    while (true) {
+        attempt += 1;
+        var rand_bytes: [4]u8 = undefined;
+        io.random(&rand_bytes);
+        const tmp_path = try std.fmt.bufPrint(&buf, "{s}.yayl-tmp-{d}", .{ path, std.mem.readInt(u32, &rand_bytes, .little) });
+        var file = cwd.createFile(io, tmp_path, .{ .truncate = true, .exclusive = true }) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                if (attempt >= 4) return err;
+                continue;
+            },
+            else => return err,
+        };
+        var ok = false;
+        defer if (!ok) {
+            file.close(io);
+            cwd.deleteFile(io, tmp_path) catch {};
+        };
+        try file.writeStreamingAll(io, bytes);
+        // Flush to stable storage before the rename so the visible
+        // file never contains torn content after a crash.
+        try file.sync(io);
+        file.close(io);
+        ok = true;
+        try cwd.rename(tmp_path, cwd, path, io);
+        return;
+    }
 }
 
 /// Read a whole file, bounded. Returns `error.StreamTooLong` past
