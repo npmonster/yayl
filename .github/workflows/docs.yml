@@ -1,21 +1,17 @@
 # Publishes the generated API reference to GitHub Pages.
 #
-# INERT UNTIL PAGES IS ENABLED. This runs on workflow_dispatch only, so it
-# cannot turn CI red before the repository is ready. To finish wiring it up:
-#
-#   1. Settings -> Pages -> Build and deployment -> Source: GitHub Actions
-#   2. Run this workflow once by hand (Actions tab -> Publish API docs -> Run
-#      workflow) and confirm the deployment succeeds
-#   3. Add the tag trigger, so every release publishes its own docs:
-#
-#        push:
-#          tags: ['v*']
+# Pages is enabled with GitHub Actions as the source, and the site is live at
+# https://npmonster.github.io/yayl/. Tagging a release republishes it.
 #
 # Kept separate from ci.yml deliberately: a docs deployment failing should
 # never be able to fail the gate that decides whether the library is correct.
 name: docs
 
 on:
+  # Every release publishes its own docs.
+  push:
+    tags: ['v*']
+  # Kept so the site can be rebuilt without cutting a tag.
   workflow_dispatch:
 
 permissions:
