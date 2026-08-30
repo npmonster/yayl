@@ -292,7 +292,14 @@ pub const Document = struct {
     /// Parse the first document of `input`. Extra documents in the same
     /// stream are ignored; use `parseAll` for multi-document streams.
     pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Document {
-        var p = try Parser.init(allocator, null, input);
+        return parseDiag(allocator, input, null);
+    }
+
+    /// Like `parse`, additionally recording a positioned diagnostic per
+    /// problem in `d`. The error return is unchanged; on success `d`
+    /// stays empty.
+    pub fn parseDiag(allocator: std.mem.Allocator, input: []const u8, d: ?*diag.Diag) !Document {
+        var p = try Parser.init(allocator, d, input);
         defer p.deinit();
         var docs = try parseStream(allocator, &p, 1, input);
         defer docs.deinit(allocator);
@@ -302,7 +309,13 @@ pub const Document = struct {
 
     /// Parse every document in `input`.
     pub fn parseAll(allocator: std.mem.Allocator, input: []const u8) !std.ArrayList(Document) {
-        var p = try Parser.init(allocator, null, input);
+        return parseAllDiag(allocator, input, null);
+    }
+
+    /// Like `parseAll`, additionally recording positioned diagnostics
+    /// in `d`.
+    pub fn parseAllDiag(allocator: std.mem.Allocator, input: []const u8, d: ?*diag.Diag) !std.ArrayList(Document) {
+        var p = try Parser.init(allocator, d, input);
         defer p.deinit();
         return parseStream(allocator, &p, null, input);
     }

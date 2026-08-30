@@ -16,6 +16,7 @@
 //! `1.0` is a conversion error.
 
 const std = @import("std");
+const diag_mod = @import("diag.zig");
 const document_mod = @import("document.zig");
 const token_mod = @import("token.zig");
 
@@ -52,21 +53,16 @@ pub const Value = union(enum) {
     }
 };
 
-pub const Error = error{
-    TypeMismatch,
-    UnsupportedType,
-    OutOfMemory,
-    /// Re-exported so callers can catch whole-parse failures uniformly.
-    InvalidSyntax,
-    InvalidUtf8,
-};
+/// Conversion failures (`TypeMismatch`, `UnsupportedType`) and OOM,
+/// plus the library's whole `YamlError` vocabulary: parse failures
+/// keep their identity (bad UTF-8 input is `InvalidUtf8`, not a
+/// generic syntax error).
+pub const Error = error{ TypeMismatch, UnsupportedType, OutOfMemory } || diag_mod.YamlError;
 
-/// Parse the first document of `input` into a Value.
+/// Parse the first document of `input` into a Value. Parse failures
+/// keep their real error (`InvalidUtf8`, `InvalidSyntax`, ...).
 pub fn parseToValue(alloc: std.mem.Allocator, input: []const u8) Error!Value {
-    var doc = document_mod.Document.parse(alloc, input) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidSyntax,
-    };
+    var doc = try document_mod.Document.parse(alloc, input);
     defer doc.deinit();
     const root = doc.root orelse return .null_;
     return nodeToValue(alloc, root);
@@ -440,4 +436,9 @@ pub fn freeValue(alloc: std.mem.Allocator, v: Value) void {
         },
         else => {},
     }
+}
+
+test "parseToValue keeps the real parse error" {
+    try testing.expectError(error.InvalidUtf8, parseToValue(testing.allocator, "a: \xff\xfe\n"));
+    try testing.expectError(error.InvalidSyntax, parseToValue(testing.allocator, "a: b\n  c: d\n"));
 }

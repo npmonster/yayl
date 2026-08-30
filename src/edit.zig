@@ -276,7 +276,10 @@ pub const Editor = struct {
         switch (edit) {
             .set => |s| try applySet(doc, s.path, s.value),
             .delete => |path| {
-                _ = ed.one(path) catch return; // no match: no-op
+                _ = ed.one(path) catch |err| {
+                    try noopOrOOM(err);
+                    return; // no match: no-op
+                };
                 try applyDelete(doc, path);
             },
             .insert => |ins| try applyInsert(doc, ins),
@@ -344,10 +347,20 @@ pub const Editor = struct {
             }
         }
         switch (p.segments[p.segments.len - 1]) {
-            .key => |k| _ = doc.mappingRemove(cur, k) catch return,
-            .index => |ix| _ = doc.sequenceRemove(cur, ix) catch return,
+            .key => |k| _ = doc.mappingRemove(cur, k) catch |err| try noopOrOOM(err),
+            .index => |ix| _ = doc.sequenceRemove(cur, ix) catch |err| try noopOrOOM(err),
             else => return error.AmbiguousOperation,
         }
+    }
+
+    /// A delete that matches nothing is a no-op (documented `Edit`
+    /// semantics); OOM must propagate so an atomic batch rolls back
+    /// instead of silently "succeeding".
+    fn noopOrOOM(err: anyerror) Error!void {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => {},
+        };
     }
 
     fn applyInsert(doc: *Document, ins: anytype) Error!void {
@@ -639,7 +652,7 @@ test "batch success applies every edit" {
     try testing.expectEqualStrings("a: 10\nc: 3\n", out);
 }
 
-test "allocation failures in batch leak nothing" {
+test "set and append batch" {
     var doc = try Document.parse(testing.allocator, "a: 1\nb:\n  - x\n");
     defer doc.deinit();
     var ed = Editor.init(&doc);
@@ -651,4 +664,30 @@ test "allocation failures in batch leak nothing" {
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("a: 2\nb:\n  - x\n  - y\n", out);
+}
+
+test "deleting a missing path is a no-op" {
+    var doc = try Document.parse(testing.allocator, "a: 1\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{.{ .delete = "$.missing" }});
+    try ed.apply(&.{.{ .delete = "$.a.deep" }}); // scalar in the middle
+    try ed.apply(&.{.{ .delete = "$.a[0]" }}); // index into a scalar
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a: 1\n", out);
+}
+
+test "allocation failures in a delete batch propagate and leak nothing" {
+    try std.testing.checkAllAllocationFailures(testing.allocator, deleteBatch, .{});
+}
+
+fn deleteBatch(alloc: std.mem.Allocator) !void {
+    var doc = try Document.parse(alloc, "a: 1\nb: 2\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{.{ .delete = "$.b" }});
+    const out = try doc.write(alloc);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("a: 1\n", out);
 }

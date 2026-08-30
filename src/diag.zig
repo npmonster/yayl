@@ -83,6 +83,9 @@ pub const YamlError = error{
     NestingTooDeep,
     /// Alias would create a reference cycle during expansion.
     AliasCycle,
+    /// A codepoint being encoded has no UTF-8 representation (a
+    /// surrogate half or a value above U+10FFFF).
+    InvalidCodepoint,
 };
 
 /// Diagnostic collector — the fy_diag equivalent.

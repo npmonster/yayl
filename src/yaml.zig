@@ -67,6 +67,30 @@ pub fn parseAll(allocator: std.mem.Allocator, input: []const u8) !std.ArrayList(
     return Document.parseAll(allocator, input);
 }
 
+/// Like `parse`, additionally recording a positioned diagnostic per
+/// problem in `d` (line, column, message). The error return is
+/// unchanged — `d` carries the human-readable detail, e.g.:
+///
+/// ```zig
+/// var d: yaml.Diag = .{ .alloc = allocator };
+/// defer d.deinit();
+/// if (yaml.parseDiag(allocator, input, &d)) |doc| {
+///     var document = doc;
+///     defer document.deinit();
+/// } else |err| {
+///     const report = try d.render(allocator); // "2:3: error: ..."
+///     defer allocator.free(report);
+/// }
+/// ```
+pub fn parseDiag(allocator: std.mem.Allocator, input: []const u8, d: *Diag) !Document {
+    return Document.parseDiag(allocator, input, d);
+}
+
+/// Like `parseAll`, additionally recording positioned diagnostics in `d`.
+pub fn parseAllDiag(allocator: std.mem.Allocator, input: []const u8, d: *Diag) !std.ArrayList(Document) {
+    return Document.parseAllDiag(allocator, input, d);
+}
+
 test {
     _ = diag;
     _ = pool;
@@ -116,6 +140,23 @@ test "invalid input surfaces a yaml error" {
     const alloc = std.testing.allocator;
     const r = parse(alloc, "a: b\n  c: d\n"); // bad indentation
     try std.testing.expectError(error.InvalidSyntax, r);
+}
+
+test "parseDiag surfaces positioned diagnostics" {
+    const alloc = std.testing.allocator;
+    var d: Diag = .{ .alloc = alloc };
+    defer d.deinit();
+    const r = parseDiag(alloc, "a: b\n  c: d\n", &d);
+    try std.testing.expectError(error.InvalidSyntax, r);
+    try std.testing.expect(d.list.items.len > 0);
+    try std.testing.expect(d.list.items[0].mark.line >= 1);
+
+    // Valid input records nothing.
+    var d2: Diag = .{ .alloc = alloc };
+    defer d2.deinit();
+    var doc = try parseDiag(alloc, "ok: 1\n", &d2);
+    defer doc.deinit();
+    try std.testing.expectEqual(@as(usize, 0), d2.list.items.len);
 }
 
 test "multi-document stream" {
