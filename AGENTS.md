@@ -22,9 +22,8 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 - **Work through plumb**. All code work goes through the plumb MCP
   daemon; setup and the full tool policy are in [Working with plumb](#working-with-plumb) at the end of this file.
 - Run `zig build test` before and after any change; the suite must stay green
-  with **zero leaks** (tests run under `std.testing.allocator`). The canonical
-  gate is `make verify` (fmt + library compile + Debug and ReleaseSafe tests);
-  CI runs the same on Zig 0.16.0.
+  with **zero leaks** (tests run under `std.testing.allocator`). CI runs the
+  canonical `make verify` gate on Zig 0.16.0.
 - OOM paths are real code: anything that registers a fresh allocation must
   `errdefer` it (seven real leaks were found this way). Public allocating
   operations are covered by `std.testing.checkAllAllocationFailures`.
@@ -44,6 +43,41 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 - Tests: keep them in the same file as the code (Zig convention). The root
   `src/yaml.zig` `test { _ = <module>; }` block pulls every module's tests in;
   new modules must be added there.
+
+### Verification and shared-checkout discipline
+
+- `zig build check` cannot validate visibility or signature changes that only
+  become reachable through `src/edit.zig`; run `zig build test` for those
+  changes.
+- `make verify` covers formatting, library compilation, Debug and ReleaseSafe
+  tests, conformance, unchanged round trips, and edit preservation.
+- Parsing, differential, and unchanged round-trip gates do not exercise edits;
+  `zig build preservation` is the edit gate.
+- Prove every regression test red without its fix, verify CI-only behaviour in
+  CI, and remeasure reported counts instead of copying stale totals.
+- In a shared checkout, check sessions and claims, share intent before editing,
+  and commit completed work immediately. Normally use `git commit -- <paths>`:
+  a bare `git commit` consumes the whole index, including another session's
+  staged work.
+- Never stash, overwrite the live tree with `cp`, or run
+  `git checkout -- <file>` without first proving the target clean; each can
+  discard another session's uncommitted work. Use a detached worktree for
+  before/after comparisons.
+- If overlap on a dirty file is unavoidable, build the intended file in a
+  detached worktree or temporary path, then stage its blob without touching the
+  live file:
+
+  ```sh
+  blob=$(git hash-object -w /absolute/path/to/prepared-file)
+  git update-index --cacheinfo 100644 "$blob" path/to/file
+  git diff --cached -- path/to/file
+  git diff --cached --name-only
+  git commit -m "message"
+  ```
+
+  This is the one index-only exception to path-limited commits: the final bare
+  commit is intentional because `git commit -- <paths>` would read the dirty
+  working-tree file again. The whole index must contain only the reviewed blob.
 
 ## Module map and conversion status
 
