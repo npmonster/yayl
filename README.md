@@ -26,7 +26,7 @@ It has since grown its own editing API, value runtime, schema layer, and file I/
 
 ## Requirements
 
-Zig 0.16.0 or later in the 0.16 series.
+Zig 0.16.x is supported; `build.zig.zon` sets 0.16.0 as the minimum, and CI pins 0.16.0 exactly.
 
 ## Install
 
