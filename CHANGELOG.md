@@ -81,11 +81,8 @@ one that cannot follow, being a declaration rather than a field.
   document why calling them from outside the library corrupts a
   document: the two `drop*` functions must run before an entry is
   detached, because the span is derived from where the next entry
-  starts. They stay `pub` because `edit.zig` needs them and Zig has no
-  module-internal visibility.
-- The path grammar's inability to address a key containing `.`, `[` or
-  `]` is documented in the usage guide rather than only counted inside
-  the preservation harness.
+  starts. They stay `pub` because `edit.zig` calls them across a file
+  boundary and `pub` in Zig is file-granular.
 
 
 ### Fixed

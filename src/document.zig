@@ -466,8 +466,10 @@ pub const Document = struct {
     /// from source and your change is silently dropped — that omission is
     /// what made `move` a silent copy until 9162c7d. Use `mappingAppend`.
     ///
-    /// `pub` only because `edit.zig` needs it; Zig has no module-internal
-    /// visibility. Not part of the supported API.
+    /// `pub` only because `edit.zig` calls it across a file boundary and
+    /// `pub` in Zig is file-granular. Not part of the supported API.
+    /// Moving these into a file the module root never re-exports would
+    /// make them unreachable to consumers; that refactor is not done yet.
     pub fn attachPair(self: *Document, map: *Node, key: *Node, value: *Node) !void {
         switch (map.data) {
             .mapping => |*m| {
