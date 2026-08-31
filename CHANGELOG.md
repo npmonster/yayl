@@ -21,7 +21,7 @@ series; APIs may still move, and anything that does is listed here.
   the usage guide": it is now fixed rather than documented. The
   preservation sweep's unaddressable count goes from 25 to 0 on the
   fixtures and 52 to 0 on the variants; the 21 remaining on the corpus
-  are complex `? key` mappings, which have no path form at all.
+  are explicit `? key` mappings, which have no path form at all.
 
 ### Fixed
 
@@ -92,6 +92,9 @@ one that cannot follow, being a declaration rather than a field.
   detached, because the span is derived from where the next entry
   starts. They stay `pub` because `edit.zig` calls them across a file
   boundary and `pub` in Zig is file-granular.
+- The path grammar's inability to address a key containing `.`, `[` or
+  `]` is documented in the usage guide rather than only counted inside
+  the preservation harness.
 
 
 ### Fixed
@@ -301,5 +304,5 @@ aarch64-linux.
 
 Foundation: pool, diagnostics, UTF-8, character classes, token/scanner
 layer, event parser, document model with builder, and the emitter —
-with the PLAN-9 quality pass (build/CI gates, ownership model, error
+with the quality pass (build/CI gates, ownership model, error
 vocabulary, allocation-failure testing).

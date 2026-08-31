@@ -100,7 +100,7 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 ### Scanner status
 
 The full pinned yaml-test-suite corpus passes (351/351, zero skips):
-complex keys, tab strictness (column-0 tabs indenting constructs are
+explicit keys, tab strictness (column-0 tabs indenting constructs are
 rejected; separation tabs are fine), flow/quoted continuation
 indentation bounds, block scalar folding/indentation indicators.
 `make verify` and `make roundtrip` keep it honest (stale-skip guard).
