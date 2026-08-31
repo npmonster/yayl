@@ -19,6 +19,7 @@
 const std = @import("std");
 const document_mod = @import("document.zig");
 const emitter_mod = @import("emitter.zig");
+const internal = @import("internal.zig");
 
 const Document = document_mod.Document;
 const Node = document_mod.Node;
@@ -510,7 +511,7 @@ pub const Editor = struct {
                 .mapping => |*m| {
                     for (m.pairs.items, 0..) |p, i| {
                         if (p.value == node) {
-                            try doc.dropPairSpan(parent, p);
+                            try internal.dropPairSpan(doc, parent, p);
                             _ = m.pairs.orderedRemove(i);
                             doc.markModified(parent);
                             break;
@@ -520,7 +521,7 @@ pub const Editor = struct {
                 .sequence => |*sq| {
                     for (sq.items.items, 0..) |item, i| {
                         if (item == node) {
-                            try doc.dropItemSpan(parent, node);
+                            try internal.dropItemSpan(doc, parent, node);
                             _ = sq.items.orderedRemove(i);
                             doc.markModified(parent);
                             break;
@@ -585,7 +586,7 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node)) Er
             for (m.pairs.items) |p| {
                 const k = try cloneNode(doc, p.key, anchors);
                 const v = try cloneNode(doc, p.value, anchors);
-                try doc.attachPair(n, k, v);
+                try internal.attachPair(doc, n, k, v);
                 // Preserve the pair's original extent.
                 if (n.data == .mapping) {
                     const pairs = n.data.mapping.pairs.items;
@@ -601,7 +602,7 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node)) Er
             if (node.anchor) |a| try anchors.put(try doc.pool.dupe(a), n);
             for (sq.items.items) |item| {
                 const child = try cloneNode(doc, item, anchors);
-                try doc.attachItem(n, child);
+                try internal.attachItem(doc, n, child);
             }
             for (sq.dropped.items) |d| {
                 try n.data.sequence.dropped.append(doc.pool.allocator(), d);

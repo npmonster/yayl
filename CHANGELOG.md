@@ -5,6 +5,21 @@ series; APIs may still move, and anything that does is listed here.
 
 ## Unreleased
 
+### Changed
+
+- The INTERNAL document-model plumbing — `attachPair`, `attachItem`,
+  `dropPairSpan`, `dropItemSpan` — moved from `Document` methods to free
+  functions in `src/internal.zig`, a file the module root never
+  re-exports. They were always documented as unsupported (`pub` only
+  because `edit.zig` calls them across a file boundary), but as methods
+  they travelled with the flattened `yaml.Document` type and stayed
+  reachable to downstream consumers. Now `yaml.Document.attachPair` (and
+  every other route: `yaml.document.*`, `yaml.internal`, reflection over
+  the decl lists) is a compile error. No supported API changed; a
+  consumer that was calling these had no correctness guarantee anyway —
+  the `attach*` pair skips `markModified`, which silently drops the
+  edit on re-emission.
+
 ### Added
 
 - Quoted path segments: `$["a.b"]` and `$['a.b']` address a key

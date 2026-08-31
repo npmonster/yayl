@@ -9,6 +9,7 @@ const std = @import("std");
 const ctype = @import("ctype.zig");
 const diag = @import("diag.zig");
 const event_mod = @import("event.zig");
+const internal = @import("internal.zig");
 const markup = @import("markup.zig");
 const parser_mod = @import("parser.zig");
 const pool_mod = @import("pool.zig");
@@ -454,51 +455,20 @@ pub const Document = struct {
     // Mutation (fy_node_* insert equivalents)
     // ------------------------------------------------------------------
 
+    // The structural attach/drop plumbing (`attachPair`, `attachItem`,
+    // `dropPairSpan`, `dropItemSpan`) lives in `internal.zig` as free
+    // functions, so it is unreachable from outside the module.
+
     /// Append a key/value pair to a mapping node, maintaining parent links.
     pub fn mappingAppend(self: *Document, map: *Node, key: *Node, value: *Node) !void {
-        try self.attachPair(map, key, value);
+        try internal.attachPair(self, map, key, value);
         self.markModified(map);
-    }
-
-    /// INTERNAL. Structural append that deliberately skips the `modified`
-    /// mark, for the builder composing a parsed tree. Calling this from
-    /// outside leaves the subtree looking clean, so it re-emits verbatim
-    /// from source and your change is silently dropped — that omission is
-    /// what made `move` a silent copy until 9162c7d. Use `mappingAppend`.
-    ///
-    /// `pub` only because `edit.zig` calls it across a file boundary and
-    /// `pub` in Zig is file-granular. Not part of the supported API.
-    /// Moving these into a file the module root never re-exports would
-    /// make them unreachable to consumers; that refactor is not done yet.
-    pub fn attachPair(self: *Document, map: *Node, key: *Node, value: *Node) !void {
-        switch (map.data) {
-            .mapping => |*m| {
-                try m.pairs.append(self.pool.allocator(), .{ .key = key, .value = value });
-                key.parent = map;
-                value.parent = map;
-            },
-            else => return error.InvalidSyntax,
-        }
     }
 
     /// Append an item to a sequence node, maintaining parent links.
     pub fn sequenceAppend(self: *Document, seq: *Node, item: *Node) !void {
-        try self.attachItem(seq, item);
+        try internal.attachItem(self, seq, item);
         self.markModified(seq);
-    }
-
-    /// INTERNAL. Structural append without the `modified` mark. Same
-    /// hazard as `attachPair`; use `sequenceAppend`.
-    ///
-    /// `pub` only because `edit.zig` needs it. Not part of the supported API.
-    pub fn attachItem(self: *Document, seq: *Node, item: *Node) !void {
-        switch (seq.data) {
-            .sequence => |*s| {
-                try s.items.append(self.pool.allocator(), item);
-                item.parent = seq;
-            },
-            else => return error.InvalidSyntax,
-        }
     }
 
     /// Insert an item into a sequence at `index`.
@@ -521,7 +491,7 @@ pub const Document = struct {
             .mapping => |*m| {
                 for (m.pairs.items, 0..) |p, i| {
                     if (std.mem.eql(u8, p.key.scalarValue() orelse continue, key)) {
-                        try self.dropPairSpan(map, p);
+                        try internal.dropPairSpan(self, map, p);
                         const removed = m.pairs.orderedRemove(i);
                         removed.value.parent = null;
                         removed.key.parent = null;
@@ -543,162 +513,13 @@ pub const Document = struct {
                 // Tombstone BEFORE detaching: the span depends on where
                 // the following item starts (as in `mappingRemove`).
                 const removed = s.items.items[index];
-                try self.dropItemSpan(seq, removed);
+                try internal.dropItemSpan(self, seq, removed);
                 _ = s.items.orderedRemove(index);
                 removed.parent = null;
                 self.markModified(seq);
                 return removed;
             },
             else => return error.InvalidSyntax,
-        }
-    }
-
-    /// Source offset where the entry after `p` begins, or null when `p`
-    /// is the last (or is not found).
-    fn nextEntryStart(m: anytype, p: Pair) ?usize {
-        for (m.pairs.items, 0..) |q, i| {
-            if (q.key != p.key) continue;
-            if (i + 1 >= m.pairs.items.len) return null;
-            const ns = m.pairs.items[i + 1].key.src orelse return null;
-            if (ns.synthetic) return null;
-            return ns.start;
-        }
-        return null;
-    }
-
-    /// Source offset where the item after `item` begins, or null when
-    /// `item` is the last (or is not found).
-    fn nextItemStart(s: anytype, item: *const Node) ?usize {
-        for (s.items.items, 0..) |q, i| {
-            if (q != item) continue;
-            if (i + 1 >= s.items.items.len) return null;
-            const ns = s.items.items[i + 1].src orelse return null;
-            if (ns.synthetic) return null;
-            return ns.entry_start;
-        }
-        return null;
-    }
-
-    /// True when `s` is only spaces, tabs and line breaks.
-    fn isBlankRun(s: []const u8) bool {
-        return std.mem.indexOfNone(u8, s, " \t\r\n") == null;
-    }
-
-    /// Record a tombstoned byte range, keeping the list ASCENDING by
-    /// start. Emission walks a container's bytes in document order and
-    /// skips tombstones as it passes them (emitter `writeGap`), so a
-    /// range appended out of order would resurrect the deleted bytes
-    /// it covers — and edits applied after an earlier one can easily
-    /// detach entries in reverse document order.
-    fn dropRange(self: *Document, drops: *std.ArrayList([2]usize), from: usize, to: usize) !void {
-        var i: usize = 0;
-        while (i < drops.items.len and drops.items[i][0] < from) i += 1;
-        try drops.insert(self.pool.allocator(), i, .{ from, to });
-    }
-
-    /// INTERNAL. Tombstone the source bytes a mapping entry occupied.
-    ///
-    /// MUST run BEFORE the entry is detached: the span is derived from
-    /// where the NEXT entry starts, and the fate of a `- ` sequence
-    /// indicator on the same line is decided from the successor. Called
-    /// after detaching, it tombstones the wrong bytes silently. Returns
-    /// early for flow containers — an emitter gap-walk invariant, not a
-    /// document-model one.
-    ///
-    /// `pub` only because `edit.zig` needs it. Not part of the supported API.
-    pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
-        const src = self.source orelse return;
-        const ks = p.key.src orelse return;
-        if (ks.synthetic) return;
-        switch (map.data) {
-            .mapping => |*m| {
-                // A flow collection re-emits normalized from the tree, so
-                // it has no verbatim bytes to skip. Its entries share a
-                // line with the parent's `key:`, so a line-range
-                // tombstone would swallow those bytes too.
-                if (m.style == .flow) return;
-                var from = markup.lineStart(src, ks.entry_start);
-                var to = markup.lineEnd(src, p.src_end orelse ks.end);
-                // A mapping that is a sequence item carries the `- `
-                // indicator in its FIRST entry's leading bytes, but the
-                // indicator belongs to the item and outlives the entry.
-                // Leave it in place and consume the successor's own
-                // indentation instead, so it moves up onto that line
-                // (`- name: x` + `  port: 1` -> `- port: 1`). Only when
-                // nothing but blanks separates them: a comment in
-                // between has to stay where the author put it.
-                if (ks.entry_start < ks.start) {
-                    if (nextEntryStart(m, p)) |nx| {
-                        if (nx >= to and isBlankRun(src[to..nx])) {
-                            from = ks.start;
-                            to = nx;
-                        } else {
-                            // Something the author wrote — a comment —
-                            // sits between the two entries and has to
-                            // stay where it is, so the successor cannot
-                            // move up. Keep the indicator on its own
-                            // line (dropping the space after it) and
-                            // remove only this entry's own text.
-                            from = ks.start;
-                            while (from > ks.entry_start and src[from - 1] == ' ') from -= 1;
-                            to = markup.newlineAt(src, p.src_end orelse ks.end);
-                        }
-                    } else {
-                        // No successor at all: this entry was the item's
-                        // only one, so the mapping empties and re-emits
-                        // as `{}`. The item itself survives -- it just
-                        // becomes `- {}` -- so the indicator has to stay
-                        // put. Taking the whole line, indicator and all,
-                        // deletes a sequence entry nobody asked to
-                        // delete and leaves the `{}` dangling at the
-                        // parent's column, which does not parse.
-                        from = ks.start;
-                        to = markup.newlineAt(src, p.src_end orelse ks.end);
-                    }
-                }
-                if (to <= from) return;
-                // Losing a tombstone to OOM would resurrect the deleted
-                // entry verbatim on the next write: propagate the error.
-                try self.dropRange(&m.dropped, from, to);
-            },
-            else => {},
-        }
-    }
-
-    /// INTERNAL. Tombstone the source bytes a sequence entry occupied.
-    /// Same ordering requirement as `dropPairSpan`: the span depends on
-    /// where the next entry starts, so it must run before the item is
-    /// detached. Returns early for flow containers.
-    ///
-    /// `pub` only because `edit.zig` needs it. Not part of the supported API.
-    pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
-        const src = self.source orelse return;
-        const is = item.src orelse return;
-        if (is.synthetic) return;
-        switch (seq.data) {
-            .sequence => |*s| {
-                // Flow items share their line with the parent's `key:`
-                // (see dropPairSpan).
-                if (s.style == .flow) return;
-                var from = markup.lineStart(src, is.entry_start);
-                var to = markup.lineEnd(src, is.end);
-                // A nested sequence (`- - a`) puts an OUTER item's
-                // indicator on this item's line. That indicator belongs
-                // to the outer item and outlives this one, so leave it
-                // and consume the successor's indentation instead
-                // (see dropPairSpan for the mapping equivalent).
-                if (std.mem.indexOfScalar(u8, src[from..is.entry_start], '-') != null) {
-                    if (nextItemStart(s, item)) |nx| {
-                        if (nx >= to and isBlankRun(src[to..nx])) {
-                            from = is.entry_start;
-                            to = nx;
-                        }
-                    }
-                }
-                if (to <= from) return;
-                try self.dropRange(&s.dropped, from, to);
-            },
-            else => {},
         }
     }
 
@@ -1055,12 +876,12 @@ const Builder = struct {
         const frame = &self.stack.items[self.stack.items.len - 1];
         switch (frame.node.data) {
             .sequence => {
-                try self.doc.attachItem(frame.node, n);
+                try internal.attachItem(self.doc, frame.node, n);
                 self.growSpan(frame.node, n.src orelse return);
             },
             .mapping => {
                 if (frame.pending_key) |key| {
-                    try self.doc.attachPair(frame.node, key, n);
+                    try internal.attachPair(self.doc, frame.node, key, n);
                     // A valueless pair ends at its ':'; a synthesized
                     // empty value's own span points at the next token
                     // and must not be trusted.
