@@ -733,6 +733,35 @@ pub const Document = struct {
         return cur;
     }
 
+    /// Replace one recoverable flow-sequence slot without changing its
+    /// position or separator layout. The replacement inherits the old
+    /// item's exact byte bounds; false means the caller must use ordinary
+    /// remove/insert semantics.
+    ///
+    /// `pub` only because `edit.zig` calls it across a file boundary and
+    /// `pub` in Zig is file-granular. Not part of the supported API.
+    pub fn sequenceReplace(self: *Document, seq: *Node, index: usize, value: *Node) bool {
+        switch (seq.data) {
+            .sequence => |*s| {
+                if (s.style != .flow or index >= s.items.items.len) return false;
+                const old = s.items.items[index];
+                const old_src = old.src orelse return false;
+                if (old_src.synthetic) return false;
+
+                value.parent = seq;
+                value.src = .{
+                    .entry_start = old_src.entry_start,
+                    .start = old_src.entry_start,
+                    .end = old_src.end,
+                };
+                s.items.items[index] = value;
+                self.markModified(value);
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     /// Replace the existing value node `existing` (a value of `map`)
     /// with `value`, preserving pair order and the key node. Returns
     /// false when `existing` is not a value of `map`.

@@ -23,6 +23,15 @@ series; APIs may still move, and anything that does is listed here.
   fixtures and 52 to 0 on the variants; the 21 remaining on the corpus
   are complex `? key` mappings, which have no path form at all.
 
+### Fixed
+
+- `Editor.set` no longer collapses a recoverable flow sequence when replacing
+  a scalar or alias: multi-line spacing, comments, commas, trailing commas, and
+  surrounding sibling bytes stay exact. The replacement inherits the old
+  item's non-synthetic slot span, including its property bytes, so removed
+  anchors and tags cannot reappear. Flow insertion and removal still require
+  comma reflow and remain outside this preservation path.
+
 ## 0.11.0 — 2026-08-31
 
 ### Changed

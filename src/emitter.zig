@@ -17,10 +17,10 @@
 //! PORT NOTE: libfyaml's CST covers every byte including intra-node
 //! layout; this port keeps per-node/entry spans, so some re-emitted
 //! subtrees normalize their internal layout. Untouched bytes are
-//! exact. A multi-line flow mapping now survives a value change (see
-//! `flowLayoutRecoverable`); adding or removing a flow entry, or
-//! replacing a flow sequence item, still collapses the collection,
-//! because there is no original slot left to write the entry into.
+//! exact. A multi-line flow mapping and a recoverable flow-sequence
+//! replacement survive a value change (see `flowLayoutRecoverable`).
+//! Actual insertion or removal, including an explicit remove-plus-insert,
+//! still collapses the collection because separators must be re-flowed.
 //!
 //! A subtree with no span at all -- brand-new, or moved, since `move`
 //! clears the span that described the old location -- has no layout to
@@ -1071,9 +1071,9 @@ pub const Emitter = struct {
             .sequence => |*sq| {
                 if (sq.items.items.len == 0) return false;
                 for (sq.items.items) |item| {
-                    // A replaced sequence item keeps no span, and a flow
-                    // container records no tombstone to recover the slot
-                    // from, so there is nothing left to write into.
+                    // `Editor.set` transfers a recoverable original slot
+                    // to its replacement. Raw remove/insert operations do
+                    // not, so they still fail this check and normalize.
                     const is = item.src orelse return false;
                     if (is.synthetic) return false;
                     if (!self.nodeClean(item) and !rewritableInFlow(item)) return false;
@@ -1093,7 +1093,10 @@ pub const Emitter = struct {
 
     /// A changed entry we can write back into a flow slot: a scalar or
     /// an alias, carrying no properties of its own.
-    fn rewritableInFlow(node: *Node) bool {
+    ///
+    /// `pub` only so `edit.zig` can use the emitter's exact eligibility
+    /// rule across the file boundary. Not part of the supported API.
+    pub fn rewritableInFlow(node: *Node) bool {
         if (node.anchor != null or node.tag != null) return false;
         return switch (node.data) {
             .scalar, .alias => true,
@@ -1674,12 +1677,11 @@ test "a modified multi-line flow mapping keeps its layout" {
 }
 
 test "flow collections normalize when the layout cannot carry the change" {
-    // The boundary, pinned deliberately. Preserving layout means writing
-    // each surviving entry back into its own slot; when an entry is
-    // added or removed there is no slot to write into, and separators
-    // would have to be re-flowed around the hole. That is a different
-    // job, so those still collapse to one line -- correct, just not
-    // layout-preserving.
+    // The boundary, pinned deliberately. `Editor.set` can preserve a
+    // recoverable flow-sequence slot, but actual insertion or removal has
+    // no slot to write into and separators must be re-flowed around the
+    // change. Those operations still collapse to one line -- correct,
+    // just not layout-preserving.
     {
         // Deleting an entry: the gap between survivors would still hold
         // the departed entry's bytes, which `flowFillerCommas` detects.
@@ -1691,12 +1693,12 @@ test "flow collections normalize when the layout cannot carry the change" {
         try testing.expectEqualStrings("m: {b: 2}\n", out);
     }
     {
-        // A replaced SEQUENCE item keeps no span, and a flow container
-        // records no tombstone, so its slot is unrecoverable.
+        // An explicit remove-plus-insert keeps no span, and a flow
+        // container records no tombstone, so its slot is unrecoverable.
         var doc = try Document.parse(testing.allocator, "s: [\n  alpha,\n  beta,\n  ]\n");
         defer doc.deinit();
-        // What `Editor.set` on an index does underneath: drop the item
-        // and splice a replacement in at the same position.
+        // Deliberately exercise the raw operations rather than
+        // `Editor.set`, whose eligible replacement path preserves a slot.
         const seq = doc.pathGet(&.{"s"}).?;
         _ = (try doc.sequenceRemove(seq, 1)).?;
         try doc.sequenceInsert(seq, 1, try doc.createScalar("Z", .plain));

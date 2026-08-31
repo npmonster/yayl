@@ -1895,6 +1895,70 @@ fn findFirstScalar(ed: *yaml.edit.Editor, node: *yaml.Node, comps: *std.ArrayLis
     }
 }
 
+test "flow-sequence replacements preserve exact slots and surrounding bytes" {
+    const input =
+        \\before: keep
+        \\flow: [
+        \\  &first !!str alpha  , # first separator
+        \\  beta , # middle separator
+        \\  !!str &last gamma , # trailing comma
+        \\  ]
+        \\after: keep
+        \\
+    ;
+    const Case = struct {
+        path: []const u8,
+        value: []const u8,
+        want: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .path = "$.flow[0]",
+            .value = "FIRST",
+            .want =
+            \\before: keep
+            \\flow: [
+            \\  FIRST  , # first separator
+            \\  beta , # middle separator
+            \\  !!str &last gamma , # trailing comma
+            \\  ]
+            \\after: keep
+            \\
+            ,
+        },
+        .{
+            .path = "$.flow[2]",
+            .value = "LAST",
+            .want =
+            \\before: keep
+            \\flow: [
+            \\  &first !!str alpha  , # first separator
+            \\  beta , # middle separator
+            \\  LAST , # trailing comma
+            \\  ]
+            \\after: keep
+            \\
+            ,
+        },
+    };
+
+    for (cases) |case| {
+        var doc = try yaml.parse(std.testing.allocator, input);
+        defer doc.deinit();
+        var ed = yaml.edit.Editor.init(&doc);
+        try ed.set(case.path, try doc.createScalar(case.value, .plain));
+
+        const out = try doc.write(std.testing.allocator);
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(case.want, out);
+
+        var reparsed = try yaml.parse(std.testing.allocator, out);
+        defer reparsed.deinit();
+        var check = yaml.edit.Editor.init(&reparsed);
+        try std.testing.expectEqualStrings(case.value, (try check.one(case.path)).scalarValue().?);
+    }
+}
+
 test "preservation sweep: bounded edits over every valid corpus document" {
     // Leak-checking allocator WITHOUT per-allocation stack traces (see
     // the fixture sweep above for the cost arithmetic).

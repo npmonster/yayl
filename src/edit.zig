@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const document_mod = @import("document.zig");
+const emitter_mod = @import("emitter.zig");
 
 const Document = document_mod.Document;
 const Node = document_mod.Node;
@@ -397,12 +398,19 @@ pub const Editor = struct {
                 const cur = try setContainer(doc, parent, false);
                 if (!cur.isSequence()) return error.NotASequence;
                 if (cur.items()) |items| {
-                    if (ix < items.len and sameScalarPresentation(items[ix], value)) return;
+                    if (ix < items.len) {
+                        if (sameScalarPresentation(items[ix], value)) return;
+                        if (emitter_mod.Emitter.rewritableInFlow(value) and
+                            doc.sequenceReplace(cur, ix, value))
+                        {
+                            return;
+                        }
+                    }
                 }
-                // Tombstone the old item's line, drop it, and splice the
-                // replacement in at the same position: untouched
-                // siblings re-emit verbatim, the new item normalizes at
-                // the sibling indentation.
+                // Block slots, synthetic/missing flow spans, collections,
+                // and values carrying properties use ordinary removal and
+                // insertion. Their layout is normalized at the measured
+                // sibling indentation.
                 _ = (try doc.sequenceRemove(cur, ix)) orelse return error.UnknownPath;
                 try doc.sequenceInsert(cur, ix, value);
             },
@@ -1407,7 +1415,7 @@ test "setting a scalar to its own presentation is a byte-identical no-op" {
         try ed.set("$.branches[0]", try doc.createScalar("y", .plain));
         const out = try doc.write(testing.allocator);
         defer testing.allocator.free(out);
-        try testing.expectEqualStrings("branches: [y]\n", out);
+        try testing.expectEqualStrings("branches: [ y ]\n", out);
     }
     {
         var doc = try Document.parse(testing.allocator, "key: 5\n");
