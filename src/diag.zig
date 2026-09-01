@@ -72,8 +72,12 @@ pub const YamlError = error{
     /// Quoted scalar was not terminated before EOF. Unterminated flow
     /// collections surface as `InvalidSyntax`.
     Unterminated,
-    /// Collection nesting exceeds the scanner's `max_nesting` limit.
+    /// Collection nesting exceeds the scanner's `max_nesting` limit,
+    /// or emission exceeds the emitter's `max_depth`.
     NestingTooDeep,
+    /// Input is longer than `max_input_bytes` allows. Checked before
+    /// scanning, so nothing is allocated for it.
+    InputTooLarge,
     /// Alias would create a reference cycle during expansion.
     AliasCycle,
     /// A codepoint being encoded has no UTF-8 representation (a

@@ -69,11 +69,17 @@ pub const Parser = struct {
     temp_bytes: std.ArrayList([]u8) = .empty,
     temp_tags: std.ArrayList([]TagDirective) = .empty,
 
+    /// Parse `input` under the default `scanner.Options`.
     pub fn init(allocator: std.mem.Allocator, d: ?*Diag, input: []const u8) !Parser {
+        return initOpts(allocator, d, input, .{});
+    }
+
+    /// `init` with explicit bounds and input policy.
+    pub fn initOpts(allocator: std.mem.Allocator, d: ?*Diag, input: []const u8, options: scanner_mod.Options) !Parser {
         return .{
             .allocator = allocator,
             .d = d,
-            .scanner = try Scanner.init(allocator, d, input),
+            .scanner = try Scanner.initOpts(allocator, d, input, options),
         };
     }
 

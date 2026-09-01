@@ -106,6 +106,22 @@ if (yaml.parseDiag(alloc, input, &d)) |doc| {
 }
 ```
 
+### Untrusted input
+
+The defaults are sized for a config file you control. For YAML that arrives from somewhere else, set the bounds explicitly with `yaml.parseOpts` (or `parseAllOpts`):
+
+```zig
+var doc = try yaml.parseOpts(alloc, payload, null, .{
+    .max_input_bytes = 1 << 20, // default 64 MiB
+    .max_nesting = 32,          // default 200, flow levels plus block indents
+});
+defer doc.deinit();
+```
+
+Oversized input fails with `error.InputTooLarge` before anything is scanned, and a nesting bomb with `error.NestingTooDeep`. A NUL byte is rejected as `error.InvalidSyntax`, since YAML 1.2 does not admit one; pass `.embedded_nul = .truncate` for libyaml's cut-off-at-the-NUL behaviour, remembering it discards everything after it.
+
+Two other bounds matter once you go past the tree: `value.Limits` and `schema.Limits` bound alias expansion (those layers expand by copying, so output is not bounded by input size), and `Emitter.max_depth` bounds emission of documents you built yourself rather than parsed.
+
 The root node is `doc.root`. Nodes are scalars, mappings, or sequences. Use the accessors to inspect them safely:
 
 ```zig

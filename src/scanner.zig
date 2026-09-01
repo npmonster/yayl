@@ -24,6 +24,46 @@ const YamlError = diag.YamlError;
 /// 7.4.2 and 8.2.2, which bound it in Unicode characters, not bytes).
 const max_simple_key_chars: usize = 1024;
 
+/// What to do about a NUL byte in the input.
+pub const EmbeddedNul = enum {
+    /// Fail with `error.InvalidSyntax`. NUL is not a printable
+    /// character in YAML 1.2 (spec 5.1 `c-printable` excludes #x0), so
+    /// input carrying one is not a YAML stream.
+    reject,
+    /// Treat it as end of input, as libyaml and fy_reader do because a
+    /// C string ends there. Zig has a length, so this is a compatibility
+    /// mode rather than a necessity: everything after the NUL is
+    /// silently discarded.
+    truncate,
+};
+
+/// Bounds and input-handling policy for one parse.
+///
+/// The defaults are the library's own: they are what `yaml.parse` uses,
+/// and no honest document reaches them. Raise or lower them per call
+/// with `yaml.parseOpts` / `yaml.parseAllOpts` — a service accepting
+/// untrusted YAML will usually want `max_input_bytes` far below the
+/// default, and a tool reading its own generated files may legitimately
+/// need `max_nesting` above it.
+pub const Options = struct {
+    /// Reject input longer than this before scanning it. Parsing keeps
+    /// the whole input in memory (and a `Document` keeps its own copy
+    /// for byte-faithful re-emission), so input size is the first thing
+    /// worth bounding on a hostile stream. `yaml.file` applies its own
+    /// bound at read time; this one covers the in-memory entry points,
+    /// which had none.
+    max_input_bytes: usize = 64 << 20,
+
+    /// Hard cap on collection nesting, flow levels plus block indents.
+    /// Guards against nesting bombs and, because parsing is the only
+    /// producer of deep trees the emitter later walks, keeps emission
+    /// clear of its own `max_depth`.
+    max_nesting: usize = 200,
+
+    /// How a NUL byte in the input is handled.
+    embedded_nul: EmbeddedNul = .reject,
+};
+
 /// YAML tokenizer: turns input bytes into a token stream (fy-scan port).
 pub const Scanner = struct {
     allocator: std.mem.Allocator,
@@ -73,10 +113,29 @@ pub const Scanner = struct {
         pos: usize = 0,
     };
 
+    /// Scan `input` under the default `Options`.
     pub fn init(allocator: std.mem.Allocator, d: ?*Diag, input: []const u8) !Scanner {
-        // libyaml/fy_reader treat a NUL byte as end of input.
+        return initOpts(allocator, d, input, .{});
+    }
+
+    /// `init` with explicit bounds and input policy.
+    pub fn initOpts(allocator: std.mem.Allocator, d: ?*Diag, input: []const u8, options: Options) !Scanner {
+        if (input.len > options.max_input_bytes) {
+            diag.emitBestEffort(d, .err, .{}, "input is {d} bytes, over the {d}-byte limit", .{ input.len, options.max_input_bytes });
+            return error.InputTooLarge;
+        }
+
         var end = input.len;
-        if (std.mem.indexOfScalar(u8, input, 0)) |i| end = i;
+        if (std.mem.indexOfScalar(u8, input, 0)) |i| switch (options.embedded_nul) {
+            // Silently dropping everything past the NUL is data loss, and
+            // the spec does not admit the byte in the first place.
+            .reject => {
+                const mark: Mark = .{ .offset = i };
+                diag.emitBestEffort(d, .err, mark, "input contains a NUL byte, which YAML does not permit", .{});
+                return error.InvalidSyntax;
+            },
+            .truncate => end = i,
+        };
         const eff = input[0..end];
 
         if (!utf8.valid(eff)) {
@@ -84,7 +143,7 @@ pub const Scanner = struct {
             return error.InvalidUtf8;
         }
 
-        var self: Scanner = .{ .allocator = allocator, .d = d, .input = eff, .pos = 0, .mark = .{} };
+        var self: Scanner = .{ .allocator = allocator, .d = d, .input = eff, .pos = 0, .mark = .{}, .max_nesting = options.max_nesting };
         // Skip a UTF-8 BOM if present (fy_reader does this too). The
         // mark travels with `pos`: every span built from a mark is an
         // absolute byte offset into `input`, so leaving `mark.offset`

@@ -13,6 +13,7 @@ const internal = @import("internal.zig");
 const markup = @import("markup.zig");
 const parser_mod = @import("parser.zig");
 const pool_mod = @import("pool.zig");
+const scanner_mod = @import("scanner.zig");
 const token_mod = @import("token.zig");
 
 const Mark = diag.Mark;
@@ -31,6 +32,14 @@ const VersionDirective = token_mod.VersionDirective;
 /// alias semantics): `- *a` occupies its own slot in the tree with its
 /// own source span and formatting, pointing at the anchored target.
 pub const NodeKind = enum { scalar, mapping, sequence, alias };
+
+/// Bounds and input policy for a parse — `scanner.Options`, named for
+/// the layer callers reach it through. Use it with `parseOpts` /
+/// `parseAllOpts`; `parse` and `parseAll` use the defaults.
+pub const ParseOptions = scanner_mod.Options;
+
+/// What a parse does with a NUL byte in the input. See `ParseOptions`.
+pub const EmbeddedNul = scanner_mod.EmbeddedNul;
 
 /// One mapping entry; both nodes are pool-owned. `src` records where
 /// the pair's bytes end in the original source (see `Node.src`), so
@@ -335,7 +344,18 @@ pub const Document = struct {
     /// problem in `d`. The error return is unchanged; on success `d`
     /// stays empty.
     pub fn parseDiag(allocator: std.mem.Allocator, input: []const u8, d: ?*diag.Diag) !Document {
-        var p = try Parser.init(allocator, d, input);
+        return parseOpts(allocator, input, d, .{});
+    }
+
+    /// `parseDiag` with explicit bounds and input policy. Pass `d` as
+    /// null for no diagnostics.
+    pub fn parseOpts(
+        allocator: std.mem.Allocator,
+        input: []const u8,
+        d: ?*diag.Diag,
+        options: ParseOptions,
+    ) !Document {
+        var p = try Parser.initOpts(allocator, d, input, options);
         defer p.deinit();
         var docs = try parseStream(allocator, &p, 1, input);
         defer docs.deinit(allocator);
@@ -351,7 +371,18 @@ pub const Document = struct {
     /// Like `parseAll`, additionally recording positioned diagnostics
     /// in `d`.
     pub fn parseAllDiag(allocator: std.mem.Allocator, input: []const u8, d: ?*diag.Diag) !std.ArrayList(Document) {
-        var p = try Parser.init(allocator, d, input);
+        return parseAllOpts(allocator, input, d, .{});
+    }
+
+    /// `parseAllDiag` with explicit bounds and input policy. Pass `d` as
+    /// null for no diagnostics.
+    pub fn parseAllOpts(
+        allocator: std.mem.Allocator,
+        input: []const u8,
+        d: ?*diag.Diag,
+        options: ParseOptions,
+    ) !std.ArrayList(Document) {
+        var p = try Parser.initOpts(allocator, d, input, options);
         defer p.deinit();
         return parseStream(allocator, &p, null, input);
     }

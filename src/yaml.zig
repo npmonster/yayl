@@ -46,6 +46,8 @@ pub const ScalarStyle = token.ScalarStyle;
 pub const NodeKind = document.NodeKind;
 pub const CoreTag = document.CoreTag;
 pub const resolveCoreTag = document.resolveCoreTag;
+pub const ParseOptions = document.ParseOptions;
+pub const EmbeddedNul = document.EmbeddedNul;
 pub const Node = document.Node;
 pub const Pair = document.Pair;
 pub const Document = document.Document;
@@ -90,6 +92,37 @@ pub fn parseDiag(allocator: std.mem.Allocator, input: []const u8, d: *Diag) !Doc
 /// Like `parseAll`, additionally recording positioned diagnostics in `d`.
 pub fn parseAllDiag(allocator: std.mem.Allocator, input: []const u8, d: *Diag) !std.ArrayList(Document) {
     return Document.parseAllDiag(allocator, input, d);
+}
+
+/// `parse` with explicit bounds and input policy, and an optional
+/// diagnostic collector. For untrusted input — the defaults are sized
+/// for a trusted config file, not a hostile stream:
+///
+/// ```zig
+/// var doc = try yaml.parseOpts(allocator, payload, null, .{
+///     .max_input_bytes = 1 << 20,
+///     .max_nesting = 32,
+/// });
+/// defer doc.deinit();
+/// ```
+pub fn parseOpts(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    d: ?*Diag,
+    options: ParseOptions,
+) !Document {
+    return Document.parseOpts(allocator, input, d, options);
+}
+
+/// `parseAll` with explicit bounds and input policy. The bounds apply
+/// to the stream as a whole, not per document.
+pub fn parseAllOpts(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    d: ?*Diag,
+    options: ParseOptions,
+) !std.ArrayList(Document) {
+    return Document.parseAllOpts(allocator, input, d, options);
 }
 
 test {
@@ -399,4 +432,66 @@ test "deep nesting and empty collections" {
     defer doc2.deinit();
     try std.testing.expect(doc2.pathGet(&.{ "a", "b", "c" }).?.isSequence());
     try std.testing.expect(doc2.pathGet(&.{ "a", "d" }).?.isMapping());
+}
+
+test "parse bounds are reachable through the public API" {
+    const allocator = std.testing.allocator;
+
+    // Input size. The default entry points had no bound at all: the
+    // 64 MiB in `yaml.file` only ever covered reads from disk.
+    try std.testing.expectError(
+        error.InputTooLarge,
+        parseOpts(allocator, "a: 1\n", null, .{ .max_input_bytes = 4 }),
+    );
+    {
+        // Non-vacuous: the same input parses when the bound admits it.
+        var doc = try parseOpts(allocator, "a: 1\n", null, .{ .max_input_bytes = 5 });
+        defer doc.deinit();
+        try std.testing.expectEqualStrings("1", doc.pathGet(&.{"a"}).?.scalarValue().?);
+    }
+
+    // Nesting. The 200-level default is not a knob a caller could reach
+    // without hand-rolling a Scanner.
+    try std.testing.expectError(
+        error.NestingTooDeep,
+        parseOpts(allocator, "[[[[a]]]]", null, .{ .max_nesting = 2 }),
+    );
+    {
+        var doc = try parseOpts(allocator, "[[[[a]]]]", null, .{ .max_nesting = 8 });
+        defer doc.deinit();
+        try std.testing.expect(doc.root != null);
+    }
+}
+
+test "an embedded NUL is rejected, and truncation is opt-in" {
+    const allocator = std.testing.allocator;
+    const input = "a: 1\nb: \x00 2\n";
+
+    // Default: NUL is not a printable character in YAML 1.2, and
+    // silently dropping the rest of the buffer is data loss.
+    try std.testing.expectError(error.InvalidSyntax, parse(allocator, input));
+
+    // The libyaml behaviour is still available, and still lossy --
+    // everything from the NUL on is gone, which is the point of making
+    // it explicit.
+    var doc = try parseOpts(allocator, input, null, .{ .embedded_nul = .truncate });
+    defer doc.deinit();
+    try std.testing.expectEqualStrings("1", doc.pathGet(&.{"a"}).?.scalarValue().?);
+    // `b`'s value was cut off mid-scalar: the key survives, its content
+    // does not. That silent half-entry is exactly why `.reject` is the
+    // default.
+    try std.testing.expectEqualStrings("", doc.pathGet(&.{"b"}).?.scalarValue().?);
+}
+
+test "a parse diagnostic survives the options path" {
+    const allocator = std.testing.allocator;
+    var d: Diag = .{ .allocator = allocator };
+    defer d.deinit();
+    try std.testing.expectError(
+        error.InvalidSyntax,
+        parseOpts(allocator, "a: 1\nb: \x00 2\n", &d, .{}),
+    );
+    const report = try d.render(allocator);
+    defer allocator.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, "NUL") != null);
 }

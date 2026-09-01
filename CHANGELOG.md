@@ -5,6 +5,25 @@ series; APIs may still move, and anything that does is listed here.
 
 ## Unreleased
 
+### Added
+
+- `ParseOptions` and the `parseOpts` / `parseAllOpts` entry points
+  (`Document.parseOpts` / `parseAllOpts` underneath) put the parse
+  bounds in the caller's hands. `max_input_bytes` (64 MiB) is a new
+  bound: the in-memory entry points had none, and `yaml.file`'s limit
+  only ever covered reads from disk. `max_nesting` (200) was previously
+  reachable only by hand-rolling a `Scanner`. Over-long input fails with
+  the new `error.InputTooLarge` before it is scanned.
+
+### Changed
+
+- **A NUL byte in the input is now rejected** with `error.InvalidSyntax`
+  and a positioned diagnostic, instead of silently truncating the input
+  there. YAML 1.2 does not admit the byte (spec 5.1 `c-printable`), and
+  the old behaviour was inherited from libyaml, where a C string has no
+  choice. It cost a caller the entire remainder of the buffer with no
+  indication. `ParseOptions.embedded_nul = .truncate` restores it.
+
 ### Fixed
 
 - Emission is depth-bounded. `Emitter` carries `max_depth` (1000) and
