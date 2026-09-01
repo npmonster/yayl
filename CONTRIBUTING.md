@@ -20,7 +20,7 @@ lives in [AGENTS.md](AGENTS.md); read it before touching code.
 ## Before you open a PR
 
 ```sh
-make verify        # the full gate
+make verify        # every gate except differential (which needs a C compiler)
 make differential  # optional: event parity vs libfyaml (needs a C compiler)
 ```
 

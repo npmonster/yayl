@@ -195,19 +195,23 @@ The feature set is complete and gated. 1.0 waits on real-world use: run your wor
 Deliberate for v1:
 
 - Input has to fit in memory. Byte-faithful re-emission works by slicing the original bytes, so a document keeps a copy of its whole source; chunked input would trade that guarantee away rather than merely complicate it. The parser streams *events* (pull-based), and that layer is chunk-ready. See the note in `src/file.zig`.
-- Modified subtrees normalize their internal layout when they re-emit. A multi-line flow *mapping* keeps its layout when you change a value, but adding or removing a flow entry, or replacing an item of a flow *sequence*, still collapses the collection to one line. Untouched bytes are always exact.
+- Modified subtrees normalize their internal layout when they re-emit. Replacing a value keeps the layout of a multi-line flow collection, mapping or sequence alike. Adding or removing a flow entry still collapses the collection to one line. Untouched bytes are always exact.
 - Subtrees the emitter owns — brand-new ones, and moved ones — get block layout at the file's own indent width, but not the original's internal detail: a moved subtree keeps its structure and values, not the comments and blank lines that were inside it.
 - No parse cache. A `Document` is mutable, so a cache would have to hand out deep clones, which is not clearly cheaper than re-parsing. See the note in `src/file.zig`.
+- Duplicate mapping keys are kept, not rejected. YAML 1.2 §3.2.1.1 requires keys to be unique, but real-world files carry duplicates and dropping one silently is worse than surfacing it. Both entries survive a round trip; `lookup` and path reads return the first.
+- Merge keys (`<<: *base`) are not resolved. `<<` parses as an ordinary key whose value is an alias, which is correct for YAML 1.2 — merge keys are a 1.1-era extension — but it will surprise anyone arriving from Kubernetes or GitLab configs, so it is called out rather than left to be discovered.
+- `yaml.value` and `yaml.schema` bound alias expansion. They expand aliases by copying, so output is a function of the expanded tree rather than the input; both cap that by default and return `error.LimitExceeded` past it. See the memory notes in [docs/USAGE.md](docs/USAGE.md).
 
 ## Development
 
 ```sh
-make verify        # everything below except differential
+make verify        # every gate below except differential
 make conformance   # yaml-test-suite corpus
 make roundtrip     # emit(parse(x)) == x over corpus + fixtures
 make preservation  # an edit changes only the lines it should (fixtures only)
+make consume       # build a package against the packaged library (.paths check)
 make differential  # event-stream parity vs libfyaml (needs a C compiler)
-zig build examples # compile-checked example programs (zig-out/bin)
+make examples      # compile-checked example programs (zig-out/bin)
 zig build bench    # throughput CLI
 ```
 

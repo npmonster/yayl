@@ -218,7 +218,10 @@ fn filterMatches(candidate: *Node, key: []const u8, value: []const u8) bool {
 }
 
 fn collectDescend(allocator: std.mem.Allocator, node: *Node, key: []const u8, out: *std.ArrayList(*Node)) Error!void {
-    // Depth-bounded pre-order walk collecting every `key` match.
+    // Pre-order walk collecting every `key` match. Not depth-bounded
+    // itself: for parsed input the scanner's nesting cap bounds it
+    // transitively, but a tree built programmatically can nest as deep
+    // as the builder went.
     const cur = node.resolveAlias();
     if (cur.pairs()) |pairs| {
         for (pairs) |p| {
@@ -388,7 +391,7 @@ pub const Editor = struct {
                     // `lookup` only matches values of the mapping `cur`,
                     // so the in-place replace must succeed; falling
                     // through would append a duplicate key.
-                    if (!doc.mappingReplace(cur, existing, value)) return error.InvalidSyntax;
+                    if (!internal.mappingReplace(doc, cur, existing, value)) return error.InvalidSyntax;
                     return;
                 }
                 try doc.mappingAppend(cur, try doc.createScalar(last, .plain), value);
@@ -402,7 +405,7 @@ pub const Editor = struct {
                     if (ix < items.len) {
                         if (sameScalarPresentation(items[ix], value)) return;
                         if (emitter_mod.Emitter.rewritableInFlow(value) and
-                            doc.sequenceReplace(cur, ix, value))
+                            internal.sequenceReplace(doc, cur, ix, value))
                         {
                             return;
                         }

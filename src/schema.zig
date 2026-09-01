@@ -21,7 +21,22 @@ const document_mod = @import("document.zig");
 
 const Node = document_mod.Node;
 
-pub const Error = error{OutOfMemory};
+pub const Error = error{ OutOfMemory, LimitExceeded };
+
+/// Bounds on how much of a document one validation may walk.
+///
+/// Validation resolves aliases, so a node reached through M aliases is
+/// walked M times: the work is bounded by the expanded tree, not by the
+/// input. Same shape as `value.Limits`, and it matters for the same
+/// reason — see that type for the arithmetic.
+pub const Limits = struct {
+    /// Maximum nodes one validation may visit. Validation stops with
+    /// `error.LimitExceeded` on the node that would exceed it.
+    max_nodes: usize = 1 << 20,
+
+    /// No bound. Only for input you produced yourself.
+    pub const unlimited: Limits = .{ .max_nodes = std.math.maxInt(usize) };
+};
 
 pub const Schema = struct {
     kind: Kind,
@@ -83,20 +98,33 @@ pub const Schema = struct {
         return .{ .kind = .{ .map = .{ .fields = fields, .deny_unknown = true } } };
     }
 
-    /// Validate `node`; returns the list of violations (empty when
-    /// valid). `path` is the logical path reported in violations.
+    /// Validate `node` under the default `Limits`; returns the list of
+    /// violations (empty when valid). `path` is the logical path
+    /// reported in violations.
     pub fn validate(
         self: *const Schema,
         allocator: std.mem.Allocator,
         node: *const Node,
         path: []const u8,
     ) Error![]Violation {
+        return self.validateLimited(allocator, node, path, .{});
+    }
+
+    /// `validate` with an explicit bound on nodes visited.
+    pub fn validateLimited(
+        self: *const Schema,
+        allocator: std.mem.Allocator,
+        node: *const Node,
+        path: []const u8,
+        limits: Limits,
+    ) Error![]Violation {
         var violations: std.ArrayList(Violation) = .empty;
         errdefer {
             for (violations.items) |*v| v.deinitSelf(allocator);
             violations.deinit(allocator);
         }
-        try checkSchema(self, allocator, node, path, &violations);
+        var remaining = limits.max_nodes;
+        try checkSchema(self, allocator, node, path, &violations, &remaining);
         return violations.toOwnedSlice(allocator);
     }
 };
@@ -142,7 +170,9 @@ fn checkNodeCoreTag(node: *const Node) ?document_mod.CoreTag {
     return document_mod.resolveCoreTag(s, node.data.scalar.style);
 }
 
-fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const Node, path: []const u8, out: *std.ArrayList(Violation)) Error!void {
+fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const Node, path: []const u8, out: *std.ArrayList(Violation), remaining: *usize) Error!void {
+    if (remaining.* == 0) return error.LimitExceeded;
+    remaining.* -= 1;
     const cur = node.resolveAlias();
     switch (schema.kind) {
         .any => {},
@@ -189,7 +219,7 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
             for (list, 0..) |item, i| {
                 const child_path = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path, i });
                 defer allocator.free(child_path);
-                try checkSchema(items, allocator, item, child_path, out);
+                try checkSchema(items, allocator, item, child_path, out, remaining);
             }
         },
         .map => |map_spec| {
@@ -222,7 +252,7 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
                 var matched = false;
                 for (fields) |field| {
                     if (std.mem.eql(u8, field.key, kv)) {
-                        try checkSchema(field.schema, allocator, p.value, child_path, out);
+                        try checkSchema(field.schema, allocator, p.value, child_path, out, remaining);
                         matched = true;
                         break;
                     }
@@ -353,4 +383,45 @@ fn validateConfig(allocator: std.mem.Allocator) !void {
     const violations = try schema.validate(allocator, doc.root.?, "$");
     defer freeViolations(allocator, violations);
     try testing.expectEqual(@as(usize, 1), violations.len);
+}
+
+test "validation walks a bounded number of nodes" {
+    // Aliases are resolved on the way down, so a recursive schema walks
+    // the EXPANDED tree: this input is ~130 bytes and 4 nested levels of
+    // five aliases each, so `l3` expands to 1 + 5 + 25 + 125 nodes.
+    //
+    // The schema has to recurse for this to bite. `Schema.any` returns
+    // without descending, so it visits exactly one node no matter what
+    // it is pointed at -- which is why this test nests `seq` schemas
+    // rather than using `any` at the top.
+    const src =
+        \\l0: &l0 [x, x, x, x, x]
+        \\l1: &l1 [*l0, *l0, *l0, *l0, *l0]
+        \\l2: &l2 [*l1, *l1, *l1, *l1, *l1]
+        \\l3: &l3 [*l2, *l2, *l2, *l2, *l2]
+        \\
+    ;
+    var doc = try document_mod.Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    const deep = doc.pathGet(&.{"l3"}).?;
+
+    const s1 = Schema{ .kind = .{ .seq = &Schema.any } };
+    const s2 = Schema{ .kind = .{ .seq = &s1 } };
+    const s3 = Schema{ .kind = .{ .seq = &s2 } };
+
+    // A tight bound stops the walk instead of letting it run to the
+    // expanded size.
+    try testing.expectError(
+        error.LimitExceeded,
+        s3.validateLimited(testing.allocator, deep, "$", .{ .max_nodes = 8 }),
+    );
+
+    // The default is a bound, not absent.
+    try testing.expectEqual(@as(usize, 1 << 20), (Limits{}).max_nodes);
+
+    // A bound above the expanded size validates normally, so the guard
+    // does not reject ordinary documents.
+    const violations = try s3.validateLimited(testing.allocator, deep, "$", .{ .max_nodes = 10_000 });
+    defer freeViolations(testing.allocator, violations);
+    try testing.expectEqual(@as(usize, 0), violations.len);
 }

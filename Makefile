@@ -8,7 +8,7 @@ ZIG ?= zig
 .DEFAULT_GOAL := help
 .MAIN: help
 
-.PHONY: help all build check test test-release examples fmt fmt-write docs corpus libfyaml conformance roundtrip preservation differential verify clean
+.PHONY: help all build check test test-release examples fmt fmt-write docs corpus libfyaml conformance roundtrip preservation differential consume verify clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' Makefile
@@ -59,11 +59,18 @@ preservation: ## Edit-preservation sweeps over tests/fixtures (edits change only
 differential: corpus libfyaml ## Compare yayl vs libfyaml event streams over the corpus (needs a C compiler)
 	sh scripts/differential.sh
 
+# The only gate that consumes the library the way a dependent does:
+# `zig fetch` applies `.paths` from build.zig.zon, so a source file
+# missing there keeps every other gate green while every dependent
+# fails to build.
+consume: ## Build a throwaway package against the packaged library (catches .paths omissions)
+	sh scripts/consumer-smoke.sh
+
 # NOTE: the sweep asserts line-level non-interference on every edit
 # position in every fixture, plus weak invariants (re-parse, entry gone,
 # sentinel present) and semantic value-tree equality on the skip
 # categories — a skip is never silent.
-verify: fmt check test test-release conformance roundtrip preservation ## Full quality gate: fmt, compile, tests (Debug + ReleaseSafe), corpus, round trip, edit preservation
+verify: fmt check test test-release examples conformance roundtrip preservation consume ## Quality gate minus differential: fmt, compile, tests (Debug + ReleaseSafe), examples, corpus, round trip, edit preservation, packaged-consumer smoke
 
 clean: ## Remove build artifacts (zig-out/) and the incremental cache
 	rm -rf zig-cache .zig-cache-global zig-out

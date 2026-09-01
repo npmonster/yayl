@@ -198,9 +198,10 @@ yaml-test-suite corpus documents, and CRLF, BOM and no-final-newline
 variants of every fixture — each output re-parsed and compared as a
 semantic value tree, with shapes that legitimately normalize counted
 as skips rather than asserted away. The skip summary also names the
-shapes the edit path does not yet preserve — flow collections,
-explicit-key entries, tagged or empty keys, tab-indented entries, and
-new lines inside CRLF documents — so the gap is measured, not hidden.
+shapes the edit path does not yet preserve — flow entry insertion and
+removal (replacement is preserved), explicit-key entries, tagged or
+empty keys, tab-indented entries, and new lines inside CRLF documents
+— so the gap is measured, not hidden.
 
 ## Editing: paths, batches, moves
 
@@ -358,7 +359,17 @@ The layering mirrors libfyaml and is public:
 * Nesting is capped (`Scanner.max_nesting`, 200) and simple keys are
   length-capped, so adversarial input is rejected rather than run out
   of memory. Over-deep nesting returns `error.NestingTooDeep`; an
-  over-long simple key returns `error.InvalidSyntax`.
+  over-long simple key returns `error.InvalidSyntax`. Those caps bound
+  the scanner, parser and document layers.
+* `yaml.value` and `yaml.schema` need a second bound, because they
+  expand aliases by copying: output size is a function of the expanded
+  tree, not of the input, so N levels aliasing the level above M times
+  is M^N. Both are bounded by default (`value.Limits.max_values` and
+  `schema.Limits.max_nodes`, 1 << 20 each), returning
+  `error.LimitExceeded` rather than allocating without end. Use
+  `parseToValueLimited` / `nodeToValueLimited` / `validateLimited` to
+  choose your own bound, and `Limits.unlimited` only for input you
+  produced yourself.
 
 ## Memory and error model
 

@@ -61,20 +61,64 @@ pub const Value = union(enum) {
 /// plus the library's whole `YamlError` vocabulary: parse failures
 /// keep their identity (bad UTF-8 input is `InvalidUtf8`, not a
 /// generic syntax error).
-pub const Error = error{ TypeMismatch, UnsupportedType, OutOfMemory } || diag_mod.YamlError;
+pub const Error = error{ TypeMismatch, UnsupportedType, OutOfMemory, LimitExceeded } || diag_mod.YamlError;
 
-/// Parse the first document of `input` into a Value. Parse failures
-/// keep their real error (`InvalidUtf8`, `InvalidSyntax`, ...).
+/// Bounds on how much one conversion may materialise.
+///
+/// Conversion expands aliases by copying, so output size is not bounded
+/// by input size: a document of N nesting levels that each alias the
+/// level above M times converts to M^N values. 194 bytes reaches ~19.5k
+/// values at 6x5; 10x10 is 10^10. The parse and document layers are not
+/// affected — an alias stays a single node there, and nesting is capped
+/// at 200 — so this bound exists only where the copying happens.
+pub const Limits = struct {
+    /// Maximum Values one conversion may produce, counting every scalar,
+    /// sequence slot and mapping entry. Conversion stops with
+    /// `error.LimitExceeded` on the value that would exceed it.
+    max_values: usize = 1 << 20,
+
+    /// No bound. Only for input you produced yourself.
+    pub const unlimited: Limits = .{ .max_values = std.math.maxInt(usize) };
+};
+
+/// Parse the first document of `input` into a Value, under the default
+/// `Limits`. Parse failures keep their real error (`InvalidUtf8`,
+/// `InvalidSyntax`, ...).
 pub fn parseToValue(allocator: std.mem.Allocator, input: []const u8) Error!Value {
+    return parseToValueLimited(allocator, input, .{});
+}
+
+/// `parseToValue` with an explicit expansion bound.
+pub fn parseToValueLimited(allocator: std.mem.Allocator, input: []const u8, limits: Limits) Error!Value {
     var doc = try document_mod.Document.parse(allocator, input);
     defer doc.deinit();
     const root = doc.root orelse return .null;
-    return nodeToValue(allocator, root);
+    return nodeToValueLimited(allocator, root, limits);
 }
 
-/// Convert a document subtree into a Value. Strings are duplicated
-/// into `allocator`; the tree is untouched.
+/// Convert a document subtree into a Value under the default `Limits`.
+/// Strings are duplicated into `allocator`; the tree is untouched.
 pub fn nodeToValue(allocator: std.mem.Allocator, node: *const Node) Error!Value {
+    return nodeToValueLimited(allocator, node, .{});
+}
+
+/// `nodeToValue` with an explicit expansion bound. Pass
+/// `Limits.unlimited` only for input you produced yourself.
+pub fn nodeToValueLimited(allocator: std.mem.Allocator, node: *const Node, limits: Limits) Error!Value {
+    var remaining = limits.max_values;
+    return convert(allocator, node, &remaining);
+}
+
+/// One unit of budget per Value produced. Charged on entry, so the
+/// error fires on the value that would exceed the bound rather than
+/// after the allocation for it.
+fn charge(remaining: *usize) Error!void {
+    if (remaining.* == 0) return error.LimitExceeded;
+    remaining.* -= 1;
+}
+
+fn convert(allocator: std.mem.Allocator, node: *const Node, remaining: *usize) Error!Value {
+    try charge(remaining);
     const cur = node.resolveAlias();
     switch (cur.data) {
         .scalar => |s| return scalarToValue(allocator, s.value, s.style),
@@ -87,7 +131,7 @@ pub fn nodeToValue(allocator: std.mem.Allocator, node: *const Node) Error!Value 
                 allocator.free(out);
             }
             for (sq.items.items, 0..) |item, i| {
-                out[i] = try nodeToValue(allocator, item);
+                out[i] = try convert(allocator, item, remaining);
                 filled = i + 1;
             }
             return .{ .sequence = out };
@@ -111,7 +155,7 @@ pub fn nodeToValue(allocator: std.mem.Allocator, node: *const Node) Error!Value 
                 errdefer allocator.free(key_copy);
                 out[i] = .{
                     .key = key_copy,
-                    .value = try nodeToValue(allocator, p.value),
+                    .value = try convert(allocator, p.value, remaining),
                 };
                 filled = i + 1;
             }
@@ -686,4 +730,57 @@ fn valueRoundTrip(allocator: std.mem.Allocator) !void {
     const Point = struct { x: i32, label: []const u8 };
     const vp = try fromZig(allocator, Point{ .x = 1, .label = label });
     defer freeValue(allocator, vp);
+}
+
+// The amplification this bound exists for: each level aliases the one
+// above five times, so the value count is ~5^levels while the input
+// stays a few hundred bytes.
+fn aliasBomb(allocator: std.mem.Allocator, levels: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "l0: &l0 [x, x, x, x, x]\n");
+    for (1..levels) |i| {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "l{d}: &l{d} [*l{d}, *l{d}, *l{d}, *l{d}, *l{d}]\n",
+            .{ i, i, i - 1, i - 1, i - 1, i - 1, i - 1 },
+        );
+        defer allocator.free(line);
+        try buf.appendSlice(allocator, line);
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+test "alias expansion is bounded, and the bound is configurable" {
+    const allocator = std.testing.allocator;
+
+    // Small input, enormous output: 8 levels is ~5^8 leaves from well
+    // under a kilobyte of YAML.
+    const bomb = try aliasBomb(allocator, 8);
+    defer allocator.free(bomb);
+    try std.testing.expect(bomb.len < 1024);
+
+    // A caller-supplied bound stops it. The budget is charged per value
+    // produced, so this returns after ~10k values rather than after the
+    // hundreds of thousands the document would expand to.
+    try std.testing.expectError(
+        error.LimitExceeded,
+        parseToValueLimited(allocator, bomb, .{ .max_values = 10_000 }),
+    );
+
+    // The default is a bound, not absent. Asserted directly rather than
+    // by converting a document large enough to trip it: that would make
+    // this test allocate a million values every run.
+    try std.testing.expectEqual(@as(usize, 1 << 20), (Limits{}).max_values);
+
+    // The bound is not so tight that ordinary documents trip it: the
+    // same shape at 3 levels is ~125 leaves and converts fine.
+    const small = try aliasBomb(allocator, 3);
+    defer allocator.free(small);
+    const v = try parseToValueLimited(allocator, small, .{ .max_values = 1000 });
+    defer freeValue(allocator, v);
+
+    // And an explicit opt-out still works, for input you produced.
+    const v2 = try parseToValueLimited(allocator, small, Limits.unlimited);
+    defer freeValue(allocator, v2);
 }

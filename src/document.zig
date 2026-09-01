@@ -49,8 +49,14 @@ pub const Scalar = struct {
     style: ScalarStyle = .plain,
 };
 
-/// Mapping payload. Add entries via `Document.mappingAppend`, which
-/// rejects duplicate keys.
+/// Mapping payload. Add entries via `Document.mappingAppend`.
+///
+/// Key uniqueness is NOT enforced, here or at parse time: YAML 1.2
+/// §3.2.1.1 requires keys to be unique, but this library keeps what the
+/// input actually contained rather than rejecting it, because real-world
+/// files carry duplicates and losing them silently is worse than
+/// surfacing them. `lookup` returns the first match, and a duplicate
+/// appended here re-emits as a second entry with the same key.
 pub const Mapping = struct {
     pairs: std.ArrayList(Pair) = .empty,
     style: CollectionStyle = .block,
@@ -554,54 +560,6 @@ pub const Document = struct {
         return cur;
     }
 
-    /// Replace one recoverable flow-sequence slot without changing its
-    /// position or separator layout. The replacement inherits the old
-    /// item's exact byte bounds; false means the caller must use ordinary
-    /// remove/insert semantics.
-    ///
-    /// `pub` only because `edit.zig` calls it across a file boundary and
-    /// `pub` in Zig is file-granular. Not part of the supported API.
-    pub fn sequenceReplace(self: *Document, seq: *Node, index: usize, value: *Node) bool {
-        switch (seq.data) {
-            .sequence => |*s| {
-                if (s.style != .flow or index >= s.items.items.len) return false;
-                const old = s.items.items[index];
-                const old_src = old.src orelse return false;
-                if (old_src.synthetic) return false;
-
-                value.parent = seq;
-                value.src = .{
-                    .entry_start = old_src.entry_start,
-                    .start = old_src.entry_start,
-                    .end = old_src.end,
-                };
-                s.items.items[index] = value;
-                self.markModified(value);
-                return true;
-            },
-            else => return false,
-        }
-    }
-
-    /// Replace the existing value node `existing` (a value of `map`)
-    /// with `value`, preserving pair order and the key node. Returns
-    /// false when `existing` is not a value of `map`.
-    pub fn mappingReplace(self: *Document, map: *Node, existing: *Node, value: *Node) bool {
-        const pairs = switch (map.data) {
-            .mapping => |*m| m.pairs.items,
-            else => return false,
-        };
-        for (pairs) |*p| {
-            if (p.value == existing) {
-                value.parent = map;
-                p.value = value;
-                self.markModified(map);
-                return true;
-            }
-        }
-        return false;
-    }
-
     /// Set the value at a mapping-key path, creating intermediate mappings
     /// as needed. The final segment is replaced or appended.
     pub fn pathSet(self: *Document, path: []const []const u8, value: *Node) !void {
@@ -612,7 +570,7 @@ pub const Document = struct {
             // `lookup` only matches values of the mapping `cur`, so the
             // in-place replace must succeed; falling through would
             // append a duplicate key.
-            if (!self.mappingReplace(cur, existing, value)) return error.InvalidSyntax;
+            if (!internal.mappingReplace(self, cur, existing, value)) return error.InvalidSyntax;
             return;
         }
         try self.mappingAppend(cur, try self.createScalar(last, .plain), value);

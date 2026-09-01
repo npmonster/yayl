@@ -246,5 +246,15 @@ for cid in ids:
     cases += 1
 
 print(f"differential: {cases} compared, {mismatch} mismatches, {skipped} not comparable (fail-flagged)")
+
+# A gate that compared nothing must not report success. The conformance
+# and round-trip gates assert a floor for the same reason: a corpus that
+# failed to fetch, or a filter that excluded everything, otherwise exits
+# 0 while observing nothing.
+MIN_CASES = 250
+if cases < MIN_CASES:
+    print(f"differential: FAILED -- only {cases} cases compared, expected at least {MIN_CASES}")
+    sys.exit(1)
+
 sys.exit(1 if mismatch else 0)
 EOF

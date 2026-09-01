@@ -190,3 +190,48 @@ pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
         else => {},
     }
 }
+
+/// INTERNAL. Replace one recoverable flow-sequence slot without changing
+/// its position or separator layout. The replacement inherits the old
+/// item's exact byte bounds; false means the caller must fall back to
+/// ordinary remove/insert semantics.
+pub fn sequenceReplace(self: *Document, seq: *Node, index: usize, value: *Node) bool {
+    switch (seq.data) {
+        .sequence => |*s| {
+            if (s.style != .flow or index >= s.items.items.len) return false;
+            const old = s.items.items[index];
+            const old_src = old.src orelse return false;
+            if (old_src.synthetic) return false;
+
+            value.parent = seq;
+            value.src = .{
+                .entry_start = old_src.entry_start,
+                .start = old_src.entry_start,
+                .end = old_src.end,
+            };
+            s.items.items[index] = value;
+            self.markModified(value);
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// INTERNAL. Replace the existing value node `existing` (a value of
+/// `map`) with `value`, preserving pair order and the key node. Returns
+/// false when `existing` is not a value of `map`.
+pub fn mappingReplace(self: *Document, map: *Node, existing: *Node, value: *Node) bool {
+    const pairs = switch (map.data) {
+        .mapping => |*m| m.pairs.items,
+        else => return false,
+    };
+    for (pairs) |*p| {
+        if (p.value == existing) {
+            value.parent = map;
+            p.value = value;
+            self.markModified(map);
+            return true;
+        }
+    }
+    return false;
+}
