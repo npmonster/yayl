@@ -54,10 +54,35 @@ pub const Emitter = struct {
     /// Active source for faithful emission (empty when normalized).
     src: []const u8 = "",
     indent_step: usize = 2,
+    /// Nesting levels currently open. Emission is recursive, so this
+    /// bounds native stack use; see `max_depth`.
+    depth: usize = 0,
+    /// Deepest node nesting this emitter will serialize before returning
+    /// `error.NestingTooDeep`.
+    ///
+    /// Parsed documents cannot reach it — the scanner caps nesting at
+    /// `scanner.max_nesting` (200) — but a tree built through
+    /// `createSequence`/`sequenceAppend` or `value.toNode` has no such
+    /// bound, and unbounded recursion here is a stack overflow rather
+    /// than a typed error. A level costs at most two counts (the
+    /// faithful walker delegating to the normalizing one), so the real
+    /// depth admitted is at least half this.
+    max_depth: usize = 1000,
 
-    /// Emission fails on output allocation or on a programmatic node
-    /// graph that cannot be serialized (unanchored cycle).
+    /// Emission fails on output allocation, on a programmatic node
+    /// graph that cannot be serialized (unanchored cycle), or on one
+    /// nested past `max_depth`.
     pub const Error = std.mem.Allocator.Error || diag.YamlError;
+
+    /// Open one nesting level, or fail. Paired with `leave`.
+    fn enter(self: *Emitter) Error!void {
+        if (self.depth >= self.max_depth) return error.NestingTooDeep;
+        self.depth += 1;
+    }
+
+    fn leave(self: *Emitter) void {
+        self.depth -= 1;
+    }
 
     pub fn init(allocator: std.mem.Allocator, out: *std.ArrayList(u8)) Emitter {
         return .{
@@ -556,6 +581,8 @@ pub const Emitter = struct {
     /// Modified block containers walk their slots so untouched entries
     /// stay verbatim; everything else re-emits normalized.
     fn emitContent(self: *Emitter, node: *Node, indent: usize) Error!usize {
+        try self.enter();
+        defer self.leave();
         switch (node.data) {
             .scalar => |s| {
                 const props = try self.writeProperties(node);
@@ -890,6 +917,8 @@ pub const Emitter = struct {
     // ------------------------------------------------------------------
 
     fn emitNode(self: *Emitter, node: *Node, indent: usize) Error!void {
+        try self.enter();
+        defer self.leave();
         // Alias emission: an anchored node that was already written is
         // referenced as *anchor instead of duplicating its content.
         if (self.seen.get(node)) |anchor| {
@@ -1166,6 +1195,8 @@ pub const Emitter = struct {
     }
 
     fn emitFlowBody(self: *Emitter, node: *Node) Error!void {
+        try self.enter();
+        defer self.leave();
         if (node.anchor) |a| {
             try self.writeByte('&');
             try self.write(a);
@@ -1706,4 +1737,52 @@ test "flow collections normalize when the layout cannot carry the change" {
         defer testing.allocator.free(out);
         try testing.expectEqualStrings("s: [alpha, Z]\n", out);
     }
+}
+
+test "a programmatically nested tree is bounded, not a stack overflow" {
+    // The scanner's nesting cap covers parsed input, but a tree built
+    // through the document API is never scanned. Before the emitter
+    // carried its own bound this recursed until the native stack ran
+    // out; the contract is a typed error.
+    var doc = Document.init(testing.allocator);
+    defer doc.deinit();
+
+    const root = try doc.createSequence();
+    doc.root = root;
+    var cur = root;
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        const next = try doc.createSequence();
+        try doc.sequenceAppend(cur, next);
+        cur = next;
+    }
+    try doc.sequenceAppend(cur, try doc.createScalar("leaf", .plain));
+
+    try testing.expectError(error.NestingTooDeep, doc.write(testing.allocator));
+}
+
+test "the depth bound is a bound, and nesting under it still emits" {
+    // Non-vacuous in both directions: the shallow tree must round trip,
+    // so the guard is not simply rejecting everything.
+    var doc = Document.init(testing.allocator);
+    defer doc.deinit();
+
+    const root = try doc.createSequence();
+    doc.root = root;
+    var cur = root;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        const next = try doc.createSequence();
+        try doc.sequenceAppend(cur, next);
+        cur = next;
+    }
+    try doc.sequenceAppend(cur, try doc.createScalar("leaf", .plain));
+
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "leaf") != null);
+
+    // And the emitted text re-parses, so the bound did not truncate it.
+    var again = try Document.parse(testing.allocator, out);
+    defer again.deinit();
 }

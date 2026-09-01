@@ -5,6 +5,18 @@ series; APIs may still move, and anything that does is listed here.
 
 ## Unreleased
 
+### Fixed
+
+- Emission is depth-bounded. `Emitter` carries `max_depth` (1000) and
+  returns `error.NestingTooDeep` past it. 0.12.0 bounded the two layers
+  that copy — `value` and `schema` — but `Document.write` was still
+  unbounded: `emitContent`/`emitNode`/`emitFlowBody` recurse per nesting
+  level, and the scanner's 200-level cap does not apply to a tree that
+  was never scanned. A document built through `createSequence` +
+  `sequenceAppend` in a loop, or through `value.toNode` from a deep Zig
+  value, overflowed the native stack instead of returning an error.
+  Parsed documents cannot reach the bound.
+
 ## 0.12.0 — 2026-09-01
 
 ### Added
