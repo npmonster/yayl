@@ -5,7 +5,36 @@ series; APIs may still move, and anything that does is listed here.
 
 ## Unreleased
 
+## 0.12.0 — 2026-09-01
+
+### Added
+
+- `value.Limits` and `schema.Limits` bound alias expansion, with
+  `parseToValueLimited`, `nodeToValueLimited` and
+  `Schema.validateLimited` to set one and `Limits.unlimited` to opt out.
+  Both layers expand aliases by copying, so output size is a function of
+  the expanded tree rather than of the input: N levels each aliasing the
+  level above M times is M^N values. A 194-byte document reached ~19,530
+  values at 6×5; 10×10 is 10^10. The default bound is 1 << 20 for both,
+  and exceeding it returns the new `error.LimitExceeded` rather than
+  allocating without end.
+
+  The scanner's existing caps (nesting 200, simple-key length) already
+  covered the scanner, parser, document and emitter layers — an alias
+  stays one node there. This is the second bound, for the two layers
+  that copy. Note that a schema only walks the expansion if it recurses:
+  `Schema.any` returns without descending, so it visits exactly one node
+  whatever it is pointed at.
+
 ### Changed
+
+- `sequenceReplace` and `mappingReplace` moved to `src/internal.zig`,
+  completing the move below. They are the same leak and were missed the
+  first time — `sequenceReplace`'s own doc comment said "Not part of the
+  supported API" while it was reachable as
+  `yaml.Document.sequenceReplace`. The public surface of `yaml.Document`
+  is now 22 declarations; all six internals are compile errors from a
+  consumer.
 
 - The INTERNAL document-model plumbing — `attachPair`, `attachItem`,
   `dropPairSpan`, `dropItemSpan` — moved from `Document` methods to free
@@ -46,6 +75,49 @@ series; APIs may still move, and anything that does is listed here.
   item's non-synthetic slot span, including its property bytes, so removed
   anchors and tags cannot reappear. Flow insertion and removal still require
   comma reflow and remain outside this preservation path.
+
+- `scripts/differential.sh` exits 1 when fewer than 250 cases were
+  compared. It previously reported success having compared nothing — a
+  corpus that failed to fetch, or a filter that excluded everything,
+  passed the gate silently. Conformance and round-trip already assert a
+  floor for exactly this reason.
+
+- `make verify` runs `examples` and the new `consume` target (the
+  packaged-consumer smoke test) instead of describing itself as "the
+  full gate" while skipping both. `consume` is the only gate that can
+  catch a source file missing from `.paths`, which keeps every other
+  gate green while every dependent fails to build. There was no Make
+  target wrapping `scripts/consumer-smoke.sh` at all before this.
+
+### Documentation
+
+Four statements that were false, now corrected — the same class of error
+this project has hit repeatedly, so they are listed rather than folded
+quietly into other entries.
+
+- The README said replacing an item of a flow *sequence* collapses the
+  collection to one line. The flow-sequence fix above made that false;
+  layout, comments and trailing commas survive. The USAGE skip-category
+  list carried the same claim.
+- `Mapping`'s doc comment claimed `Document.mappingAppend` "rejects
+  duplicate keys". It does not, and neither does the parser. Documented
+  as the deliberate choice it is: YAML 1.2 §3.2.1.1 requires unique
+  keys, but real-world files carry duplicates and dropping one silently
+  is worse than keeping it. Both entries survive a round trip; `lookup`
+  and path reads return the first.
+- `collectDescend` was commented "Depth-bounded pre-order walk". It
+  takes no depth parameter and checks nothing; for parsed input the
+  scanner's nesting cap bounds it transitively, but a programmatically
+  built tree can nest as deep as the builder went.
+- `make verify` was called "the full gate" in CONTRIBUTING.md and
+  "everything below except differential" in the README while omitting
+  two gates.
+
+Two real gaps are now documented rather than left to be discovered:
+duplicate mapping keys are kept rather than rejected, and merge keys
+(`<<: *base`) are not resolved — correct for YAML 1.2, where merge keys
+are a 1.1-era extension, but a surprise to anyone arriving from
+Kubernetes or GitLab configuration.
 
 ## 0.11.0 — 2026-08-31
 
