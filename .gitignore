@@ -1,8 +1,12 @@
-.zig-cache/
-.zig-cache-global/
+# Zig build artifacts
+.zig*
 zig-out/
 *.o
 vendor/
+
+# Local Git and agent metadata/worktrees
+.git/
+.github/
 .plumb/
 .zcode/
 .claude/
