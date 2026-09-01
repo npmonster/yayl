@@ -58,6 +58,25 @@ var doc = try yaml.parseOpts(allocator, input, null, .{ .max_input_bytes = 512 <
   region ends mid-line at `--- foo` and its own trailing comment belongs
   to the *next* document's leading bytes.
 
+- `toZig` / `fromZig` handle the three shapes they were rejecting.
+
+  **String-keyed maps.** A `labels:` block whose keys are the data had
+  no typed path at all: a YAML mapping could only become a fixed
+  struct. All four std spellings work — `StringHashMap`,
+  `StringHashMapUnmanaged`, `StringArrayHashMap`,
+  `StringArrayHashMapUnmanaged` — recognised by shape rather than by
+  name. The array-backed ones keep insertion order. On a duplicate key
+  the first wins, matching `Node.lookup`.
+
+  **Tagged unions**, externally tagged as JSON does it: one entry keyed
+  by the active field, `void` written as null. Zero entries or two is
+  `error.TypeMismatch`, not a guess; an untagged union stays
+  `error.UnsupportedType`, since nothing names the active field.
+
+  **Single-item pointers in `toZig`.** `fromZig` already serialized a
+  `*T` by dereferencing it, so a type the library could write it could
+  not read back.
+
 - Schema gains the constraints it was missing: `floatRange`, `strLen`
   (counted in codepoints, so a multibyte name is not penalised),
   `seqLen`, `nullable`, and the compositions `allOf` / `anyOf` /

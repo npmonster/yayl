@@ -331,6 +331,39 @@ defer yaml.value.freeValue(alloc, v);
 doc.root = try yaml.value.toNode(&doc, v);
 ~~~
 
+The full set `toZig`/`fromZig` handle: `bool`, every int and float
+width, `?T`, enums (by name), `[]const u8`, slices and arrays of a
+supported element type, `*T`, structs (by field name, with defaults and
+optionals honoured), tagged unions, and string-keyed maps. Anything
+else is `error.UnsupportedType`.
+
+**Dynamic mappings.** A `labels:` block whose keys are the data has no
+struct to convert into. Use a string-keyed map — any of the four std
+spellings works, recognised by shape:
+
+~~~zig
+const Labels = std.StringArrayHashMapUnmanaged([]const u8);
+var labels = try yaml.value.toZig(Labels, alloc, val.get("labels").?);
+defer yaml.value.deinitZig(Labels, alloc, labels);
+~~~
+
+Prefer the `ArrayHashMap` spellings: they keep insertion order, which
+for YAML is usually the order the author wrote. Where a mapping carries
+a duplicate key the **first** wins, matching `Node.lookup` — YAML
+permits duplicates and this library keeps them, so a map has to choose,
+and choosing the last would disagree with every other read path.
+
+**Tagged unions** are externally tagged, as JSON does it: exactly one
+entry, keyed by the active field's name. A `void` field is written as
+null. Zero entries or two is `error.TypeMismatch` rather than a guess,
+and an untagged union is `error.UnsupportedType` — nothing names the
+active field.
+
+~~~zig
+const Source = union(enum) { path: []const u8, port: u16, inherit: void };
+// port: 8080  ->  Source{ .port = 8080 }
+~~~
+
 ## Validation: optional schemas
 
 `yaml.schema` validates a node against a small descriptor and
