@@ -203,6 +203,28 @@ removal (replacement is preserved), explicit-key entries, tagged or
 empty keys, tab-indented entries, and new lines inside CRLF documents
 — so the gap is measured, not hidden.
 
+### Choosing the layout of new content
+
+`doc.write` and `yaml.writeAll` take an options form — `writeOpts` and
+`writeAllOpts` — that sets the indent for content the emitter lays out
+itself:
+
+~~~zig
+const out = try doc.writeOpts(alloc, .{ .indent = 4 });
+defer alloc.free(out);
+~~~
+
+It applies only where there are no source bytes to copy: a document you
+built, or a new subtree inside a parsed one. Bytes that re-emit verbatim
+are never touched by it — the round-trip guarantee outranks a layout
+preference. A parsed document measures its own convention by default, so
+a new subtree matches the file it lands in; set `indent` for documents
+built from nothing, where there is nothing to measure. The value is
+clamped to 1..8.
+
+`EmitOptions` also carries `max_depth`, the emission depth bound
+described under [Untrusted input](#untrusted-input).
+
 ### Writing a whole stream
 
 `doc.write` writes one document. For a stream, use `yaml.writeAll`, the

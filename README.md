@@ -198,8 +198,8 @@ If a batch fails, the original document is left byte-identical.
 
 ## Values, schemas, files
 
-- `yaml.value`: tagged semantic `Value` trees, node conversion, and Zig-native `toZig`/`fromZig` for supported scalars, structs, optionals, enums, arrays, and slices. Use `Document` when YAML presentation matters.
-- `yaml.schema`: opt-in validation descriptors (types, ranges, enums, required keys) with structured violations.
+- `yaml.value`: tagged semantic `Value` trees, node conversion, and Zig-native `toZig`/`fromZig` for scalars, structs, optionals, enums, arrays, slices, pointers, tagged unions, and string-keyed maps for mappings whose keys are the data. Use `Document` when YAML presentation matters.
+- `yaml.schema`: opt-in validation descriptors (types, numeric and length ranges, enums, required keys, `nullable`, and `allOf`/`anyOf`/`oneOf`) with structured violations.
 - `yaml.file`: bounded file reads and atomic replacement (sibling temp file, file sync, rename). This prevents torn writes, not every form of power-loss data loss.
 
 ## Ownership
@@ -223,6 +223,8 @@ Deliberate for v1:
 - Modified subtrees normalize their internal layout when they re-emit. Replacing a value keeps the layout of a multi-line flow collection, mapping or sequence alike. Adding or removing a flow entry still collapses the collection to one line. Untouched bytes are always exact.
 - Subtrees the emitter owns — brand-new ones, and moved ones — get block layout at the file's own indent width, but not the original's internal detail: a moved subtree keeps its structure and values, not the comments and blank lines that were inside it.
 - No parse cache. A `Document` is mutable, so a cache would have to hand out deep clones, which is not clearly cheaper than re-parsing. See the note in `src/file.zig`.
+- Emission buffers the whole output; there is no writer-based sink. This is not an oversight to be tidied up later: byte-faithful emission needs random access to what it has already written — it inserts separators and newlines behind the cursor — so a forward-only writer cannot express it. `doc.write` and `yaml.writeAll` return an owned slice, and `yaml.file.writeFile` puts it on disk atomically.
+- Comments are preserved, not addressable. They survive as source bytes the emitter copies, so an edit keeps them exactly; there is no API to read a node's comment, or to add, change or remove one. Making them addressable means putting comment spans in the node model, which touches the round-trip guarantee, so it is a design change rather than an addition.
 - Duplicate mapping keys are kept, not rejected. YAML 1.2 §3.2.1.1 requires keys to be unique, but real-world files carry duplicates and dropping one silently is worse than surfacing it. Both entries survive a round trip; `lookup` and path reads return the first.
 - Merge keys (`<<: *base`) are not resolved. `<<` parses as an ordinary key whose value is an alias, which is correct for YAML 1.2 — merge keys are a 1.1-era extension — but it will surprise anyone arriving from Kubernetes or GitLab configs, so it is called out rather than left to be discovered.
 - `yaml.value` and `yaml.schema` bound alias expansion. They expand aliases by copying, so output is a function of the expanded tree rather than the input; both cap that by default and return `error.LimitExceeded` past it. See the memory notes in [docs/USAGE.md](docs/USAGE.md).

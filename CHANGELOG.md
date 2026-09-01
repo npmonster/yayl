@@ -58,6 +58,18 @@ var doc = try yaml.parseOpts(allocator, input, null, .{ .max_input_bytes = 512 <
   region ends mid-line at `--- foo` and its own trailing comment belongs
   to the *next* document's leading bytes.
 
+- `EmitOptions`, via `Document.writeOpts` and `writeAllOpts`, chooses
+  the indent width for content the emitter lays out itself and carries
+  the emission depth bound. A parsed document still measures its own
+  convention by default — a new subtree should match the file it lands
+  in — but a document built from nothing had no convention to measure
+  and no way to say what it wanted; it was 2 spaces, always. The value
+  is clamped to 1..8, since 0 would emit YAML that does not re-parse.
+
+  It cannot affect bytes that re-emit verbatim, and there is a test
+  that asserts exactly that: the round-trip guarantee outranks a layout
+  preference.
+
 - `toZig` / `fromZig` handle the three shapes they were rejecting.
 
   **String-keyed maps.** A `labels:` block whose keys are the data had

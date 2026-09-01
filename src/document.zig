@@ -41,6 +41,11 @@ pub const ParseOptions = scanner_mod.Options;
 /// What a parse does with a NUL byte in the input. See `ParseOptions`.
 pub const EmbeddedNul = scanner_mod.EmbeddedNul;
 
+/// Layout choices for emission — `emitter.Emitter.Options`, named for
+/// the layer callers reach it through. Use it with `writeOpts` /
+/// `writeAllOpts`; `write` and `writeAll` use the defaults.
+pub const EmitOptions = @import("emitter.zig").Emitter.Options;
+
 /// One mapping entry; both nodes are pool-owned. `src` records where
 /// the pair's bytes end in the original source (see `Node.src`), so
 /// untouched pairs re-emit byte-identically.
@@ -672,11 +677,18 @@ pub const Document = struct {
     /// indentation included) unless a node was modified after parsing;
     /// modified subtrees are re-emitted normalized in place.
     pub fn write(self: *const Document, allocator: std.mem.Allocator) ![]u8 {
+        return self.writeOpts(allocator, .{});
+    }
+
+    /// `write` with explicit layout choices for the parts the emitter
+    /// lays out itself. See `EmitOptions`.
+    pub fn writeOpts(self: *const Document, allocator: std.mem.Allocator, options: EmitOptions) ![]u8 {
         const emitter_mod = @import("emitter.zig");
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         var em = emitter_mod.Emitter.init(allocator, &out);
         defer em.deinit();
+        em.configure(options);
         try em.emitDocument(self);
         return try out.toOwnedSlice(allocator);
     }
@@ -700,6 +712,11 @@ pub const Document = struct {
 /// Each document is emitted by its own `Emitter`, so anchors are scoped
 /// per document as YAML requires.
 pub fn writeAll(allocator: std.mem.Allocator, docs: []const Document) ![]u8 {
+    return writeAllOpts(allocator, docs, .{});
+}
+
+/// `writeAll` with explicit layout choices. See `EmitOptions`.
+pub fn writeAllOpts(allocator: std.mem.Allocator, docs: []const Document, options: EmitOptions) ![]u8 {
     const emitter_mod = @import("emitter.zig");
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -708,6 +725,7 @@ pub fn writeAll(allocator: std.mem.Allocator, docs: []const Document) ![]u8 {
         const body_start = out.items.len;
         var em = emitter_mod.Emitter.init(allocator, &out);
         defer em.deinit();
+        em.configure(options);
         try em.emitDocument(doc);
 
         if (i == 0) continue;
@@ -1445,4 +1463,76 @@ test "writeAll separates hand-built documents" {
     const again = try writeAll(allocator, &.{ one, two });
     defer allocator.free(again);
     try testing.expectEqualStrings(out, again);
+}
+
+test "emit options set the indent for content the emitter lays out" {
+    const allocator = std.testing.allocator;
+
+    // A document built from nothing has no convention to measure, so
+    // before this its indent was simply 2, with no way to say otherwise.
+    var doc = Document.init(allocator);
+    defer doc.deinit();
+    doc.root = try doc.createMapping();
+    const inner = try doc.createMapping();
+    try doc.mappingAppend(doc.root.?, try doc.createScalar("outer", .plain), inner);
+    try doc.mappingAppend(inner, try doc.createScalar("key", .plain), try doc.createScalar("v", .plain));
+
+    const two = try doc.write(allocator);
+    defer allocator.free(two);
+    try testing.expectEqualStrings("outer:\n  key: v\n", two);
+
+    const four = try doc.writeOpts(allocator, .{ .indent = 4 });
+    defer allocator.free(four);
+    try testing.expectEqualStrings("outer:\n    key: v\n", four);
+
+    // Clamped rather than trusted: 0 would emit unparseable YAML.
+    const clamped = try doc.writeOpts(allocator, .{ .indent = 0 });
+    defer allocator.free(clamped);
+    try testing.expectEqualStrings("outer:\n key: v\n", clamped);
+}
+
+test "emit options cannot disturb bytes that re-emit verbatim" {
+    const allocator = std.testing.allocator;
+    // The guarantee has priority over the preference: untouched source
+    // bytes are copied, so an indent request cannot reach them.
+    const src = "outer:\n      key: v\n      other: w\n";
+    var doc = try Document.parse(allocator, src);
+    defer doc.deinit();
+    const out = try doc.writeOpts(allocator, .{ .indent = 2 });
+    defer allocator.free(out);
+    try testing.expectEqualStrings(src, out);
+
+    // It does reach a new subtree, which has no source bytes of its own.
+    var edited = try Document.parse(allocator, src);
+    defer edited.deinit();
+    const added = try edited.createMapping();
+    try edited.mappingAppend(added, try edited.createScalar("n", .plain), try edited.createScalar("1", .plain));
+    try edited.pathSet(&.{"fresh"}, added);
+    const with_new = try edited.writeOpts(allocator, .{ .indent = 3 });
+    defer allocator.free(with_new);
+    try testing.expect(std.mem.indexOf(u8, with_new, "fresh:\n   n: 1") != null);
+    // ... and the original lines are still exactly as they were.
+    try testing.expect(std.mem.indexOf(u8, with_new, "outer:\n      key: v\n      other: w\n") != null);
+}
+
+test "emit options carry the depth bound" {
+    const allocator = std.testing.allocator;
+    var doc = Document.init(allocator);
+    defer doc.deinit();
+    const root = try doc.createSequence();
+    doc.root = root;
+    var cur = root;
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        const next = try doc.createSequence();
+        try doc.sequenceAppend(cur, next);
+        cur = next;
+    }
+    try doc.sequenceAppend(cur, try doc.createScalar("leaf", .plain));
+
+    // Well under the default, so this is the bound doing the work.
+    try testing.expectError(error.NestingTooDeep, doc.writeOpts(allocator, .{ .max_depth = 8 }));
+    const ok = try doc.writeOpts(allocator, .{ .max_depth = 500 });
+    defer allocator.free(ok);
+    try testing.expect(std.mem.indexOf(u8, ok, "leaf") != null);
 }

@@ -54,6 +54,9 @@ pub const Emitter = struct {
     /// Active source for faithful emission (empty when normalized).
     src: []const u8 = "",
     indent_step: usize = 2,
+    /// True when the caller set `indent_step` explicitly, so faithful
+    /// emission must not overwrite it with the source's own convention.
+    forced_indent: bool = false,
     /// Nesting levels currently open. Emission is recursive, so this
     /// bounds native stack use; see `max_depth`.
     depth: usize = 0,
@@ -235,6 +238,31 @@ pub const Emitter = struct {
     // Document level
     // ------------------------------------------------------------------
 
+    /// Layout choices for content the emitter lays out itself: nodes
+    /// with no source bytes to copy — a whole document you built, or a
+    /// new subtree inside a parsed one. It cannot affect bytes that are
+    /// re-emitted verbatim, which is the point of those bytes.
+    pub const Options = struct {
+        /// Spaces per nesting level. Null measures the document's own
+        /// convention and falls back to 2, which is what a parsed
+        /// document wants: a new subtree should match the file it lands
+        /// in, not the emitter's taste. Set it for a document you built
+        /// from nothing, where there is no convention to measure.
+        /// Clamped to 1..8.
+        indent: ?usize = null,
+
+        /// Nesting past which emission fails rather than recursing.
+        /// See `Emitter.max_depth`.
+        max_depth: usize = 1000,
+    };
+
+    /// Apply `options` to this emitter.
+    pub fn configure(self: *Emitter, options: Options) void {
+        if (options.indent) |n| self.indent_step = @min(@max(n, 1), 8);
+        self.forced_indent = options.indent != null;
+        self.max_depth = options.max_depth;
+    }
+
     /// Serialize `doc` into the output list. Parsed documents re-emit
     /// byte-faithfully outside modified slots; programmatic documents
     /// emit normalized.
@@ -292,9 +320,11 @@ pub const Emitter = struct {
         // because a pathological source (or a tab-indented one measured
         // in columns) must not make the emitter write absurd runs of
         // spaces; two is the YAML house default when unmeasurable.
-        if (doc.root) |root| {
-            if (self.inferIndentStep(root)) |step| {
-                self.indent_step = @min(@max(step, 1), 8);
+        if (!self.forced_indent) {
+            if (doc.root) |root| {
+                if (self.inferIndentStep(root)) |step| {
+                    self.indent_step = @min(@max(step, 1), 8);
+                }
             }
         }
         try self.write(src[doc.region_start..doc.body_start]);
