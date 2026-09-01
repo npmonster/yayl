@@ -6,7 +6,6 @@ vendor/
 
 # Local Git and agent metadata/worktrees
 .git/
-.github/
 .plumb/
 .zcode/
 .claude/
