@@ -484,7 +484,7 @@ test "an embedded NUL is rejected, and truncation is opt-in" {
     try std.testing.expectEqualStrings("", doc.pathGet(&.{"b"}).?.scalarValue().?);
 }
 
-test "a parse diagnostic survives the options path" {
+test "a parse diagnostic survives the options path, positioned" {
     const allocator = std.testing.allocator;
     var d: Diag = .{ .allocator = allocator };
     defer d.deinit();
@@ -494,5 +494,45 @@ test "a parse diagnostic survives the options path" {
     );
     const report = try d.render(allocator);
     defer allocator.free(report);
+    // `Diag.render` prints line:column and never the offset, so a mark
+    // carrying only an offset renders as a confident `1:1` -- a wrong
+    // position is worse than none. The NUL is on line 2, column 4.
+    try std.testing.expect(std.mem.startsWith(u8, report, "2:4: error: "));
     try std.testing.expect(std.mem.indexOf(u8, report, "NUL") != null);
+}
+
+test "a UTF-16 stream is named, not reported as a stray NUL" {
+    const allocator = std.testing.allocator;
+    var d: Diag = .{ .allocator = allocator };
+    defer d.deinit();
+    // UTF-16LE "a: 1": every ASCII character carries a NUL high byte, so
+    // the NUL check sees it first and would send the reader hunting for
+    // a stray byte in what is simply the wrong encoding.
+    const utf16 = "\xFF\xFEa\x00:\x00 \x001\x00";
+    try std.testing.expectError(error.InvalidUtf8, parseDiag(allocator, utf16, &d));
+    const report = try d.render(allocator);
+    defer allocator.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, "UTF-16") != null);
+}
+
+test "an escaped NUL is content, not a raw NUL" {
+    const allocator = std.testing.allocator;
+    // `\0` inside a double-quoted scalar is legal YAML and decodes to a
+    // real NUL in the *value*. Now that raw NULs in the input are
+    // rejected, this is the one interaction worth a permanent witness:
+    // emission must never write that byte out raw, or a document would
+    // stop round-tripping through its own writer.
+    var doc = try parse(allocator, "a: \"x\\0y\"\n");
+    defer doc.deinit();
+    const decoded = doc.pathGet(&.{"a"}).?.scalarValue().?;
+    try std.testing.expectEqual(@as(usize, 3), decoded.len);
+    try std.testing.expectEqual(@as(u8, 0), decoded[1]);
+
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOfScalar(u8, out, 0) == null);
+
+    var again = try parse(allocator, out);
+    defer again.deinit();
+    try std.testing.expectEqualStrings(decoded, again.pathGet(&.{"a"}).?.scalarValue().?);
 }

@@ -64,9 +64,17 @@ pub const Emitter = struct {
     /// `scanner.max_nesting` (200) — but a tree built through
     /// `createSequence`/`sequenceAppend` or `value.toNode` has no such
     /// bound, and unbounded recursion here is a stack overflow rather
-    /// than a typed error. A level costs at most two counts (the
-    /// faithful walker delegating to the normalizing one), so the real
-    /// depth admitted is at least half this.
+    /// than a typed error.
+    ///
+    /// A node is charged more than once only where emission crosses
+    /// from one land into another, and a root-to-leaf path crosses at
+    /// most two such boundaries: faithful to normalized (`emitContent`
+    /// delegating to `emitNode` for a `src == null` block node, which
+    /// never calls back), and either of those to flow (`emitFlowBody`,
+    /// which only ever calls `emitFlowNode`). The two cannot both apply
+    /// to the same node — the first needs a non-empty block collection,
+    /// the second a flow or empty one. So charges ≤ real depth + 2, and
+    /// the nesting actually admitted is `max_depth - 2`.
     max_depth: usize = 1000,
 
     /// Emission fails on output allocation, on a programmatic node
@@ -81,6 +89,9 @@ pub const Emitter = struct {
     }
 
     fn leave(self: *Emitter) void {
+        // Every caller pairs this with `enter` through `defer`, which
+        // holds on the error path too. An unpaired call would wrap.
+        std.debug.assert(self.depth > 0);
         self.depth -= 1;
     }
 

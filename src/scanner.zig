@@ -60,9 +60,42 @@ pub const Options = struct {
     /// clear of its own `max_depth`.
     max_nesting: usize = 200,
 
+    // These are the parse-layer bounds only. Two others live where the
+    // work they bound happens, and a caller hardening against hostile
+    // input wants all four: `value.Limits` / `schema.Limits` bound alias
+    // expansion (those layers expand by copying, so their output is not
+    // bounded by input size), and `emitter.Emitter.max_depth` bounds
+    // emission of a document that was built rather than parsed.
+
     /// How a NUL byte in the input is handled.
     embedded_nul: EmbeddedNul = .reject,
 };
+
+/// Position of byte `offset` in `input`, for a diagnostic raised before
+/// scanning starts.
+///
+/// `Diag.render` prints line and column and never the offset, so a mark
+/// carrying only an offset renders as `1:1` — a confidently wrong
+/// position, which is worse than none. Columns are counted in
+/// codepoints, as the scanner's own marks are, but defensively: this
+/// runs before UTF-8 validation, so it counts every byte that is not a
+/// continuation byte rather than decoding.
+fn markOf(input: []const u8, offset: usize) Mark {
+    var mark: Mark = .{ .offset = offset };
+    var line_start: usize = 0;
+    for (input[0..offset], 0..) |b, i| {
+        if (b == '\n') {
+            mark.line += 1;
+            line_start = i + 1;
+        }
+    }
+    var column: usize = 1;
+    for (input[line_start..offset]) |b| {
+        if (b & 0xC0 != 0x80) column += 1;
+    }
+    mark.column = column;
+    return mark;
+}
 
 /// YAML tokenizer: turns input bytes into a token stream (fy-scan port).
 pub const Scanner = struct {
@@ -130,8 +163,16 @@ pub const Scanner = struct {
             // Silently dropping everything past the NUL is data loss, and
             // the spec does not admit the byte in the first place.
             .reject => {
-                const mark: Mark = .{ .offset = i };
-                diag.emitBestEffort(d, .err, mark, "input contains a NUL byte, which YAML does not permit", .{});
+                // A UTF-16 stream is mostly NULs to a byte reader, and
+                // "NUL byte" would send the reader hunting for one.
+                // yayl is UTF-8 only (spec 5.2 also allows 16 and 32).
+                if (input.len >= 2 and (std.mem.startsWith(u8, input, "\xFF\xFE") or
+                    std.mem.startsWith(u8, input, "\xFE\xFF")))
+                {
+                    diag.emitBestEffort(d, .err, Mark.start, "input has a UTF-16 byte order mark; only UTF-8 is supported", .{});
+                    return error.InvalidUtf8;
+                }
+                diag.emitBestEffort(d, .err, markOf(input, i), "input contains a NUL byte, which YAML does not permit", .{});
                 return error.InvalidSyntax;
             },
             .truncate => end = i,

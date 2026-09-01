@@ -5,6 +5,43 @@ series; APIs may still move, and anything that does is listed here.
 
 ## Unreleased
 
+### Behaviour changes — read this before upgrading
+
+Two calls that used to succeed can now return an error. Both are
+deliberate and both have an opt-out; neither is a silent change.
+
+**A NUL byte in the input is rejected** — `error.InvalidSyntax`, with a
+positioned diagnostic — where it previously truncated the input at that
+byte and parsed the prefix as if nothing were missing.
+
+The old behaviour was libyaml's, where a C string has no choice about
+ending at a NUL. Zig has a length and no such constraint, and YAML 1.2
+does not admit the byte at all (spec 5.1 `c-printable` excludes #x0).
+The decisive argument is what it did to this library's own headline
+workflow: `Document.source` kept the *truncated* slice, and faithful
+emission writes `source` back out, so `parse` → edit → `write` on a file
+containing a stray NUL silently destroyed everything after it — in the
+file. That is data destruction on the primary path, not a compatibility
+quirk.
+
+To restore the old behaviour, opt in explicitly:
+
+```zig
+var doc = try yaml.parseOpts(allocator, input, null, .{ .embedded_nul = .truncate });
+```
+
+A UTF-16 stream (which is mostly NULs to a byte reader) is now named as
+such — `error.InvalidUtf8`, "input has a UTF-16 byte order mark" —
+rather than reported as a stray NUL.
+
+**Input over 64 MiB is rejected** with the new `error.InputTooLarge`,
+where the in-memory entry points previously had no bound at all. If you
+stream large documents through `yaml.parse`, raise it:
+
+```zig
+var doc = try yaml.parseOpts(allocator, input, null, .{ .max_input_bytes = 512 << 20 });
+```
+
 ### Added
 
 - `yaml.writeAll(allocator, docs)` serializes a whole stream — the
@@ -28,15 +65,6 @@ series; APIs may still move, and anything that does is listed here.
   only ever covered reads from disk. `max_nesting` (200) was previously
   reachable only by hand-rolling a `Scanner`. Over-long input fails with
   the new `error.InputTooLarge` before it is scanned.
-
-### Changed
-
-- **A NUL byte in the input is now rejected** with `error.InvalidSyntax`
-  and a positioned diagnostic, instead of silently truncating the input
-  there. YAML 1.2 does not admit the byte (spec 5.1 `c-printable`), and
-  the old behaviour was inherited from libyaml, where a C string has no
-  choice. It cost a caller the entire remainder of the buffer with no
-  indication. `ParseOptions.embedded_nul = .truncate` restores it.
 
 ### Fixed
 
