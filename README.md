@@ -173,6 +173,15 @@ const out = try doc.write(alloc); // "# config\nport: 9090 # user facing\n"
 defer alloc.free(out);
 ```
 
+For a whole stream use `yaml.writeAll(allocator, docs)`, the counterpart to `parseAll`:
+
+```zig
+const out = try yaml.writeAll(alloc, docs.items);
+defer alloc.free(out);
+```
+
+`writeAll(parseAll(input))` reproduces `input` byte for byte. Do not concatenate `doc.write()` yourself: documents with no `---` between them — two separately parsed strings, or two you built — merge into a single document, so two mappings silently become one mapping with duplicate keys. `writeAll` inserts a marker exactly where one is required and absent, and nothing where a boundary is already there.
+
 ## Edit with paths, batch atomically
 
 `yaml.edit.Editor` queries with a path grammar (`$.a.b[0]`, `[*]`, `..name`, `[?key=value]`) and applies edits (set, delete, insert, append, move) as an atomic batch over a deep clone of the tree:

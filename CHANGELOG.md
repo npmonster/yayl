@@ -7,6 +7,20 @@ series; APIs may still move, and anything that does is listed here.
 
 ### Added
 
+- `yaml.writeAll(allocator, docs)` serializes a whole stream — the
+  counterpart `parseAll` never had. `writeAll(parseAll(input))` is
+  byte-exact, and unlike concatenating `doc.write()` by hand it cannot
+  silently merge two documents into one: without a `---` between them,
+  two mappings become one mapping with duplicate keys. A marker is
+  inserted only where a boundary is required and absent.
+
+  The round-trip gate now runs through `writeAll` rather than a
+  hand-rolled concatenation, so the byte-exactness claim is checked
+  against the whole corpus (265 streams) rather than the unit tests'
+  handful of shapes. It caught one: corpus L383, where a document's
+  region ends mid-line at `--- foo` and its own trailing comment belongs
+  to the *next* document's leading bytes.
+
 - `ParseOptions` and the `parseOpts` / `parseAllOpts` entry points
   (`Document.parseOpts` / `parseAllOpts` underneath) put the parse
   bounds in the caller's hands. `max_input_bytes` (64 MiB) is a new

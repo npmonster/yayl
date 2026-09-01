@@ -682,6 +682,83 @@ pub const Document = struct {
     }
 };
 
+/// Serialize a whole stream: every document, in order, into one buffer.
+///
+/// The counterpart to `parseAll`. `writeAll(parseAll(input))` reproduces
+/// `input` byte for byte, because each document keeps its own source
+/// region and the regions are contiguous across the stream.
+///
+/// Concatenating `doc.write()` yourself is *not* the same thing, and the
+/// difference is a silent corruption rather than an error: two documents
+/// that carry no document-start marker between them — two separately
+/// parsed single-document strings, or two documents built by hand —
+/// concatenate into one document, and two mappings become one mapping
+/// with duplicate keys. This inserts `---` wherever a boundary is
+/// required and absent, and inserts nothing where one is already there,
+/// which is why the round trip stays byte-exact.
+///
+/// Each document is emitted by its own `Emitter`, so anchors are scoped
+/// per document as YAML requires.
+pub fn writeAll(allocator: std.mem.Allocator, docs: []const Document) ![]u8 {
+    const emitter_mod = @import("emitter.zig");
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    for (docs, 0..) |*doc, i| {
+        const body_start = out.items.len;
+        var em = emitter_mod.Emitter.init(allocator, &out);
+        defer em.deinit();
+        try em.emitDocument(doc);
+
+        if (i == 0) continue;
+        if (endsStream(out.items[0..body_start])) continue;
+        if (startsDocument(out.items[body_start..])) continue;
+
+        // No boundary either side: supply one. Nothing is inserted on
+        // the path above, which is what keeps a parsed stream byte-exact
+        // -- including the case that motivated this shape, where a
+        // document's region ends mid-line (`--- foo`) and its own
+        // trailing comment belongs to the *next* document's leading
+        // bytes. Inserting a newline there unconditionally would cut
+        // that line in half.
+        const sep = if (body_start > 0 and out.items[body_start - 1] != '\n') "\n---\n" else "---\n";
+        try out.insertSlice(allocator, body_start, sep);
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+/// True when `text` opens a new document — its first line that is not
+/// blank, a comment or a directive is a `---` marker. Directives imply
+/// one, since a directive can only precede a document start.
+fn startsDocument(text: []const u8) bool {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (trimmed.len == 0) continue;
+        if (trimmed[0] == '#') continue;
+        if (trimmed[0] == '%') return true;
+        return std.mem.startsWith(u8, line, "---") and
+            (line.len == 3 or line[3] == ' ' or line[3] == '\t');
+    }
+    return false;
+}
+
+/// True when `text` ends with an explicit `...` end-of-document marker,
+/// which is itself a boundary: the next document needs no `---`.
+fn endsStream(text: []const u8) bool {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    var last: []const u8 = "";
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (std.mem.trim(u8, line, " \t").len == 0) continue;
+        last = line;
+    }
+    return std.mem.startsWith(u8, last, "...") and
+        (last.len == 3 or last[3] == ' ' or last[3] == '\t');
+}
+
 /// Builds a node tree out of parser events (fy_docbuilder). While
 /// building, every node records its source span (see `markup.Src`) so
 /// untouched regions re-emit byte-identically.
@@ -1266,4 +1343,106 @@ fn editWrite(allocator: std.mem.Allocator) !void {
     try doc.sequenceAppend(items, try doc.createScalar("z", .plain));
     const out = try doc.write(allocator);
     defer allocator.free(out);
+}
+
+test "writeAll reproduces a parsed stream byte for byte" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "a: 1\n---\nb: 2\n",
+        "---\nfirst: doc\n---\nsecond: doc\n",
+        "a: 1\n...\n---\nb: 2\n",
+        "# leading\n---\none\n--- two\n",
+        "%YAML 1.2\n---\na\n...\n",
+        "just: one\n",
+        // Corpus L383. Document 1's region ends mid-line at `--- foo`,
+        // and its own trailing comment is carried in document 2's
+        // leading bytes. Anything that "helpfully" terminates a document
+        // before the next one cuts that line in half; caught by the
+        // corpus gate, pinned here so it does not need the corpus.
+        "--- foo  # comment\n--- foo  # comment\n",
+    };
+    for (cases) |input| {
+        var docs = try Document.parseAll(allocator, input);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        const out = try writeAll(allocator, docs.items);
+        defer allocator.free(out);
+        try testing.expectEqualStrings(input, out);
+    }
+}
+
+test "writeAll separates documents that would otherwise merge" {
+    const allocator = std.testing.allocator;
+
+    // Two separately parsed single-document strings. Each re-emits as
+    // its own bytes with no marker, so plain concatenation yields one
+    // mapping with two keys -- valid YAML, wrong data, no error.
+    var first = try Document.parse(allocator, "a: 1\n");
+    defer first.deinit();
+    var second = try Document.parse(allocator, "b: 2\n");
+    defer second.deinit();
+
+    const naive = blk: {
+        const x = try first.write(allocator);
+        defer allocator.free(x);
+        const y = try second.write(allocator);
+        defer allocator.free(y);
+        break :blk try std.mem.concat(allocator, u8, &.{ x, y });
+    };
+    defer allocator.free(naive);
+    {
+        var merged = try Document.parseAll(allocator, naive);
+        defer {
+            for (merged.items) |*d| d.deinit();
+            merged.deinit(allocator);
+        }
+        // The corruption this guards against, pinned so the test fails
+        // if it ever stops being a corruption.
+        try testing.expectEqual(@as(usize, 1), merged.items.len);
+    }
+
+    const out = try writeAll(allocator, &.{ first, second });
+    defer allocator.free(out);
+    try testing.expectEqualStrings("a: 1\n---\nb: 2\n", out);
+
+    var back = try Document.parseAll(allocator, out);
+    defer {
+        for (back.items) |*d| d.deinit();
+        back.deinit(allocator);
+    }
+    try testing.expectEqual(@as(usize, 2), back.items.len);
+    try testing.expectEqualStrings("1", back.items[0].pathGet(&.{"a"}).?.scalarValue().?);
+    try testing.expectEqualStrings("2", back.items[1].pathGet(&.{"b"}).?.scalarValue().?);
+}
+
+test "writeAll separates hand-built documents" {
+    const allocator = std.testing.allocator;
+    var one = Document.init(allocator);
+    defer one.deinit();
+    one.root = try one.createMapping();
+    try one.pathSet(&.{"a"}, try one.createScalar("1", .plain));
+
+    var two = Document.init(allocator);
+    defer two.deinit();
+    two.root = try two.createMapping();
+    try two.pathSet(&.{"b"}, try two.createScalar("2", .plain));
+
+    const out = try writeAll(allocator, &.{ one, two });
+    defer allocator.free(out);
+
+    var back = try Document.parseAll(allocator, out);
+    defer {
+        for (back.items) |*d| d.deinit();
+        back.deinit(allocator);
+    }
+    try testing.expectEqual(@as(usize, 2), back.items.len);
+
+    // A document that asks for its own marker does not get a second one.
+    try testing.expect(std.mem.indexOf(u8, out, "------") == null);
+    two.explicit_start = true;
+    const again = try writeAll(allocator, &.{ one, two });
+    defer allocator.free(again);
+    try testing.expectEqualStrings(out, again);
 }

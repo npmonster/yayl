@@ -46,6 +46,7 @@ pub const ScalarStyle = token.ScalarStyle;
 pub const NodeKind = document.NodeKind;
 pub const CoreTag = document.CoreTag;
 pub const resolveCoreTag = document.resolveCoreTag;
+pub const writeAll = document.writeAll;
 pub const ParseOptions = document.ParseOptions;
 pub const EmbeddedNul = document.EmbeddedNul;
 pub const Node = document.Node;

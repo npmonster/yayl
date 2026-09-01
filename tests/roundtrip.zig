@@ -139,16 +139,18 @@ fn roundTrip(allocator: std.mem.Allocator, input: []const u8) !?[]const u8 {
         return "no document in stream";
     }
 
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    for (docs.items) |*d| {
-        const text = try d.write(allocator);
-        defer allocator.free(text);
-        try out.appendSlice(allocator, text);
-    }
+    // Through `writeAll`, not a hand-rolled concatenation: the stream
+    // writer is what a consumer is told to use, so it is what the gate
+    // has to hold to byte-exactness. It inserts a `---` only where a
+    // boundary is required and absent, and every corpus stream that
+    // parses as more than one document already carries its own -- so a
+    // spurious insertion shows up here as a diff, across the whole
+    // corpus, rather than only in the unit tests' handful of shapes.
+    const out = try yaml.writeAll(allocator, docs.items);
+    defer allocator.free(out);
 
-    if (std.mem.eql(u8, out.items, input)) return null;
-    return firstDiff(input, out.items);
+    if (std.mem.eql(u8, out, input)) return null;
+    return firstDiff(input, out);
 }
 
 fn firstDiff(input: []const u8, out: []const u8) []const u8 {
