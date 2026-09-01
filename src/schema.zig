@@ -51,8 +51,27 @@ pub const Schema = struct {
         str_enum: []const []const u8,
         /// Integer range, inclusive.
         int_range: struct { min: i64, max: i64 },
-        /// Sequence whose items must each match `items`.
-        seq: *const Schema,
+        /// Float range, inclusive. Integers satisfy it too, as they do
+        /// for `float`: YAML's core schema resolves `1` as an int, and
+        /// rejecting it where a number was asked for is a papercut.
+        float_range: struct { min: f64, max: f64 },
+        /// String length in codepoints, inclusive. Codepoints rather
+        /// than bytes: a bound written as "at most 32 characters" means
+        /// characters, and a multibyte name would fail a byte bound for
+        /// no reason the author intended.
+        str_len: struct { min: usize, max: usize },
+        /// Sequence whose items must each match `items`, optionally
+        /// with a bound on how many there are.
+        seq: struct { items: *const Schema, min_len: ?usize = null, max_len: ?usize = null },
+        /// Null, or the inner schema. Distinct from a non-required
+        /// field: the key must be present, its value may be null.
+        nullable: *const Schema,
+        /// Must match every branch.
+        all_of: []const *const Schema,
+        /// Must match at least one branch.
+        any_of: []const *const Schema,
+        /// Must match exactly one branch.
+        one_of: []const *const Schema,
         /// Mapping with declared fields. Unknown keys are allowed
         /// unless `deny_unknown` is set.
         map: struct { fields: []const Field, deny_unknown: bool = false },
@@ -83,9 +102,45 @@ pub const Schema = struct {
         return .{ .kind = .{ .int_range = .{ .min = min, .max = max } } };
     }
 
+    /// A number in the inclusive range `[min, max]`. Integers qualify.
+    pub fn floatRange(min: f64, max: f64) Schema {
+        return .{ .kind = .{ .float_range = .{ .min = min, .max = max } } };
+    }
+
+    /// A string of `min` to `max` codepoints, inclusive.
+    pub fn strLen(min: usize, max: usize) Schema {
+        return .{ .kind = .{ .str_len = .{ .min = min, .max = max } } };
+    }
+
     /// A sequence whose items must each match `items`.
     pub fn seq(items: *const Schema) Schema {
-        return .{ .kind = .{ .seq = items } };
+        return .{ .kind = .{ .seq = .{ .items = items } } };
+    }
+
+    /// A sequence of `min` to `max` items, each matching `items`.
+    pub fn seqLen(items: *const Schema, min: usize, max: usize) Schema {
+        return .{ .kind = .{ .seq = .{ .items = items, .min_len = min, .max_len = max } } };
+    }
+
+    /// Null, or `inner`. Use for a key that must be present but whose
+    /// value may be null; a merely optional key is `required = false`.
+    pub fn nullable(inner: *const Schema) Schema {
+        return .{ .kind = .{ .nullable = inner } };
+    }
+
+    /// Matches only if every branch matches.
+    pub fn allOf(branches: []const *const Schema) Schema {
+        return .{ .kind = .{ .all_of = branches } };
+    }
+
+    /// Matches if at least one branch matches.
+    pub fn anyOf(branches: []const *const Schema) Schema {
+        return .{ .kind = .{ .any_of = branches } };
+    }
+
+    /// Matches only if exactly one branch matches.
+    pub fn oneOf(branches: []const *const Schema) Schema {
+        return .{ .kind = .{ .one_of = branches } };
     }
 
     /// A mapping with declared `fields`; unknown keys are allowed.
@@ -165,6 +220,33 @@ fn typeErr(allocator: std.mem.Allocator, path: []const u8, want: []const u8, out
     return appendViolation(allocator, out, path, "type", "expected {s}", .{want});
 }
 
+/// Does `branch` match `node`? Runs a full validation into a scratch
+/// list and reports only whether it was empty.
+///
+/// The branch's own violations are deliberately dropped: under `any_of`
+/// a failing branch is not an error, it is a branch that did not apply,
+/// and surfacing four sets of failures for a value that had to match
+/// one of four forms buries the actual problem. The composite reports
+/// one violation naming the composition instead.
+///
+/// Budget is shared with the enclosing validation, so exploring
+/// branches cannot escape `Limits.max_nodes`.
+fn branchMatches(
+    branch: *const Schema,
+    allocator: std.mem.Allocator,
+    node: *const Node,
+    path: []const u8,
+    remaining: *usize,
+) Error!bool {
+    var scratch: std.ArrayList(Violation) = .empty;
+    defer {
+        for (scratch.items) |*v| v.deinitSelf(allocator);
+        scratch.deinit(allocator);
+    }
+    try checkSchema(branch, allocator, node, path, &scratch, remaining);
+    return scratch.items.len == 0;
+}
+
 fn checkNodeCoreTag(node: *const Node) ?document_mod.CoreTag {
     const s = node.scalarValue() orelse return null;
     return document_mod.resolveCoreTag(s, node.data.scalar.style);
@@ -214,12 +296,67 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
                 try appendViolation(allocator, out, path, "range", "{d} is outside [{d}, {d}]", .{ v, r.min, r.max });
             }
         },
-        .seq => |items| {
+        .float_range => |r| {
+            const k = checkNodeCoreTag(cur);
+            if (k != .float and k != .int) return typeErr(allocator, path, "a number", out);
+            const text = cur.scalarValue().?;
+            const v = std.fmt.parseFloat(f64, text) catch
+                document_mod.floatSpecial(text) orelse {
+                try typeErr(allocator, path, "a number", out);
+                return;
+            };
+            // A NaN fails every comparison, so test for it rather than
+            // letting `v < min` quietly report it as in range.
+            if (std.math.isNan(v) or v < r.min or v > r.max) {
+                try appendViolation(allocator, out, path, "range", "{d} is outside [{d}, {d}]", .{ v, r.min, r.max });
+            }
+        },
+        .str_len => |r| {
+            const s = cur.scalarValue() orelse return typeErr(allocator, path, "a string", out);
+            const n = std.unicode.utf8CountCodepoints(s) catch s.len;
+            if (n < r.min or n > r.max) {
+                try appendViolation(allocator, out, path, "length", "length {d} is outside [{d}, {d}]", .{ n, r.min, r.max });
+            }
+        },
+        .seq => |spec| {
             const list = cur.items() orelse return typeErr(allocator, path, "a sequence", out);
+            if (spec.min_len) |min| if (list.len < min) {
+                try appendViolation(allocator, out, path, "length", "{d} items, at least {d} required", .{ list.len, min });
+            };
+            if (spec.max_len) |max| if (list.len > max) {
+                try appendViolation(allocator, out, path, "length", "{d} items, at most {d} allowed", .{ list.len, max });
+            };
             for (list, 0..) |item, i| {
                 const child_path = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path, i });
                 defer allocator.free(child_path);
-                try checkSchema(items, allocator, item, child_path, out, remaining);
+                try checkSchema(spec.items, allocator, item, child_path, out, remaining);
+            }
+        },
+        .nullable => |inner| {
+            if (checkNodeCoreTag(cur) == .null) return;
+            try checkSchema(inner, allocator, node, path, out, remaining);
+        },
+        .all_of => |branches| {
+            // Every branch reports into the caller's list directly: with
+            // `all_of` each failure is a real failure, and the author
+            // wants to see all of them, not just the first.
+            for (branches) |branch| {
+                try checkSchema(branch, allocator, node, path, out, remaining);
+            }
+        },
+        .any_of, .one_of => |branches| {
+            var matched: usize = 0;
+            for (branches) |branch| {
+                if (try branchMatches(branch, allocator, node, path, remaining)) matched += 1;
+            }
+            switch (schema.kind) {
+                .any_of => if (matched == 0) {
+                    try appendViolation(allocator, out, path, "any_of", "matches none of the {d} allowed forms", .{branches.len});
+                },
+                .one_of => if (matched != 1) {
+                    try appendViolation(allocator, out, path, "one_of", "matches {d} of the {d} allowed forms, exactly one required", .{ matched, branches.len });
+                },
+                else => unreachable,
             }
         },
         .map => |map_spec| {
@@ -405,9 +542,9 @@ test "validation walks a bounded number of nodes" {
     defer doc.deinit();
     const deep = doc.pathGet(&.{"l3"}).?;
 
-    const s1 = Schema{ .kind = .{ .seq = &Schema.any } };
-    const s2 = Schema{ .kind = .{ .seq = &s1 } };
-    const s3 = Schema{ .kind = .{ .seq = &s2 } };
+    const s1 = Schema.seq(&Schema.any);
+    const s2 = Schema.seq(&s1);
+    const s3 = Schema.seq(&s2);
 
     // A tight bound stops the walk instead of letting it run to the
     // expanded size.
@@ -424,4 +561,127 @@ test "validation walks a bounded number of nodes" {
     const violations = try s3.validateLimited(testing.allocator, deep, "$", .{ .max_nodes = 10_000 });
     defer freeViolations(testing.allocator, violations);
     try testing.expectEqual(@as(usize, 0), violations.len);
+}
+
+test "float range, string length and sequence length" {
+    const allocator = testing.allocator;
+    var doc = try document_mod.Document.parse(allocator,
+        \\ratio: 0.75
+        \\whole: 2
+        \\huge: 12.5
+        \\name: café
+        \\empty: ""
+        \\tags: [a, b, c]
+        \\one: [x]
+        \\nan: .nan
+        \\
+    );
+    defer doc.deinit();
+
+    const cases = [_]struct { key: []const u8, schema: Schema, want: usize, rule: []const u8 = "" }{
+        .{ .key = "ratio", .schema = Schema.floatRange(0, 1), .want = 0 },
+        // An integer satisfies a number bound, as it does for `float`.
+        .{ .key = "whole", .schema = Schema.floatRange(0, 10), .want = 0 },
+        .{ .key = "huge", .schema = Schema.floatRange(0, 1), .want = 1 },
+        // NaN compares false against everything; it must not pass a
+        // range check by default.
+        // "range", not "type": `.nan` really is a float under the core
+        // schema, so this asserts we parsed it and then rejected it on
+        // the comparison, rather than never recognising it as a number.
+        .{ .key = "nan", .schema = Schema.floatRange(0, 1), .want = 1, .rule = "range" },
+        // Codepoints, not bytes: "café" is 4 characters in 5 bytes.
+        .{ .key = "name", .schema = Schema.strLen(1, 4), .want = 0 },
+        .{ .key = "name", .schema = Schema.strLen(1, 3), .want = 1 },
+        .{ .key = "empty", .schema = Schema.strLen(1, 8), .want = 1 },
+        .{ .key = "tags", .schema = Schema.seqLen(&Schema.str, 1, 3), .want = 0 },
+        .{ .key = "tags", .schema = Schema.seqLen(&Schema.str, 1, 2), .want = 1 },
+        .{ .key = "one", .schema = Schema.seqLen(&Schema.str, 2, 5), .want = 1 },
+    };
+    for (cases) |c| {
+        const violations = try c.schema.validate(allocator, doc.pathGet(&.{c.key}).?, "$");
+        defer freeViolations(allocator, violations);
+        testing.expectEqual(c.want, violations.len) catch |err| {
+            std.debug.print("key '{s}' produced {d} violations, wanted {d}\n", .{ c.key, violations.len, c.want });
+            return err;
+        };
+        if (c.rule.len > 0) try testing.expectEqualStrings(c.rule, violations[0].rule);
+    }
+}
+
+test "nullable is not the same as optional" {
+    const allocator = testing.allocator;
+    var doc = try document_mod.Document.parse(allocator, "a: null\nb: 7\nc: text\n");
+    defer doc.deinit();
+
+    const s = Schema.nullable(&Schema.int);
+    for ([_][]const u8{ "a", "b" }) |key| {
+        const violations = try s.validate(allocator, doc.pathGet(&.{key}).?, "$");
+        defer freeViolations(allocator, violations);
+        try testing.expectEqual(@as(usize, 0), violations.len);
+    }
+    {
+        const violations = try s.validate(allocator, doc.pathGet(&.{"c"}).?, "$");
+        defer freeViolations(allocator, violations);
+        try testing.expectEqual(@as(usize, 1), violations.len);
+    }
+
+    // The distinction: a required key whose value may be null still has
+    // to be present. `required = false` would accept its absence.
+    const with_null = Schema.map(&.{.{ .key = "a", .schema = &s, .required = true }});
+    var missing = try document_mod.Document.parse(allocator, "other: 1\n");
+    defer missing.deinit();
+    const violations = try with_null.validate(allocator, missing.root.?, "$");
+    defer freeViolations(allocator, violations);
+    try testing.expectEqual(@as(usize, 1), violations.len);
+    try testing.expectEqualStrings("required", violations[0].rule);
+}
+
+test "allOf, anyOf and oneOf" {
+    const allocator = testing.allocator;
+    var doc = try document_mod.Document.parse(allocator, "n: 5\nbig: 500\nword: hello\n");
+    defer doc.deinit();
+
+    const in_low = Schema.intRange(0, 10);
+    const in_high = Schema.intRange(5, 1000);
+
+    const cases = [_]struct { key: []const u8, schema: Schema, want: usize, rule: []const u8 }{
+        // allOf reports each failing branch, because each is a real
+        // requirement: 500 is in [5,1000] but not in [0,10].
+        .{ .key = "n", .schema = Schema.allOf(&.{ &in_low, &in_high }), .want = 0, .rule = "" },
+        .{ .key = "big", .schema = Schema.allOf(&.{ &in_low, &in_high }), .want = 1, .rule = "range" },
+        // anyOf: one branch is enough, and a total miss reports once
+        // rather than once per branch.
+        .{ .key = "big", .schema = Schema.anyOf(&.{ &in_low, &in_high }), .want = 0, .rule = "" },
+        .{ .key = "word", .schema = Schema.anyOf(&.{ &in_low, &in_high }), .want = 1, .rule = "any_of" },
+        // oneOf: 5 satisfies both ranges, which is one too many.
+        .{ .key = "n", .schema = Schema.oneOf(&.{ &in_low, &in_high }), .want = 1, .rule = "one_of" },
+        .{ .key = "big", .schema = Schema.oneOf(&.{ &in_low, &in_high }), .want = 0, .rule = "" },
+        .{ .key = "word", .schema = Schema.oneOf(&.{ &in_low, &in_high }), .want = 1, .rule = "one_of" },
+    };
+    for (cases) |c| {
+        const violations = try c.schema.validate(allocator, doc.pathGet(&.{c.key}).?, "$");
+        defer freeViolations(allocator, violations);
+        testing.expectEqual(c.want, violations.len) catch |err| {
+            std.debug.print("key '{s}' produced {d} violations, wanted {d}\n", .{ c.key, violations.len, c.want });
+            return err;
+        };
+        if (c.want > 0) try testing.expectEqualStrings(c.rule, violations[0].rule);
+    }
+}
+
+test "a composition branch cannot escape the node budget" {
+    const allocator = testing.allocator;
+    var doc = try document_mod.Document.parse(allocator, "s: [1, 2, 3, 4, 5]\n");
+    defer doc.deinit();
+    // Branch exploration shares the enclosing budget; without that, a
+    // composite over N branches would multiply the work a bound was
+    // meant to cap.
+    const branch = Schema.seq(&Schema.int);
+    const composite = Schema.anyOf(&.{ &branch, &branch, &branch });
+    try testing.expectError(error.LimitExceeded, composite.validateLimited(
+        allocator,
+        doc.pathGet(&.{"s"}).?,
+        "$",
+        .{ .max_nodes = 8 },
+    ));
 }

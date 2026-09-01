@@ -203,6 +203,36 @@ removal (replacement is preserved), explicit-key entries, tagged or
 empty keys, tab-indented entries, and new lines inside CRLF documents
 — so the gap is measured, not hidden.
 
+### Writing a whole stream
+
+`doc.write` writes one document. For a stream, use `yaml.writeAll`, the
+counterpart to `parseAll`:
+
+~~~zig
+var docs = try yaml.parseAll(alloc, input);
+defer {
+    for (docs.items) |*d| d.deinit();
+    docs.deinit(alloc);
+}
+const out = try yaml.writeAll(alloc, docs.items);
+defer alloc.free(out);
+// out == input, byte for byte
+~~~
+
+Do not concatenate `doc.write()` yourself. It happens to work for a
+stream that was parsed as one, because the documents' source regions
+are contiguous — and it silently corrupts everything else. Two
+separately parsed single-document strings, or two documents you built,
+carry no `---` between them, so the result re-parses as *one* document
+and two mappings become one mapping with duplicate keys: valid YAML,
+wrong data, no error. `writeAll` inserts a marker exactly where a
+boundary is required and absent, and nothing where one already exists,
+which is what keeps the round trip byte-exact.
+
+The round-trip gate runs through `writeAll` over the whole corpus, so
+that byte-exactness is checked against 265 real streams rather than a
+handful of shapes.
+
 ## Editing: paths, batches, moves
 
 `yaml.edit.Editor` layers a documented path grammar and atomic edits
@@ -323,6 +353,37 @@ for (violations) |viol| {
 
 Use `Schema.mapStrict` to also reject undeclared keys.
 
+The full descriptor set:
+
+| Constructor | Accepts |
+| --- | --- |
+| `any`, `scalar` | anything; any scalar |
+| `str`, `boolean`, `int`, `float` | core-schema types (`float` also accepts an integer) |
+| `strEnum(values)` | a string from a fixed set |
+| `intRange(min, max)`, `floatRange(min, max)` | a number in an inclusive range |
+| `strLen(min, max)` | a string of that many **codepoints** |
+| `seq(items)`, `seqLen(items, min, max)` | a sequence, optionally length-bounded |
+| `map(fields)`, `mapStrict(fields)` | a mapping; `mapStrict` rejects undeclared keys |
+| `nullable(inner)` | null, or `inner` |
+| `allOf(b)`, `anyOf(b)`, `oneOf(b)` | every branch, at least one, exactly one |
+
+`nullable` is not the same as a non-required field: `required = false`
+lets the key be absent, `nullable` requires the key and lets its value
+be null. `anyOf` and `oneOf` report a single violation naming the
+composition rather than the failures of every branch, since a branch
+that does not apply is not an error; `allOf` reports each failing
+branch, because there each one is a real requirement.
+
+There is no regex constraint. Zig's standard library has no regex
+engine, and shipping one inside a YAML library to back a single
+descriptor is the wrong trade; match the string yourself after
+validation if you need it.
+
+Validation resolves aliases and so is bounded by `Limits`, like the
+value layer — see [Untrusted input](#untrusted-input) below. Branch
+exploration under `anyOf`/`oneOf` shares the enclosing budget, so a
+composite cannot multiply the work past the bound.
+
 ## Files
 
 `yaml.file` wraps parsing and writing with production safeguards:
@@ -356,20 +417,55 @@ The layering mirrors libfyaml and is public:
   the decision note in `src/file.zig`'s module docs): the event API
   streams events; the input itself lives in memory.
 * `yaml.markup` — the source-span arithmetic behind round trips.
-* Nesting is capped (`Scanner.max_nesting`, 200) and simple keys are
-  length-capped, so adversarial input is rejected rather than run out
-  of memory. Over-deep nesting returns `error.NestingTooDeep`; an
-  over-long simple key returns `error.InvalidSyntax`. Those caps bound
-  the scanner, parser and document layers.
-* `yaml.value` and `yaml.schema` need a second bound, because they
-  expand aliases by copying: output size is a function of the expanded
-  tree, not of the input, so N levels aliasing the level above M times
-  is M^N. Both are bounded by default (`value.Limits.max_values` and
-  `schema.Limits.max_nodes`, 1 << 20 each), returning
-  `error.LimitExceeded` rather than allocating without end. Use
-  `parseToValueLimited` / `nodeToValueLimited` / `validateLimited` to
-  choose your own bound, and `Limits.unlimited` only for input you
-  produced yourself.
+
+## Untrusted input
+
+Every default here is sized for a config file you control. YAML that
+arrives from elsewhere needs four bounds, and they live in three places
+because they bound three different kinds of work.
+
+**Parsing** — `ParseOptions`, via `yaml.parseOpts` / `parseAllOpts`:
+
+~~~zig
+var doc = try yaml.parseOpts(alloc, payload, null, .{
+    .max_input_bytes = 1 << 20, // default 64 MiB
+    .max_nesting = 32,          // default 200
+});
+defer doc.deinit();
+~~~
+
+`max_input_bytes` is checked before the input is scanned, so an
+oversized stream costs nothing but the length check
+(`error.InputTooLarge`). `max_nesting` counts flow levels plus block
+indents and yields `error.NestingTooDeep`. Simple keys are separately
+capped at 1024 characters (`error.InvalidSyntax`), per spec 7.4.2.
+
+A NUL byte is rejected (`error.InvalidSyntax`), since YAML 1.2 does not
+admit one; `.embedded_nul = .truncate` restores libyaml's cut-off-there
+behaviour, which discards everything after the byte.
+
+**Converting and validating** — `value.Limits` and `schema.Limits`.
+These layers expand aliases *by copying*, so their output is a function
+of the expanded tree rather than of the input: N levels each aliasing
+the level above M times is M^N, and a 194-byte document reaches ~19.5k
+values. Both default to `1 << 20` and return `error.LimitExceeded`:
+
+~~~zig
+const v = try yaml.value.parseToValueLimited(alloc, payload, .{ .max_values = 10_000 });
+const violations = try schema.validateLimited(alloc, node, "$", .{ .max_nodes = 10_000 });
+~~~
+
+`nodeToValueLimited` takes the same bound, and `Limits.unlimited` opts
+out — only for input you produced yourself.
+
+**Emitting** — `Emitter.max_depth` (1000). Parsing cannot produce a tree
+deep enough to reach it, since `max_nesting` is lower; this bounds
+documents you *built*, through `createSequence`/`sequenceAppend` or
+`value.toNode`, which nothing else caps. Past it, `Document.write`
+returns `error.NestingTooDeep` instead of overflowing the stack.
+
+**Reading files** — `yaml.file` applies its own `max_bytes` (64 MiB) at
+read time, before the bytes reach the parser.
 
 ## Memory and error model
 

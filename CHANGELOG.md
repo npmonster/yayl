@@ -58,6 +58,27 @@ var doc = try yaml.parseOpts(allocator, input, null, .{ .max_input_bytes = 512 <
   region ends mid-line at `--- foo` and its own trailing comment belongs
   to the *next* document's leading bytes.
 
+- Schema gains the constraints it was missing: `floatRange`, `strLen`
+  (counted in codepoints, so a multibyte name is not penalised),
+  `seqLen`, `nullable`, and the compositions `allOf` / `anyOf` /
+  `oneOf`. `nullable` is the distinction a non-required field could not
+  express — the key must be present, its value may be null.
+
+  `anyOf` and `oneOf` report one violation naming the composition
+  instead of the failures of every branch, since a branch that does not
+  apply is not an error; `allOf` reports each failing branch. Branch
+  exploration shares the enclosing `Limits` budget, so a composite
+  cannot multiply work past the bound.
+
+  `Kind.seq` changed payload from `*const Schema` to a struct carrying
+  the item schema and optional length bounds. `Schema.seq(items)` is
+  unchanged; only code building `.kind = .{ .seq = ... }` by hand is
+  affected.
+
+  Still absent, deliberately: a regex/pattern constraint. Zig's standard
+  library has no regex engine, and vendoring one to back a single
+  descriptor is the wrong trade.
+
 - `ParseOptions` and the `parseOpts` / `parseAllOpts` entry points
   (`Document.parseOpts` / `parseAllOpts` underneath) put the parse
   bounds in the caller's hands. `max_input_bytes` (64 MiB) is a new
