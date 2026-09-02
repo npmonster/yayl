@@ -32,6 +32,7 @@
 const std = @import("std");
 const diag = @import("diag.zig");
 const document_mod = @import("document.zig");
+const internal = @import("internal.zig");
 const markup = @import("markup.zig");
 const token_mod = @import("token.zig");
 
@@ -327,7 +328,18 @@ pub const Emitter = struct {
                 }
             }
         }
-        try self.write(src[doc.region_start..doc.body_start]);
+        // The head is verbatim, except for tombstones: a leading comment
+        // block rewritten on the first entry lives here, and the root
+        // container's tombstone list is what removes the old lines.
+        if (doc.root) |root| {
+            if (root.src != null) {
+                try self.writeGap(root, doc.region_start, doc.body_start);
+            } else {
+                try self.write(src[doc.region_start..doc.body_start]);
+            }
+        } else {
+            try self.write(src[doc.region_start..doc.body_start]);
+        }
         var stop = doc.body_start;
         if (doc.root) |root| {
             stop = try self.emitRoot(root, markup.columnOf(src, doc.body_start), doc.body_end);
@@ -366,10 +378,11 @@ pub const Emitter = struct {
         if (try self.writeCleanSlice(node, s.entry_start)) |end| return end;
         switch (node.data) {
             // Modified scalar/alias: re-emit content, then the original
-            // line remainder (trailing comment) and tail from there.
+            // line remainder (or a written trailing comment) and tail
+            // from there.
             .scalar, .alias => {
                 _ = try self.emitContent(node, indent);
-                return self.writeRemainder(s.end);
+                return self.writeEntryTail(node, s.end);
             },
             // Modified container: its slot walk consumes through the
             // last entry's line end.
@@ -414,26 +427,55 @@ pub const Emitter = struct {
         // gap anchor untouched for the next original sibling.
         if (ks) |s| {
             if (!s.synthetic) {
-                try self.writeGap(container, gap_start, s.entry_start);
+                // A written leading block replaces the entry's own
+                // lines: stop the verbatim gap at the entry's line
+                // start (the tombstoned old block is already skipped in
+                // there), write the new lines, then re-assemble the
+                // entry's line -- indentation, framing indicator, key.
+                const pending = internal.pairLeadingOverride(src, key, value);
+                if (pending != null) {
+                    const ls = markup.lineStart(src, s.entry_start);
+                    try self.writeGap(container, gap_start, ls);
+                    const col = markup.columnOf(src, s.entry_start);
+                    try self.writePendingLeadingText(pending, col, self.terminatorAt(s.entry_start));
+                    try self.write(src[s.entry_start..s.start]);
+                } else {
+                    try self.writeGap(container, gap_start, s.entry_start);
+                }
                 try self.breakBeforeEntry(entry_col);
             }
         } else if (pair_end == null) {
             // Brand-new pair. While the previous entry's line is still
-            // open, its remainder — a trailing comment — belongs to THAT
-            // entry: write it before opening a line of our own, or the
-            // new entry slots in ahead of the comment and steals it.
+            // open, its remainder — a trailing comment, or plain
+            // trailing blanks — belongs to THAT entry: write it before
+            // opening a line of our own, or the new entry slots in
+            // ahead of it and the next sibling's gap re-attaches the
+            // bytes to the wrong line.
             var gap = gap_start;
             var owed_terminator = false;
-            if (!self.endsWithNewline() and markup.remainderHasComment(src, gap)) {
-                const nl = markup.newlineAt(src, gap);
+            if (!self.endsWithNewline() and markup.newlineAt(src, gap) > gap) {
                 gap = try self.writeRemainder(gap);
                 // `writeRemainder` took the line terminator along with
-                // the comment; this entry now owes the line ending.
-                owed_terminator = gap > nl;
+                // the remainder; this entry now owes the line ending.
+                owed_terminator = true;
             }
             gap = try self.writeContainerFraming(container, gap);
-            if (try self.openEntryLine(entry_col)) owed_terminator = true;
+            const pending = internal.pairLeadingOverride(src, key, value);
+            if (pending != null) {
+                // Written lines terminate themselves and end with the
+                // indentation the entry continues on.
+                try self.writePendingLeadingText(pending, entry_col, self.terminatorAt(gap));
+                owed_terminator = true;
+            } else if (try self.openEntryLine(entry_col)) {
+                owed_terminator = true;
+            }
             try self.emitEntry(key, value, entry_col);
+            if (value.pending_trailing) |tt| {
+                if (tt.len > 0) {
+                    try self.writeByte(' ');
+                    try self.write(tt);
+                }
+            }
             if (owed_terminator and !self.endsWithNewline()) try self.writeByte('\n');
             return gap;
         }
@@ -453,10 +495,10 @@ pub const Emitter = struct {
         if (value_empty) {
             if (ks != null and pair_end != null) {
                 try self.write(src[ks.?.end..pair_end.?]);
-                return self.writeRemainder(pair_end.?);
+                return self.writeEntryTail(value, pair_end.?);
             }
             try self.writeByte(':');
-            if (pair_end) |pe| return self.writeRemainder(pe);
+            if (pair_end) |pe| return self.writeEntryTail(value, pe);
             return gap_start;
         }
 
@@ -484,12 +526,30 @@ pub const Emitter = struct {
                     if (emptiedCollection(value)) {
                         try self.write(src[s.end..vs.entry_start]);
                         try self.indentEmptied(markup.columnOf(src, s.entry_start));
+                    } else if (value.pending_leading != null and
+                        markup.lineStart(src, vs.entry_start) != markup.lineStart(src, s.start))
+                    {
+                        // A written leading block for a BLOCK value
+                        // replaces the comment lines between the key's
+                        // colon and the value's first line. The verbatim
+                        // gap stops after its last newline -- the lines'
+                        // indentation is re-written below with the new
+                        // block. (An inline value's block belongs to the
+                        // pair and was already written at the key's gap.)
+                        const vls = markup.lineStart(src, vs.entry_start);
+                        const split = s.end + if (std.mem.lastIndexOfScalar(u8, src[s.end..vls], '\n')) |idx|
+                            idx + 1
+                        else
+                            0;
+                        try self.writeGap(value, s.end, split);
+                        const vcol = markup.columnOf(src, vs.entry_start);
+                        try self.writePendingLeadingText(value.pending_leading, vcol, self.terminatorAt(vs.entry_start));
                     } else {
                         try self.writeGap(value, s.end, vs.entry_start);
                     }
                 }
                 if (try self.writeCleanSlice(value, vs.entry_start)) |vend| {
-                    return self.writeRemainder(pair_end orelse vend);
+                    return self.writeEntryTail(value, pair_end orelse vend);
                 }
                 const stop = try self.emitContent(value, markup.columnOf(src, vs.start));
                 // A container walk that reached the line end already
@@ -509,7 +569,7 @@ pub const Emitter = struct {
                 // it points at live bytes: after a brand-new last entry
                 // it still sits inside the deleted entry's text.
                 const from = if (stop < base and !dropCovers(value, stop)) stop else base;
-                _ = try self.writeRemainder(from);
+                _ = try self.writeEntryTail(value, from);
                 // Advance past the value's original extent either way,
                 // so the tombstoned tail is not re-emitted.
                 return le;
@@ -519,7 +579,7 @@ pub const Emitter = struct {
             // entry — and `? key: ` would not parse.
             if (!expl) try self.write(": ");
             _ = try self.emitContent(value, entry_col + self.indent_step);
-            if (pair_end) |pe| return self.writeRemainder(pe);
+            if (pair_end) |pe| return self.writeEntryTail(value, pe);
             return gap_start;
         }
         // Brand-new value: layout by its shape.
@@ -545,7 +605,7 @@ pub const Emitter = struct {
         if (pair_end) |pe| {
             const le = markup.lineEnd(src, pe);
             if (self.endsWithNewline()) return le;
-            return self.writeRemainder(pe);
+            return self.writeEntryTail(value, pe);
         }
         return gap_start;
     }
@@ -576,15 +636,27 @@ pub const Emitter = struct {
             }
             var gap = gap_start;
             var owed_terminator = false;
-            if (has_original_prev and !self.endsWithNewline() and markup.remainderHasComment(src, gap)) {
-                const nl = markup.newlineAt(src, gap);
+            if (has_original_prev and !self.endsWithNewline() and markup.newlineAt(src, gap) > gap) {
                 gap = try self.writeRemainder(gap);
-                owed_terminator = gap > nl; // see the pair case
+                owed_terminator = true; // see the pair case
             }
             gap = try self.writeContainerFraming(container, gap);
-            if (try self.openEntryLine(entry_col)) owed_terminator = true;
+            if (item.pending_leading) |pt| {
+                // Written lines terminate themselves and end with the
+                // indentation the entry continues on.
+                try self.writePendingLeadingText(pt, entry_col, self.terminatorAt(gap));
+                owed_terminator = true;
+            } else if (try self.openEntryLine(entry_col)) {
+                owed_terminator = true;
+            }
             try self.write("- ");
             _ = try self.emitContent(item, entry_col + 2);
+            if (item.pending_trailing) |tt| {
+                if (tt.len > 0) {
+                    try self.writeByte(' ');
+                    try self.write(tt);
+                }
+            }
             if (owed_terminator and !self.endsWithNewline()) try self.writeByte('\n');
             return gap;
         };
@@ -598,7 +670,20 @@ pub const Emitter = struct {
             }
             return error.AliasCycle;
         }
-        try self.writeGap(container, gap_start, s.entry_start);
+        if (item.pending_leading != null) {
+            // A written leading block replaces the item's own comment
+            // lines; the verbatim gap stops at the item's line start
+            // (tombstoned old lines are already skipped in there). The
+            // entry's line is re-assembled here: indentation, then the
+            // `- ` framing the walk's content emission assumes copied.
+            const ls = markup.lineStart(src, s.entry_start);
+            try self.writeGap(container, gap_start, ls);
+            const col = markup.columnOf(src, s.entry_start);
+            try self.writePendingLeadingText(item.pending_leading, col, self.terminatorAt(s.entry_start));
+            try self.write(src[s.entry_start..s.start]);
+        } else {
+            try self.writeGap(container, gap_start, s.entry_start);
+        }
         try self.breakBeforeEntry(entry_col);
         if (!s.synthetic) {
             if (try self.writeCleanSlice(item, s.entry_start)) |end| return end;
@@ -610,7 +695,7 @@ pub const Emitter = struct {
             const le = markup.lineEnd(src, s.end);
             if (stop >= le) return stop;
             if (self.endsWithNewline()) return le;
-            return self.writeRemainder(s.end);
+            return self.writeEntryTail(item, s.end);
         }
         // Synthesized empty item: the entry shell only.
         try self.emitted.put(item, {});
@@ -942,6 +1027,57 @@ pub const Emitter = struct {
         const le = markup.lineEnd(src, offset);
         if (offset < le) try self.write(src[offset..le]);
         return le;
+    }
+
+    /// The line terminator convention the source uses at `offset`.
+    /// Written comments keep the document's convention; bytes with no
+    /// source behind them default to `\n`.
+    fn terminatorAt(self: *const Emitter, offset: usize) []const u8 {
+        const src = self.src;
+        if (offset == 0 or offset > src.len) return "\n";
+        const nl = markup.newlineAt(src, offset);
+        if (nl < src.len and src[nl] == '\n' and nl > 0 and src[nl - 1] == '\r') return "\r\n";
+        return "\n";
+    }
+
+    /// Write the tail of an entry's line: the trailing comment and the
+    /// terminator. A node with a pending trailing override (see
+    /// `Document.setTrailingComment`) gets the canonical ` # text` —
+    /// or, for the empty override (a deletion), just the terminator —
+    /// instead of the original bytes. Returns the offset past the line.
+    fn writeEntryTail(self: *Emitter, node: *const Node, offset: usize) Error!usize {
+        const src = self.src;
+        const t = node.pending_trailing orelse return self.writeRemainder(offset);
+        const le = markup.lineEnd(src, offset);
+        if (t.len == 0) {
+            // Deletion: the blanks and the comment go, the terminator
+            // stays structural.
+            if (!self.endsWithNewline()) try self.write(self.terminatorAt(offset));
+            return le;
+        }
+        try self.writeByte(' ');
+        try self.write(t);
+        try self.write(self.terminatorAt(offset));
+        return le;
+    }
+
+    /// Write a pending leading comment block ahead of an entry, one
+    /// line per source line at the entry's own column, then the
+    /// indentation the entry itself continues on. The caller must have
+    /// stopped copying the original gap at the entry's line start (see
+    /// the split-gap sites); the empty override (a deletion) writes
+    /// nothing — the tombstoned block is already skipped in the gap.
+    fn writePendingLeadingText(self: *Emitter, pending: ?[]const u8, col: usize, term: []const u8) Error!void {
+        const t = pending orelse return;
+        if (t.len == 0) return;
+        if (!self.endsWithNewline()) try self.writeByte('\n');
+        var it = std.mem.splitScalar(u8, t, '\n');
+        while (it.next()) |line| {
+            try self.writeIndent(col);
+            try self.write(line);
+            try self.write(term);
+        }
+        try self.writeIndent(col);
     }
 
     fn writeNewlineIndent(self: *Emitter, indent: usize) Error!void {

@@ -1,6 +1,6 @@
 # Design: making comments addressable
 
-**Status:** proposal, awaiting human approval. Workstream B1 of PLAN-12.
+**Status:** approved as written by the human driver, 2026-09-02. Implemented in 0.14.0 (workstream B2 of PLAN-12). Original proposal text below.
 **Author:** vast-wren. Reviewed by: —
 
 ## The problem

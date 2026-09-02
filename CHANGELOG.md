@@ -5,6 +5,39 @@ series; APIs may still move, and anything that does is listed here.
 
 ## Unreleased
 
+### Added
+
+**Comments are addressable.** `node.trailingComment(&doc)` and
+`node.leadingComments(&doc)` return a node's trailing and leading
+comments as raw slices into the source (`"# user facing"`), and
+`doc.setTrailingComment(node, text)` / `doc.setLeadingComments(node,
+text)` write, change, and delete them (`null` deletes). Written
+comments re-emit canonically — `content # text`, leading lines at the
+entry's column, the document's line-ending convention kept — and
+re-setting the comment a node already has is a byte-identical no-op,
+asserted per comment position by the preservation sweep. Reads are
+safe by construction: they compute spans over bytes the emitter
+already copies, so no emitted byte can change. Free-floating comments
+(blank-line-separated, document head before `---`) and comments inside
+flow collections are out of scope and stay pure source bytes. Design
+and rationale: `docs/design/comments.md`.
+
+### Fixed
+
+- `Document.parse` + `write` no longer drop a trailing comment on the
+  root node's own line (`a: 1 # c`): the document's round-trip region
+  now ends where the root's last line ends. `parseAll` masked this by
+  attributing those bytes to the next document's head; a single
+  `parse` lost them.
+- Deleting the first item of a block sequence when that item is an
+  empty scalar (`- # Empty`) was a silent no-op: the item's span is a
+  borrowed point, so no tombstone was recorded and the next item's gap
+  re-emitted the deleted line verbatim.
+- Inserting into a sequence after a line that ends in trailing blanks
+  (tabs or spaces before the line break) migrated those blanks onto
+  the wrong line; a brand-new entry now carries the previous entry's
+  line remainder with it.
+
 ## 0.13.0 — 2026-09-02
 
 ### Behaviour changes — read this before upgrading

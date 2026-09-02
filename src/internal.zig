@@ -83,7 +83,7 @@ fn isBlankRun(s: []const u8) bool {
 /// range appended out of order would resurrect the deleted bytes
 /// it covers — and edits applied after an earlier one can easily
 /// detach entries in reverse document order.
-fn dropRange(self: *Document, drops: *std.ArrayList([2]usize), from: usize, to: usize) !void {
+pub fn dropRange(self: *Document, drops: *std.ArrayList([2]usize), from: usize, to: usize) !void {
     var i: usize = 0;
     while (i < drops.items.len and drops.items[i][0] < from) i += 1;
     try drops.insert(self.pool.allocator(), i, .{ from, to });
@@ -163,12 +163,27 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
 pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
     const src = self.source orelse return;
     const is = item.src orelse return;
-    if (is.synthetic) return;
     switch (seq.data) {
         .sequence => |*s| {
             // Flow items share their line with the parent's `key:`
             // (see dropPairSpan).
             if (s.style == .flow) return;
+            if (is.synthetic) {
+                // A synthesized empty item's span is a point borrowed
+                // from the NEXT token (`entry_start == start == end`),
+                // unusable for slicing forward — but the bytes the item
+                // owns are the line(s) BEFORE that point: `- # Empty`
+                // borrows the next item's dash. Tombstone from the last
+                // line break before the borrowed point; without this,
+                // deleting the item was a silent no-op (the next item's
+                // gap re-emitted the deleted bytes verbatim). Found by
+                // the preservation corpus sweep once `parse`'s region
+                // covered the document tail.
+                const from = if (is.end > 0) markup.lineStart(src, is.end - 1) else 0;
+                const to = is.end;
+                if (to > from) try dropRange(self, &s.dropped, from, to);
+                return;
+            }
             var from = markup.lineStart(src, is.entry_start);
             var to = markup.lineEnd(src, is.end);
             // A nested sequence (`- - a`) puts an OUTER item's
@@ -234,4 +249,18 @@ pub fn mappingReplace(self: *Document, map: *Node, existing: *Node, value: *Node
         }
     }
     return false;
+}
+
+/// INTERNAL. The leading comment override the emitter must write ahead
+/// of a pair's key: the key's own, or — for a pair whose value shares
+/// the key's line, where the value stands in for the pair — the value's.
+/// A block value's comments are its own and are handled at that value's
+/// own slot, not here.
+pub fn pairLeadingOverride(src: []const u8, key: *const Node, value: *const Node) ?[]const u8 {
+    if (key.pending_leading) |t| return t;
+    const ks = key.src orelse return value.pending_leading; // brand-new key: the value stands in
+    const vs = value.src orelse return value.pending_leading; // brand-new value sits inline
+    if (ks.synthetic or vs.synthetic) return value.pending_leading;
+    const same_line = markup.lineStart(src, vs.entry_start) == markup.lineStart(src, ks.start);
+    return if (same_line) value.pending_leading else null;
 }

@@ -127,6 +127,57 @@ pub fn remainderHasComment(source: []const u8, offset: usize) bool {
     return std.mem.indexOfScalar(u8, source[offset..nl], '#') != null;
 }
 
+/// The raw trailing comment after content ending at `end`: a
+/// `{start, end}` span covering the `#` through the last byte before the
+/// line terminator, or null when the remainder holds no comment. The
+/// blanks between the content and the `#` are not part of the span --
+/// they are presentation, and comment writes canonicalize them.
+pub fn trailingCommentSpan(source: []const u8, end: usize) ?[2]usize {
+    if (end > source.len) return null;
+    const nl = newlineAt(source, end);
+    var i = end;
+    while (i < nl and (source[i] == ' ' or source[i] == '\t')) i += 1;
+    if (i < nl and source[i] == '#') return .{ i, nl };
+    return null;
+}
+
+/// The raw leading comment block immediately above the line containing
+/// `entry_start`: a `{start, end}` span covering the `#` of the topmost
+/// line through the last byte of the bottom-most line's comment, with
+/// the interior newlines and indentation included and the final line
+/// terminator excluded. Null when the line directly above is not a
+/// comment. The scan stops at a blank line -- that is the rule that
+/// makes "belongs to this entry" decidable -- and at any non-comment
+/// line, so a block separated from its entry, or a free-floating one,
+/// attaches to nothing.
+pub fn leadingCommentSpan(source: []const u8, entry_start: usize) ?[2]usize {
+    const own = lineStart(source, entry_start);
+    if (own == 0) return null; // first line: nothing above to attach
+    var line = lineStart(source, own - 1); // the line directly above
+    var top_hash: ?usize = null;
+    var bottom_end: usize = 0;
+    while (true) {
+        const nl = newlineAt(source, line);
+        var i = line;
+        while (i < nl and (source[i] == ' ' or source[i] == '\t')) i += 1;
+        if (i >= nl or source[i] != '#') break;
+        top_hash = i;
+        if (bottom_end == 0) bottom_end = nl;
+        if (line == 0) break;
+        const prev = lineStart(source, line - 1);
+        if (prev == line) break; // cannot rise further
+        line = prev;
+    }
+    if (top_hash) |th| {
+        // A CRLF terminator's `\r` belongs to the line break, not to
+        // the comment.
+        var end = bottom_end;
+        if (end > th and source[end - 1] == '\r') end -= 1;
+        return .{ th, end };
+    }
+    return null;
+}
+
 /// The indentation (in bytes) of the line containing `offset`: the
 /// number of leading spaces. Tabs count as one byte each; the scanner
 /// rejects tab indentation in block context, so this only matters for
@@ -231,4 +282,55 @@ test "remainderHasComment" {
     // '#' at end of input without newline.
     const tail = "a: 1 #";
     try std.testing.expect(remainderHasComment(tail, 5));
+}
+
+test "trailingCommentSpan returns the raw hash-through-end bytes" {
+    const src = "port: 8080   # user facing\nb: 2\n";
+    // Content ends after "8080" (offset 11); the span starts at the '#'.
+    const span = trailingCommentSpan(src, 11).?;
+    try std.testing.expectEqualStrings("# user facing", src[span[0]..span[1]]);
+    // No comment on the next line.
+    try std.testing.expect(trailingCommentSpan(src, 27) == null);
+    // A '#' in a value does not leak: only blanks may precede it.
+    try std.testing.expect(trailingCommentSpan("a: x#y\n", 5) == null);
+    // Unterminated final line still reads.
+    const tail = "k: v # end";
+    const t = trailingCommentSpan(tail, 4).?;
+    try std.testing.expectEqualStrings("# end", tail[t[0]..t[1]]);
+}
+
+test "leadingCommentSpan stacks upward and stops at blanks and content" {
+    // One comment directly above the entry ('h' of host is at 16).
+    const one = "# the main host\nhost: localhost\n";
+    {
+        const span = leadingCommentSpan(one, 16).?;
+        try std.testing.expectEqualStrings("# the main host", one[span[0]..span[1]]);
+    }
+    // Stacked: topmost '#' through the bottom line's end.
+    const stacked = "# one\n# two\nkey: v\n";
+    {
+        const span = leadingCommentSpan(stacked, 12).?;
+        try std.testing.expectEqualStrings("# one\n# two", stacked[span[0]..span[1]]);
+    }
+    // A blank line breaks the attachment.
+    const blanked = "# far away\n\nkey: v\n";
+    try std.testing.expect(leadingCommentSpan(blanked, 12) == null);
+    // A non-comment line does too.
+    const content = "prev: 1\nkey: v\n";
+    try std.testing.expect(leadingCommentSpan(content, 8) == null);
+    // First line of the document: nothing above to attach.
+    try std.testing.expect(leadingCommentSpan("key: v\n", 0) == null);
+    // Indented comments keep their indentation inside the span
+    // (the '-' of the item is at 25).
+    const indented = "top:\n  # about the value\n  - a\n";
+    {
+        const span = leadingCommentSpan(indented, 25).?;
+        try std.testing.expectEqualStrings("# about the value", indented[span[0]..span[1]]);
+    }
+    // CRLF: the terminator bytes stay outside the span ('k' is at 7).
+    const crlf = "# win\r\nk: v\r\n";
+    {
+        const span = leadingCommentSpan(crlf, 7).?;
+        try std.testing.expectEqualStrings("# win", crlf[span[0]..span[1]]);
+    }
 }

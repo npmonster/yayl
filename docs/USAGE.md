@@ -11,12 +11,13 @@ Contents:
 4. [Change a parsed document](#change-a-parsed-document)
 5. [Byte-faithful round trips](#byte-faithful-round-trips)
 6. [Editing: paths, batches, moves](#editing-paths-batches-moves)
-7. [Values: schema-free data and Zig conversion](#values-schema-free-data-and-zig-conversion)
-8. [Validation: optional schemas](#validation-optional-schemas)
-9. [Files](#files)
-10. [Events and tokens (lower levels)](#events-and-tokens-lower-levels)
-11. [Memory and error model](#memory-and-error-model)
-12. [Building and testing from source](#building-and-testing-from-source)
+7. [Comments: read and write](#comments-read-and-write)
+8. [Values: schema-free data and Zig conversion](#values-schema-free-data-and-zig-conversion)
+9. [Validation: optional schemas](#validation-optional-schemas)
+10. [Files](#files)
+11. [Events and tokens (lower levels)](#events-and-tokens-lower-levels)
+12. [Memory and error model](#memory-and-error-model)
+13. [Building and testing from source](#building-and-testing-from-source)
 
 ## Adding yayl to a project
 
@@ -310,6 +311,64 @@ in block layout at its destination, indented to match the file's own
 convention; its structure and values survive, its internal comments
 and blank lines do not. Untouched siblings stay verbatim. Moving a
 node into its own subtree is rejected (`error.MoveIntoSubtree`).
+
+## Comments: read and write
+
+Comments are addressable. Reads are raw: exactly the source bytes, a
+`#` included, with no allocation — a slice into the document.
+
+~~~zig
+var doc = try yaml.parse(alloc,
+    \\# service configuration
+    \\name: api   # user facing
+    \\port: 8080
+    \\
+);
+defer doc.deinit();
+
+const name = doc.pathGet(&.{"name"}).?;
+const tail = name.trailingComment(&doc);   // "# user facing"
+const head = name.leadingComments(&doc);   // "# service configuration"
+~~~
+
+`leadingComments` returns the own-line comment(s) immediately above the
+entry, newline-joined (`"# one\n# two"`). A blank line breaks the
+attachment, which is what makes "belongs to this entry" decidable. For a
+pair, the value stands in for the entry: an inline value (`host:
+localhost`) reads the pair's comments, and a block value (a mapping or
+sequence on its own line) reads the comments above it. A container's
+trailing comment is the one on its last entry's line, so the collection
+and that entry read the same bytes.
+
+Writes take the same raw form and canonicalize only the spacing:
+
+~~~zig
+try doc.setTrailingComment(name, "# renamed");
+try doc.setLeadingComments(doc.pathGet(&.{"port"}).?, "# rate limit\n# in req/s");
+try doc.setTrailingComment(name, null);    // null deletes
+~~~
+
+A written trailing comment re-emits as `content # text`; a written
+leading block re-emits at the entry's own column, keeping the
+document's line-terminator convention (CRLF stays CRLF). Re-setting the
+comment a node already has is a no-op — nothing is marked and every
+source byte stays — the same guarantee the edit API gives for
+unchanged scalars, asserted per position by `make preservation`.
+Comments work on brand-new values too: set a value with `pathSet`,
+then annotate it.
+
+Rejected with `error.InvalidSyntax`, rather than silently dropped at
+emission time: comment text that is not one raw comment (no `#`, or a
+line break in a trailing comment), trailing comments on block
+collections (address the last entry), on the pair's key (the comment
+follows the value), on literal/folded or multi-line scalars (the value
+owns its lines), and anything inside a flow collection.
+
+Out of scope, deliberately: free-floating comments — separated from
+content by a blank line, or in the document head before `---` — and
+comments inside flow collections. They are preserved byte-for-byte
+like all source bytes, but no node claims them. The design history is
+in [docs/design/comments.md](../docs/design/comments.md).
 
 ## Values: schema-free data and Zig conversion
 

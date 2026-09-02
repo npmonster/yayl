@@ -519,7 +519,10 @@ fn walkTargets(
                     try walkTargets(allocator, ed, input, referenced, pair.value, comps, found, depth + 1, unsafe, unsupported);
                     continue;
                 }
-                const line = if (pair.key.src) |s| lineOf(input, s.entry_start) else 0;
+                const line = if (pair.key.src) |s| blk: {
+                    if (s.synthetic and s.end > 0) break :blk lineOf(input, s.end - 1);
+                    break :blk lineOf(input, s.entry_start);
+                } else 0;
                 const end_line = if (pair.src_end) |e| lineOf(input, e) else line;
                 const ks = pair.key.src;
                 const vs = pair.value.src;
@@ -565,8 +568,14 @@ fn walkTargets(
                     try walkTargets(allocator, ed, input, referenced, item, comps, found, depth + 1, unsafe, unsupported);
                     continue;
                 }
-                const line = if (item.src) |sp| lineOf(input, sp.entry_start) else 0;
-                const end_line = if (item.src) |sp| lineOf(input, sp.end) else line;
+                // A synthetic span borrows the next token's offsets, so
+                // entry_start names the FOLLOWING line; the item's own
+                // bytes are the line ending at the borrowed point.
+                const line = if (item.src) |sp| blk: {
+                    if (sp.synthetic and sp.end > 0) break :blk lineOf(input, sp.end - 1);
+                    break :blk lineOf(input, sp.entry_start);
+                } else 0;
+                const end_line = if (item.src) |sp| (if (sp.synthetic) line else lineOf(input, sp.end)) else line;
                 try found.targets.append(allocator, .{
                     .path = path,
                     .line = line,
@@ -2184,4 +2193,221 @@ test "preservation: deleting two siblings composes identically in either order" 
         try std.testing.expectEqualStrings("7", re.pathGet(&.{"k7"}).?.scalarValue().?);
         try std.testing.expectEqualStrings("8", re.pathGet(&.{"k8"}).?.scalarValue().?);
     }
+}
+
+// ----------------------------------------------------------------------
+// Comment positions (PLAN-12 B2, docs/design/comments.md): re-setting
+// the comment a node already has must be byte-identical — the same
+// no-op property the scalar sweep asserts — and every comment in every
+// fixture must be reachable from some node, so the attachment rules
+// leave nothing orphaned.
+// ----------------------------------------------------------------------
+
+fn collectNodes(allocator: std.mem.Allocator, node: *yaml.Node, out: *std.ArrayList(*yaml.Node)) !void {
+    try out.append(allocator, node);
+    if (node.pairs()) |ps| {
+        for (ps) |p| {
+            try collectNodes(allocator, p.key, out);
+            try collectNodes(allocator, p.value, out);
+        }
+    } else if (node.items()) |items| {
+        for (items) |item| try collectNodes(allocator, item, out);
+    }
+}
+
+test "preservation sweep: comment positions — set-to-same is byte-identical" {
+    var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer std.debug.assert(da.deinit() == .ok);
+    const allocator = da.allocator();
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var dir = try std.Io.Dir.cwd().openDir(io, fixtures_dir, .{ .iterate = true });
+    defer dir.close(io);
+    var checked_trailing: usize = 0;
+    var checked_leading: usize = 0;
+    var skipped: usize = 0;
+    var fixtures: usize = 0;
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".yaml") and !std.mem.endsWith(u8, entry.name, ".yml")) continue;
+        const input = try dir.readFileAlloc(io, entry.name, allocator, .limited(4 << 20));
+        defer allocator.free(input);
+        // Sweep the FIRST document's region, like the edit sweep above.
+        var text = input;
+        {
+            var docs = try yaml.parseAll(allocator, text);
+            defer {
+                for (docs.items) |*d| d.deinit();
+                docs.deinit(allocator);
+            }
+            if (docs.items.len == 0) continue;
+            if (docs.items.len > 1) text = input[docs.items[0].region_start..docs.items[0].region_end];
+        }
+        var nodes: std.ArrayList(*yaml.Node) = .empty;
+        defer nodes.deinit(allocator);
+        {
+            var doc = try yaml.parse(allocator, text);
+            defer doc.deinit();
+            const root = doc.root orelse continue;
+            try collectNodes(allocator, root, &nodes);
+            // Snapshot the readable comments: the walk below re-parses
+            // per position, so nothing holds across writes.
+            const Trailing = struct { node: *yaml.Node, text: []const u8 };
+            const Leading = struct { node: *yaml.Node, text: []const u8 };
+            var trailings: std.ArrayList(Trailing) = .empty;
+            defer trailings.deinit(allocator);
+            var leadings: std.ArrayList(Leading) = .empty;
+            defer leadings.deinit(allocator);
+            for (nodes.items) |n| {
+                if (n.trailingComment(&doc)) |t| {
+                    try trailings.append(allocator, .{ .node = n, .text = try allocator.dupe(u8, t) });
+                }
+                if (n.leadingComments(&doc)) |t| {
+                    try leadings.append(allocator, .{ .node = n, .text = try allocator.dupe(u8, t) });
+                }
+            }
+            fixtures += 1;
+            for (trailings.items) |c| {
+                var d2 = try yaml.parse(allocator, text);
+                defer d2.deinit();
+                // A container READS its last entry's trailing comment
+                // but writes are the entry's business: the API rejects
+                // that position honestly, and the sweep counts it out.
+                d2.setTrailingComment(c.node, c.text) catch |err| switch (err) {
+                    error.InvalidSyntax => {
+                        skipped += 1;
+                        continue;
+                    },
+                    else => return err,
+                };
+                const out = try d2.write(allocator);
+                defer allocator.free(out);
+                if (!std.mem.eql(u8, out, text)) {
+                    return error.CommentSetSameNotByteIdentical;
+                }
+                checked_trailing += 1;
+            }
+            for (leadings.items) |c| {
+                var d2 = try yaml.parse(allocator, text);
+                defer d2.deinit();
+                d2.setLeadingComments(c.node, c.text) catch |err| switch (err) {
+                    error.InvalidSyntax => {
+                        skipped += 1;
+                        continue;
+                    },
+                    else => return err,
+                };
+                const out = try d2.write(allocator);
+                defer allocator.free(out);
+                if (!std.mem.eql(u8, out, text)) {
+                    return error.CommentSetSameNotByteIdentical;
+                }
+                checked_leading += 1;
+            }
+            for (trailings.items) |c| allocator.free(c.text);
+            for (leadings.items) |c| allocator.free(c.text);
+        }
+    }
+    // The sweep must actually run: the fixtures carry plenty of comments.
+    if (fixtures < 10) return error.TestUnexpectedResult;
+    if (checked_trailing < 5 or checked_leading < 5) return error.TestUnexpectedResult;
+}
+
+test "preservation sweep: every comment in every fixture is reachable" {
+    var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer std.debug.assert(da.deinit() == .ok);
+    const allocator = da.allocator();
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var reachable_total: usize = 0;
+    var dir = try std.Io.Dir.cwd().openDir(io, fixtures_dir, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".yaml") and !std.mem.endsWith(u8, entry.name, ".yml")) continue;
+        const input = try dir.readFileAlloc(io, entry.name, allocator, .limited(4 << 20));
+        defer allocator.free(input);
+
+        // Per document: head comments before `---` are free-floating by
+        // design, so only the body region is scanned, and only its own
+        // reads may claim a comment.
+        var docs = try yaml.parseAll(allocator, input);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        for (docs.items) |*doc| {
+            const root = doc.root orelse continue;
+            var nodes: std.ArrayList(*yaml.Node) = .empty;
+            defer nodes.deinit(allocator);
+            try collectNodes(allocator, root, &nodes);
+            var claimed: std.ArrayList([]const u8) = .empty;
+            defer claimed.deinit(allocator);
+            for (nodes.items) |n| {
+                if (n.trailingComment(doc)) |t| try claimed.append(allocator, t);
+                if (n.leadingComments(doc)) |t| try claimed.append(allocator, t);
+            }
+
+            var line_start = doc.body_start;
+            while (line_start < doc.region_end and line_start < input.len) {
+                const nl = std.mem.indexOfScalarPos(u8, input, line_start, '\n') orelse @min(input.len, doc.region_end);
+                const line = input[line_start..nl];
+                const trimmed = std.mem.trimStart(u8, line, " \t");
+                if (trimmed.len > 0 and trimmed[0] == '#' and !inNodeSpan(nodes.items, line_start)) {
+                    // Content directly below (next line neither blank
+                    // nor another comment)? Then the attachment rules
+                    // say some node claims this line.
+                    var probe = nl + 1;
+                    var content_below = false;
+                    while (probe < doc.region_end and probe < input.len) {
+                        const pnl = std.mem.indexOfScalarPos(u8, input, probe, '\n') orelse @min(input.len, doc.region_end);
+                        const pline = std.mem.trim(u8, input[probe..pnl], " \t\r");
+                        if (pline.len == 0) break; // blank line: free-floating
+                        if (pline[0] == '#') {
+                            probe = pnl + 1;
+                            continue;
+                        }
+                        content_below = true;
+                        break;
+                    }
+                    if (content_below) {
+                        reachable_total += 1;
+                        const want = std.mem.trimEnd(u8, trimmed, " \t\r");
+                        var found = false;
+                        for (claimed.items) |c| {
+                            if (std.mem.indexOf(u8, c, want) != null) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) return error.CommentNotReachable;
+                    }
+                }
+                if (nl >= input.len or nl >= doc.region_end) break;
+                line_start = nl + 1;
+            }
+        }
+    }
+    // The sweep must actually run: the fixtures carry attached comments.
+    if (reachable_total == 0) return error.TestUnexpectedResult;
+}
+
+/// True when `offset` falls inside a SCALAR node's own span — block
+/// scalar content, whose `#` lines are data, not comments. Container
+/// spans deliberately do not count: they cover the whole document.
+fn inNodeSpan(nodes: []const *yaml.Node, offset: usize) bool {
+    for (nodes) |n| {
+        if (n.kind() != .scalar) continue;
+        const sp = n.src orelse continue;
+        if (sp.synthetic) continue;
+        if (offset >= sp.start and offset < sp.end) return true;
+    }
+    return false;
 }

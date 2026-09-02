@@ -104,6 +104,15 @@ pub const Node = struct {
     /// True once the node's value or child list was modified after
     /// parsing; its span is no longer trusted for verbatim emission.
     modified: bool = false,
+    /// Comment overrides written through `setTrailingComment`. Null means
+    /// "no override"; the empty slice means "comment deleted". Non-empty
+    /// text is the raw comment (`# ...`, pool-owned) the emitter writes
+    /// in place of whatever the source had. See the reads, which return
+    /// these as-is.
+    pending_trailing: ?[]const u8 = null,
+    /// Comment block written through `setLeadingComments`; same null /
+    /// empty / raw convention, lines separated by `\n`.
+    pending_leading: ?[]const u8 = null,
     data: Data = .{ .scalar = .{} },
 
     pub const Data = union(NodeKind) {
@@ -197,6 +206,52 @@ pub const Node = struct {
 
     /// Depth bound for alias chasing (resolveAlias, emitter).
     pub const max_alias_depth: usize = 100;
+
+    // ------------------------------------------------------------------
+    // Comments (see docs/design/comments.md)
+    // ------------------------------------------------------------------
+
+    /// The node's trailing (same-line) comment, raw: from the `#` to the
+    /// last byte before the line terminator, a slice into
+    /// `Document.source` (or into the text passed to `setTrailingComment`
+    /// via the document pool). Null when there is none, or when a
+    /// written comment was deleted.
+    ///
+    /// For a `key: value # c` pair the comment is read off the VALUE
+    /// node (the pair's value stands in for the pair); a block
+    /// collection's trailing comment sits on its last entry's line, so
+    /// the collection and that entry read the same bytes. A node built
+    /// programmatically has no source bytes and reads null until
+    /// something is written.
+    pub fn trailingComment(self: *const Node, doc: *const Document) ?[]const u8 {
+        if (self.pending_trailing) |t| return if (t.len == 0) null else t;
+        const doc_src = doc.source orelse return null;
+        const s = self.src orelse return null;
+        if (s.synthetic) return null;
+        const span = markup.trailingCommentSpan(doc_src, s.end) orelse return null;
+        return doc_src[span[0]..span[1]];
+    }
+
+    /// The node's leading comment block: the own-line comment(s)
+    /// immediately above the entry, with no blank line in between, raw
+    /// and newline-joined (`"# one\n# two"`). Null when there is none,
+    /// or when a written block was deleted.
+    ///
+    /// A sequence item and a mapping key carry the comments above their
+    /// line; for an inline value (`host: localhost`) the value stands in
+    /// for the pair and reads the pair's block, so key and value read
+    /// the same bytes; for a block value (a mapping or sequence on its
+    /// own line) the comments above it are its own. Free-floating
+    /// comments -- separated by a blank line, or in the document head
+    /// before `---` -- attach to nothing.
+    pub fn leadingComments(self: *const Node, doc: *const Document) ?[]const u8 {
+        if (self.pending_leading) |t| return if (t.len == 0) null else t;
+        const doc_src = doc.source orelse return null;
+        const s = self.src orelse return null;
+        if (s.synthetic) return null;
+        const span = markup.leadingCommentSpan(doc_src, s.entry_start) orelse return null;
+        return doc_src[span[0]..span[1]];
+    }
 };
 
 /// The Core Schema tag a plain scalar resolves to, in the spec's
@@ -566,8 +621,229 @@ pub const Document = struct {
     }
 
     // ------------------------------------------------------------------
-    // High level path API
+    // Comments: writes (docs/design/comments.md, approved 2026-09-02)
     // ------------------------------------------------------------------
+
+    /// Set the node's trailing (same-line) comment. Null deletes it.
+    /// `text` is raw — exactly what `trailingComment` returns: one line
+    /// starting with `#`, no line breaks. A written comment re-emits
+    /// canonically as `content # text` (single blank, the node's own
+    /// line terminator convention kept); deleting removes the old
+    /// comment and its separating blanks but keeps the terminator.
+    ///
+    /// Re-setting the comment the node already has is a no-op: nothing
+    /// is marked, every source byte stays. The same guarantee the edit
+    /// API gives for unchanged scalars, and the property the
+    /// preservation sweep asserts at every comment position.
+    ///
+    /// Only scalars and aliases carry a writable trailing comment — a
+    /// block collection's trailing comment sits on its last entry's
+    /// line, so address it through that entry. A comment is not
+    /// addressable inside a flow collection, and a block scalar's value
+    /// owns every line after its header, so `setTrailingComment`
+    /// rejects containers, flow-positioned nodes, and literal/folded
+    /// scalars with `error.InvalidSyntax` rather than silently dropping
+    /// the write at emission time.
+    pub fn setTrailingComment(self: *Document, node: *Node, text: ?[]const u8) !void {
+        // Validate the position first: a write that emission would
+        // silently drop must fail here instead.
+        if (!self.trailingWritablePosition(node)) return error.InvalidSyntax;
+        const t = text orelse {
+            if (node.trailingComment(self) == null) return; // nothing to delete
+            node.pending_trailing = "";
+            self.markModified(node);
+            return;
+        };
+        try validateTrailingText(t);
+        // Set-to-same is a no-op, so the byte-identical invariant holds
+        // whatever spacing the original had.
+        if (node.trailingComment(self)) |cur| {
+            if (std.mem.eql(u8, cur, t)) return;
+        }
+        node.pending_trailing = try self.pool.dupe(t);
+        self.markModified(node);
+    }
+
+    /// Set the node's leading comment block: the own-line comments
+    /// immediately above the entry. Null deletes the block. `text` is
+    /// the raw block, newline-joined (`"# one\n# two"`), every line
+    /// blank-indented then `#`; one trailing newline is tolerated.
+    /// Written lines re-emit at the entry's own column, with the
+    /// document's line-terminator convention; a deleted block's lines
+    /// disappear whole.
+    ///
+    /// Like `setTrailingComment`, set-to-same is a no-op. Rejects nodes
+    /// whose comment block cannot be rewritten honestly — a root scalar
+    /// (its head is free-floating), a scalar sitting as a block value
+    /// (no gap of its own to rewrite), anything inside a flow
+    /// collection, and a block separated from this document's region —
+    /// with `error.InvalidSyntax`.
+    pub fn setLeadingComments(self: *Document, node: *Node, text: ?[]const u8) !void {
+        const t: ?[]const u8 = if (text) |raw| try normalizeLeadingText(raw) else null;
+        // Position and current block, for the no-op check and the
+        // tombstone below.
+        const current: ?[]const u8 = blk: {
+            if (self.leadingPositionWritable(node)) break :blk node.leadingComments(self);
+            // Deleting from an unwritable position is a no-op unless a
+            // pending override exists there to remove.
+            if (t == null and node.pending_leading != null) break :blk node.pending_leading;
+            return error.InvalidSyntax;
+        };
+        if (t) |body| {
+            if (current) |cur| {
+                if (std.mem.eql(u8, cur, body)) return;
+            }
+        } else if (current == null) return; // nothing to delete
+
+        // Sequence matters for OOM: duplicate first, tombstone second,
+        // publish last — a failure before the publish leaves the node
+        // untouched (the duplicate is pool garbage, freed with the pool).
+        const stored: ?[]const u8 = if (t) |body| try self.pool.dupe(body) else "";
+        if (current != null and node.pending_leading == null) try self.tombstoneLeadingBlock(node);
+        node.pending_leading = stored;
+        self.markModified(node);
+    }
+
+    /// True when `setTrailingComment` can act on this node.
+    fn trailingWritablePosition(self: *const Document, node: *Node) bool {
+        _ = self;
+        switch (node.data) {
+            .scalar => |s| switch (s.style) {
+                .literal, .folded => return false, // the value owns its lines
+                else => {},
+            },
+            .mapping, .sequence => return false, // address the last entry
+            .alias => {},
+        }
+        // A multi-line value re-emits as a block scalar, whose lines
+        // are all its own; a comment written now would be dropped at
+        // emission time.
+        if (node.scalarValue()) |v| {
+            if (std.mem.indexOfScalar(u8, v, '\n') != null) return false;
+        }
+        if (insideFlow(node)) return false;
+        if (isMappingKey(node)) return false; // the pair's comment lives after the value
+        return true;
+    }
+
+    /// True when `setLeadingComments` can act on this node: the position
+    /// has a gap of its own, and that gap is rewritable verbatim bytes.
+    fn leadingPositionWritable(self: *const Document, node: *Node) bool {
+        if (insideFlow(node)) return false;
+        const src = self.source orelse return false;
+        const owner = gapOwnerForLeading(node, src) orelse return false;
+        return dropsOf(owner) != null;
+    }
+
+    /// Tombstone the source lines of the node's current leading block,
+    /// so the verbatim gap walk skips them. The range covers whole
+    /// lines: the structural separator before the block (the previous
+    /// line's terminator) survives, and so does the entry's own
+    /// indentation after it.
+    fn tombstoneLeadingBlock(self: *Document, node: *Node) !void {
+        const src = self.source orelse return;
+        const s = node.src orelse return; // brand-new: no block in the source
+        if (s.synthetic) return;
+        const span = markup.leadingCommentSpan(src, s.entry_start) orelse return;
+        // A root entry sharing its line with `---` reads backwards into
+        // the previous document's region; those bytes are not ours.
+        if (span[0] < self.region_start or span[1] > self.region_end) return error.InvalidSyntax;
+        const owner = gapOwnerForLeading(node, src) orelse return error.InvalidSyntax;
+        const drops = dropsOf(owner) orelse return error.InvalidSyntax;
+        const from = markup.lineStart(src, span[0]);
+        const to = markup.lineEnd(src, span[1]);
+        if (to <= from) return;
+        try internal.dropRange(self, drops, from, to);
+    }
+
+    fn validateTrailingText(t: []const u8) !void {
+        if (t.len == 0 or t[0] != '#') return error.InvalidSyntax;
+        for (t) |c| {
+            if (c == '\n' or c == '\r') return error.InvalidSyntax;
+        }
+    }
+
+    /// Strip one optional trailing newline and require every line to be
+    /// blank-indented then `#`. Blank lines inside a block are rejected:
+    /// they would break the adjacency that makes the block re-readable.
+    fn normalizeLeadingText(raw: []const u8) ![]const u8 {
+        var t = raw;
+        if (std.mem.endsWith(u8, t, "\r\n")) t = t[0 .. t.len - 2];
+        if (std.mem.endsWith(u8, t, "\n")) t = t[0 .. t.len - 1];
+        if (t.len == 0) return error.InvalidSyntax;
+        var it = std.mem.splitScalar(u8, t, '\n');
+        while (it.next()) |line| {
+            var i: usize = 0;
+            while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+            if (i >= line.len or line[i] != '#') return error.InvalidSyntax;
+        }
+        return t;
+    }
+
+    fn isMappingKey(node: *const Node) bool {
+        const parent = node.parent orelse return false;
+        if (parent.kind() != .mapping) return false;
+        for (parent.pairs().?) |p| {
+            if (p.key == node) return true;
+        }
+        return false;
+    }
+
+    fn insideFlow(node: *const Node) bool {
+        const parent = node.parent orelse return false;
+        return switch (parent.data) {
+            .mapping => |m| m.style == .flow,
+            .sequence => |s| s.style == .flow,
+            else => false,
+        };
+    }
+
+    /// The container whose verbatim gap carries the node's leading
+    /// block, and therefore whose tombstone list must record it: the
+    /// parent for keys, items and inline values; the node itself for a
+    /// block value (the comments sit between its key's colon and its
+    /// first line). Null when the position has no gap of its own.
+    fn gapOwnerForLeading(node: *Node, src: []const u8) ?*Node {
+        const parent = node.parent orelse {
+            // The root. A container's first entry can carry a block in
+            // the document head; a root scalar's head is free-floating.
+            return switch (node.data) {
+                .mapping, .sequence => node,
+                else => null,
+            };
+        };
+        switch (parent.data) {
+            .mapping => {
+                if (isBlockValue(parent, node, src)) return node;
+                return parent;
+            },
+            .sequence => return parent,
+            else => return null,
+        }
+    }
+
+    /// True when `node` is a mapping value that starts on its own line
+    /// (a block value), rather than one sitting after `key:` on the
+    /// key's line.
+    fn isBlockValue(parent: *const Node, node: *const Node, src: []const u8) bool {
+        const ps = parent.pairs() orelse return false;
+        for (ps) |p| {
+            if (p.value != node) continue;
+            const ks = p.key.src orelse return false;
+            const ns = node.src orelse return false;
+            if (ks.synthetic or ns.synthetic) return false;
+            return markup.lineStart(src, ns.entry_start) > markup.lineStart(src, ks.start);
+        }
+        return false;
+    }
+
+    fn dropsOf(node: *Node) ?*std.ArrayList([2]usize) {
+        return switch (node.data) {
+            .mapping => |*m| &m.dropped,
+            .sequence => |*s| &s.dropped,
+            else => null,
+        };
+    }
 
     /// Look a node up by mapping-key path.
     pub fn pathGet(self: *const Document, path: []const []const u8) ?*Node {
@@ -657,14 +933,29 @@ pub const Document = struct {
         const rs = root.src orelse return;
         self.body_start = rs.entry_start;
         self.body_end = rs.end;
+        // The implicit region ends where the root's last LINE ends: a
+        // trailing comment on the root's own line is this document's
+        // tail, not the next document's leading bytes. (Found by the
+        // comment API: `parse` never reaches the stream-end event that
+        // used to paper over this by handing those bytes to the next
+        // document's head, so `parse` + `write` dropped a root trailing
+        // comment.)
         var end = rs.end;
         if (self.explicit_end) {
             end = markup.lineEnd(src, doc_end);
         } else if (end < src.len) {
-            if (src[end] == '\r' and end + 1 < src.len and src[end + 1] == '\n') {
-                end += 2;
-            } else if (src[end] == '\n') {
-                end += 1;
+            if (rs.synthetic) {
+                // A synthesized empty scalar's span is a point borrowed
+                // from the next token; extending to its line end would
+                // swallow the next document's bytes (corpus 6XDY). The
+                // terminator itself is still structural.
+                if (src[end] == '\r' and end + 1 < src.len and src[end + 1] == '\n') {
+                    end += 2;
+                } else if (src[end] == '\n') {
+                    end += 1;
+                }
+            } else {
+                end = markup.lineEnd(src, end);
             }
         }
         self.region_end = @max(end, self.body_start);
@@ -1535,4 +1826,275 @@ test "emit options carry the depth bound" {
     const ok = try doc.writeOpts(allocator, .{ .max_depth = 500 });
     defer allocator.free(ok);
     try testing.expect(std.mem.indexOf(u8, ok, "leaf") != null);
+}
+
+// ----------------------------------------------------------------------
+// Comments: reads and writes (docs/design/comments.md, PLAN-12 B2).
+// ----------------------------------------------------------------------
+
+const comment_src =
+    \\# service configuration
+    \\name: api   # user facing
+    \\# stale, replaced below
+    \\port: 8080
+    \\
+    \\# separated from port by a blank line
+    \\debug: false
+    \\
+;
+
+test "comment reads: trailing and leading, raw" {
+    var doc = try Document.parse(testing.allocator, comment_src);
+    defer doc.deinit();
+    const root = doc.root.?;
+
+    // Trailing: raw, from the '#' to before the terminator.
+    try testing.expectEqualStrings("# user facing", root.lookup("name").?.trailingComment(&doc).?);
+    try testing.expect(root.lookup("port").?.trailingComment(&doc) == null);
+
+    // Leading, read off the (inline) value standing in for the pair: the
+    // block directly above. A blank line breaks the attachment.
+    try testing.expectEqualStrings("# service configuration", root.lookup("name").?.leadingComments(&doc).?);
+    try testing.expectEqualStrings("# stale, replaced below", root.lookup("port").?.leadingComments(&doc).?);
+    try testing.expectEqualStrings("# separated from port by a blank line", root.lookup("debug").?.leadingComments(&doc).?);
+
+    // The key reads the same block as its inline value.
+    const pairs = root.pairs().?;
+    try testing.expectEqualStrings("# service configuration", pairs[0].key.leadingComments(&doc).?);
+
+    // A programmatically built node has no source bytes to read.
+    var built = Document.init(testing.allocator);
+    defer built.deinit();
+    const n = try built.createScalar("x", .plain);
+    try testing.expect(n.trailingComment(&built) == null);
+    try testing.expect(n.leadingComments(&built) == null);
+}
+
+test "comment reads on containers, aliases and block values" {
+    const src =
+        \\top:
+        \\  # about the sequence
+        \\  - one   # first
+        \\  - &v two
+        \\  - *v
+        \\
+    ;
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    const top = doc.pathGet(&.{"top"}).?;
+
+    // The block value's own comments are the ones above its first line.
+    try testing.expectEqualStrings("# about the sequence", top.leadingComments(&doc).?);
+    // A mid-sequence comment is its item's trailing comment.
+    try testing.expectEqualStrings("# first", top.items().?[0].trailingComment(&doc).?);
+    try testing.expect(top.trailingComment(&doc) == null);
+    // Alias occurrences read their own spans.
+    try testing.expect(top.items().?[2].trailingComment(&doc) == null);
+}
+
+test "comment write: set, change, delete a trailing comment" {
+    var doc = try Document.parse(testing.allocator, comment_src);
+    defer doc.deinit();
+    const port = doc.pathGet(&.{"port"}).?;
+
+    // Add where there was none.
+    try doc.setTrailingComment(port, "# the door");
+    {
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(
+            "# service configuration\nname: api   # user facing\n# stale, replaced below\nport: 8080 # the door\n\n# separated from port by a blank line\ndebug: false\n",
+            out,
+        );
+        // Reads see the written comment without a re-parse.
+        try testing.expectEqualStrings("# the door", port.trailingComment(&doc).?);
+    }
+
+    // Change: canonical single blank replaces the original spacing.
+    try doc.setTrailingComment(port, "# changed");
+    {
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "port: 8080 # changed\n") != null);
+    }
+
+    // Delete.
+    try doc.setTrailingComment(port, null);
+    {
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(
+            "# service configuration\nname: api   # user facing\n# stale, replaced below\nport: 8080\n\n# separated from port by a blank line\ndebug: false\n",
+            out,
+        );
+    }
+}
+
+test "comment write: re-setting the same comment is byte-identical" {
+    const src =
+        \\# service configuration
+        \\name: api   # user facing
+        \\port: 8080 # one space here
+        \\
+    ;
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+
+    // Same text, whatever the original spacing: a no-op, so even the
+    // three blanks before the first comment survive untouched.
+    try doc.setTrailingComment(doc.pathGet(&.{"name"}).?, "# user facing");
+    try testing.expect(doc.pathGet(&.{"name"}).?.modified == false);
+    // A different text is a real edit and marks the tree.
+    try doc.setTrailingComment(doc.pathGet(&.{"name"}).?, "# renamed");
+    try testing.expect(doc.pathGet(&.{"name"}).?.modified == true);
+
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "# service configuration\nname: api # renamed\nport: 8080 # one space here\n",
+        out,
+    );
+}
+
+test "comment write: leading blocks set, change and delete whole lines" {
+    var doc = try Document.parse(testing.allocator, comment_src);
+    defer doc.deinit();
+    const port = doc.pathGet(&.{"port"}).?;
+
+    try doc.setLeadingComments(port, "# rate limit\n# in requests/second");
+    {
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(
+            "# service configuration\nname: api   # user facing\n# rate limit\n# in requests/second\nport: 8080\n\n# separated from port by a blank line\ndebug: false\n",
+            out,
+        );
+        try testing.expectEqualStrings(
+            "# rate limit\n# in requests/second",
+            port.leadingComments(&doc).?,
+        );
+    }
+
+    // Delete removes the lines whole; the entry below stays put.
+    try doc.setLeadingComments(port, null);
+    {
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(
+            "# service configuration\nname: api   # user facing\nport: 8080\n\n# separated from port by a blank line\ndebug: false\n",
+            out,
+        );
+    }
+}
+
+test "comment write: a comment on a brand-new entry, the motivating case" {
+    var doc = try Document.parse(testing.allocator, "name: api\n");
+    defer doc.deinit();
+    try doc.pathSet(&.{"port"}, try doc.createScalar("8080", .plain));
+
+    // The replacement value has no source span; its trailing comment is
+    // synthesized at emission time.
+    try doc.setTrailingComment(doc.pathGet(&.{"port"}).?, "# user facing");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("name: api\nport: 8080 # user facing\n", out);
+
+    // Comment round trip: parse(emit(doc)) reads the same comments back.
+    var again = try Document.parse(testing.allocator, out);
+    defer again.deinit();
+    try testing.expectEqualStrings("# user facing", again.pathGet(&.{"port"}).?.trailingComment(&again).?);
+}
+
+test "comment write: sibling bytes survive a comment edit" {
+    const src =
+        \\# head
+        \\a: 1  # keep
+        \\b: 2
+        \\c: [x, y]
+        \\
+    ;
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try doc.setLeadingComments(doc.pathGet(&.{"b"}).?, "# new\n# block");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(
+        "# head\na: 1  # keep\n# new\n# block\nb: 2\nc: [x, y]\n",
+        out,
+    );
+}
+
+test "comment write: rejects what it cannot write honestly" {
+    var doc = try Document.parse(testing.allocator, "a: 1 # c\nlist:\n  - x\nflow: [1, 2]\n");
+    defer doc.deinit();
+
+    // Not a comment / not one line.
+    try testing.expectError(error.InvalidSyntax, doc.setTrailingComment(doc.pathGet(&.{"a"}).?, "no hash"));
+    try testing.expectError(error.InvalidSyntax, doc.setTrailingComment(doc.pathGet(&.{"a"}).?, "# two\nlines"));
+    // Trailing on a block collection: address its last entry instead.
+    try testing.expectError(error.InvalidSyntax, doc.setTrailingComment(doc.pathGet(&.{"list"}).?, "# c"));
+    // Trailing on the pair's key: the comment lives after the value.
+    try testing.expectError(error.InvalidSyntax, doc.setTrailingComment(doc.root.?.pairs().?[0].key, "# c"));
+    // Inside a flow collection: not addressable (design, out of scope).
+    const flow_item = doc.pathGet(&.{"flow"}).?.items().?[0];
+    try testing.expectError(error.InvalidSyntax, doc.setTrailingComment(flow_item, "# c"));
+    try testing.expectError(error.InvalidSyntax, doc.setLeadingComments(flow_item, "# c"));
+    // Leading text with a non-comment line.
+    try testing.expectError(error.InvalidSyntax, doc.setLeadingComments(doc.pathGet(&.{"a"}).?, "# ok\nplain line"));
+}
+
+test "comment round trip: every written comment survives write and re-parse" {
+    const src =
+        \\# doc head
+        \\a: 1   # tail of a
+        \\b:
+        \\  # about b
+        \\  - x
+        \\  - y  # tail of y
+        \\
+    ;
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try doc.setTrailingComment(doc.pathGet(&.{"a"}).?, "# new tail");
+    try doc.setLeadingComments(doc.pathGet(&.{"b"}).?, "# rewritten");
+
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    var again = try Document.parse(testing.allocator, out);
+    defer again.deinit();
+    try testing.expectEqualStrings("# new tail", again.pathGet(&.{"a"}).?.trailingComment(&again).?);
+    try testing.expectEqualStrings("# rewritten", again.pathGet(&.{"b"}).?.leadingComments(&again).?);
+    try testing.expectEqualStrings("# doc head", again.pathGet(&.{"a"}).?.leadingComments(&again).?);
+    const items = again.pathGet(&.{"b"}).?.items().?;
+    try testing.expectEqualStrings("# tail of y", items[1].trailingComment(&again).?);
+}
+
+test "comment write in a CRLF document keeps the convention" {
+    const src = "# head\r\na: 1 # one\r\nb: 2\r\n";
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try doc.setTrailingComment(doc.pathGet(&.{"b"}).?, "# two");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# head\r\na: 1 # one\r\nb: 2 # two\r\n", out);
+
+    // And a written leading block uses the same terminator.
+    try doc.setLeadingComments(doc.pathGet(&.{"b"}).?, "# lead");
+    const out2 = try doc.write(testing.allocator);
+    defer testing.allocator.free(out2);
+    try testing.expectEqualStrings("# head\r\na: 1 # one\r\n# lead\r\nb: 2 # two\r\n", out2);
+}
+
+test "allocation failures in comment writes leak nothing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, commentWrite, .{});
+}
+
+fn commentWrite(allocator: std.mem.Allocator) !void {
+    var doc = try Document.parse(allocator, "# head\na: 1 # tail\nb: 2\n");
+    defer doc.deinit();
+    try doc.setTrailingComment(doc.pathGet(&.{"a"}).?, "# rewritten");
+    try doc.setLeadingComments(doc.pathGet(&.{"b"}).?, "# new\n# block");
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "# rewritten") != null);
 }

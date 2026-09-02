@@ -575,6 +575,11 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node)) Er
         .tag = node.tag,
         .src = node.src,
         .modified = node.modified,
+        // Written comments travel with the clone: they are pool-owned
+        // slices like everything else, so sharing the slice between the
+        // original and the clone is fine.
+        .pending_trailing = node.pending_trailing,
+        .pending_leading = node.pending_leading,
         .data = undefined,
     };
     switch (node.data) {
