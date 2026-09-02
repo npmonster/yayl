@@ -134,7 +134,7 @@ pub fn build(b: *std.Build) void {
     // only compiles it but RUNS its full-surface demo against a real
     // fixture, so the public API stays end-to-end usable in CI forever.
     const examples_step = b.step("examples", "Build (and exercise) the example programs");
-    inline for (.{ "parse", "edit", "yq_lite" }) |name| {
+    inline for (.{ "parse", "edit", "yq_lite", "values", "schema", "files" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{

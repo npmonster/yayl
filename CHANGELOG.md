@@ -37,6 +37,49 @@ and rationale: `docs/design/comments.md`.
   (tabs or spaces before the line break) migrated those blanks onto
   the wrong line; a brand-new entry now carries the previous entry's
   line remainder with it.
+- A TAB in a block scalar header (`fold: >\t-`) passed the
+  whitespace check, left the scanner mid-line, and leaked the rest of
+  the header line into the content loop, where an arithmetic underflow
+  panicked (`integer overflow` in `scanBlockScalar`). Found by the new
+  fuzz harness on its first long run; the header now accepts spaces
+  and tabs and rejects anything else before the line break with a
+  typed error.
+- Replacing a mapping value with a node that carries presentation
+  spans from elsewhere — a `cloneTree` copy — silently re-emitted the
+  original bytes instead of the replacement (or read out of bounds
+  when the span named a shorter source). Replacements now re-emit
+  normalized; `edit.cloneTreeInto` is the safe cross-document form.
+
+### Added
+
+**Fuzzing.** A deterministic seeded harness (`src/fuzz.zig`) mutates a
+seed corpus — embedded shapes, the fixtures, and vendored
+yaml-test-suite inputs — and asserts the contract: parse or a typed
+error, safe emission, re-parse, and write idempotence. A bounded smoke
+runs inside `zig build test`; `zig build fuzz -- <seed> <iterations>`
+is the reproducible long-run target (the same seed replays the same
+inputs, so a reported failure is rerunnable).
+
+**Cross-document copies.** `yaml.edit.cloneTreeInto(doc, node)`
+deep-clones a subtree into another document with spans cleared — the
+copy re-emits normalized, like a moved subtree. (`cloneTree` remains
+the same-document form the editor's batches use.)
+
+**Benchmarks in CI.** `scripts/bench-corpus.sh` times the hot paths
+(parse, write, round trip, edit+write) over the fixtures and a bounded
+corpus slice, printing stable machine-readable lines; CI runs it as a
+report-only job (`continue-on-error`) — numbers, never gates.
+
+**Security policy.** `SECURITY.md` documents the reporting channel and
+the actual threat model for untrusted input: every bound (input size,
+nesting, alias expansion, emission depth, NUL policy), its default,
+and how to change it.
+
+**Examples** for the value, schema, and file surfaces
+(`examples/values.zig`, `examples/schema.zig`, `examples/files.zig`),
+compile-checked and wired into `zig build examples` alongside the
+`yq_lite` dogfood tool, whose full-surface demo now also RUNS in the
+examples build.
 
 ## 0.13.0 — 2026-09-02
 

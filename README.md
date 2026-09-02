@@ -238,7 +238,8 @@ make preservation  # an edit changes only the lines it should (fixtures only)
 make consume       # build a package against the packaged library (.paths check)
 make differential  # event-stream parity vs libfyaml (needs a C compiler)
 make examples      # compile-checked example programs (zig-out/bin)
-zig build bench    # throughput CLI
+zig build bench    # throughput CLI (scripts/bench-corpus.sh: fixtures + corpus)
+zig build fuzz     # deterministic long-run fuzz harness (smoke runs in `test`)
 ```
 
 The gates, in both Debug and ReleaseSafe:

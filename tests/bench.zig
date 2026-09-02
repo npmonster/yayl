@@ -3,6 +3,11 @@
 //! numbers instead of claims.
 //!
 //! Usage: bench <file.yaml> [iterations]
+//!        bench --machine <file.yaml> [iterations]
+//!
+//! `--machine` prints one stable line per hot path
+//! (`yayl_bench op=... file=... mib_per_s=... ms_per_op=...`), which is
+//! what `scripts/bench-corpus.sh` and the non-gating CI job consume.
 
 const std = @import("std");
 const yaml = @import("yayl");
@@ -14,15 +19,25 @@ pub fn main(init: std.process.Init) !void {
 
     var it = std.process.Args.Iterator.init(init.minimal.args);
     _ = it.next();
-    const path = it.next() orelse {
-        std.debug.print("usage: bench <file.yaml> [iterations]\n", .{});
+    var machine = false;
+    var first: ?[:0]const u8 = it.next();
+    if (first) |a| {
+        if (std.mem.eql(u8, a, "--machine")) {
+            machine = true;
+            first = it.next();
+        }
+    }
+    const path = first orelse {
+        std.debug.print("usage: bench [--machine] <file.yaml> [iterations]\n", .{});
         return error.Usage;
     };
     const iterations_text = it.next() orelse "20";
     const iterations: usize = @intCast(try std.fmt.parseInt(usize, iterations_text, 10));
 
     const input = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 << 20));
-    std.debug.print("input: {s} ({d} bytes, {d} iterations)\n", .{ path, input.len, iterations });
+    if (!machine) {
+        std.debug.print("input: {s} ({d} bytes, {d} iterations)\n", .{ path, input.len, iterations });
+    }
 
     // Warm up.
     {
@@ -82,6 +97,15 @@ pub fn main(init: std.process.Init) !void {
 
     _ = &total_parsed;
     const p = std.debug.print;
+    if (machine) {
+        // Stable, machine-readable lines (the non-gating CI job and
+        // scripts/bench-corpus.sh parse these).
+        p("yayl_bench op=parse file={s} mib_per_s={d:.1} ms_per_op={d:.3}\n", .{ path, mibPerS(total_parsed, parse_ns), ms(parse_ns, iterations) });
+        p("yayl_bench op=write file={s} mib_per_s={d:.1} ms_per_op={d:.3}\n", .{ path, mibPerS(total_written, write_ns), ms(write_ns, iterations) });
+        p("yayl_bench op=round_trip file={s} ms_per_op={d:.3}\n", .{ path, ms(roundtrip_ns, iterations) });
+        p("yayl_bench op=edit_write file={s} ms_per_op={d:.3}\n", .{ path, ms(edit_ns, iterations) });
+        return;
+    }
     p("parse:      {d:>6.1} MiB/s ({d:.1} ms/op)\n", .{
         mibPerS(total_parsed, parse_ns), ms(parse_ns, iterations),
     });

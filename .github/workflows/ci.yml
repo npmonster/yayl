@@ -73,6 +73,29 @@ jobs:
           name: conformance-report
           path: zig-out/conformance-report.json
 
+  # Benchmarks report numbers; they never gate a build. Shared runners
+  # are too noisy for performance thresholds — this job exists so the
+  # hot paths get exercised (and their trend visible in the logs) on
+  # every change to main, and so a perf regression shows up as a
+  # conversation, not a red X.
+  bench:
+    name: Benchmarks (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Fetch pinned YAML Test Suite corpus
+        run: sh scripts/fetch-corpus.sh
+
+      - name: Bench hot paths over fixtures and corpus (ReleaseFast)
+        run: sh scripts/bench-corpus.sh 20
+
   # The in-tree gates above all build from the working tree, so they
   # cannot see the one failure mode that breaks every dependent while
   # staying green here: a source file missing from `.paths` in

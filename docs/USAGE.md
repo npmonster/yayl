@@ -312,6 +312,16 @@ convention; its structure and values survive, its internal comments
 and blank lines do not. Untouched siblings stay verbatim. Moving a
 node into its own subtree is rejected (`error.MoveIntoSubtree`).
 
+To copy a subtree into a *different* document, use
+`yaml.edit.cloneTreeInto(&target_doc, node)`: it deep-clones the node
+into the target document's pool with presentation spans cleared, so the
+copy re-emits normalized there (structure and values survive, internal
+layout and comments do not — the moved-subtree contract).
+`yaml.edit.cloneTree` is the same-document form used by the editor's
+atomic batches; it keeps spans, and attaching its result anywhere but
+the source document would make the emitter copy bytes from the wrong
+source.
+
 ## Comments: read and write
 
 Comments are addressable. Reads are raw: exactly the source bytes, a
@@ -603,7 +613,15 @@ read time, before the bytes reach the parser.
 make help         # target list
 make verify       # the full gate
 zig-out/bin/bench tests/fixtures/serde-ci.yml 500   # throughput
+sh scripts/bench-corpus.sh      # hot paths over fixtures + corpus (machine lines)
+zig build fuzz -- 12345 100000  # deterministic long-run fuzz harness
 ~~~
+
+The fuzz harness also runs as a bounded smoke inside `zig build test`,
+so every test run fuzzes something. Its contract: mutated inputs parse
+or return a typed error; inputs that parse emit, re-parse, and are
+write-idempotent. Failures print the seed and iteration, so any crash
+is reproducible by rerunning with the same seed.
 
 The individual gates and their current numbers are in the
 [README](../README.md#development).
