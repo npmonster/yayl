@@ -5,6 +5,8 @@ series; APIs may still move, and anything that does is listed here.
 
 ## Unreleased
 
+## 0.13.0 — 2026-09-02
+
 ### Behaviour changes — read this before upgrading
 
 Two calls that used to succeed can now return an error. Both are
