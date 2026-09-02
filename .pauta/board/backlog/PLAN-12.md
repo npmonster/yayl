@@ -2,7 +2,7 @@
 id: PLAN-12
 title: 0.13.0 completeness: dogfood, comment API, fuzzing, hardening lane, policy/examples/bench
 created: 2026-09-01T09:16:37Z
-updated: 2026-09-01T10:32:37Z
+updated: 2026-09-02T07:59:08Z
 tags: [release, 0.13.0, completeness, api, fuzzing, docs]
 deps: []
 skills: []
@@ -251,3 +251,25 @@ Commits on main, all after v0.12.0 (7a0f539), all under CHANGELOG `## Unreleased
 **One behaviour change** the release notes must carry, deliberately not silent: a NUL byte in the input is now rejected (`error.InvalidSyntax`) instead of truncating the input there. The argument that settles it, found by patient-storm: `Document.source` kept the *truncated* slice and faithful emission writes `source` back, so parse → edit → write on a NUL-carrying file destroyed everything after the NUL **in the file**. `.embedded_nul = .truncate` opts back in. CHANGELOG carries it under its own "Behaviour changes — read this before upgrading" heading, at crisp-dingo's request, alongside the new 64 MiB input bound.
 
 **Still open from D and adjacent, for whoever takes this card:** `scripts/differential.sh` not run by me; merge keys (`<<`) still unresolved and duplicate keys still kept (both deliberate, both documented); no regex constraint in schema (no regex engine in std — documented as a decision, not an omission); emission buffers by design and has no writer sink (faithful emission writes behind its own cursor, so a forward-only writer cannot express it — now documented in README's limitations rather than left to be discovered).
+- 2026-09-02T07:59:08Z vast-wren — **v0.13.0 is released.** On direct human instruction, which overrides this card's sequencing. Logged so the card is not left describing a world that no longer exists; I have not moved its lane, approved it, or submitted it.
+
+Release commit `30763d4` (`release: 0.13.0`), tag `v0.13.0` annotated and pushed at that explicit sha, GitHub Release published and marked Latest.
+
+Evidence, in the order it was gathered:
+- Detached worktree at the release sha under my scratchpad (not the shared checkout), vendor/ copied in: `make verify` green — conformance 351 pass/0 fail/0 skip/0 stale, roundtrip 265 pass/0 fail/4 skip, preservation zero failures across fixtures/corpus/variants, consumer-smoke byte-faithful. Then `scripts/differential.sh` separately: 269 compared, 0 mismatches. Worktree removed.
+- Pushed; CI on `30763d4` green on all six jobs — verify, Consume as a dependency, macos-latest, windows-latest, ubuntu-24.04-arm (tag-version-match correctly skipped, no tag yet).
+- Tagged, pushed; CI on the tag green including **tag-version-match: success**, plus the docs workflow, which means the API reference is published for 0.13.0.
+
+**What shipped:** workstream D in full (ParseOptions, EmitOptions, writeAll/writeAllOpts, value/schema surface gaps) and B1 (`docs/design/comments.md`).
+
+**What did NOT ship, and is now 0.14.0 work — the card's remaining scope:**
+- **A** — no dogfooding consumer example, no friction report.
+- **B2** — comment API unimplemented. The design doc is committed and still needs the human decision this card gates it on. Comments remain preserved but not addressable.
+- **C** — no fuzzing beyond the three fixed-seed smoke tests in `src/yaml.zig`; no allocation-failure injection for scanner (63 allocator sites), parser (18) or emitter (17); the three audit suspicions are all still unresolved, including `edit.cloneTree` pointed at a second Document.
+- **E** — no SECURITY.md, no examples for value/schema/file, no bench job in CI.
+
+The release notes say all of that explicitly under a "Not in this release" heading rather than letting a reader infer it.
+
+**One thing a re-scoper should know:** E1 (SECURITY.md) was contingent on D landing so the bounds list would be true. D has landed, so E1 is now unblocked and the list it must document is: scanner `max_nesting` 200 and the 1024-character simple-key cap; `value.Limits`/`schema.Limits` at 1 << 20 with `Limits.unlimited`; `Emitter.max_depth` 1000; and `ParseOptions.max_input_bytes` 64 MiB plus `embedded_nul`. Four bounds in three places, all reachable from `ParseOptions`' doc comment, which cross-references the others.
+
+Also closed en route: the **v0.12.0 GitHub Release object**, which never existed — `gh release list` had v0.11.0 as Latest until today because crisp-dingo's token was read-only. Both v0.12.0 and v0.13.0 now have Release objects with notes.
