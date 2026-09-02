@@ -33,10 +33,10 @@ Zig 0.16.x is supported; `build.zig.zon` sets 0.16.0 as the minimum, and CI pins
 Add the package, pinned to a release:
 
 ```sh
-zig fetch --save git+https://github.com/npmonster/yayl#v0.13.0
+zig fetch --save git+https://github.com/npmonster/yayl#v0.14.0
 ```
 
-That records the resolved commit and a content hash in your `build.zig.zon`, so your build stays reproducible even if the tag later moves or disappears. Leave off `#v0.13.0` and you pin whatever `main` happens to be at that moment, which is rarely what you want.
+That records the resolved commit and a content hash in your `build.zig.zon`, so your build stays reproducible even if the tag later moves or disappears. Leave off `#v0.14.0` and you pin whatever `main` happens to be at that moment, which is rarely what you want.
 
 Wire the module into your `build.zig`:
 
