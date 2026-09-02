@@ -144,6 +144,9 @@ test {
     _ = value;
     _ = schema;
     _ = file;
+    // The fuzz harness is internal (never re-exported); its tests run
+    // with the suite so CI always fuzzes something.
+    _ = @import("fuzz.zig");
 }
 
 test "parse and write round trip" {
@@ -362,6 +365,10 @@ test "property: write(parse(write(parse(x)))) is a fixpoint" {
     }
 }
 
+test "fuzz smoke: mutated corpus never panics, leaks, or loses the round trip" {
+    try @import("fuzz.zig").runSmoke(std.testing.allocator);
+}
+
 fn parseOnly(allocator: std.mem.Allocator) !void {
     var doc = try parse(allocator, "name: yayl\nitems:\n  - one\n  - two\n");
     defer doc.deinit();
@@ -537,4 +544,39 @@ test "an escaped NUL is content, not a raw NUL" {
     var again = try parse(allocator, out);
     defer again.deinit();
     try std.testing.expectEqualStrings(decoded, again.pathGet(&.{"a"}).?.scalarValue().?);
+}
+
+test "allocation failures in emission leak nothing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, emitBuilt, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, emitStream, .{});
+}
+
+/// Emission as its own allocation-failure family: a built document
+/// (nested block + flow + quoted scalars) through writeOpts, and a
+/// multi-document stream through writeAll.
+fn emitBuilt(allocator: std.mem.Allocator) !void {
+    var doc = Document.init(allocator);
+    defer doc.deinit();
+    const root = try doc.createMapping();
+    doc.root = root;
+    const inner = try doc.createMapping();
+    try doc.mappingAppend(root, try doc.createScalar("outer", .plain), inner);
+    try doc.mappingAppend(inner, try doc.createScalar("name", .plain), try doc.createScalar("a: b", .double_quoted));
+    const seq = try doc.createSequence();
+    try doc.mappingAppend(root, try doc.createScalar("list", .plain), seq);
+    try doc.sequenceAppend(seq, try doc.createScalar("one", .plain));
+    try doc.sequenceAppend(seq, try doc.createScalar("two", .plain));
+    const out = try doc.writeOpts(allocator, .{ .indent = 3 });
+    defer allocator.free(out);
+}
+
+fn emitStream(allocator: std.mem.Allocator) !void {
+    var docs = try parseAll(allocator, "---\na: 1\n---\nb: 2\n");
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(allocator);
+    }
+    const out = try writeAll(allocator, docs.items);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("---\na: 1\n---\nb: 2\n", out);
 }

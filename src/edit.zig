@@ -560,20 +560,41 @@ fn clearSpans(node: *Node) void {
 /// Deep-clone a subtree into `doc`'s pool, preserving presentation
 /// spans (so a rolled-back-to clone still round-trips untouched parts
 /// byte-identically) and rebuilding alias targets within the clone.
+///
+/// SAME-DOCUMENT ONLY. The clone's spans index the source the tree was
+/// parsed from: attaching the result anywhere except back into `doc`'s
+/// own tree makes the emitter copy bytes from the wrong source —
+/// silently, or as an out-of-bounds read when the other document is
+/// shorter. For a tree that will live in a different document, use
+/// `cloneTreeInto`, which clears spans so the copy re-emits normalized
+/// (the same contract as `move`).
 pub fn cloneTree(doc: *Document, root: *Node) Error!*Node {
     var anchors = std.StringHashMap(*Node).init(doc.allocator);
     defer anchors.deinit();
-    return cloneNode(doc, root, &anchors);
+    return cloneNode(doc, root, &anchors, false);
 }
 
-fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node)) Error!*Node {
+/// Deep-clone a subtree from ANOTHER document into `doc`'s pool.
+/// Presentation spans are cleared: the clone has no source bytes in
+/// `doc`, so it re-emits normalized — structure and values survive,
+/// internal layout, comments and blank lines do not (exactly the moved
+/// subtree's contract). Alias targets pointing outside the cloned
+/// subtree are followed for their values; anchors are rebuilt within
+/// the clone.
+pub fn cloneTreeInto(doc: *Document, root: *Node) Error!*Node {
+    var anchors = std.StringHashMap(*Node).init(doc.allocator);
+    defer anchors.deinit();
+    return cloneNode(doc, root, &anchors, true);
+}
+
+fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), clear_spans: bool) Error!*Node {
     const n = try doc.pool.create(Node);
     n.* = .{
         .parent = null,
         .mark = node.mark,
         .anchor = node.anchor,
         .tag = node.tag,
-        .src = node.src,
+        .src = if (clear_spans) null else node.src,
         .modified = node.modified,
         // Written comments travel with the clone: they are pool-owned
         // slices like everything else, so sharing the slice between the
@@ -592,8 +613,8 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node)) Er
             n.data = .{ .mapping = .{ .style = m.style } };
             if (node.anchor) |a| try anchors.put(try doc.pool.dupe(a), n);
             for (m.pairs.items) |p| {
-                const k = try cloneNode(doc, p.key, anchors);
-                const v = try cloneNode(doc, p.value, anchors);
+                const k = try cloneNode(doc, p.key, anchors, clear_spans);
+                const v = try cloneNode(doc, p.value, anchors, clear_spans);
                 try internal.attachPair(doc, n, k, v);
                 // Preserve the pair's original extent.
                 if (n.data == .mapping) {
@@ -609,7 +630,7 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node)) Er
             n.data = .{ .sequence = .{ .style = sq.style } };
             if (node.anchor) |a| try anchors.put(try doc.pool.dupe(a), n);
             for (sq.items.items) |item| {
-                const child = try cloneNode(doc, item, anchors);
+                const child = try cloneNode(doc, item, anchors, clear_spans);
                 try internal.attachItem(doc, n, child);
             }
             for (sq.dropped.items) |d| {
@@ -1494,4 +1515,99 @@ test "editing explicit-key entries emits valid YAML" {
         defer testing.allocator.free(out);
         try testing.expectEqualStrings("? Mark McGwire\n? Sammy Sosa\nzz_added: added\n", out);
     }
+}
+
+test "a spanned clone replacing a slot is emitted, not silently dropped" {
+    // The audit suspicion, same-document form: `cloneTree` preserves
+    // spans, so the clone looks clean to the emitter — and before
+    // `mappingReplace` marked the replacement, the pair's fast path
+    // re-emitted the ORIGINAL bytes and the replacement vanished.
+    var doc = try Document.parse(testing.allocator, "a: 1\ntop:\n  x: 42\n");
+    defer doc.deinit();
+    const clone = try cloneTree(&doc, doc.pathGet(&.{"top"}).?);
+    try testing.expect(internal.mappingReplace(&doc, doc.root.?, doc.pathGet(&.{"a"}).?, clone));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a:\n  x: 42\ntop:\n  x: 42\n", out);
+}
+
+test "cloneTreeInto a second document cannot copy the wrong source bytes" {
+    // The audit suspicion, cross-document form: the clone's spans index
+    // the FIRST document's source. Before spans were cleared, attaching
+    // the clone into a shorter document either panicked on the
+    // out-of-bounds slice or re-emitted document A's bytes from inside
+    // document B's slot, silently.
+    var a = try Document.parse(testing.allocator,
+        \\# padding to push the subtree's spans far into A's source
+        \\keep: 1
+        \\keep2: 2
+        \\subtree:
+        \\  x: 42
+        \\
+    );
+    defer a.deinit();
+    var b = try Document.parse(testing.allocator, "small: 1\nother: 2\n");
+    defer b.deinit();
+
+    const copy = try cloneTreeInto(&b, a.pathGet(&.{"subtree"}).?);
+    try testing.expect(copy.src == null);
+    // Replace an ORIGINAL slot: the replacement must appear.
+    try testing.expect(internal.mappingReplace(&b, b.root.?, b.pathGet(&.{"other"}).?, copy));
+    const out = try b.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("small: 1\nother:\n  x: 42\n", out);
+
+    // And the round trip of the result re-parses to the same values.
+    var again = try Document.parse(testing.allocator, out);
+    defer again.deinit();
+    try testing.expectEqualStrings("42", again.pathGet(&.{ "other", "x" }).?.scalarValue().?);
+    try testing.expectEqualStrings("1", again.pathGet(&.{"small"}).?.scalarValue().?);
+}
+
+test "allocation failures in insert and move batches leak nothing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, insertMoveBatch, .{});
+}
+
+/// Insert and move go through `Editor.apply`'s clone-and-swap path and
+/// sequence bookkeeping — the allocation-heaviest edits. On any OOM the
+/// original tree must survive intact and leak-free.
+fn insertMoveBatch(allocator: std.mem.Allocator) !void {
+    var doc = try Document.parse(allocator,
+        \\from:
+        \\  - alpha
+        \\  - beta
+        \\to:
+        \\  items: []
+        \\
+    );
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{
+        .{ .insert = .{
+            .sequence = "$.from",
+            .position = "$.from[1]",
+            .value = try doc.createScalar("gamma", .plain),
+            .before = true,
+        } },
+        .{ .move = .{ .from = "$.from[0]", .to = "$.to", .key = "moved" } },
+        .{ .append = .{ .sequence = "$.from", .value = try doc.createScalar("delta", .plain) } },
+    });
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+}
+
+test "allocation failures in a cross-document clone leak nothing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, crossDocumentClone, .{});
+}
+
+fn crossDocumentClone(allocator: std.mem.Allocator) !void {
+    var a = try Document.parse(allocator, "keep:\n  x: [1, 2]\n  y: {z: 3}\n");
+    defer a.deinit();
+    var b = try Document.parse(allocator, "small: 1\n");
+    defer b.deinit();
+    const copy = try cloneTreeInto(&b, a.pathGet(&.{"keep"}).?);
+    try b.pathSet(&.{"imported"}, copy);
+    const out = try b.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("small: 1\nimported:\n  x: [1, 2]\n  y: {z: 3}\n", out);
 }

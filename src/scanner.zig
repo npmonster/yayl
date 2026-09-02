@@ -988,10 +988,13 @@ pub const Scanner = struct {
                 self.skipCp();
             }
         }
-        // End of header: spaces, optional comment (which must be
-        // whitespace-separated, corpus X4QW), then a line break.
+        // End of header: spaces or tabs, optional comment (which must
+        // be whitespace-separated, corpus X4QW), then a line break.
+        // Found by the fuzzer (PLAN-12 C1): a TAB here used to pass the
+        // isBlankz check, leave the scanner mid-line, and leak the rest
+        // of the header line into the content loop.
         var header_ws = false;
-        while (self.at(0) == ' ') {
+        while (self.at(0) == ' ' or self.at(0) == '\t') {
             self.skipCp();
             header_ws = true;
         }
@@ -1123,8 +1126,11 @@ pub const Scanner = struct {
             trailing_breaks = 0;
 
             // Capture the line, keeping any spaces past the strip column
-            // (they belong to more-indented lines).
-            const text_start = self.pos - (ws - strip);
+            // (they belong to more-indented lines). Saturating: since the
+            // header now always ends at a line break, `ws >= strip`
+            // always holds here — the subtraction underflow the fuzzer
+            // found is unreachable except through a header leak.
+            const text_start = self.pos - (ws -| strip);
             while (self.at(0) != 0 and !ctype.isBreak(self.at(0))) self.skipCp();
             try value.appendSlice(self.allocator, self.input[text_start..self.pos]);
 

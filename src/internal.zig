@@ -244,7 +244,14 @@ pub fn mappingReplace(self: *Document, map: *Node, existing: *Node, value: *Node
         if (p.value == existing) {
             value.parent = map;
             p.value = value;
-            self.markModified(map);
+            // A replacement must never carry a span into a slot it does
+            // not describe. A spanned replacement (a clone) either
+            // looks clean — the pair's fast path re-emits the ORIGINAL
+            // bytes and the replacement silently vanishes — or re-emits
+            // whatever region its span happens to name. Clear it and
+            // mark it: the value re-emits normalized, like a moved one.
+            value.src = null;
+            self.markModified(value);
             return true;
         }
     }

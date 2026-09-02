@@ -112,6 +112,23 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&bench_install.step);
     b.getInstallStep().dependOn(&bench_install.step);
 
+    // Long-run fuzz harness (PLAN-12 C1): manual, never a gate. The
+    // same harness runs as a bounded smoke test inside `zig build test`.
+    const fuzz_exe = b.addExecutable(.{
+        .name = "fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const fuzz_install = b.addInstallArtifact(fuzz_exe, .{});
+    const fuzz_step = b.step("fuzz", "Run the deterministic fuzz harness (seed, iterations via --)");
+    fuzz_step.dependOn(&fuzz_install.step);
+    var fuzz_run = b.addRunArtifact(fuzz_exe);
+    if (b.args) |args| fuzz_run.addArgs(args);
+    fuzz_step.dependOn(&fuzz_run.step);
+
     // Examples: small compile-checked programs (see examples/). yq_lite is
     // the dogfood consumer (PLAN-12 workstream A): `zig build examples` not
     // only compiles it but RUNS its full-surface demo against a real
