@@ -112,9 +112,12 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&bench_install.step);
     b.getInstallStep().dependOn(&bench_install.step);
 
-    // Examples: small compile-checked programs (see examples/).
-    const examples_step = b.step("examples", "Build the example programs");
-    inline for (.{ "parse", "edit" }) |name| {
+    // Examples: small compile-checked programs (see examples/). yq_lite is
+    // the dogfood consumer (PLAN-12 workstream A): `zig build examples` not
+    // only compiles it but RUNS its full-surface demo against a real
+    // fixture, so the public API stays end-to-end usable in CI forever.
+    const examples_step = b.step("examples", "Build (and exercise) the example programs");
+    inline for (.{ "parse", "edit", "yq_lite" }) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -126,5 +129,11 @@ pub fn build(b: *std.Build) void {
         });
         const install = b.addInstallArtifact(exe, .{});
         examples_step.dependOn(&install.step);
+        if (comptime std.mem.eql(u8, name, "yq_lite")) {
+            var run = b.addRunArtifact(exe);
+            run.addArgs(&.{ "demo", "tests/fixtures/markdownlint.yaml", "zig-out/yq-lite-demo.yaml" });
+            run.step.dependOn(&install.step);
+            examples_step.dependOn(&run.step);
+        }
     }
 }
