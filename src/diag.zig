@@ -72,8 +72,11 @@ pub const YamlError = error{
     /// Quoted scalar was not terminated before EOF. Unterminated flow
     /// collections surface as `InvalidSyntax`.
     Unterminated,
-    /// Collection nesting exceeds the scanner's `max_nesting` limit,
-    /// or emission exceeds the emitter's `max_depth`.
+    /// Collection nesting exceeds a depth bound: the scanner's
+    /// `max_nesting` while parsing, the emitter's `max_depth` while
+    /// writing, or `value.Limits.max_depth` / `schema.Limits.max_depth`
+    /// while converting or validating a tree that was built rather than
+    /// parsed.
     NestingTooDeep,
     /// Input is longer than `max_input_bytes` allows. Checked before
     /// scanning, so nothing is allocated for it.

@@ -21,7 +21,7 @@ const document_mod = @import("document.zig");
 
 const Node = document_mod.Node;
 
-pub const Error = error{ OutOfMemory, LimitExceeded };
+pub const Error = error{ OutOfMemory, LimitExceeded, NestingTooDeep };
 
 /// Bounds on how much of a document one validation may walk.
 ///
@@ -34,8 +34,28 @@ pub const Limits = struct {
     /// `error.LimitExceeded` on the node that would exceed it.
     max_nodes: usize = 1 << 20,
 
+    /// Deepest nesting one validation will descend before returning
+    /// `error.NestingTooDeep`.
+    ///
+    /// Validation is recursive, so this bounds native stack use, and a
+    /// node count cannot stand in for it: a linear chain of N nested
+    /// collections is N nodes but N frames deep. Composition branches
+    /// (`all_of`, `any_of`, `one_of`, `nullable`) re-enter on the same
+    /// node, so a deeply composed schema charges depth without
+    /// descending the document — deliberately, since those frames are
+    /// just as real. Same default as `value.Limits.max_depth` and
+    /// `Emitter.max_depth`.
+    max_depth: usize = 1000,
+
     /// No bound. Only for input you produced yourself.
-    pub const unlimited: Limits = .{ .max_nodes = std.math.maxInt(usize) };
+    ///
+    /// This lifts the depth bound as well, which re-arms the stack
+    /// overflow it exists to prevent. To lift only the node budget, set
+    /// `max_nodes` and leave `max_depth` alone.
+    pub const unlimited: Limits = .{
+        .max_nodes = std.math.maxInt(usize),
+        .max_depth = std.math.maxInt(usize),
+    };
 };
 
 pub const Schema = struct {
@@ -178,8 +198,8 @@ pub const Schema = struct {
             for (violations.items) |*v| v.deinitSelf(allocator);
             violations.deinit(allocator);
         }
-        var remaining = limits.max_nodes;
-        try checkSchema(self, allocator, node, path, &violations, &remaining);
+        var budget: Budget = .{ .remaining = limits.max_nodes, .max_depth = limits.max_depth };
+        try checkSchema(self, allocator, node, path, &violations, &budget);
         return violations.toOwnedSlice(allocator);
     }
 };
@@ -236,14 +256,14 @@ fn branchMatches(
     allocator: std.mem.Allocator,
     node: *const Node,
     path: []const u8,
-    remaining: *usize,
+    b: *Budget,
 ) Error!bool {
     var scratch: std.ArrayList(Violation) = .empty;
     defer {
         for (scratch.items) |*v| v.deinitSelf(allocator);
         scratch.deinit(allocator);
     }
-    try checkSchema(branch, allocator, node, path, &scratch, remaining);
+    try checkSchema(branch, allocator, node, path, &scratch, b);
     return scratch.items.len == 0;
 }
 
@@ -252,9 +272,38 @@ fn checkNodeCoreTag(node: *const Node) ?document_mod.CoreTag {
     return document_mod.resolveCoreTag(s, node.data.scalar.style);
 }
 
-fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const Node, path: []const u8, out: *std.ArrayList(Violation), remaining: *usize) Error!void {
-    if (remaining.* == 0) return error.LimitExceeded;
-    remaining.* -= 1;
+/// What one validation has left to spend: nodes it may still visit, and
+/// how deep the walk currently is. Shared with every branch explored, so
+/// composition cannot escape either bound.
+const Budget = struct {
+    remaining: usize,
+    depth: usize = 0,
+    max_depth: usize,
+
+    /// One unit per node visited.
+    fn charge(self: *Budget) Error!void {
+        if (self.remaining == 0) return error.LimitExceeded;
+        self.remaining -= 1;
+    }
+
+    /// Open one nesting level, or fail. Paired with `leave`.
+    fn enter(self: *Budget) Error!void {
+        if (self.depth >= self.max_depth) return error.NestingTooDeep;
+        self.depth += 1;
+    }
+
+    fn leave(self: *Budget) void {
+        // Every caller pairs this with `enter` through `defer`, which
+        // holds on the error path too. An unpaired call would wrap.
+        std.debug.assert(self.depth > 0);
+        self.depth -= 1;
+    }
+};
+
+fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const Node, path: []const u8, out: *std.ArrayList(Violation), b: *Budget) Error!void {
+    try b.charge();
+    try b.enter();
+    defer b.leave();
     const cur = node.resolveAlias();
     switch (schema.kind) {
         .any => {},
@@ -329,25 +378,25 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
             for (list, 0..) |item, i| {
                 const child_path = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path, i });
                 defer allocator.free(child_path);
-                try checkSchema(spec.items, allocator, item, child_path, out, remaining);
+                try checkSchema(spec.items, allocator, item, child_path, out, b);
             }
         },
         .nullable => |inner| {
             if (checkNodeCoreTag(cur) == .null) return;
-            try checkSchema(inner, allocator, node, path, out, remaining);
+            try checkSchema(inner, allocator, node, path, out, b);
         },
         .all_of => |branches| {
             // Every branch reports into the caller's list directly: with
             // `all_of` each failure is a real failure, and the author
             // wants to see all of them, not just the first.
             for (branches) |branch| {
-                try checkSchema(branch, allocator, node, path, out, remaining);
+                try checkSchema(branch, allocator, node, path, out, b);
             }
         },
         .any_of, .one_of => |branches| {
             var matched: usize = 0;
             for (branches) |branch| {
-                if (try branchMatches(branch, allocator, node, path, remaining)) matched += 1;
+                if (try branchMatches(branch, allocator, node, path, b)) matched += 1;
             }
             switch (schema.kind) {
                 .any_of => if (matched == 0) {
@@ -389,7 +438,7 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
                 var matched = false;
                 for (fields) |field| {
                     if (std.mem.eql(u8, field.key, kv)) {
-                        try checkSchema(field.schema, allocator, p.value, child_path, out, remaining);
+                        try checkSchema(field.schema, allocator, p.value, child_path, out, b);
                         matched = true;
                         break;
                     }
@@ -666,6 +715,86 @@ test "allOf, anyOf and oneOf" {
             return err;
         };
         if (c.want > 0) try testing.expectEqualStrings(c.rule, violations[0].rule);
+    }
+}
+
+test "validation is depth-bounded, on the document and on the schema" {
+    const allocator = testing.allocator;
+    const Document = document_mod.Document;
+
+    // Recovered from the v0.12.0 audit (vast-wren, suspicion 2). Like
+    // `value.convert`, validation recursed once per level with only the
+    // node budget to stop it, and a linear chain is one node per level —
+    // so the 1<<20 budget could not fire before the native stack gave
+    // out. Reproduced on macOS arm64 against v0.14.0 with a
+    // self-referential schema: 4,000 levels validated cleanly, 8,000
+    // segfaulted.
+    //
+    // A schema that is its own item schema descends once per document
+    // level, which is what makes the document's depth the binding one.
+    var deep: Schema = undefined;
+    deep = Schema.seq(&deep);
+
+    {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        const root = try doc.createSequence();
+        doc.root = root;
+        var cur = root;
+        var i: usize = 0;
+        while (i < 1200) : (i += 1) {
+            const child = try doc.createSequence();
+            try doc.sequenceAppend(cur, child);
+            cur = child;
+        }
+
+        try testing.expectError(error.NestingTooDeep, deep.validate(allocator, root, "$"));
+    }
+
+    // The default is a bound, not absent, and agrees with value's.
+    try testing.expectEqual(@as(usize, 1000), (Limits{}).max_depth);
+
+    // Ordinary documents are nowhere near it.
+    {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        const root = try doc.createSequence();
+        doc.root = root;
+        var cur = root;
+        var i: usize = 0;
+        while (i < 100) : (i += 1) {
+            const child = try doc.createSequence();
+            try doc.sequenceAppend(cur, child);
+            cur = child;
+        }
+        const violations = try deep.validate(allocator, root, "$");
+        defer allocator.free(violations);
+        try testing.expectEqual(@as(usize, 0), violations.len);
+    }
+
+    // Composition re-enters on the same node, so a deeply composed
+    // schema is bounded too — those frames are just as real as the ones
+    // spent descending the document. A chain of `nullable` over a
+    // non-null scalar recurses once per link.
+    {
+        var doc = try Document.parse(allocator, "x: 1\n");
+        defer doc.deinit();
+        const node = doc.pathGet(&.{"x"}).?;
+
+        var chain: [40]Schema = undefined;
+        chain[39] = Schema.any;
+        var i: usize = 39;
+        while (i > 0) : (i -= 1) chain[i - 1] = .{ .kind = .{ .nullable = &chain[i] } };
+
+        try testing.expectError(
+            error.NestingTooDeep,
+            chain[0].validateLimited(allocator, node, "$.x", .{ .max_depth = 8 }),
+        );
+
+        // Under a bound that admits the whole chain it validates.
+        const violations = try chain[0].validateLimited(allocator, node, "$.x", .{ .max_depth = 64 });
+        defer allocator.free(violations);
+        try testing.expectEqual(@as(usize, 0), violations.len);
     }
 }
 

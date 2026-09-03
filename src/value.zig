@@ -77,8 +77,30 @@ pub const Limits = struct {
     /// `error.LimitExceeded` on the value that would exceed it.
     max_values: usize = 1 << 20,
 
+    /// Deepest nesting one conversion will descend before returning
+    /// `error.NestingTooDeep`.
+    ///
+    /// Conversion is recursive, so this bounds native stack use, and it
+    /// is a separate concern from `max_values`: a linear chain of N
+    /// nested collections is only N values but N frames deep, so the
+    /// value budget cannot stand in for it. Parsed documents cannot
+    /// reach this — the scanner caps nesting at 200 — but a tree built
+    /// through `createSequence`/`sequenceAppend` or `toNode` has no such
+    /// bound, and unbounded recursion here is a stack overflow rather
+    /// than a typed error. Matches `Emitter.max_depth`, so a tree this
+    /// conversion accepts is one the emitter will also serialize.
+    max_depth: usize = 1000,
+
     /// No bound. Only for input you produced yourself.
-    pub const unlimited: Limits = .{ .max_values = std.math.maxInt(usize) };
+    ///
+    /// This lifts the depth bound as well, which re-arms the stack
+    /// overflow it exists to prevent: a deep enough tree aborts the
+    /// process instead of returning an error. To lift only the value
+    /// budget, set `max_values` and leave `max_depth` alone.
+    pub const unlimited: Limits = .{
+        .max_values = std.math.maxInt(usize),
+        .max_depth = std.math.maxInt(usize),
+    };
 };
 
 /// Parse the first document of `input` into a Value, under the default
@@ -105,20 +127,43 @@ pub fn nodeToValue(allocator: std.mem.Allocator, node: *const Node) Error!Value 
 /// `nodeToValue` with an explicit expansion bound. Pass
 /// `Limits.unlimited` only for input you produced yourself.
 pub fn nodeToValueLimited(allocator: std.mem.Allocator, node: *const Node, limits: Limits) Error!Value {
-    var remaining = limits.max_values;
-    return convert(allocator, node, &remaining);
+    var budget: Budget = .{ .remaining = limits.max_values, .max_depth = limits.max_depth };
+    return convert(allocator, node, &budget);
 }
 
-/// One unit of budget per Value produced. Charged on entry, so the
-/// error fires on the value that would exceed the bound rather than
-/// after the allocation for it.
-fn charge(remaining: *usize) Error!void {
-    if (remaining.* == 0) return error.LimitExceeded;
-    remaining.* -= 1;
-}
+/// What one conversion has left to spend: Values it may still produce,
+/// and how deep the walk currently is. Both bounds are checked on entry
+/// to `convert`, so either error names the value that would have
+/// exceeded it rather than firing after the work is done.
+const Budget = struct {
+    remaining: usize,
+    depth: usize = 0,
+    max_depth: usize,
 
-fn convert(allocator: std.mem.Allocator, node: *const Node, remaining: *usize) Error!Value {
-    try charge(remaining);
+    /// One unit per Value produced.
+    fn charge(self: *Budget) Error!void {
+        if (self.remaining == 0) return error.LimitExceeded;
+        self.remaining -= 1;
+    }
+
+    /// Open one nesting level, or fail. Paired with `leave`.
+    fn enter(self: *Budget) Error!void {
+        if (self.depth >= self.max_depth) return error.NestingTooDeep;
+        self.depth += 1;
+    }
+
+    fn leave(self: *Budget) void {
+        // Every caller pairs this with `enter` through `defer`, which
+        // holds on the error path too. An unpaired call would wrap.
+        std.debug.assert(self.depth > 0);
+        self.depth -= 1;
+    }
+};
+
+fn convert(allocator: std.mem.Allocator, node: *const Node, b: *Budget) Error!Value {
+    try b.charge();
+    try b.enter();
+    defer b.leave();
     const cur = node.resolveAlias();
     switch (cur.data) {
         .scalar => |s| return scalarToValue(allocator, s.value, s.style),
@@ -131,7 +176,7 @@ fn convert(allocator: std.mem.Allocator, node: *const Node, remaining: *usize) E
                 allocator.free(out);
             }
             for (sq.items.items, 0..) |item, i| {
-                out[i] = try convert(allocator, item, remaining);
+                out[i] = try convert(allocator, item, b);
                 filled = i + 1;
             }
             return .{ .sequence = out };
@@ -155,7 +200,7 @@ fn convert(allocator: std.mem.Allocator, node: *const Node, remaining: *usize) E
                 errdefer allocator.free(key_copy);
                 out[i] = .{
                     .key = key_copy,
-                    .value = try convert(allocator, p.value, remaining),
+                    .value = try convert(allocator, p.value, b),
                 };
                 filled = i + 1;
             }
@@ -964,6 +1009,94 @@ test "alias expansion is bounded, and the bound is configurable" {
     // And an explicit opt-out still works, for input you produced.
     const v2 = try parseToValueLimited(allocator, small, Limits.unlimited);
     defer freeValue(allocator, v2);
+}
+
+/// A linear chain of `depth` nested sequences, built through the public
+/// document API. Parsed input cannot produce this — the scanner caps
+/// nesting at 200 — which is exactly why the depth bound exists: it is
+/// for trees a consumer builds itself.
+fn deepChain(doc: *Document, depth: usize) !*Node {
+    const root = try doc.createSequence();
+    var cur = root;
+    var i: usize = 0;
+    while (i < depth) : (i += 1) {
+        const child = try doc.createSequence();
+        try doc.sequenceAppend(cur, child);
+        cur = child;
+    }
+    return root;
+}
+
+test "conversion is depth-bounded, so a deep built tree errors instead of overflowing the stack" {
+    const allocator = testing.allocator;
+
+    // Recovered from the v0.12.0 audit (vast-wren, suspicion 2): before
+    // this bound, conversion recursed once per level with only the value
+    // budget to stop it. A linear chain is one value per level, so the
+    // 1<<20 budget could not fire until a million levels — the native
+    // stack gave out between 4k and 8k first, aborting the process with
+    // no typed error at all. Measured on macOS arm64: 4,000 returned
+    // cleanly, 8,000 aborted, 10,000 segfaulted.
+    {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        const root = try deepChain(&doc, 1200);
+        doc.root = root;
+
+        // Past the default bound: a typed error, and the process lives.
+        try testing.expectError(error.NestingTooDeep, nodeToValue(allocator, root));
+    }
+
+    // The default is a bound, not absent, and it matches the emitter's
+    // so a tree conversion accepts is one emission will also serialize.
+    try testing.expectEqual(@as(usize, 1000), (Limits{}).max_depth);
+
+    // The bound is not so tight that ordinary trees trip it.
+    {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        const root = try deepChain(&doc, 100);
+        doc.root = root;
+        const v = try nodeToValue(allocator, root);
+        defer freeValue(allocator, v);
+        try testing.expect(v == .sequence);
+    }
+
+    // The bound is the caller's: an explicit one fires where asked, and
+    // the level just under it still converts.
+    {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        const root = try deepChain(&doc, 40);
+        doc.root = root;
+
+        try testing.expectError(
+            error.NestingTooDeep,
+            nodeToValueLimited(allocator, root, .{ .max_depth = 8 }),
+        );
+
+        // 41 nodes on the chain (root + 40), so 41 is the first depth
+        // that admits the whole thing.
+        const v = try nodeToValueLimited(allocator, root, .{ .max_depth = 41 });
+        defer freeValue(allocator, v);
+    }
+
+    // Depth and value budget are independent bounds: a wide-but-shallow
+    // tree is stopped by max_values, not by max_depth.
+    {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        const root = try doc.createSequence();
+        doc.root = root;
+        var i: usize = 0;
+        while (i < 50) : (i += 1) {
+            try doc.sequenceAppend(root, try doc.createScalar("x", .plain));
+        }
+        try testing.expectError(
+            error.LimitExceeded,
+            nodeToValueLimited(allocator, root, .{ .max_values = 10 }),
+        );
+    }
 }
 
 test "dynamic mappings convert to string maps, in all four spellings" {

@@ -582,11 +582,22 @@ const violations = try schema.validateLimited(alloc, node, "$", .{ .max_nodes = 
 `nodeToValueLimited` takes the same bound, and `Limits.unlimited` opts
 out — only for input you produced yourself.
 
+Both also carry `max_depth` (1000, matching the emitter), because a
+count of values cannot stand in for a depth: a linear chain of N nested
+collections is N values but N stack frames. Past it they return
+`error.NestingTooDeep`. Parsed input cannot reach either depth bound —
+`max_nesting` is lower — so this, like the emitter's, is for trees you
+*built*. `Limits.unlimited` lifts the depth bound too, which re-arms the
+stack overflow it prevents; to lift only the value budget, set
+`max_values` (or `max_nodes`) and leave `max_depth` alone.
+
 **Emitting** — `Emitter.max_depth` (1000). Parsing cannot produce a tree
 deep enough to reach it, since `max_nesting` is lower; this bounds
 documents you *built*, through `createSequence`/`sequenceAppend` or
-`value.toNode`, which nothing else caps. Past it, `Document.write`
-returns `error.NestingTooDeep` instead of overflowing the stack.
+`value.toNode`. Past it, `Document.write` returns `error.NestingTooDeep`
+instead of overflowing the stack. Conversion and validation carry the
+same bound at the same default, so a tree one of the three accepts is
+one the others will accept too.
 
 **Reading files** — `yaml.file` applies its own `max_bytes` (64 MiB) at
 read time, before the bytes reach the parser.

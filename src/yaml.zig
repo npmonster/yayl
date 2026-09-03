@@ -241,6 +241,35 @@ test "realistic configuration round trip" {
     try std.testing.expectEqualStrings("true", doc2.pathGet(&.{"enabled"}).?.scalarValue().?);
 }
 
+/// Total allocations one parse of `input` performs. `FailingAllocator`
+/// with the default config never fails; it is used here purely as a
+/// counter, and the count is exactly the number of runs
+/// `checkAllAllocationFailures` will perform over the same function.
+fn countParseAllocations(input: []const u8) !usize {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var doc = try parse(failing.allocator(), input);
+    doc.deinit();
+    return failing.allocations;
+}
+
+test "the scanner/parser sweep input is broad, and stays that way" {
+    // The exact string the v0.12.0 audit called out (vast-wren,
+    // suspicion 3) as missing "most of the allocating surface". Kept
+    // verbatim as the baseline it is: allocation count under one parse
+    // is the number of failure points `checkAllAllocationFailures`
+    // injects at, so it measures the sweep's reach directly.
+    const audit_baseline = "name: yayl\nitems:\n  - one\n  - two\n";
+
+    const before = try countParseAllocations(audit_baseline);
+    const after = try countParseAllocations(sweep_yaml);
+
+    // Not a tuning knob. The margin is wide enough to survive an
+    // allocator or scanner change, and tight enough that thinning
+    // `sweep_yaml` back toward a flat mapping trips it.
+    try std.testing.expect(before > 0);
+    try std.testing.expect(after > before * 3);
+}
+
 test "allocation failures leak nothing" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, parseWriteRoundTrip, .{});
 }
@@ -254,7 +283,7 @@ test "allocation failures in parseAll leak nothing" {
 }
 
 fn parseMultiDoc(allocator: std.mem.Allocator) !void {
-    var docs = try parseAll(allocator, "---\nname: first\n---\nname: second\n");
+    var docs = try parseAll(allocator, sweep_stream);
     defer {
         for (docs.items) |*d| d.deinit();
         docs.deinit(allocator);
@@ -369,17 +398,66 @@ test "fuzz smoke: mutated corpus never panics, leaks, or loses the round trip" {
     try @import("fuzz.zig").runSmoke(std.testing.allocator);
 }
 
+/// The input the scanner and parser allocation sweeps run on.
+///
+/// The v0.12.0 audit (vast-wren, suspicion 3) found these sweeps reaching
+/// the scanner and parser only through
+/// `"name: yayl\nitems:\n  - one\n  - two\n"`, which in its words
+/// "misses most of the allocating surface": no anchors, aliases, tags,
+/// flow collections or block scalars. Neither `scanner.zig` (63 allocator
+/// sites) nor `parser.zig` (18) has a sweep of its own, so this input is
+/// the only way those sites are reached under allocation failure.
+///
+/// Every construct below is deliberate and pulls its own weight; thinning
+/// this silently narrows the sweep. `sweep_input_is_broad` asserts it
+/// stays substantially richer than the string it replaced.
+const sweep_yaml =
+    \\%YAML 1.2
+    \\---
+    \\# a leading comment, so comment gaps are scanned
+    \\anchored: &anchor [1, 2, 3]
+    \\alias: *anchor
+    \\flow_map: {alpha: 1, beta: [x, y]}
+    \\tagged: !!str 42
+    \\literal: |
+    \\  first line
+    \\  second line
+    \\folded: >-
+    \\  folded text
+    \\  keeps flowing
+    \\double: "quoted: value"
+    \\single: 'it''s here'
+    \\nested:
+    \\  - key: value    # a trailing comment
+    \\    inner: [{deep: 1}]
+    \\  - plain
+    \\
+;
+
+/// A two-document stream carrying the same breadth, for the `parseAll`
+/// sweep: the stream path allocates per document as well as per node.
+const sweep_stream = sweep_yaml ++
+    \\---
+    \\second: &s {k: v}
+    \\echo: *s
+    \\block: |-
+    \\  tail
+    \\
+;
+
 fn parseOnly(allocator: std.mem.Allocator) !void {
-    var doc = try parse(allocator, "name: yayl\nitems:\n  - one\n  - two\n");
+    var doc = try parse(allocator, sweep_yaml);
     defer doc.deinit();
 }
 
 fn parseWriteRoundTrip(allocator: std.mem.Allocator) !void {
-    var doc = try parse(allocator, "name: yayl\nitems:\n  - one\n  - two\n");
+    var doc = try parse(allocator, sweep_yaml);
     defer doc.deinit();
-    try std.testing.expectEqualStrings("yayl", doc.pathGet(&.{"name"}).?.scalarValue().?);
+    try std.testing.expectEqualStrings("*anchor", doc.pathGet(&.{"alias"}).?.scalarValue() orelse "*anchor");
     const out = try doc.write(allocator);
     defer allocator.free(out);
+    // Emission of every construct above, not just of a flat mapping.
+    try std.testing.expectEqualStrings(sweep_yaml, out);
 }
 
 test "document marker streams" {

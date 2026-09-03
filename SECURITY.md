@@ -33,6 +33,8 @@ and every one is adjustable through the public API.
 | Simple key length | fixed cap | 1024 characters | not adjustable (spec 7.4.2) |
 | Alias expansion (values) | `value.Limits.max_values` | 1,048,576 | `parseToValueLimited`, `nodeToValueLimited`, `Limits.unlimited` to opt out |
 | Alias expansion (validation) | `schema.Limits.max_nodes` | 1,048,576 | `Schema.validateLimited` |
+| Conversion depth | `value.Limits.max_depth` | 1000 | `parseToValueLimited`, `nodeToValueLimited` |
+| Validation depth | `schema.Limits.max_depth` | 1000 | `Schema.validateLimited` |
 | Emission depth | `Emitter.max_depth` | 1000 | `writeOpts`/`writeAllOpts` (`EmitOptions.max_depth`) |
 | Embedded NUL bytes | `ParseOptions.embedded_nul` | rejected (`.reject`) | `.truncate` restores the old lossy cut-off |
 
@@ -40,23 +42,32 @@ Two shapes motivate the expansion bounds: N levels each aliasing the
 level above M times is M^N values — a 194-byte document reached ~19.5k
 values — and a deep tree built programmatically (through
 `createSequence`/`sequenceAppend` or `value.toNode`), which the scanner
-never sees and `max_nesting` therefore never bounds. Where a bound
-applies it returns a typed error (`error.LimitExceeded`,
-`error.NestingTooDeep`) rather than growing without limit, and on that
+never sees and `max_nesting` therefore never bounds. Every one of these
+bounds returns a typed error (`error.LimitExceeded`,
+`error.NestingTooDeep`) rather than growing without limit; on the
 failure path the caller gets an error, not a half-built result.
 
-**Known gap: deep programmatic trees are depth-bounded only in the
-emitter.** `Emitter.max_depth` bounds emission, but `value.nodeToValue`
-and `Schema.validate` recurse over the node graph carrying only the
-node-count budget above — there is no depth counter on either path. A
-tree built programmatically past roughly 4,000 to 8,000 levels
-overflows the native stack and aborts the process well before
-`max_values` or `max_nodes` can fire, so on that path the caller does
-not get a typed error at all. Parsed input cannot reach this:
-`max_nesting` caps it at 200. Only a consumer that builds such a tree
-itself can, and if you build trees from untrusted data you should bound
-their depth yourself before converting or validating. A real depth
-bound is tracked for a future release.
+Depth is bounded separately from size, on all three recursive paths, and
+for a reason: a count of values or nodes cannot stand in for a depth,
+because a linear chain of N nested collections is N values but N stack
+frames. `value.Limits.max_depth`, `schema.Limits.max_depth` and
+`Emitter.max_depth` all default to 1000 and all return
+`error.NestingTooDeep`, so a tree one of them accepts is one the other
+two accept.
+
+The conversion and validation paths previously carried only the
+node-count budget. A tree built past roughly 4,000 to 8,000 levels
+overflowed the native stack and aborted the process before that budget
+could fire — no typed error, no recovery. Parsed input was never
+affected (`max_nesting` caps nesting at 200); it needed a tree the
+consumer built itself. Both paths now carry the depth bound above, with
+regression tests that fail if it is removed. See the CHANGELOG entry for
+the release that carries the fix.
+
+`Limits.unlimited` lifts the depth bound along with the size one, which
+re-arms exactly that hazard. It is documented for input you produced
+yourself; to lift only the size budget, set `max_values` (or
+`max_nodes`) and leave `max_depth` at its default.
 
 Parsing itself is bounded in memory: a `Document` is an arena over the
 input plus its nodes, and emission writes into a caller-owned buffer.

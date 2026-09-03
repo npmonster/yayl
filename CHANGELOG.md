@@ -7,16 +7,41 @@ series; APIs may still move, and anything that does is listed here.
 
 ### Fixed
 
-**SECURITY.md described a bound that does not exist.** It said a deep
-tree built programmatically was "bounded only by the emitter's depth
-limit" and that the caller "gets an error, not a half-built result".
-`value.nodeToValue` and `Schema.validate` carry a node-count budget but
-no depth counter, so such a tree overflows the native stack and aborts
-the process between roughly 4,000 and 8,000 levels — long before
-`max_values`/`max_nodes` can fire, and with no typed error. The page now
-records this as a known gap with the real numbers. Parsed input is
-unaffected (`max_nesting` caps nesting at 200); the depth bound itself
-is still to come.
+**Conversion and validation are depth-bounded.** `value.nodeToValue` and
+`Schema.validate` recurse over the node graph, and carried only a
+node-count budget (`max_values`/`max_nodes`, 1,048,576) to stop them. A
+count cannot stand in for a depth: a linear chain of N nested
+collections is N values but N stack frames, so a tree built through
+`createSequence`/`sequenceAppend` past roughly 4,000 to 8,000 levels
+overflowed the native stack and **aborted the process** long before the
+budget could fire — no typed error, no recovery. Reproduced on both
+paths (4,000 clean, 8,000 abort, 10,000 segfault) before the fix.
+
+`value.Limits` and `schema.Limits` now carry `max_depth`, defaulting to
+1000 to match `Emitter.max_depth`, and return `error.NestingTooDeep`
+past it — so a tree conversion accepts is one emission will serialize.
+Parsed input was never affected (`max_nesting` caps nesting at 200);
+this is for trees a consumer builds. `Limits.unlimited` lifts the depth
+bound too, which re-arms the hazard, and now says so.
+
+This was the second of the three v0.12.0 audit suspicions, whose
+original text was recovered from the session record on 2026-09-03.
+
+### Changed
+
+**`schema.Error` gained `NestingTooDeep`.** Required by the bound above.
+Callers that switch exhaustively over `schema.Error` need a new arm;
+`value.Error` already admitted it through `YamlError` and is unchanged.
+
+**The scanner/parser allocation-failure sweep got much broader.** It ran
+on a flat four-line mapping, which the v0.12.0 audit flagged as missing
+"most of the allocating surface" — no anchors, aliases, tags, flow
+collections or block scalars — while `scanner.zig` (63 allocator sites)
+and `parser.zig` (18) have no sweep of their own. The sweep input now
+carries all of those plus directives, comments, both block scalar styles
+with chomping, and both quoted styles, taking one parse from 32
+allocation-failure points to 112. A test asserts the breadth so it
+cannot quietly regress. This was the third audit suspicion.
 
 ## 0.14.0 — 2026-09-02
 
