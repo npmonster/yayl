@@ -1,7 +1,7 @@
 .{
     .name = .yayl,
     .fingerprint = 0xc49f7ed1a8db0b85,
-    .version = "0.14.0",
+    .version = "0.15.0",
     .minimum_zig_version = "0.16.0",
     .description = "A YAML 1.2 parser, document model and emitter for Zig. Edits re-emit byte-faithfully: untouched bytes, comments and layout survive.",
     .license = "MIT",
