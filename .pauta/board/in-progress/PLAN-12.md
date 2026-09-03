@@ -2,15 +2,20 @@
 id: PLAN-12
 title: 0.13.0 completeness: dogfood, comment API, fuzzing, hardening lane, policy/examples/bench
 created: 2026-09-01T09:16:37Z
-updated: 2026-09-02T15:57:42Z
+updated: 2026-09-03T10:50:34Z
 tags: [release, 0.13.0, completeness, api, fuzzing, docs]
 deps: []
 skills: []
 review_rounds: 0
 priority: 1
-activation: hold
+activation: run
 activation_at: ""
 activation_id: ""
+approved_revision: 2
+approved_at: 2026-09-02T22:34:34Z
+approved_by: human:web
+worker: pale-owl (zcode GLM — drove the implementation and the 0.14.0 release)
+auto_review: false
 ---
 
 ## Plan
@@ -236,6 +241,21 @@ state: active
 - {"kind":"iteration","at":"2026-09-02T15:57:21Z","contract_revision":2,"verification":"grep -qi 'comment' docs/USAGE.md","result":"Pass — dedicated \"Comments: read and write\" section in docs/USAGE.md.","context":"Session pale-owl, 2026-09-02.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Ran contract verify line (USAGE documents comments).","next_state":"Review."}
 - {"kind":"iteration","at":"2026-09-02T15:57:31Z","contract_revision":2,"verification":"grep -q '0.14.0' build.zig.zon","result":"Pass — build.zig.zon .version = \"0.14.0\".","context":"Session pale-owl, 2026-09-02.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Ran contract verify line (package version).","next_state":"Review."}
 - {"kind":"iteration","at":"2026-09-02T15:57:42Z","contract_revision":2,"verification":"grep -q 'v0.14.0' README.md","result":"Pass — both README install pins read #v0.14.0; stale-0.13 sweep outside CHANGELOG history clean.","context":"Session pale-owl, 2026-09-02.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Ran contract verify line (README install pin).","next_state":"All 14 verify lines recorded; submit for review."}
+- {"kind":"approval","at":"2026-09-02T22:34:34Z","contract_revision":2,"activation":"run","actor":"human:web","reason":"Approved in pauta web"}
+- {"kind":"iteration","at":"2026-09-02T22:38:41Z","contract_revision":2,"verification":"zig fmt --check build.zig build.zig.zon src tests examples","result":"Pass.","context":"Driven by session pale-owl after the human approved revision 2 (human:web, activation run). Same tree as the released tag.","artifact":"v0.14.0 @ 41b9821537f271f2ce31a0d06f6d911aedd84007","hypothesis":"Verify line passes on the released tree.","action":"Controller verification (run 2, post-approval 22:34): formatting check on the tagged release tree.","next_state":"Recording the remaining controller verification lines."}
+- {"kind":"iteration","at":"2026-09-02T22:38:54Z","contract_revision":2,"verification":"zig build check","result":"Pass.","context":"Post-approval controller run.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Controller verification (run 2): library compile.","next_state":"Remaining lines."}
+- {"kind":"iteration","at":"2026-09-02T22:39:09Z","contract_revision":2,"verification":"zig build test --summary all","result":"Pass — 228/228, zero leaks.","context":"Post-approval controller run.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Controller verification (run 2): unit suite.","next_state":"Remaining lines."}
+- {"kind":"iteration","at":"2026-09-02T22:39:23Z","contract_revision":2,"verification":"zig build examples","result":"Pass — six examples compile, yq_lite demo asserts untouched bytes.","context":"Post-approval controller run.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Controller verification (run 2): examples build and run.","next_state":"Remaining lines."}
+- {"kind":"iteration","at":"2026-09-02T22:41:03Z","contract_revision":2,"verification":"zig build conformance --summary all","result":"Pass — 351/0/0/0, pinned baseline held.","context":"Post-approval controller run.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Controller verification (run 2): corpus conformance.","next_state":"Remaining lines."}
+- {"kind":"iteration","at":"2026-09-02T22:41:17Z","contract_revision":2,"verification":"zig build roundtrip --summary all","result":"Pass — 265/0/4, pinned baseline held.","context":"Post-approval controller run.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Controller verification (run 2): byte-faithful round trip.","next_state":"Remaining lines."}
+- {"kind":"iteration","at":"2026-09-02T22:41:30Z","contract_revision":2,"verification":"zig build preservation --summary all","result":"Pass — 9/9, zero failures.","context":"Post-approval controller run.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Controller verification (run 2): edit preservation including comment sweeps.","next_state":"Remaining lines."}
+- {"kind":"iteration","at":"2026-09-02T22:41:44Z","contract_revision":2,"verification":"sh scripts/consumer-smoke.sh","result":"Pass — byte-faithful.","context":"Post-approval controller run.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Controller verification (run 2): packaged consumer smoke.","next_state":"Remaining lines."}
+- {"kind":"iteration","at":"2026-09-02T22:42:25Z","contract_revision":2,"verification":"sh scripts/differential.sh","result":"Pass — 269 compared, 0 mismatches.","context":"Post-approval controller run.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Controller verification (run 2): libfyaml differential.","next_state":"Remaining lines."}
+- {"kind":"iteration","at":"2026-09-02T22:42:38Z","contract_revision":2,"verification":"test -f SECURITY.md","result":"Pass.","context":"Post-approval controller run.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Controller verification (run 2): SECURITY.md present.","next_state":"Remaining lines."}
+- {"kind":"iteration","at":"2026-09-02T22:42:52Z","contract_revision":2,"verification":"test -f docs/design/comments.md","result":"Pass.","context":"Post-approval controller run.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Controller verification (run 2): design doc present.","next_state":"Remaining lines."}
+- {"kind":"iteration","at":"2026-09-02T22:43:06Z","contract_revision":2,"verification":"grep -qi 'comment' docs/USAGE.md","result":"Pass — dedicated section present.","context":"Post-approval controller run.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Controller verification (run 2): USAGE documents comments.","next_state":"Remaining lines."}
+- {"kind":"iteration","at":"2026-09-02T22:43:20Z","contract_revision":2,"verification":"grep -q '0.14.0' build.zig.zon","result":"Pass — .version = \"0.14.0\".","context":"Post-approval controller run.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Controller verification (run 2): package version 0.14.0.","next_state":"Last line."}
+- {"kind":"iteration","at":"2026-09-02T22:43:33Z","contract_revision":2,"verification":"grep -q 'v0.14.0' README.md","result":"Pass — both pins read #v0.14.0.","context":"Post-approval controller run; final line.","artifact":"v0.14.0 @ 41b9821","hypothesis":"Verify line passes.","action":"Controller verification (run 2): README install pins.","next_state":"All 14 lines recorded post-approval; submit for review."}
 
 ## Log
 - 2026-09-01T09:16:37Z created
@@ -322,3 +342,22 @@ Evidence, in the order gathered:
 - Release ✓ CHANGELOG rolled, .version 0.14.0, both README pins #v0.14.0, stale-0.13 sweep clean, detached-worktree verify + differential, CI green, tag green.
 
 Remaining for the human: move this card to done (lane moves from review are human acceptance on this board), and the suspicions-2/3 question above.
+- 2026-09-03T10:50:34Z 2026-09-03 — smooth-shark (claude-code) — **The two "unrecoverable" audit suspicions ARE recovered, and one of them is a confirmed open defect in v0.14.0.**
+
+**Recovery.** The original text survives in the local Claude Code session transcripts under `~/.claude/projects/-Users-gilberto-Projects-yayl/`, which the earlier search did not cover (it searched plumb memories, card logs, release notes, CHANGELOG and git log — all correctly, and the text is in none of them). Provenance: the suspicions are **vast-wren's** (session `7f5f99f9`), relayed in **crisp-dingo's** v0.12.0 audit report (session `1332b39f`) under its `## NOT CHECKED` heading. Verbatim:
+
+> vast-wren's SUSPECTED items I did not reproduce: `edit.cloneTree` pointed at a second Document corrupting spans; stack overflow in emitter/value recursion on deep *programmatic* trees at runtime; the thinness of allocation-failure injection in scanner/parser/emitter specifically. Treat all as unproven.
+
+So the three were: (1) cloneTree cross-Document spans — the named one, already CONFIRMED and fixed in 28869db. (2) stack overflow on deep programmatic trees. (3) allocation-injection thinness in scanner/parser/emitter.
+
+**Suspicion 2 — CONFIRMED, reproduced at runtime, and STILL OPEN.** Half of it was closed by 9f53814: `Emitter.max_depth = 1000` is a real bound with a typed `error.NestingTooDeep`. The value/schema half was not. `value.convert` (`src/value.zig:121-165`) and `schema.checkSchema` (`src/schema.zig:255`) are plainly recursive and carry only a **node-count** budget (`Limits.max_values`/`max_nodes` = 1,048,576), never a depth counter — `grep -c max_depth src/value.zig src/schema.zig` gives 0, 0.
+
+Reproduced on the v0.14.0 tree (detached worktree at b8457fb, probe outside the shared checkout): build a linear nest via `createSequence`/`sequenceAppend`, then call `yaml.value.nodeToValue`. Depths 1,000 / 2,000 / 4,000 return cleanly; **8,000 aborts (stack overflow, rc=134)**; **10,000 segfaults**, with a backtrace of `convert` at `value.zig:134` repeated to exhaustion.
+
+The process dies between 4,000 and 8,000 deep — roughly **150x before** the documented 1,048,576 bound can fire. Not reachable from parsed input (the scanner caps nesting at 200); reachable from any programmatically built tree, i.e. exactly the "deep *programmatic* trees" vast-wren named. `schema.checkSchema` is structurally identical (recursion + node budget, no depth counter) but I did **not** separately reproduce it — calling that INSPECTED, not confirmed.
+
+**This makes a published SECURITY.md claim false.** `SECURITY.md:40-45` states that a deep tree built programmatically "is bounded only by the emitter's depth limit" and that both bounds "return typed errors ... rather than growing without limit; on the failure path the caller gets an error, not a half-built result." On the value/schema path the caller does not get an error — the process aborts. The bounds table row "Alias expansion (values) | `value.Limits.max_values` | 1,048,576" overstates what actually protects that path.
+
+**Suspicion 3 — HALF closed, half open, verbatim.** The emitter half is genuinely closed: C2 added a dedicated emission family (`emitBuilt`/`emitStream` at `src/yaml.zig:549-552`) covering `writeOpts` and `writeAll`. The scanner/parser half is untouched. `grep -c checkAllAllocationFailures src/*.zig` still gives scanner.zig **0**, parser.zig **0**, emitter.zig **0** direct sweeps, and the two parse-side entry points are still the exact thin inputs vast-wren quoted — `parseOnly` and `parseWriteRoundTrip` (`src/yaml.zig:372-383`) both parse only `name: yayl / items: - one - two`, with no anchors, aliases, tags, flow collections or block scalars. Scanner's 63 allocator sites and parser's 18 are still exercised only through that.
+
+**Net:** the substitute audit was real work and found four real defects, but it is not a resolution of suspicions 2 and 3 — those are now recovered, and suspicion 2 is a reproduced, unfixed defect in the shipped release. Recording here so it is durable this time; the fix-or-defer decision is the human's.
