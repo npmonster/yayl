@@ -39,11 +39,24 @@ and every one is adjustable through the public API.
 Two shapes motivate the expansion bounds: N levels each aliasing the
 level above M times is M^N values — a 194-byte document reached ~19.5k
 values — and a deep tree built programmatically (through
-`createSequence`/`sequenceAppend` or `value.toNode`) is bounded only by
-the emitter's depth limit, since the scanner never sees it. Both bounds
-return typed errors (`error.LimitExceeded`, `error.NestingTooDeep`)
-rather than growing without limit; on the failure path the caller gets
-an error, not a half-built result.
+`createSequence`/`sequenceAppend` or `value.toNode`), which the scanner
+never sees and `max_nesting` therefore never bounds. Where a bound
+applies it returns a typed error (`error.LimitExceeded`,
+`error.NestingTooDeep`) rather than growing without limit, and on that
+failure path the caller gets an error, not a half-built result.
+
+**Known gap: deep programmatic trees are depth-bounded only in the
+emitter.** `Emitter.max_depth` bounds emission, but `value.nodeToValue`
+and `Schema.validate` recurse over the node graph carrying only the
+node-count budget above — there is no depth counter on either path. A
+tree built programmatically past roughly 4,000 to 8,000 levels
+overflows the native stack and aborts the process well before
+`max_values` or `max_nodes` can fire, so on that path the caller does
+not get a typed error at all. Parsed input cannot reach this:
+`max_nesting` caps it at 200. Only a consumer that builds such a tree
+itself can, and if you build trees from untrusted data you should bound
+their depth yourself before converting or validating. A real depth
+bound is tracked for a future release.
 
 Parsing itself is bounded in memory: a `Document` is an arena over the
 input plus its nodes, and emission writes into a caller-owned buffer.

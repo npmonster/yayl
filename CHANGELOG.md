@@ -3,6 +3,21 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Fixed
+
+**SECURITY.md described a bound that does not exist.** It said a deep
+tree built programmatically was "bounded only by the emitter's depth
+limit" and that the caller "gets an error, not a half-built result".
+`value.nodeToValue` and `Schema.validate` carry a node-count budget but
+no depth counter, so such a tree overflows the native stack and aborts
+the process between roughly 4,000 and 8,000 levels — long before
+`max_values`/`max_nodes` can fire, and with no typed error. The page now
+records this as a known gap with the real numbers. Parsed input is
+unaffected (`max_nesting` caps nesting at 200); the depth bound itself
+is still to come.
+
 ## 0.14.0 — 2026-09-02
 
 ### Added
