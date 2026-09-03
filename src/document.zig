@@ -137,9 +137,16 @@ pub const Node = struct {
         return self.data == .alias;
     }
 
-    /// Follow alias nodes to the underlying node. Bounded so a
-    /// programmatically built alias cycle terminates (the scanner
-    /// rejects cycles in parsed input).
+    /// Follow alias nodes to the underlying node, bounded by
+    /// `max_alias_depth` so an alias *chain* terminates.
+    ///
+    /// That bound is on the chain, not on the graph: nothing rejects a
+    /// cycle, in parsed input or built. `&a [*a]` parses, and this
+    /// returns the enclosing sequence, so a caller that recurses into
+    /// the result revisits the same node forever. Every recursive walk
+    /// over resolved nodes carries its own depth bound for that reason
+    /// — see `edit.max_walk_depth`, `value.Limits.max_depth` and
+    /// `schema.Limits.max_depth`.
     pub fn resolveAlias(self: *const Node) *const Node {
         var cur = self;
         var depth: usize = 0;

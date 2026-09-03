@@ -37,8 +37,22 @@ pub const Error = error{
     NotAMapping,
     AmbiguousOperation,
     MoveIntoSubtree,
+    NestingTooDeep,
     OutOfMemory,
 };
+
+/// Deepest node nesting the recursive edit walks will follow before
+/// returning `error.NestingTooDeep`. Matches `value.Limits.max_depth`,
+/// `schema.Limits.max_depth` and `Emitter.max_depth`.
+///
+/// Two distinct things reach it. A document built through
+/// `createSequence`/`sequenceAppend` can nest arbitrarily deep, as it
+/// can for conversion and emission. But `..key` descent also follows
+/// aliases, and an alias may point at an *enclosing* anchor: `&a [*a]`
+/// is eight bytes, parses, and describes a cycle of infinite depth.
+/// Nothing rejects that at parse time, so the bound is what stops the
+/// walk — for parsed input as much as for built trees.
+const max_walk_depth: usize = 1000;
 
 /// One parsed path segment.
 pub const Segment = union(enum) {
@@ -181,7 +195,7 @@ pub fn resolve(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*N
                         for (pairs) |p| try next.append(allocator, p.value);
                     }
                 },
-                .descend => |k| try collectDescend(allocator, node, k, &next),
+                .descend => |k| try collectDescend(allocator, node, k, &next, 0),
                 .filter => |f| {
                     // Sequences: every item whose mapping carries
                     // key == value. Mappings: every value that does.
@@ -217,20 +231,22 @@ fn filterMatches(candidate: *Node, key: []const u8, value: []const u8) bool {
     return false;
 }
 
-fn collectDescend(allocator: std.mem.Allocator, node: *Node, key: []const u8, out: *std.ArrayList(*Node)) Error!void {
-    // Pre-order walk collecting every `key` match. Not depth-bounded
-    // itself: for parsed input the scanner's nesting cap bounds it
-    // transitively, but a tree built programmatically can nest as deep
-    // as the builder went.
+fn collectDescend(allocator: std.mem.Allocator, node: *Node, key: []const u8, out: *std.ArrayList(*Node), depth: usize) Error!void {
+    // Pre-order walk collecting every `key` match, bounded by
+    // `max_walk_depth`. The bound is load-bearing rather than defensive:
+    // this walk resolves aliases, and an alias to an enclosing anchor
+    // (`&a {k: *a}`) is a cycle of infinite depth that parses fine, so
+    // without it eleven bytes of input abort the process.
+    if (depth >= max_walk_depth) return error.NestingTooDeep;
     const cur = node.resolveAlias();
     if (cur.pairs()) |pairs| {
         for (pairs) |p| {
             const kv = p.key.scalarValue() orelse continue;
             if (std.mem.eql(u8, kv, key)) try out.append(allocator, p.value);
         }
-        for (pairs) |p| try collectDescend(allocator, p.value, key, out);
+        for (pairs) |p| try collectDescend(allocator, p.value, key, out, depth + 1);
     } else if (cur.items()) |items| {
-        for (items) |child| try collectDescend(allocator, child, key, out);
+        for (items) |child| try collectDescend(allocator, child, key, out, depth + 1);
     }
 }
 
@@ -571,7 +587,7 @@ fn clearSpans(node: *Node) void {
 pub fn cloneTree(doc: *Document, root: *Node) Error!*Node {
     var anchors = std.StringHashMap(*Node).init(doc.allocator);
     defer anchors.deinit();
-    return cloneNode(doc, root, &anchors, false);
+    return cloneNode(doc, root, &anchors, false, 0);
 }
 
 /// Deep-clone a subtree from ANOTHER document into `doc`'s pool.
@@ -584,10 +600,13 @@ pub fn cloneTree(doc: *Document, root: *Node) Error!*Node {
 pub fn cloneTreeInto(doc: *Document, root: *Node) Error!*Node {
     var anchors = std.StringHashMap(*Node).init(doc.allocator);
     defer anchors.deinit();
-    return cloneNode(doc, root, &anchors, true);
+    return cloneNode(doc, root, &anchors, true, 0);
 }
 
-fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), clear_spans: bool) Error!*Node {
+fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), clear_spans: bool, depth: usize) Error!*Node {
+    // Structural recursion only — an alias is copied as an alias, never
+    // followed — so a cycle cannot reach here, but a deep built tree can.
+    if (depth >= max_walk_depth) return error.NestingTooDeep;
     const n = try doc.pool.create(Node);
     n.* = .{
         .parent = null,
@@ -613,8 +632,8 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
             n.data = .{ .mapping = .{ .style = m.style } };
             if (node.anchor) |a| try anchors.put(try doc.pool.dupe(a), n);
             for (m.pairs.items) |p| {
-                const k = try cloneNode(doc, p.key, anchors, clear_spans);
-                const v = try cloneNode(doc, p.value, anchors, clear_spans);
+                const k = try cloneNode(doc, p.key, anchors, clear_spans, depth + 1);
+                const v = try cloneNode(doc, p.value, anchors, clear_spans, depth + 1);
                 try internal.attachPair(doc, n, k, v);
                 // Preserve the pair's original extent.
                 if (n.data == .mapping) {
@@ -630,7 +649,7 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
             n.data = .{ .sequence = .{ .style = sq.style } };
             if (node.anchor) |a| try anchors.put(try doc.pool.dupe(a), n);
             for (sq.items.items) |item| {
-                const child = try cloneNode(doc, item, anchors, clear_spans);
+                const child = try cloneNode(doc, item, anchors, clear_spans, depth + 1);
                 try internal.attachItem(doc, n, child);
             }
             for (sq.dropped.items) |d| {
@@ -1562,6 +1581,75 @@ test "cloneTreeInto a second document cannot copy the wrong source bytes" {
     defer again.deinit();
     try testing.expectEqualStrings("42", again.pathGet(&.{ "other", "x" }).?.scalarValue().?);
     try testing.expectEqualStrings("1", again.pathGet(&.{"small"}).?.scalarValue().?);
+}
+
+test "an alias to an enclosing anchor is a parsed cycle, and cannot abort the process" {
+    const allocator = std.testing.allocator;
+
+    // Eleven bytes. `&a` anchors the mapping, `*a` inside it aliases
+    // back to it, so `resolveAlias` on the alias returns the enclosing
+    // mapping and a naive `..key` descent revisits it forever. This is
+    // spec-legal and parses: nothing rejects a cycle at parse time.
+    //
+    // Before the bound in `collectDescend`, this aborted the process
+    // with a stack overflow — reachable from untrusted input through a
+    // documented public path (`$..key`), which is exactly the threat
+    // model SECURITY.md states.
+    {
+        var doc = try Document.parse(allocator, "&a {k: *a}\n");
+        defer doc.deinit();
+
+        // The cycle is real, not a parse quirk.
+        const k = doc.pathGet(&.{"k"}).?;
+        try std.testing.expect(k.isAlias());
+        try std.testing.expect(k.resolveAlias() == doc.root.?);
+
+        var ed = Editor.init(&doc);
+        try std.testing.expectError(error.NestingTooDeep, ed.all("$..k"));
+        try std.testing.expectError(error.NestingTooDeep, ed.one("$..k"));
+    }
+
+    // The sequence spelling of the same shape.
+    {
+        var doc = try Document.parse(allocator, "&a [*a]\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try std.testing.expectError(error.NestingTooDeep, ed.all("$..anything"));
+    }
+
+    // A non-cyclic alias still descends normally: the bound stops a
+    // cycle, it does not break aliases.
+    {
+        var doc = try Document.parse(allocator, "base: &b {k: v}\nuse: *b\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const hits = try ed.all("$..k");
+        defer allocator.free(hits);
+        // Once under `base`, once through the alias under `use`.
+        try std.testing.expectEqual(@as(usize, 2), hits.len);
+    }
+}
+
+test "the edit walks are depth-bounded on a built tree too" {
+    const allocator = std.testing.allocator;
+
+    var doc = Document.init(allocator);
+    defer doc.deinit();
+    const root = try doc.createMapping();
+    doc.root = root;
+    var cur = root;
+    var i: usize = 0;
+    while (i < 1200) : (i += 1) {
+        const inner = try doc.createMapping();
+        try doc.mappingAppend(cur, try doc.createScalar("k", .plain), inner);
+        cur = inner;
+    }
+
+    var ed = Editor.init(&doc);
+    try std.testing.expectError(error.NestingTooDeep, ed.all("$..k"));
+
+    // `cloneTree` recurses structurally over the same tree.
+    try std.testing.expectError(error.NestingTooDeep, cloneTree(&doc, root));
 }
 
 test "allocation failures in insert and move batches leak nothing" {

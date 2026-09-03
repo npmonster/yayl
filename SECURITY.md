@@ -35,6 +35,7 @@ and every one is adjustable through the public API.
 | Alias expansion (validation) | `schema.Limits.max_nodes` | 1,048,576 | `Schema.validateLimited` |
 | Conversion depth | `value.Limits.max_depth` | 1000 | `parseToValueLimited`, `nodeToValueLimited` |
 | Validation depth | `schema.Limits.max_depth` | 1000 | `Schema.validateLimited` |
+| Edit walk depth (`..key`, clone) | `edit.max_walk_depth` | 1000 | not adjustable |
 | Emission depth | `Emitter.max_depth` | 1000 | `writeOpts`/`writeAllOpts` (`EmitOptions.max_depth`) |
 | Embedded NUL bytes | `ParseOptions.embedded_nul` | rejected (`.reject`) | `.truncate` restores the old lossy cut-off |
 
@@ -47,22 +48,39 @@ bounds returns a typed error (`error.LimitExceeded`,
 `error.NestingTooDeep`) rather than growing without limit; on the
 failure path the caller gets an error, not a half-built result.
 
-Depth is bounded separately from size, on all three recursive paths, and
-for a reason: a count of values or nodes cannot stand in for a depth,
-because a linear chain of N nested collections is N values but N stack
-frames. `value.Limits.max_depth`, `schema.Limits.max_depth` and
-`Emitter.max_depth` all default to 1000 and all return
-`error.NestingTooDeep`, so a tree one of them accepts is one the other
-two accept.
+Depth is bounded separately from size, on every recursive walk over the
+node graph, and for a reason: a count of values or nodes cannot stand in
+for a depth, because a linear chain of N nested collections is N values
+but N stack frames. `value.Limits.max_depth`, `schema.Limits.max_depth`,
+`edit.max_walk_depth` and `Emitter.max_depth` all default to 1000 and
+all return `error.NestingTooDeep`.
 
-The conversion and validation paths previously carried only the
-node-count budget. A tree built past roughly 4,000 to 8,000 levels
-overflowed the native stack and aborted the process before that budget
-could fire — no typed error, no recovery. Parsed input was never
-affected (`max_nesting` caps nesting at 200); it needed a tree the
-consumer built itself. Both paths now carry the depth bound above, with
-regression tests that fail if it is removed. See the CHANGELOG entry for
-the release that carries the fix.
+They are close but not interchangeable, so do not treat one as a proxy
+for another. Conversion, validation and the edit walks charge one level
+per node on the path; the emitter charges up to two extra where
+emission crosses between its faithful, normalized and flow modes, and
+so admits two fewer levels. Measured on a linear built chain at default
+limits: a 999-node path converts and validates but fails to emit; 1000
+fails everywhere.
+
+**Alias cycles.** An alias may name an *enclosing* anchor. `&a [*a]` is
+eight bytes, is accepted by this parser as by libyaml, and describes a
+structure of infinite depth: `resolveAlias` on the alias yields the
+sequence that contains it. Nothing rejects that at parse time, and
+`max_nesting` does not bound it — that cap is on syntactic nesting, not
+on the alias graph. The depth bounds above are what stop the walk, and
+they are the reason such input returns `error.NestingTooDeep` instead of
+exhausting the stack. This applies to parsed input, not only to trees a
+consumer builds.
+
+Releases up to and including v0.14.0 did not have those bounds on the
+conversion, validation or `..key` edit paths. On v0.14.0 the eight-byte
+document above aborts the process through `value.nodeToValue`, and an
+eleven-byte one (`&a {k: *a}`) aborts it through `Editor.all("$..key")`;
+a tree built past roughly 4,000 to 8,000 levels did the same. Each is a
+crash, not a typed error. All of those paths are bounded now, with
+regression tests that fail if a bound is removed. If you consume
+untrusted YAML with an affected release, upgrade.
 
 `Limits.unlimited` lifts the depth bound along with the size one, which
 re-arms exactly that hazard. It is documented for input you produced

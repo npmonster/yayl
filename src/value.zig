@@ -83,12 +83,17 @@ pub const Limits = struct {
     /// Conversion is recursive, so this bounds native stack use, and it
     /// is a separate concern from `max_values`: a linear chain of N
     /// nested collections is only N values but N frames deep, so the
-    /// value budget cannot stand in for it. Parsed documents cannot
-    /// reach this — the scanner caps nesting at 200 — but a tree built
-    /// through `createSequence`/`sequenceAppend` or `toNode` has no such
-    /// bound, and unbounded recursion here is a stack overflow rather
-    /// than a typed error. Matches `Emitter.max_depth`, so a tree this
-    /// conversion accepts is one the emitter will also serialize.
+    /// value budget cannot stand in for it. Two things reach it: a tree
+    /// built through `createSequence`/`sequenceAppend` or `toNode`,
+    /// which nothing caps; and an alias naming an *enclosing* anchor
+    /// (`&a [*a]`, eight bytes, parses), which is a cycle of unbounded
+    /// depth — `max_nesting` bounds syntactic nesting, not the alias
+    /// graph. So this matters for parsed input too. Unbounded recursion
+    /// here is a stack overflow rather than a typed error.
+    ///
+    /// 1000, alongside `Emitter.max_depth`, though the two are not
+    /// interchangeable: the emitter charges up to two extra levels and
+    /// so admits two fewer.
     max_depth: usize = 1000,
 
     /// No bound. Only for input you produced yourself.

@@ -7,31 +7,47 @@ series; APIs may still move, and anything that does is listed here.
 
 ### Fixed
 
-**Conversion and validation are depth-bounded.** `value.nodeToValue` and
-`Schema.validate` recurse over the node graph, and carried only a
-node-count budget (`max_values`/`max_nodes`, 1,048,576) to stop them. A
-count cannot stand in for a depth: a linear chain of N nested
-collections is N values but N stack frames, so a tree built through
-`createSequence`/`sequenceAppend` past roughly 4,000 to 8,000 levels
-overflowed the native stack and **aborted the process** long before the
-budget could fire — no typed error, no recovery. Reproduced on both
-paths (4,000 clean, 8,000 abort, 10,000 segfault) before the fix.
+**Recursive walks over the node graph are depth-bounded.** `nodeToValue`,
+`Schema.validate`, `$..key` edit descent and subtree cloning all recursed
+with no depth bound. Conversion and validation carried only a node-count
+budget (`max_values`/`max_nodes`, 1,048,576), and a count cannot stand in
+for a depth: a linear chain of N nested collections is N values but N
+stack frames.
 
-`value.Limits` and `schema.Limits` now carry `max_depth`, defaulting to
-1000 to match `Emitter.max_depth`, and return `error.NestingTooDeep`
-past it — so a tree conversion accepts is one emission will serialize.
-Parsed input was never affected (`max_nesting` caps nesting at 200);
-this is for trees a consumer builds. `Limits.unlimited` lifts the depth
-bound too, which re-arms the hazard, and now says so.
+Two inputs reach it, and **one of them is parsed, not built**. An alias
+may name an enclosing anchor: `&a [*a]` is eight bytes, parses (libyaml
+accepts it too), and describes a cycle of unbounded depth, because
+resolving the alias yields the sequence that contains it. `max_nesting`
+does not bound that — the cap is on syntactic nesting, not on the alias
+graph. Separately, a tree built through `createSequence`/`sequenceAppend`
+can nest arbitrarily deep.
 
-This was the second of the three v0.12.0 audit suspicions, whose
-original text was recovered from the session record on 2026-09-03.
+On v0.14.0 both abort the process rather than returning an error:
+`value.nodeToValue` on `&a [*a]` segfaults, `Editor.all("$..key")` on
+`&a {k: *a}` (eleven bytes) segfaults, and a built chain past roughly
+4,000 to 8,000 levels does the same. **Consumers handling untrusted YAML
+should upgrade.**
+
+`value.Limits` and `schema.Limits` now carry `max_depth`, and `edit` a
+`max_walk_depth`, all defaulting to 1000 to sit alongside
+`Emitter.max_depth`, all returning `error.NestingTooDeep`. Note the
+bounds are close but not identical: the emitter admits two levels fewer,
+since it charges extra where emission crosses between its faithful,
+normalized and flow modes — at default limits a 999-node path converts
+and validates but does not emit. `Limits.unlimited` lifts the depth
+bound too, re-arming the hazard, and now says so.
+
+This was the second of the three v0.12.0 audit suspicions, whose original
+text was recovered from the session record on 2026-09-03. The parsed
+alias cycle was not part of it — an adversarial review of the fix found
+that, and it is the more serious half.
 
 ### Changed
 
-**`schema.Error` gained `NestingTooDeep`.** Required by the bound above.
-Callers that switch exhaustively over `schema.Error` need a new arm;
-`value.Error` already admitted it through `YamlError` and is unchanged.
+**`schema.Error` and `edit.Error` gained `NestingTooDeep`.** Required by
+the bounds above. Callers that switch exhaustively over either need a new
+arm; `value.Error` already admitted it through `YamlError` and is
+unchanged.
 
 **The scanner/parser allocation-failure sweep got much broader.** It ran
 on a flat four-line mapping, which the v0.12.0 audit flagged as missing

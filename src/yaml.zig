@@ -453,7 +453,13 @@ fn parseOnly(allocator: std.mem.Allocator) !void {
 fn parseWriteRoundTrip(allocator: std.mem.Allocator) !void {
     var doc = try parse(allocator, sweep_yaml);
     defer doc.deinit();
-    try std.testing.expectEqualStrings("*anchor", doc.pathGet(&.{"alias"}).?.scalarValue() orelse "*anchor");
+    // The alias node is an alias, and resolves to the anchored sequence.
+    // (Asserted through `isAlias`/`items`, not `scalarValue`: that
+    // resolves the alias and returns null for a collection, so an
+    // `orelse` on it would assert nothing at all.)
+    const alias_node = doc.pathGet(&.{"alias"}).?;
+    try std.testing.expect(alias_node.isAlias());
+    try std.testing.expectEqual(@as(usize, 3), alias_node.resolveAlias().items().?.len);
     const out = try doc.write(allocator);
     defer allocator.free(out);
     // Emission of every construct above, not just of a flat mapping.

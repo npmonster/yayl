@@ -64,11 +64,11 @@ pub const Emitter = struct {
     /// Deepest node nesting this emitter will serialize before returning
     /// `error.NestingTooDeep`.
     ///
-    /// Parsed documents cannot reach it — the scanner caps nesting at
-    /// `scanner.max_nesting` (200) — but a tree built through
-    /// `createSequence`/`sequenceAppend` or `value.toNode` has no such
-    /// bound, and unbounded recursion here is a stack overflow rather
-    /// than a typed error.
+    /// A tree built through `createSequence`/`sequenceAppend` or
+    /// `value.toNode` has no such bound, and unbounded recursion here is
+    /// a stack overflow rather than a typed error. Parsed documents
+    /// reach it only through an alias cycle (`&a [*a]`): the scanner's
+    /// `max_nesting` (200) caps syntactic nesting, not the alias graph.
     ///
     /// A node is charged more than once only where emission crosses
     /// from one land into another, and a root-to-leaf path crosses at

@@ -582,22 +582,32 @@ const violations = try schema.validateLimited(alloc, node, "$", .{ .max_nodes = 
 `nodeToValueLimited` takes the same bound, and `Limits.unlimited` opts
 out — only for input you produced yourself.
 
-Both also carry `max_depth` (1000, matching the emitter), because a
-count of values cannot stand in for a depth: a linear chain of N nested
-collections is N values but N stack frames. Past it they return
-`error.NestingTooDeep`. Parsed input cannot reach either depth bound —
-`max_nesting` is lower — so this, like the emitter's, is for trees you
-*built*. `Limits.unlimited` lifts the depth bound too, which re-arms the
-stack overflow it prevents; to lift only the value budget, set
-`max_values` (or `max_nodes`) and leave `max_depth` alone.
+Both also carry `max_depth` (1000), because a count of values cannot
+stand in for a depth: a linear chain of N nested collections is N values
+but N stack frames. Past it they return `error.NestingTooDeep`.
+
+Deeply *built* trees are the obvious way to reach that, but not the only
+one. An alias may name an enclosing anchor — `&a [*a]` parses, and
+resolving the alias yields the sequence containing it — which is a cycle
+of unbounded depth reachable from eight bytes of input. `max_nesting`
+does not stop it: that cap is on syntactic nesting, not on the alias
+graph. So the depth bound matters for parsed input too, and the same
+applies to `$..key` descent, which resolves aliases as it walks
+(`edit.max_walk_depth`, also 1000).
+
+`Limits.unlimited` lifts the depth bound too, which re-arms the stack
+overflow it prevents; to lift only the value budget, set `max_values`
+(or `max_nodes`) and leave `max_depth` alone.
 
 **Emitting** — `Emitter.max_depth` (1000). Parsing cannot produce a tree
 deep enough to reach it, since `max_nesting` is lower; this bounds
 documents you *built*, through `createSequence`/`sequenceAppend` or
 `value.toNode`. Past it, `Document.write` returns `error.NestingTooDeep`
-instead of overflowing the stack. Conversion and validation carry the
-same bound at the same default, so a tree one of the three accepts is
-one the others will accept too.
+instead of overflowing the stack. Conversion, validation and the edit
+walks carry the same default, but the emitter admits two levels fewer:
+it charges extra where emission crosses between its faithful, normalized
+and flow modes. At default limits a 999-node path converts and validates
+and then fails to emit, so treat the bounds as close, not identical.
 
 **Reading files** — `yaml.file` applies its own `max_bytes` (64 MiB) at
 read time, before the bytes reach the parser.
