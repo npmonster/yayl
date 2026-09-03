@@ -2,7 +2,7 @@
 id: PLAN-14
 title: Explicit core tags are ignored, and two unbounded parent-walks
 created: 2026-09-03T13:15:14Z
-updated: 2026-09-03T13:15:14Z
+updated: 2026-09-03T16:07:36Z
 tags: [correctness, hardening, audit, 0.15.0]
 deps: []
 skills: []
@@ -95,3 +95,24 @@ all legitimate. Reword to something true and verifiable, or drop it.
 
 ## Log
 - 2026-09-03T13:15:14Z created
+- 2026-09-03T16:07:36Z 2026-09-04 — smooth-shark (claude-code) — **All three items delivered in `fa1c9f9`. Card closed, nothing carried forward.**
+
+**A — explicit core tags.** `convert` called `scalarToValue(value, style)` and `checkNodeCoreTag` called `resolveCoreTag(value, style)`; neither read `node.tag`, though the parser attaches it correctly (asserted in the test: `tag:yaml.org,2002:str`). Added `document.coreTagFromUri` and `document.scalarCoreTag`, and routed both surfaces through them.
+
+One thing the first version of the test caught: `Schema.str`'s arm was reaching for `resolveCoreTag` directly instead of going through `checkNodeCoreTag` like every other scalar arm, so fixing `checkNodeCoreTag` alone left `!!str 42` still failing validation. The test failed for exactly that reason before I found it — worth recording, because it is the kind of thing a green suite hides.
+
+`!!int abc` is `error.TypeMismatch`, not a silent fallback to string. Non-core tags (`!myapp/thing`) and untagged scalars resolve exactly as before, both asserted.
+
+**B1 — parent cycle hang.** `sequenceAppend(s, s)` and the two-step `a`-under-`b`-then-`b`-under-`a` left `markModified` walking `parent` forever. Guarded at the two public attach points (`mappingAppend`, `sequenceAppend`) with `wouldCycle`, returning `error.WouldCycle`; `markModified` and `wouldCycle` are both bounded by `Node.max_parent_walk` so a cycle can never become a hang again even if a future path bypasses the guard.
+
+Deliberately **not** guarded in `internal.attachPair`/`attachItem`: those are called from the Builder and from `cloneNode`, where every node is freshly created and a cycle is impossible, and guarding there would have forced the error into more error sets for no safety gain.
+
+**B2 — `Editor.apply` depth.** Already covered by PLAN-13's `cloneNode` bound; the existing `cloneTree` depth test exercises the same recursion. No change needed.
+
+**C — SECURITY.md.** "No `unsafe` constructs" replaced: Zig has no such keyword and the claim was uncheckable (`src/` has 31 `@constCast`/`@ptrCast`/`undefined` sites, all legitimate). Now states what is actually true and verifiable. The section also records that the fuzz harness drives parse and emit only and does not reach value, schema or edit — which is why it could not have found any of these three, and is the most useful thing to fix next.
+
+**Error sets:** `value.Error` and `edit.Error` gain `WouldCycle`. Together with PLAN-13's `NestingTooDeep` additions, the CHANGELOG lists all of them under Changed in one place.
+
+**Gates.** `make verify` exit 0, `scripts/differential.sh` 269 compared / 0 mismatches. Baselines unmoved: conformance 351/0/0/0, roundtrip 265/0/4, preservation 9/9 zero failures, consumer-smoke byte-faithful. Tests 233 -> 236.
+
+Every item in this card's done_when is met. No follow-up card.
