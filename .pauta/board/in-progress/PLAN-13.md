@@ -2,7 +2,7 @@
 id: PLAN-13
 title: Depth-bound value/schema recursion, and close the scanner/parser allocation-sweep gap
 created: 2026-09-03T11:01:32Z
-updated: 2026-09-03T12:29:44Z
+updated: 2026-09-03T13:15:43Z
 tags: [hardening, security, 0.15.0, audit]
 deps: []
 skills: []
@@ -137,3 +137,34 @@ Cost: `zig build test` goes from ~1m to ~2m. That is the sweep doing more work, 
 **Gates, current tree.** `make verify` exit 0 (fmt, check, test Debug + ReleaseSafe, examples, conformance, roundtrip, preservation, consume) plus `scripts/differential.sh` separately. Every pinned baseline unmoved: conformance 351/0/0/0, roundtrip 265/0/4, preservation zero failures, differential 269 compared / 0 mismatches, consumer-smoke byte-faithful. Tests 228 to 231.
 
 No version bump: per this card's own note, this folds into 0.15.0 rather than taking a release of its own.
+- 2026-09-03T13:15:43Z 2026-09-03 — smooth-shark (claude-code) — **Adversarial review (Fable 5.1) found a live crash the fix had missed, and three false statements I had written. All corrected; verified independently before acting.**
+
+I did not take the review on trust. Each claim was reproduced here first.
+
+**1. A parsed alias cycle aborts the process — CONFIRMED, now fixed.** An alias may name an *enclosing* anchor. `&a [*a]` is eight bytes, parses (libyaml accepts it too), and `resolveAlias` on the alias returns the sequence containing it. `max_nesting` does not bound this: that cap is on syntactic nesting, not on the alias graph. Verified on HEAD: `&a {k: *a}` + `Editor.all("$..k")` → **segfault, rc=134**, in `resolveAlias` under `collectDescend`. Eleven bytes, documented public path, and SECURITY.md's stated threat model is "yayl parses untrusted input". `collectDescend`'s own comment claimed "for parsed input the scanner's nesting cap bounds it transitively" — false.
+
+Fixed by bounding both recursive edit walks with `edit.max_walk_depth` (1000, alongside the others): `collectDescend` (which follows aliases, so this is load-bearing) and `cloneNode` (structural only — an alias is copied, never followed — so a cycle cannot reach it, but a deep built tree can). `edit.Error` widened with `NestingTooDeep`; second error-set widening this release, both in the CHANGELOG.
+
+**2. My "parsed input was never affected" claim was FALSE — CONFIRMED against the tag.** Built a worktree at v0.14.0: parse `&a [*a]`, call `nodeToValue` → **segfault**. So the released version is crashable from eight bytes of input, not merely from a tree a consumer builds. I had written the opposite in SECURITY.md, CHANGELOG, USAGE.md and two doc comments. All corrected, and SECURITY.md now names both crashing inputs, says which releases are affected, and tells untrusted-input consumers to upgrade. This mattered most of the findings — a security page denying a real input-triggered crash in a tagged release.
+
+**3. "A tree one of them accepts is one the other two accept" was FALSE — measured.** Binary search over a linear built chain at default limits:
+
+| path nodes | convert | validate | write |
+|---|---|---|---|
+| 998 | pass | pass | pass |
+| **999** | pass | pass | **fail** |
+| 1000 | fail | fail | fail |
+
+The emitter charges up to two extra levels where emission crosses between faithful, normalized and flow modes, so it admits two fewer. Three bounds, same number, three meanings. Corrected in SECURITY.md, USAGE.md, CHANGELOG and `value.zig` to say close-but-not-interchangeable, with the measured numbers.
+
+**4. A vacuous assertion in my own new test — fixed.** `expectEqualStrings("*anchor", ...scalarValue() orelse "*anchor")` always passes: `scalarValue()` resolves the alias to a sequence and returns null, so the `orelse` arm supplied the expected value. Replaced with `isAlias()` plus a resolved `items().len == 3` check.
+
+**New regression tests** (`src/edit.zig`): the parsed cycle in both mapping and sequence spellings asserting `NestingTooDeep` from `all` and `one`; a non-cyclic alias still descending correctly (2 hits, so the bound stops cycles without breaking aliases); and a 1,200-deep built tree bounding both `all` and `cloneTree`.
+
+**Gating proof.** Disabling the `collectDescend` bound: the cycle test **aborts with SIGABRT**, and the built-tree test fails cleanly with `expected error.NestingTooDeep, found {...}`. The abort is the honest outcome there — the failure mode that test guards against *is* a crash, so it cannot fail politely. Restored: 233/233.
+
+**Gates, corrected tree.** `make verify` exit 0 plus `scripts/differential.sh`. Baselines unmoved: conformance 351/0/0/0, roundtrip 265/0/4, preservation 9/9 zero failures, differential 269 compared / 0 mismatches. Tests 231 -> 233.
+
+**What the review confirmed was sound**, having tried to break it: `Budget.enter`/`leave` pairing is airtight on every path including error returns and the assert cannot fire from any public entry; composition charging depth is not merely defensible but necessary (a self-referential schema now errors instead of overflowing); the `schema.Error` widening breaks nothing in-repo; `sweep_yaml`'s constructs are real rather than decorative (the tag genuinely lands on the node) and the 32→112 assertion is meaningful, not tautological.
+
+**Carried to PLAN-14**, out of scope here and all pre-existing: explicit core tags ignored by conversion and validation (`!!str 42` converts as an int); `markModified` hanging forever on a parent cycle built through `sequenceAppend`; and one unverifiable SECURITY.md claim about "unsafe constructs".
