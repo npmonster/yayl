@@ -1025,10 +1025,52 @@ pub const Document = struct {
                     end += 1;
                 }
             } else {
-                end = markup.lineEnd(src, end);
+                end = clampToMarker(src, end, markup.lineEnd(src, end));
             }
         }
         self.region_end = @max(end, self.body_start);
+    }
+
+    /// True when the line starting at `ls` is a document marker line:
+    /// `---` or `...` at column 0, followed by a break, a blank, or the
+    /// end of input.
+    fn isMarkerLine(src: []const u8, ls: usize) bool {
+        if (ls + 3 > src.len) return false;
+        const t = src[ls .. ls + 3];
+        if (!std.mem.eql(u8, t, "---") and !std.mem.eql(u8, t, "...")) return false;
+        if (ls + 3 == src.len) return true;
+        return switch (src[ls + 3]) {
+            '\n', '\r', ' ', '\t' => true,
+            else => false,
+        };
+    }
+
+    /// Clamp an implicit region end so it cannot reach into a line that
+    /// opens or closes another document.
+    ///
+    /// The root's `end` can already sit on the next line when its last
+    /// descendant is a synthesized empty scalar, whose span is a point
+    /// borrowed from the following token — `-\n---\n` is the six-byte
+    /// case. Running `lineEnd` from there swallows the `---`, and then
+    /// emission writes it twice: once verbatim as this document's tail,
+    /// once as the next document's marker. Every round trip grew the
+    /// text by four bytes, without bound.
+    ///
+    /// The `rs.synthetic` branch above guards the same hazard for a
+    /// synthetic ROOT (corpus 6XDY); this covers a real root whose last
+    /// child is synthetic, which that check cannot see.
+    fn clampToMarker(src: []const u8, from: usize, end: usize) usize {
+        // Start at `from`'s own line when `from` sits exactly on a line
+        // start (the borrowed-point case), otherwise at the next line.
+        var ls = markup.lineStart(src, from);
+        if (ls < from) ls = markup.lineEnd(src, from);
+        while (ls < end) {
+            if (isMarkerLine(src, ls)) return ls;
+            const next = markup.lineEnd(src, ls);
+            if (next <= ls) break;
+            ls = next;
+        }
+        return end;
     }
 
     /// Render the document back to YAML text (see emitter.zig).

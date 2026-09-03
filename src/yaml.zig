@@ -522,6 +522,57 @@ test "a lone CR ends a line, so a document region cannot swallow the next marker
     }
 }
 
+test "a document region never swallows the next document's marker" {
+    const allocator = std.testing.allocator;
+
+    // Found by the extended fuzz harness (seed 44444, iteration 43175).
+    //
+    // When a root's last descendant is a synthesized empty scalar, the
+    // root's `end` is a point borrowed from the following token, which
+    // already sits on the next line. Running to that line's end
+    // swallowed the `---` marking the next document, and emission then
+    // wrote it twice — once verbatim as this document's tail, once as
+    // the next document's own marker. `-\n---\n` grew by four bytes per
+    // round trip, without bound.
+    //
+    // `finishRegion`'s `rs.synthetic` branch guards the same hazard when
+    // the ROOT is synthetic (corpus 6XDY); it cannot see a real root
+    // whose last child is.
+    const cases = [_][]const u8{
+        "-\n---\n",
+        "---\n-\n---\n",
+        "---\n- \n---\n",
+        "---\n-\n---\n---\n",
+        "a:\n---\n",
+        "?\n---\n",
+        "- - \n---\n",
+        "-\n...\n",
+        // Ordinary streams, which were always correct — kept here so the
+        // marker handling is asserted in one place.
+        "a: 1\n---\nb: 2\n",
+        "a: 1\n...\n",
+    };
+    for (cases) |input| {
+        var docs = try parseAll(allocator, input);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        const first = try writeAll(allocator, docs.items);
+        defer allocator.free(first);
+        try std.testing.expectEqualStrings(input, first);
+
+        var again = try parseAll(allocator, first);
+        defer {
+            for (again.items) |*d| d.deinit();
+            again.deinit(allocator);
+        }
+        const second = try writeAll(allocator, again.items);
+        defer allocator.free(second);
+        try std.testing.expectEqualStrings(first, second);
+    }
+}
+
 test "document marker streams" {
     const allocator = std.testing.allocator;
 

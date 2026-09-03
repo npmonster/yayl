@@ -58,6 +58,18 @@ no error, no crash. `mappingAppend` and `sequenceAppend` now return
 `error.WouldCycle` when the child is the target or one of its ancestors,
 and the parent walk is bounded so a cycle can never become a hang again.
 
+**A synthesized trailing empty scalar let a document swallow the next
+marker too.** Same growth, a different route in: when a root's last
+descendant is a synthesized empty scalar, the root's `end` is a point
+borrowed from the following token and already sits on the next line, so
+running to that line's end took in the `---` that marks the next
+document. `-\n---\n` grew by four bytes per round trip, without bound.
+`finishRegion` already guarded this for a *synthetic root* (corpus
+6XDY), but that check cannot see a real root whose last child is
+synthetic. Implicit regions are now clamped so they can never reach into
+a `---` or `...` line. Found by the extended fuzz harness at seed 44444,
+iteration 43175.
+
 **A lone CR let a document swallow the next document's marker, and the
 round trip grew without bound.** YAML 1.2 §5.4 makes a lone `\r` a line
 break (`b-break ::= CRLF | CR | LF`) and the scanner treats it as one, so
