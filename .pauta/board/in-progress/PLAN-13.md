@@ -2,7 +2,7 @@
 id: PLAN-13
 title: Depth-bound value/schema recursion, and close the scanner/parser allocation-sweep gap
 created: 2026-09-03T11:01:32Z
-updated: 2026-09-03T11:01:32Z
+updated: 2026-09-03T12:29:44Z
 tags: [hardening, security, 0.15.0, audit]
 deps: []
 skills: []
@@ -113,3 +113,27 @@ tags, flow collections or block scalars.
 
 ## Log
 - 2026-09-03T11:01:32Z created
+- 2026-09-03T12:29:44Z 2026-09-03 — smooth-shark (claude-code) — **Both workstreams delivered.**
+
+**A — depth bound. The schema path is CONFIRMED, not merely inspected.** The card left that open; it is now settled with a runtime reproduction. A self-referential schema (`deep = Schema.seq(&deep)`) descends once per document level, so validation tracks the node graph. On v0.14.0, in a detached worktree: 4,000 levels returned "0 violations without overflowing", 8,000 **segfaulted**. Identical threshold to `value.convert`. So suspicion 2 was real on *both* recursive paths, not one.
+
+Fix: `value.Limits` and `schema.Limits` each gain `max_depth = 1000`, matching `Emitter.max_depth`, enforced by a small `Budget` type per file that mirrors the emitter's `enter`/`leave` pairing (`charge` for size, `enter` for depth, `defer leave`). Past the bound both return `error.NestingTooDeep`.
+
+- `value.Error` already admitted `NestingTooDeep` through `YamlError` — no signature change.
+- `schema.Error` did **not**; widened from `{OutOfMemory, LimitExceeded}`. That is a breaking change for a caller switching exhaustively over it, called out under Changed in the CHANGELOG.
+- `Limits.unlimited` lifts `max_depth` too, which honestly re-arms the hazard. Documented in both files rather than quietly capping it, since an "unlimited" that isn't would be worse.
+- Composition (`all_of`/`any_of`/`one_of`/`nullable`) re-enters on the same node and so charges depth without descending the document. Deliberate — those frames are just as real — and covered by its own test.
+
+**Proven to gate**, per the card invariant. Disabled both guards (`if (false and ...)`), re-ran: exactly the two new tests failed, cleanly — `expected error.NestingTooDeep, found .{ .sequence = ... }` and `expected error.NestingTooDeep, found { }` — then restored and watched 230/230 pass. The tests use depth 1200: above the 1000 bound, below the ~5000 crash threshold, so removing the guard produces a clean assertion failure rather than aborting the test runner. That sizing is the point, not an accident.
+
+**B — allocation sweep breadth, measured.** `parseOnly`/`parseWriteRoundTrip`/`parseMultiDoc` now run on `sweep_yaml`: a `%YAML 1.2` directive, leading and trailing comments, anchor, alias, flow sequence, flow mapping, `!!str` tag, literal and folded block scalars (folded with `-` chomping), double- and single-quoted scalars (with an escaped quote), and a nested block sequence of mappings containing an inline flow mapping. `parseMultiDoc` gets a two-document stream.
+
+Evidence coverage moved, as the card required: allocation count under one parse **is** the number of failure points `checkAllAllocationFailures` injects at, so it measures reach directly. Measured with `FailingAllocator` as a counter — **32 to 112 points**, 3.5x. A test asserts `after > before * 3` against the audit's original string kept verbatim, so thinning the input trips it. `parseWriteRoundTrip` also now asserts the input re-emits **byte-identically**, which both validates the fixture and exercises emission of every construct in it.
+
+Cost: `zig build test` goes from ~1m to ~2m. That is the sweep doing more work, and worth it.
+
+**Docs corrected** — yesterday's SECURITY.md retraction is replaced by the real bound (two new table rows, and the hedged "where a bound applies" wording restored to the confident form now that every path is bounded); `docs/USAGE.md` gains the depth paragraph and its "which nothing else caps" claim is fixed; `src/diag.zig`'s `NestingTooDeep` doc comment now names all four bounds instead of two. SECURITY.md deliberately does **not** claim "fixed in 0.15.0" — that version is not released.
+
+**Gates, current tree.** `make verify` exit 0 (fmt, check, test Debug + ReleaseSafe, examples, conformance, roundtrip, preservation, consume) plus `scripts/differential.sh` separately. Every pinned baseline unmoved: conformance 351/0/0/0, roundtrip 265/0/4, preservation zero failures, differential 269 compared / 0 mismatches, consumer-smoke byte-faithful. Tests 228 to 231.
+
+No version bump: per this card's own note, this folds into 0.15.0 rather than taking a release of its own.
