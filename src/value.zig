@@ -61,7 +61,7 @@ pub const Value = union(enum) {
 /// plus the library's whole `YamlError` vocabulary: parse failures
 /// keep their identity (bad UTF-8 input is `InvalidUtf8`, not a
 /// generic syntax error).
-pub const Error = error{ TypeMismatch, UnsupportedType, OutOfMemory, LimitExceeded } || diag_mod.YamlError;
+pub const Error = error{ TypeMismatch, UnsupportedType, OutOfMemory, LimitExceeded, WouldCycle } || diag_mod.YamlError;
 
 /// Bounds on how much one conversion may materialise.
 ///
@@ -171,7 +171,7 @@ fn convert(allocator: std.mem.Allocator, node: *const Node, b: *Budget) Error!Va
     defer b.leave();
     const cur = node.resolveAlias();
     switch (cur.data) {
-        .scalar => |s| return scalarToValue(allocator, s.value, s.style),
+        .scalar => return taggedScalarToValue(allocator, cur),
         .alias => unreachable, // resolveAlias never returns alias
         .sequence => |sq| {
             var out = try allocator.alloc(Value, sq.items.items.len);
@@ -214,8 +214,39 @@ fn convert(allocator: std.mem.Allocator, node: *const Node, b: *Budget) Error!Va
     }
 }
 
+/// Interpret a scalar node, honouring an explicit core tag.
+///
+/// `!!str 42` is a string and `!!int '7'` an integer: the tag is an
+/// assertion about the value, so it outranks both the plain-scalar
+/// resolution and the quoting style. A tag whose content cannot be
+/// read as the type it claims (`!!int abc`) is `error.TypeMismatch` —
+/// the document says one thing and means another, and silently
+/// returning a string would hide that. Untagged scalars, and scalars
+/// carrying a non-core tag, resolve exactly as before.
+fn taggedScalarToValue(allocator: std.mem.Allocator, node: *const Node) Error!Value {
+    const s = node.data.scalar;
+    const explicit = if (node.tag) |uri| document_mod.coreTagFromUri(uri) else null;
+    const t = explicit orelse return scalarToValue(allocator, s.value, s.style);
+
+    return switch (t) {
+        .str => .{ .string = try allocator.dupe(u8, s.value) },
+        .null => if (document_mod.resolveCoreTag(s.value, .plain) == .null)
+            .null
+        else
+            error.TypeMismatch,
+        .bool => switch (document_mod.resolveCoreTag(s.value, .plain)) {
+            .bool => .{ .bool = s.value[0] == 't' or s.value[0] == 'T' },
+            else => error.TypeMismatch,
+        },
+        .int => .{ .int = std.fmt.parseInt(i64, s.value, 0) catch return error.TypeMismatch },
+        .float => .{ .float = std.fmt.parseFloat(f64, s.value) catch
+            document_mod.floatSpecial(s.value) orelse return error.TypeMismatch },
+    };
+}
+
 /// Interpret a scalar's text under its style (core schema: only plain
-/// scalars get typed).
+/// scalars get typed). Ignores any explicit tag on the node; conversion
+/// goes through `taggedScalarToValue`, which does not.
 pub fn scalarToValue(allocator: std.mem.Allocator, text: []const u8, style: ScalarStyle) Error!Value {
     if (style != .plain) return .{ .string = try allocator.dupe(u8, text) };
     switch (document_mod.resolveCoreTag(text, .plain)) {
@@ -1102,6 +1133,117 @@ test "conversion is depth-bounded, so a deep built tree errors instead of overfl
             nodeToValueLimited(allocator, root, .{ .max_values = 10 }),
         );
     }
+}
+
+test "an explicit core tag outranks plain-scalar resolution" {
+    const allocator = testing.allocator;
+
+    // `!!str 42` had been converting to `.int = 42`: the tag was parsed
+    // onto the node and then ignored by the typed surface. The tag is an
+    // assertion about the value; honouring the plain resolution instead
+    // contradicts the document.
+    {
+        var doc = try Document.parse(allocator, "x: !!str 42\n");
+        defer doc.deinit();
+        const node = doc.pathGet(&.{"x"}).?;
+
+        // The tag really is on the node — not a decorative parse.
+        try testing.expectEqualStrings("tag:yaml.org,2002:str", node.tag.?);
+
+        const v = try nodeToValue(allocator, node);
+        defer freeValue(allocator, v);
+        try testing.expect(v == .string);
+        try testing.expectEqualStrings("42", v.string);
+    }
+
+    // The narrowing direction: a quoted scalar is a string by style, but
+    // `!!int` says otherwise.
+    {
+        var doc = try Document.parse(allocator, "x: !!int '7'\n");
+        defer doc.deinit();
+        const v = try nodeToValue(allocator, doc.pathGet(&.{"x"}).?);
+        defer freeValue(allocator, v);
+        try testing.expect(v == .int);
+        try testing.expectEqual(@as(i64, 7), v.int);
+    }
+
+    // The remaining core tags.
+    {
+        var doc = try Document.parse(allocator, "a: !!bool true\nb: !!null ~\nc: !!float 1.5\n");
+        defer doc.deinit();
+        const a = try nodeToValue(allocator, doc.pathGet(&.{"a"}).?);
+        defer freeValue(allocator, a);
+        try testing.expect(a == .bool and a.bool);
+        const b = try nodeToValue(allocator, doc.pathGet(&.{"b"}).?);
+        defer freeValue(allocator, b);
+        try testing.expect(b == .null);
+        const c = try nodeToValue(allocator, doc.pathGet(&.{"c"}).?);
+        defer freeValue(allocator, c);
+        try testing.expect(c == .float);
+    }
+
+    // A tag whose content cannot be read as the type it claims is a
+    // typed error, not a silent fallback to string: the document says
+    // one thing and means another, and hiding that helps nobody.
+    {
+        var doc = try Document.parse(allocator, "x: !!int abc\n");
+        defer doc.deinit();
+        try testing.expectError(error.TypeMismatch, nodeToValue(allocator, doc.pathGet(&.{"x"}).?));
+    }
+
+    // A non-core tag leaves resolution exactly as it was.
+    {
+        var doc = try Document.parse(allocator, "x: !myapp/thing 42\n");
+        defer doc.deinit();
+        const v = try nodeToValue(allocator, doc.pathGet(&.{"x"}).?);
+        defer freeValue(allocator, v);
+        try testing.expect(v == .int);
+    }
+
+    // Untagged scalars are untouched by any of this.
+    {
+        var doc = try Document.parse(allocator, "x: 42\ny: hello\n");
+        defer doc.deinit();
+        const x = try nodeToValue(allocator, doc.pathGet(&.{"x"}).?);
+        defer freeValue(allocator, x);
+        try testing.expect(x == .int);
+        const y = try nodeToValue(allocator, doc.pathGet(&.{"y"}).?);
+        defer freeValue(allocator, y);
+        try testing.expect(y == .string);
+    }
+}
+
+test "building a parent cycle is refused rather than hanging" {
+    const allocator = testing.allocator;
+    var doc = Document.init(allocator);
+    defer doc.deinit();
+
+    // `markModified` walks up `parent`. A self-parented node made that
+    // walk infinite: 100% CPU, no error, no crash — a hang, which is
+    // worse than a crash because there is nothing to catch and nothing
+    // in the logs.
+    const s = try doc.createSequence();
+    doc.root = s;
+    try testing.expectError(error.WouldCycle, doc.sequenceAppend(s, s));
+
+    // The two-step version: a under b, then b under a.
+    const a = try doc.createSequence();
+    const b = try doc.createSequence();
+    try doc.sequenceAppend(a, b);
+    try testing.expectError(error.WouldCycle, doc.sequenceAppend(b, a));
+
+    // Mappings, on both the key and the value side.
+    const m = try doc.createMapping();
+    const inner = try doc.createMapping();
+    try doc.mappingAppend(m, try doc.createScalar("k", .plain), inner);
+    try testing.expectError(
+        error.WouldCycle,
+        doc.mappingAppend(inner, try doc.createScalar("back", .plain), m),
+    );
+
+    // Ordinary nesting is unaffected.
+    const fresh = try doc.createSequence();
+    try doc.sequenceAppend(a, fresh);
 }
 
 test "dynamic mappings convert to string maps, in all four spellings" {

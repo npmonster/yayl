@@ -267,9 +267,13 @@ fn branchMatches(
     return scratch.items.len == 0;
 }
 
+/// The Core Schema tag of an (already alias-resolved) scalar node, or
+/// null when it is not a scalar. Honours an explicit `!!str`/`!!int`/...
+/// over the plain-scalar resolution, so `Schema.str` accepts `!!str 42`
+/// and `Schema.int` rejects it.
 fn checkNodeCoreTag(node: *const Node) ?document_mod.CoreTag {
-    const s = node.scalarValue() orelse return null;
-    return document_mod.resolveCoreTag(s, node.data.scalar.style);
+    if (node.data != .scalar) return null;
+    return document_mod.scalarCoreTag(node);
 }
 
 /// What one validation has left to spend: nodes it may still visit, and
@@ -311,10 +315,9 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
             if (!cur.isScalar()) try typeErr(allocator, path, "a scalar", out);
         },
         .str => {
-            const s = cur.scalarValue() orelse return typeErr(allocator, path, "a string", out);
-            if (document_mod.resolveCoreTag(s, cur.data.scalar.style) != .str) {
-                try typeErr(allocator, path, "a string", out);
-            }
+            // Through `checkNodeCoreTag`, like every other scalar arm,
+            // so an explicit `!!str` is honoured here too.
+            if (checkNodeCoreTag(cur) != .str) try typeErr(allocator, path, "a string", out);
         },
         .bool => {
             if (checkNodeCoreTag(cur) != .bool) try typeErr(allocator, path, "a boolean", out);
@@ -715,6 +718,62 @@ test "allOf, anyOf and oneOf" {
             return err;
         };
         if (c.want > 0) try testing.expectEqualStrings(c.rule, violations[0].rule);
+    }
+}
+
+test "validation honours an explicit core tag" {
+    const allocator = testing.allocator;
+    const Document = document_mod.Document;
+
+    // `Schema.str` used to report a type violation on `!!str 42`, and
+    // `Schema.int` used to accept it: validation read the plain-scalar
+    // resolution and ignored the tag the document actually carries.
+    {
+        var doc = try Document.parse(allocator, "x: !!str 42\n");
+        defer doc.deinit();
+        const node = doc.pathGet(&.{"x"}).?;
+
+        const ok = try Schema.str.validate(allocator, node, "$.x");
+        defer allocator.free(ok);
+        try testing.expectEqual(@as(usize, 0), ok.len);
+
+        const bad = try Schema.int.validate(allocator, node, "$.x");
+        defer {
+            for (bad) |*v| v.deinitSelf(allocator);
+            allocator.free(bad);
+        }
+        try testing.expectEqual(@as(usize, 1), bad.len);
+        try testing.expectEqualStrings("type", bad[0].rule);
+    }
+
+    // And the narrowing direction.
+    {
+        var doc = try Document.parse(allocator, "x: !!int '7'\n");
+        defer doc.deinit();
+        const node = doc.pathGet(&.{"x"}).?;
+
+        const ok = try Schema.int.validate(allocator, node, "$.x");
+        defer allocator.free(ok);
+        try testing.expectEqual(@as(usize, 0), ok.len);
+
+        const bad = try Schema.str.validate(allocator, node, "$.x");
+        defer {
+            for (bad) |*v| v.deinitSelf(allocator);
+            allocator.free(bad);
+        }
+        try testing.expectEqual(@as(usize, 1), bad.len);
+    }
+
+    // Untagged scalars validate exactly as before.
+    {
+        var doc = try Document.parse(allocator, "n: 42\ns: hello\n");
+        defer doc.deinit();
+        const n = try Schema.int.validate(allocator, doc.pathGet(&.{"n"}).?, "$.n");
+        defer allocator.free(n);
+        try testing.expectEqual(@as(usize, 0), n.len);
+        const st = try Schema.str.validate(allocator, doc.pathGet(&.{"s"}).?, "$.s");
+        defer allocator.free(st);
+        try testing.expectEqual(@as(usize, 0), st.len);
     }
 }
 

@@ -38,6 +38,7 @@ pub const Error = error{
     AmbiguousOperation,
     MoveIntoSubtree,
     NestingTooDeep,
+    WouldCycle,
     OutOfMemory,
 };
 

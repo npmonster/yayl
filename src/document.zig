@@ -214,6 +214,12 @@ pub const Node = struct {
     /// Depth bound for alias chasing (resolveAlias, emitter).
     pub const max_alias_depth: usize = 100;
 
+    /// Bound on walks up the `parent` chain (`markModified`,
+    /// `wouldCycle`). Generous next to the 1000-level depth bounds the
+    /// recursive walks carry, since a legitimate chain is bounded by
+    /// those; it exists so a parent cycle can never become a hang.
+    pub const max_parent_walk: usize = 1 << 16;
+
     // ------------------------------------------------------------------
     // Comments (see docs/design/comments.md)
     // ------------------------------------------------------------------
@@ -266,8 +272,37 @@ pub const Node = struct {
 /// `Node.tag`, which holds a fully resolved tag URI.
 pub const CoreTag = enum { null, bool, int, float, str };
 
+/// The Core Schema tag named by a fully resolved tag URI, or null when
+/// the URI is not one of the five (`!!seq`, `!!map` and any
+/// application tag included).
+pub fn coreTagFromUri(uri: []const u8) ?CoreTag {
+    const prefix = "tag:yaml.org,2002:";
+    if (!std.mem.startsWith(u8, uri, prefix)) return null;
+    const name = uri[prefix.len..];
+    if (std.mem.eql(u8, name, "str")) return .str;
+    if (std.mem.eql(u8, name, "int")) return .int;
+    if (std.mem.eql(u8, name, "float")) return .float;
+    if (std.mem.eql(u8, name, "bool")) return .bool;
+    if (std.mem.eql(u8, name, "null")) return .null;
+    return null;
+}
+
+/// The Core Schema tag a scalar node actually carries. An explicit
+/// `!!str`/`!!int`/... wins: the tag is an assertion about the value,
+/// and resolving `!!str 42` as an integer would contradict it. Plain
+/// resolution is the fallback for an untagged scalar, which is the
+/// common case.
+///
+/// `node` must already be alias-resolved and must be a scalar.
+pub fn scalarCoreTag(node: *const Node) CoreTag {
+    const s = node.data.scalar;
+    if (node.tag) |uri| if (coreTagFromUri(uri)) |t| return t;
+    return resolveCoreTag(s.value, s.style);
+}
+
 /// Resolve a plain scalar to its YAML 1.2.2 Core Schema tag (spec
-/// 10.3.2). Non-plain styles always resolve to `str`.
+/// 10.3.2). Non-plain styles always resolve to `str`. Ignores any
+/// explicit tag on the node — see `scalarCoreTag`.
 pub fn resolveCoreTag(value: []const u8, style: ScalarStyle) CoreTag {
     if (style != .plain) return .str;
     if (value.len == 0 or std.mem.eql(u8, value, "~") or
@@ -565,12 +600,14 @@ pub const Document = struct {
 
     /// Append a key/value pair to a mapping node, maintaining parent links.
     pub fn mappingAppend(self: *Document, map: *Node, key: *Node, value: *Node) !void {
+        if (wouldCycle(map, key) or wouldCycle(map, value)) return error.WouldCycle;
         try internal.attachPair(self, map, key, value);
         self.markModified(map);
     }
 
     /// Append an item to a sequence node, maintaining parent links.
     pub fn sequenceAppend(self: *Document, seq: *Node, item: *Node) !void {
+        if (wouldCycle(seq, item)) return error.WouldCycle;
         try internal.attachItem(self, seq, item);
         self.markModified(seq);
     }
@@ -914,10 +951,36 @@ pub const Document = struct {
     pub fn markModified(self: *Document, node: *Node) void {
         _ = self;
         var cur: ?*Node = node;
-        while (cur) |n| {
+        // Bounded. `mappingAppend`/`sequenceAppend` refuse to build a
+        // parent cycle, so the chain is acyclic and this never trips —
+        // but an unbounded walk up `parent` turns any future mistake
+        // into a silent hang at 100% CPU rather than a visible failure,
+        // and a hang is worse than a crash: nothing to catch, nothing
+        // in the logs.
+        var guard: usize = 0;
+        while (cur) |n| : (guard += 1) {
+            if (guard >= Node.max_parent_walk) {
+                std.debug.assert(false); // parent cycle: attach guards were bypassed
+                return;
+            }
             n.modified = true;
             cur = n.parent;
         }
+    }
+
+    /// Would attaching `child` under `parent` close a parent cycle?
+    /// True when `child` is `parent` itself or one of its ancestors.
+    /// The ancestor chain is acyclic by induction — this is the check
+    /// that keeps it so — hence the plain walk.
+    fn wouldCycle(parent: *Node, child: *Node) bool {
+        var cur: ?*Node = parent;
+        var guard: usize = 0;
+        while (cur) |n| : (guard += 1) {
+            if (n == child) return true;
+            if (guard >= Node.max_parent_walk) return true;
+            cur = n.parent;
+        }
+        return false;
     }
 
     /// The `dropped` tombstone list of a collection node (source ranges

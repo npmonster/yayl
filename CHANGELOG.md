@@ -42,12 +42,29 @@ text was recovered from the session record on 2026-09-03. The parsed
 alias cycle was not part of it — an adversarial review of the fix found
 that, and it is the more serious half.
 
+**Explicit core tags are honoured by conversion and validation.**
+`!!str 42` converted to the integer `42`, and `Schema.str` reported a
+type violation on it, because the typed surface read the plain-scalar
+resolution and ignored the tag the node carried. Now `!!str 42` is the
+string `"42"`, `!!int '7'` is the integer `7`, and both surfaces agree.
+A tag whose content cannot be read as the type it names (`!!int abc`) is
+`error.TypeMismatch` rather than a silent fallback. Non-core tags are
+unaffected, as are untagged scalars.
+
+**Building a parent cycle is refused instead of hanging.**
+`sequenceAppend(s, s)`, or appending `a` under `b` and then `b` under
+`a`, left `markModified` walking the `parent` chain forever: 100% CPU,
+no error, no crash. `mappingAppend` and `sequenceAppend` now return
+`error.WouldCycle` when the child is the target or one of its ancestors,
+and the parent walk is bounded so a cycle can never become a hang again.
+
 ### Changed
 
-**`schema.Error` and `edit.Error` gained `NestingTooDeep`.** Required by
-the bounds above. Callers that switch exhaustively over either need a new
-arm; `value.Error` already admitted it through `YamlError` and is
-unchanged.
+**Error sets gained new members.** `schema.Error` and `edit.Error` gained
+`NestingTooDeep` for the depth bounds; `edit.Error` and `value.Error`
+gained `WouldCycle` for the attach guard. Callers that switch
+exhaustively over any of these need new arms. `value.Error` already
+admitted `NestingTooDeep` through `YamlError`.
 
 **The scanner/parser allocation-failure sweep got much broader.** It ran
 on a flat four-line mapping, which the v0.12.0 audit flagged as missing

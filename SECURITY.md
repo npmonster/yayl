@@ -108,10 +108,16 @@ consume parsed documents as data:
 
 ### Memory safety
 
-yayl is pure Zig with no third-party dependencies, no `unsafe`
-constructs, no C interop, and no threads in the parsing path. Inputs
-are decoded as UTF-8 strictly (invalid UTF-8 is `error.InvalidUtf8`),
-and the scanner's bounds are fuzzed: a deterministic harness mutates
-the test-suite corpus inside the unit suite (`src/fuzz.zig`), and a
-longer manual target exists (`zig build fuzz`). Findings from fuzzing
+yayl is pure Zig with no third-party dependencies, no C interop, and no
+threads in the parsing path. ("No `unsafe` constructs" used to appear
+here; Zig has no such keyword, and the claim was not checkable. What is
+true and checkable: nodes are arena-owned, callers never free pool
+memory, and the pointer casts that do exist are within a single
+allocation's provenance.) Inputs are decoded as UTF-8 strictly (invalid
+UTF-8 is `error.InvalidUtf8`), and the scanner's bounds are fuzzed: a
+deterministic harness mutates the test-suite corpus inside the unit
+suite (`src/fuzz.zig`), and a longer manual target exists (`zig build
+fuzz`). Note that the harness drives parse and emit only — it does not
+exercise the value, schema or edit surfaces, so it cannot find defects
+there. Findings from fuzzing
 that would change verified output are treated as security-relevant.

@@ -97,9 +97,26 @@ const port = doc.pathGet(&.{ "server", "port" }) orelse return error.Missing;
 1.2.2 Core Schema tag (spec 10.3.2). Quoted scalars always resolve to
 `str`.
 
+**An explicit tag outranks that.** `!!str 42` converts to the string
+`"42"` and validates against `Schema.str`; `!!int '7'` converts to the
+integer `7` despite the quotes. The tag is an assertion about the value,
+so conversion and validation both honour it over the plain resolution.
+A tag whose content cannot be read as the type it names (`!!int abc`) is
+`error.TypeMismatch`. Non-core tags (`!myapp/thing`) are carried on the
+node and preserved on emission, but do not affect resolution.
+
 Anchors and aliases are first-class nodes: `- &v 42` followed by
 `- *v` produces a distinct alias node resolving to the anchor target
 (`node.isAlias()`, `node.resolveAlias()`).
+
+An alias may name an *enclosing* anchor, which makes the document
+cyclic — `&a [*a]` parses. The recursive walks are depth-bounded so this
+is `error.NestingTooDeep` rather than a crash, but if you resolve
+aliases yourself, do not recurse without your own bound.
+
+Building a cycle through the document API is refused: `sequenceAppend`
+and `mappingAppend` return `error.WouldCycle` if the child is the target
+or one of its ancestors.
 
 ## Build a document
 
