@@ -1035,8 +1035,14 @@ pub const Emitter = struct {
     fn terminatorAt(self: *const Emitter, offset: usize) []const u8 {
         const src = self.src;
         if (offset == 0 or offset > src.len) return "\n";
+        // `newlineAt` returns the first byte of the terminator, which
+        // for CRLF is the CR (it treats a lone CR as a break, as the
+        // scanner does). So the CRLF test is on that byte and its
+        // successor, not on a `\n` with a `\r` behind it.
         const nl = markup.newlineAt(src, offset);
-        if (nl < src.len and src[nl] == '\n' and nl > 0 and src[nl - 1] == '\r') return "\r\n";
+        if (nl < src.len and src[nl] == '\r') {
+            return if (nl + 1 < src.len and src[nl + 1] == '\n') "\r\n" else "\r";
+        }
         return "\n";
     }
 

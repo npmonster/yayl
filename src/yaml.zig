@@ -466,6 +466,62 @@ fn parseWriteRoundTrip(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings(sweep_yaml, out);
 }
 
+test "a lone CR ends a line, so a document region cannot swallow the next marker" {
+    const allocator = std.testing.allocator;
+
+    // Found by the extended fuzz harness (seed 987654321, iteration
+    // 28041) once the corpus was actually being loaded as seeds.
+    //
+    // YAML 1.2 §5.4 makes a lone CR a line break (`b-break ::= CRLF |
+    // CR | LF`) and the scanner agrees, so `x\r---\n` is two documents.
+    // But `markup.lineEnd` scanned for `\n` only, so the first
+    // document's source region ran past the CR and swallowed the
+    // `---\n` that marks the second. Emission then wrote those bytes as
+    // document one's content AND a fresh `---` for document two, so
+    // every round trip grew the text by four bytes, forever:
+    // 6 -> 10 -> 14. Byte-faithfulness and idempotence both broken.
+    const inputs = [_][]const u8{
+        "x\r---\n",
+        "a: 1\r---\n",
+        "a: |\n  x\r---\n",
+    };
+    for (inputs) |input| {
+        var docs = try parseAll(allocator, input);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        const first = try writeAll(allocator, docs.items);
+        defer allocator.free(first);
+
+        // Byte-faithful: the round trip returns the input unchanged.
+        try std.testing.expectEqualStrings(input, first);
+
+        // And a fixpoint, which is what the growth broke.
+        var again = try parseAll(allocator, first);
+        defer {
+            for (again.items) |*d| d.deinit();
+            again.deinit(allocator);
+        }
+        const second = try writeAll(allocator, again.items);
+        defer allocator.free(second);
+        try std.testing.expectEqualStrings(first, second);
+    }
+
+    // LF and CRLF were always fine; keep them asserted alongside so the
+    // three break spellings are covered in one place.
+    for ([_][]const u8{ "x\n---\n", "x\r\n---\n" }) |input| {
+        var docs = try parseAll(allocator, input);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        const out = try writeAll(allocator, docs.items);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings(input, out);
+    }
+}
+
 test "document marker streams" {
     const allocator = std.testing.allocator;
 

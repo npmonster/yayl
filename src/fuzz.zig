@@ -132,6 +132,136 @@ fn fuzzOnce(allocator: std.mem.Allocator, input: []const u8) !void {
     var p = try yaml.Parser.initOpts(allocator, null, input, .{});
     defer p.deinit();
     while (try p.nextEvent()) |_| {}
+
+    // The consuming surfaces. Until 0.15.0 this harness drove parse and
+    // emit only, so every defect in value, schema and edit was outside
+    // what it could reach — including a parsed alias cycle that aborted
+    // the process from eight bytes of input. Same contract as above: a
+    // result or a typed error, never a crash, hang or leak.
+    for (docs.items) |*doc| {
+        const root = doc.root orelse continue;
+        try fuzzValue(allocator, root);
+        try fuzzSchema(allocator, root);
+        try fuzzEdit(allocator, doc);
+    }
+}
+
+/// Conversion, and the Value round trip back into a node.
+fn fuzzValue(allocator: std.mem.Allocator, root: *yaml.Node) !void {
+    const v = yaml.value.nodeToValue(allocator, root) catch |err| {
+        try expectTypedError(err);
+        return;
+    };
+    defer yaml.value.freeValue(allocator, v);
+
+    // Value -> Node -> bytes. The rebuilt tree is normalized, not
+    // faithful, so nothing is compared against the input; the contract
+    // is that it neither crashes nor leaks.
+    var out = yaml.Document.init(allocator);
+    defer out.deinit();
+    const node = yaml.value.toNode(&out, v) catch |err| {
+        try expectTypedError(err);
+        return;
+    };
+    out.root = node;
+    const text = out.write(allocator) catch |err| {
+        try expectTypedError(err);
+        return;
+    };
+    allocator.free(text);
+}
+
+/// Validation against schemas shaped to exercise the scalar arms, the
+/// recursive descent, and composition.
+fn fuzzSchema(allocator: std.mem.Allocator, root: *yaml.Node) !void {
+    // Self-referential: descends once per document level, so a deep or
+    // cyclic document drives `checkSchema` as far as it can go.
+    var deep: yaml.schema.Schema = undefined;
+    deep = yaml.schema.Schema.seq(&deep);
+
+    const nullable_any = yaml.schema.Schema{ .kind = .{ .nullable = &yaml.schema.Schema.any } };
+    const branches = [_]*const yaml.schema.Schema{
+        &yaml.schema.Schema.str,
+        &yaml.schema.Schema.int,
+    };
+    const one_of = yaml.schema.Schema{ .kind = .{ .one_of = &branches } };
+
+    const schemas = [_]*const yaml.schema.Schema{
+        &yaml.schema.Schema.any,   &yaml.schema.Schema.str,
+        &yaml.schema.Schema.int,   &yaml.schema.Schema.boolean,
+        &yaml.schema.Schema.float, &yaml.schema.Schema.scalar,
+        &deep,                     &nullable_any,
+        &one_of,
+    };
+    for (schemas) |sch| {
+        const violations = sch.validate(allocator, root, "$") catch |err| {
+            try expectTypedError(err);
+            continue;
+        };
+        for (violations) |*viol| viol.deinitSelf(allocator);
+        allocator.free(violations);
+    }
+}
+
+/// Path resolution and a mutating batch. `..` descent resolves aliases,
+/// which is where a cyclic document bites.
+fn fuzzEdit(allocator: std.mem.Allocator, doc: *yaml.Document) !void {
+    const paths = [_][]const u8{
+        "$..a", "$..k",   "$..key", "$..x",
+        "$.a",  "$.a[0]", "$[0]",   "$",
+    };
+
+    var ed = yaml.edit.Editor.init(doc);
+    for (paths) |path| {
+        const hits = ed.all(path) catch |err| {
+            try expectTypedError(err);
+            continue;
+        };
+        allocator.free(hits);
+    }
+    for (paths) |path| {
+        _ = ed.one(path) catch |err| {
+            try expectTypedError(err);
+        };
+    }
+
+    // A mutating batch, then prove the document still round-trips.
+    // `apply` clones the root, so a deep or cyclic tree drives the
+    // clone walk too.
+    const scalar = doc.createScalar("fuzz", .plain) catch |err| {
+        try expectTypedError(err);
+        return;
+    };
+    // `set` routes through `apply`, which deep-clones the root, so a
+    // deep or cyclic tree drives the clone walk as well as the edit.
+    ed.set("$.fuzzed", scalar) catch |err| {
+        try expectTypedError(err);
+        return;
+    };
+
+    // A multi-edit batch: applied atomically, rolled back as a unit if
+    // any one of them fails.
+    const extra = doc.createScalar("batch", .plain) catch |err| {
+        try expectTypedError(err);
+        return;
+    };
+    ed.apply(&.{
+        .{ .set = .{ .path = "$.batched", .value = extra } },
+        .{ .delete = "$.fuzzed" },
+    }) catch |err| {
+        try expectTypedError(err);
+    };
+
+    const text = doc.write(allocator) catch |err| {
+        try expectTypedError(err);
+        return;
+    };
+    defer allocator.free(text);
+    var reparsed = yaml.parse(allocator, text) catch |err| {
+        try expectTypedError(err);
+        return;
+    };
+    reparsed.deinit();
 }
 
 fn writeAllDocs(allocator: std.mem.Allocator, docs: []const yaml.Document) ![]u8 {
@@ -145,12 +275,22 @@ fn writeAllDocs(allocator: std.mem.Allocator, docs: []const yaml.Document) ![]u8
 /// scanner/parser/emitter is a bug dressed up as an error.
 fn expectTypedError(err: anyerror) !void {
     const known = [_][]const u8{
-        "InvalidSyntax",    "InvalidUtf8",
-        "InvalidEscape",    "InvalidIndentation",
-        "UnknownAlias",     "UnsupportedVersion",
-        "Unterminated",     "NestingTooDeep",
-        "InputTooLarge",    "AliasCycle",
-        "InvalidCodepoint", "OutOfMemory",
+        // parse / emit
+        "InvalidSyntax",      "InvalidUtf8",
+        "InvalidEscape",      "InvalidIndentation",
+        "UnknownAlias",       "UnsupportedVersion",
+        "Unterminated",       "NestingTooDeep",
+        "InputTooLarge",      "AliasCycle",
+        "InvalidCodepoint",   "OutOfMemory",
+        // value / schema
+        "TypeMismatch",       "UnsupportedType",
+        "LimitExceeded",
+        // edit
+             "InvalidPath",
+        "UnknownPath",        "NotACollection",
+        "NotASequence",       "NotAMapping",
+        "AmbiguousOperation", "MoveIntoSubtree",
+        "WouldCycle",
     };
     const name = @errorName(err);
     for (known) |k| {
@@ -200,11 +340,23 @@ pub fn runLong(allocator: std.mem.Allocator, io: std.Io, seed: u64, iterations: 
     var corpus_dir = std.Io.Dir.cwd().openDir(io, "vendor/yaml-test-suite/src", .{ .iterate = true }) catch null;
     if (corpus_dir) |*d| {
         defer d.close(io);
+        // Two layouts, because the vendored tree has had both: a flat
+        // `<case>.yaml` per case (what `scripts/fetch-corpus.sh`
+        // produces today) and the upstream `<case>/in.yaml` directory.
+        // Accepting only the directory form silently skipped all 351
+        // files, so the long run advertised corpus seeds and never
+        // actually loaded one.
         var dit = d.iterate();
         while (try dit.next(io)) |case| {
-            if (case.kind != .directory) continue;
             var pbuf: [256]u8 = undefined;
-            const path = std.fmt.bufPrint(&pbuf, "vendor/yaml-test-suite/src/{s}/in.yaml", .{case.name}) catch continue;
+            const path = switch (case.kind) {
+                .directory => std.fmt.bufPrint(&pbuf, "vendor/yaml-test-suite/src/{s}/in.yaml", .{case.name}) catch continue,
+                .file => blk: {
+                    if (!std.mem.endsWith(u8, case.name, ".yaml")) continue;
+                    break :blk std.fmt.bufPrint(&pbuf, "vendor/yaml-test-suite/src/{s}", .{case.name}) catch continue;
+                },
+                else => continue,
+            };
             const data = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 << 10)) catch continue;
             try seeds.append(allocator, data);
             if (seeds.items.len >= 700) break;

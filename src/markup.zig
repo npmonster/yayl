@@ -37,27 +37,55 @@ pub const Src = struct {
 
 /// The offset of the first byte of the line containing `offset`.
 pub fn lineStart(source: []const u8, offset: usize) usize {
-    return if (std.mem.lastIndexOfScalar(u8, source[0..@min(offset, source.len)], '\n')) |i|
-        i + 1
-    else
-        0;
+    // A lone CR is a line break too (YAML 1.2 §5.4:
+    // `b-break ::= CRLF | CR | LF`), and the scanner agrees —
+    // `ctype.isBreak` accepts both. Scanning for `\n` alone made these
+    // helpers disagree with the scanner about where a line ends, which
+    // let a document's source region swallow the `---` belonging to the
+    // next one.
+    var i = @min(offset, source.len);
+    while (i > 0) : (i -= 1) {
+        switch (source[i - 1]) {
+            '\n' => return i,
+            '\r' => {
+                // CRLF is ONE break, ending after the LF. An offset
+                // sitting on that LF is therefore still on the earlier
+                // line, so keep scanning rather than returning a
+                // position wedged between the two bytes.
+                if (i < source.len and source[i] == '\n') continue;
+                return i;
+            },
+            else => {},
+        }
+    }
+    return 0;
 }
 
 /// The offset just past the line terminator ending the line that
 /// contains `offset`: the index of the next line's first byte (or
-/// `source.len`). Handles `\n` and `\r\n` alike: in both cases the next
-/// line begins one byte past the `\n`.
+/// `source.len`). Handles all three YAML line breaks — `\n`, `\r\n` and
+/// a lone `\r` — since `b-break ::= CRLF | CR | LF` and the scanner
+/// breaks lines on any of them.
 pub fn lineEnd(source: []const u8, offset: usize) usize {
-    const start = lineStart(source, offset);
-    const nl = std.mem.indexOfScalarPos(u8, source, start, '\n') orelse return source.len;
-    return nl + 1;
+    var i = lineStart(source, offset);
+    while (i < source.len) : (i += 1) {
+        if (source[i] == '\n') return i + 1;
+        if (source[i] == '\r') {
+            return if (i + 1 < source.len and source[i + 1] == '\n') i + 2 else i + 1;
+        }
+    }
+    return source.len;
 }
 
-/// The offset of the line terminator itself (the `\n`), or `source.len`
-/// for the final unterminated line.
+/// The offset of the line terminator itself (the `\n`, or the `\r` of a
+/// `\r\n` or lone `\r`), or `source.len` for the final unterminated
+/// line.
 pub fn newlineAt(source: []const u8, offset: usize) usize {
-    const start = lineStart(source, offset);
-    return std.mem.indexOfScalarPos(u8, source, start, '\n') orelse source.len;
+    var i = lineStart(source, offset);
+    while (i < source.len) : (i += 1) {
+        if (source[i] == '\n' or source[i] == '\r') return i;
+    }
+    return source.len;
 }
 
 /// 0-based column (in bytes) of `offset` within its line. YAML columns

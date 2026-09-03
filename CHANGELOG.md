@@ -58,6 +58,43 @@ no error, no crash. `mappingAppend` and `sequenceAppend` now return
 `error.WouldCycle` when the child is the target or one of its ancestors,
 and the parent walk is bounded so a cycle can never become a hang again.
 
+**A lone CR let a document swallow the next document's marker, and the
+round trip grew without bound.** YAML 1.2 §5.4 makes a lone `\r` a line
+break (`b-break ::= CRLF | CR | LF`) and the scanner treats it as one, so
+`x\r---\n` is two documents. But `markup.lineStart`/`lineEnd`/`newlineAt`
+scanned for `\n` only, so the first document's source region ran past the
+CR and swallowed the `---\n` belonging to the second. Emission then wrote
+those bytes as document one's content *and* a fresh `---` for document
+two, so each round trip added four bytes — 6, 10, 14, and on forever.
+Both byte-faithfulness and emitter idempotence were broken by six bytes
+of input.
+
+The three line-scanning helpers now recognise all three break spellings,
+keeping CRLF a single break so an offset can never land between the two
+bytes. `Emitter.terminatorAt` follows, since `newlineAt` now reports the
+CR of a CRLF rather than the LF.
+
+Found by the extended fuzz harness at seed 987654321, iteration 28041 —
+the first campaign run after the corpus was actually being loaded.
+
+**The fuzz harness reaches the consuming surfaces.** It drove `parseAll`,
+`writeAll` and the event API only, so every defect in `value`, `schema`
+and `edit` was structurally outside what it could find — which is why the
+depth-bound crashes, the parsed alias cycle, the ignored core tags and the
+parent-cycle hang all had to be found by hand. Each iteration now also
+converts to a `Value` and back through `toNode`, validates against nine
+schema shapes (including a self-referential one that descends per
+document level, and a composition), and resolves eight paths before
+applying a mutating edit batch and re-parsing the result. The typed-error
+vocabulary was widened to match.
+
+**The long fuzz target never loaded the corpus it advertised.** It looked
+for `vendor/yaml-test-suite/src/<case>/in.yaml`, but the vendored tree is
+flat `<case>.yaml` files, so the directory check skipped all 351 of them
+and every long run was seeded from the 30 built-in and fixture seeds.
+Both layouts are accepted now: `zig build fuzz` goes from 30 seeds to
+381.
+
 ### Changed
 
 **Error sets gained new members.** `schema.Error` and `edit.Error` gained

@@ -117,7 +117,10 @@ allocation's provenance.) Inputs are decoded as UTF-8 strictly (invalid
 UTF-8 is `error.InvalidUtf8`), and the scanner's bounds are fuzzed: a
 deterministic harness mutates the test-suite corpus inside the unit
 suite (`src/fuzz.zig`), and a longer manual target exists (`zig build
-fuzz`). Note that the harness drives parse and emit only — it does not
-exercise the value, schema or edit surfaces, so it cannot find defects
-there. Findings from fuzzing
+fuzz`). The harness drives the consuming surfaces too — conversion,
+`Value`-to-node round trip, schema validation against nine schema
+shapes, and path resolution plus a mutating edit batch — so a defect
+reachable only through `value`, `schema` or `edit` is now in range. It
+was not before 0.15.0, which is why several such defects survived to be
+found by hand. Findings from fuzzing
 that would change verified output are treated as security-relevant.
