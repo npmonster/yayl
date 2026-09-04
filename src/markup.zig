@@ -110,7 +110,16 @@ pub fn entryStart(source: []const u8, content_start: usize) usize {
     if (prev == '\n' or prev == '\r') {
         // The indicator may sit alone at the end of the previous line.
         if (i < 2) return content_start;
-        var j = if (prev == '\n') i - 1 else i - 2;
+        // Step back over the terminator: one byte for a lone CR or a
+        // lone LF, two for CRLF. The `\r` arm used to step two
+        // unconditionally, which for a LONE CR landed *inside* the
+        // previous line. In `a: 1\rb:\r  - x\rc:\r` that made the key
+        // `c` look as though it sat under the `-` indicator, so its
+        // entry_start pointed at the `-` and an edit re-emitted `- x` a
+        // second time — duplicated content, and output that would not
+        // reparse.
+        var j = i - 1;
+        if (prev == '\n' and j > 0 and source[j - 1] == '\r') j -= 1;
         while (j > 0 and (source[j - 1] == ' ' or source[j - 1] == '\t')) j -= 1;
         if (j > 0 and (source[j - 1] == '-' or source[j - 1] == '?')) {
             // Only when that line holds nothing but the indicator:

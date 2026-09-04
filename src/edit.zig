@@ -1656,6 +1656,70 @@ test "cloneTreeInto a second document cannot copy the wrong source bytes" {
     try testing.expectEqualStrings("1", again.pathGet(&.{"small"}).?.scalarValue().?);
 }
 
+test "an edit in a CR-terminated document does not duplicate an entry" {
+    const allocator = std.testing.allocator;
+
+    // Found by the fuzz harness (seed 3004 and friends, via the
+    // edited-output-must-reparse oracle).
+    //
+    // `markup.entryStart` walks back from a key to find the `-` or `?`
+    // that introduces it, and stepped back TWO bytes over a `\r`,
+    // assuming it was the LF of a CRLF. For a lone CR that lands inside
+    // the previous line, so in `a: 1\rb:\r  - x\rc:\r` the key `c`
+    // looked as though it sat under the `-` at offset 10. Its
+    // entry_start pointed there, and emitting the entry re-wrote `- x`:
+    //
+    //   delete $.a  ->  b:\r  - x\n- x\rc:\r
+    //
+    // Duplicated content, an LF injected into a CR document, and output
+    // that does not reparse. The unedited round trip was unaffected
+    // (the whole region is one verbatim slice), which is why no
+    // round-trip gate saw it.
+    const cases = [_]struct { input: []const u8, path: []const u8 }{
+        .{ .input = "a: 1\rb:\r  - x\rc:\r", .path = "$.a" },
+        .{ .input = "a: 1\rb:\r  - x\rb:\r", .path = "$.a" },
+        .{ .input = "a: 1\rb:\r  - x\r  - y\rc:\r", .path = "$.a" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(allocator, c.input);
+        defer doc.deinit();
+
+        // The unedited round trip was always fine; assert it stays so.
+        const plain = try doc.write(allocator);
+        defer allocator.free(plain);
+        try std.testing.expectEqualStrings(c.input, plain);
+
+        var ed = Editor.init(&doc);
+        try ed.delete(c.path);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+
+        // No LF smuggled into a CR document.
+        try std.testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
+        // And the result reads back.
+        var re = try Document.parse(allocator, out);
+        defer re.deinit();
+        const again = try re.write(allocator);
+        defer allocator.free(again);
+        try std.testing.expectEqualStrings(out, again);
+    }
+
+    // The CRLF and LF spellings of the same shape, which must be
+    // untouched by the terminator arithmetic.
+    for ([_][]const u8{ "a: 1\r\nb:\r\n  - x\r\nc:\r\n", "a: 1\nb:\n  - x\nc:\n" }) |input| {
+        var doc = try Document.parse(allocator, input);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete("$.a");
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        var re = try Document.parse(allocator, out);
+        defer re.deinit();
+        try std.testing.expect(re.pathGet(&.{"a"}) == null);
+        try std.testing.expect(re.pathGet(&.{"c"}) != null);
+    }
+}
+
 test "an edit that would strand an alias is refused, not silently corrupting" {
     const allocator = std.testing.allocator;
 

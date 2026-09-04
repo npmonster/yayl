@@ -17,6 +17,21 @@ document structure. `setTrailingComment` already refused CR outright;
 the leading side has to permit CRLF between lines, so it now refuses the
 lone form specifically.
 
+**An edit in a CR-terminated document duplicated an entry.**
+`markup.entryStart` walks back from a key to find the `-` or `?` that
+introduces it, and stepped back TWO bytes over a `\r`, assuming it was
+the LF of a CRLF. For a *lone* CR that lands inside the previous line,
+so in `a: 1\rb:\r  - x\rc:\r` the key `c` looked as though it sat under
+the `-`, its `entry_start` pointed there, and emitting the entry
+re-wrote the sequence item:
+
+    delete $.a  ->  b:\r  - x\n- x\rc:\r
+
+Duplicated content, an LF smuggled into a CR document, and output that
+does not reparse. The unedited round trip was unaffected — the region is
+one verbatim slice — which is why no round-trip gate saw it. CRLF and LF
+were always correct and stay so.
+
 **A comment-only file was erased by a round trip.** A stream with no node
 content produced no document, so there was nothing to re-emit and
 `writeAll(parseAll("# c\n"))` returned the empty string. For a library
