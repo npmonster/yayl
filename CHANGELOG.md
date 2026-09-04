@@ -17,6 +17,21 @@ document structure. `setTrailingComment` already refused CR outright;
 the leading side has to permit CRLF between lines, so it now refuses the
 lone form specifically.
 
+**An edit that would strand an alias is refused instead of corrupting.**
+An anchor lives on the node that defines it, so deleting or replacing
+that node while `*name` survives emitted a document that does not parse
+(`error.UnknownAlias` on the way back in). `delete` and `set` now return
+`error.AnchorReferenced` when the target subtree defines an anchor an
+alias outside it still references. The preservation sweep knew the shape
+and *skipped* those positions rather than asserting, so nothing caught
+that the output was unreadable.
+
+Two consequences worth knowing. Deleting the alias, or an anchor nothing
+references, is unaffected. But a `set` on a referenced anchored node is
+now always refused, because `createScalar` cannot attach an anchor and
+so no replacement carrying `&name` can be constructed — a real builder
+limitation, and still strictly better than emitting a broken document.
+
 **Deleting a sibling could corrupt a document into unparseable bytes.**
 An entry whose key is a synthesized empty scalar (`: 1`) has no bytes of
 its own — its span is a point borrowed from the following token — and
@@ -48,6 +63,11 @@ emitter's terminator convention only matters when a whole document uses
 it. Every seed now also runs with its line endings rewritten to CR and
 to CRLF, taking the long run from 381 seeds to 1143 and reaching that
 class deliberately rather than by luck.
+
+**The fuzz harness checks that independent edits commute.** Two edits at
+positions where neither path is a prefix of the other must produce the
+same bytes in either order; if they do not, one left the other's spans
+or tombstones in a state that depends on when it ran.
 
 **The fuzz harness checks that an edited document still reparses and is
 still a fixpoint.** `fuzzOnce` asserted write/reparse/write stability for

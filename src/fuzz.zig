@@ -145,11 +145,19 @@ fn fuzzOnce(allocator: std.mem.Allocator, input: []const u8) !void {
         try fuzzEdit(allocator, doc);
     }
 
-    // Path addressing, checked against the tree it was derived from.
-    // Unlike the fixed paths above this is an oracle rather than a
-    // smoke test: a path built by walking the document MUST resolve
-    // back, so a failure is a real addressing defect and not a miss.
-    if (docs.items.len > 0) try fuzzPaths(allocator, input);
+    // Path addressing and the edit algebra, checked against the tree
+    // they were derived from. Unlike the fixed paths above these are
+    // oracles rather than smoke tests: a path built by walking the
+    // document MUST resolve back, so a failure is a real addressing
+    // defect and not a miss.
+    //
+    // Bounded to small inputs. Each re-parses and deep-clones the tree
+    // several times (an edit clones the whole root), and the corpus
+    // seeds run to 64 KiB, which put one iteration into the hundreds of
+    // milliseconds. Every defect these have found lived in a document
+    // under a hundred bytes; the large seeds still get the parse, emit,
+    // value and schema coverage above.
+    if (docs.items.len > 0 and input.len <= 2048) try fuzzPaths(allocator, input);
 }
 
 /// One derived path and the node it was built for.
@@ -296,6 +304,84 @@ fn fuzzPaths(allocator: std.mem.Allocator, input: []const u8) !void {
     }
 
     try editedIsFixpoint(allocator, input);
+    try editsCommute(allocator, input);
+}
+
+/// Two edits at INDEPENDENT positions must produce the same bytes in
+/// either order.
+///
+/// Independent means neither path is a prefix of the other — setting an
+/// ancestor legitimately replaces the subtree a descendant lives in, so
+/// order matters there and the property does not apply. For genuine
+/// siblings it does: the emitter walks entries in source order, and if
+/// applying `a` then `b` differs from `b` then `a`, one of them left the
+/// other's spans or tombstones in a state that depends on when it ran.
+fn editsCommute(allocator: std.mem.Allocator, input: []const u8) !void {
+    var probe = yaml.parse(allocator, input) catch return;
+    defer probe.deinit();
+    const proot = probe.root orelse return;
+
+    var hits: std.ArrayList(PathHit) = .empty;
+    defer {
+        for (hits.items) |h| allocator.free(h.path);
+        hits.deinit(allocator);
+    }
+    collectPaths(allocator, proot, "$", &hits, 0) catch return;
+    if (hits.items.len < 2) return;
+
+    // First independent pair.
+    var pa: ?[]const u8 = null;
+    var pb: ?[]const u8 = null;
+    outer: for (hits.items) |x| {
+        for (hits.items) |y| {
+            if (std.mem.eql(u8, x.path, y.path)) continue;
+            if (std.mem.startsWith(u8, y.path, x.path)) continue;
+            if (std.mem.startsWith(u8, x.path, y.path)) continue;
+            pa = x.path;
+            pb = y.path;
+            break :outer;
+        }
+    }
+    const a_path = pa orelse return;
+    const b_path = pb orelse return;
+
+    // The value travels with the PATH, not with the position in the
+    // sequence — otherwise this compares two different edits and always
+    // "fails".
+    const first = applyBoth(allocator, input, .{ a_path, "fzA" }, .{ b_path, "fzB" }) catch |err| {
+        try expectTypedError(err);
+        return;
+    } orelse return;
+    defer allocator.free(first);
+    const second = applyBoth(allocator, input, .{ b_path, "fzB" }, .{ a_path, "fzA" }) catch |err| {
+        try expectTypedError(err);
+        return;
+    } orelse return;
+    defer allocator.free(second);
+
+    if (!std.mem.eql(u8, first, second)) {
+        std.debug.print("fuzz: edits do not commute\n  input={any}\n  a={s} b={s}\n  ab={any}\n  ba={any}\n", .{ input, a_path, b_path, first, second });
+        return error.FuzzEditsDoNotCommute;
+    }
+}
+
+/// Set `p1` then `p2` to fixed scalars and return the emitted bytes, or
+/// null when either edit is refused (the shapes differ per input; a
+/// typed refusal is a fine outcome and simply makes the pair unusable).
+fn applyBoth(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    e1: struct { []const u8, []const u8 },
+    e2: struct { []const u8, []const u8 },
+) !?[]u8 {
+    var doc = yaml.parse(allocator, input) catch return null;
+    defer doc.deinit();
+    var ed = yaml.edit.Editor.init(&doc);
+    const v1 = try doc.createScalar(e1[1], .plain);
+    ed.set(e1[0], v1) catch return null;
+    const v2 = try doc.createScalar(e2[1], .plain);
+    ed.set(e2[0], v2) catch return null;
+    return try doc.write(allocator);
 }
 
 /// Emission must still be a fixpoint AFTER an edit.
@@ -355,7 +441,12 @@ fn editedIsFixpoint(allocator: std.mem.Allocator, input: []const u8) !void {
 
 /// Conversion, and the Value round trip back into a node.
 fn fuzzValue(allocator: std.mem.Allocator, root: *yaml.Node) !void {
-    const v = yaml.value.nodeToValue(allocator, root) catch |err| {
+    // Tight bounds on purpose. The default 1,048,576 lets an alias
+    // bomb — which mutation produces readily from the anchored seeds —
+    // expand for seconds before erroring, and the fuzzer is looking for
+    // crashes and leaks, not for the budget's exact value. The bound
+    // itself has its own unit tests.
+    const v = yaml.value.nodeToValueLimited(allocator, root, .{ .max_values = 4096 }) catch |err| {
         try expectTypedError(err);
         return;
     };
@@ -401,7 +492,7 @@ fn fuzzSchema(allocator: std.mem.Allocator, root: *yaml.Node) !void {
         &one_of,
     };
     for (schemas) |sch| {
-        const violations = sch.validate(allocator, root, "$") catch |err| {
+        const violations = sch.validateLimited(allocator, root, "$", .{ .max_nodes = 4096 }) catch |err| {
             try expectTypedError(err);
             continue;
         };
@@ -497,7 +588,7 @@ fn expectTypedError(err: anyerror) !void {
         "UnknownPath",        "NotACollection",
         "NotASequence",       "NotAMapping",
         "AmbiguousOperation", "MoveIntoSubtree",
-        "WouldCycle",
+        "WouldCycle",         "AnchorReferenced",
     };
     const name = @errorName(err);
     for (known) |k| {
@@ -515,7 +606,14 @@ pub fn runSmoke(allocator: std.mem.Allocator) !void {
     const random = prng.random();
     var buf: [1024]u8 = undefined;
     var iteration: usize = 0;
-    while (iteration < 1200) : (iteration += 1) {
+    // Fewer iterations than the 1200 this ran when it only drove parse
+    // and emit: each one now also converts, validates against nine
+    // schemas, resolves every derived path, edits, and checks the
+    // edited output reparses, is a fixpoint, and commutes. The work per
+    // iteration is an order of magnitude up, so the count comes down to
+    // keep `zig build test` quick — the long run (`zig build fuzz`) is
+    // where volume belongs.
+    while (iteration < 400) : (iteration += 1) {
         const seed = seed_corpus[random.uintLessThan(usize, seed_corpus.len)];
         const input = mutate(random, seed, &buf);
         fuzzOnce(allocator, input) catch |err| {

@@ -39,6 +39,7 @@ pub const Error = error{
     MoveIntoSubtree,
     NestingTooDeep,
     WouldCycle,
+    AnchorReferenced,
     OutOfMemory,
 };
 
@@ -232,6 +233,67 @@ fn filterMatches(candidate: *Node, key: []const u8, value: []const u8) bool {
     return false;
 }
 
+/// Does `node` or anything under it define the anchor `name`?
+///
+/// By NAME, not by pointer: `cloneNode` re-registers anchors only for
+/// collections, so a cloned alias to an anchored SCALAR still carries a
+/// target pointer into the pre-clone tree. A name comparison is correct
+/// either way, and an anchor name is what the emitted `*name` actually
+/// refers to. Aliases are leaves here — never followed — so a parsed
+/// alias cycle cannot make this recurse forever.
+fn anchorDefinedIn(node: *const Node, name: []const u8, depth: usize) bool {
+    if (depth >= max_walk_depth) return false;
+    if (node.anchor) |a| {
+        if (std.mem.eql(u8, a, name)) return true;
+    }
+    switch (node.data) {
+        .mapping => |m| for (m.pairs.items) |pair| {
+            if (anchorDefinedIn(pair.key, name, depth + 1)) return true;
+            if (anchorDefinedIn(pair.value, name, depth + 1)) return true;
+        },
+        .sequence => |sq| for (sq.items.items) |item| {
+            if (anchorDefinedIn(item, name, depth + 1)) return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// Would removing `doomed` leave an alias pointing at nothing?
+///
+/// An anchor lives on the node that defines it, so deleting or
+/// replacing that node while `*name` survives elsewhere emits a
+/// document that does not parse — `error.UnknownAlias` on the way back
+/// in. That is silent corruption through a public API, so the edit is
+/// refused instead. The caller can delete the aliases first, or replace
+/// the anchored value rather than the node carrying the anchor.
+fn aliasWouldDangle(node: *const Node, doomed: *const Node, depth: usize) bool {
+    if (depth >= max_walk_depth) return false;
+    // Everything inside the doomed subtree is going away together, so
+    // an alias in there is not left dangling by this edit.
+    if (node == doomed) return false;
+    switch (node.data) {
+        .alias => |a| return anchorDefinedIn(doomed, a.name, 0),
+        .mapping => |m| for (m.pairs.items) |pair| {
+            if (aliasWouldDangle(pair.key, doomed, depth + 1)) return true;
+            if (aliasWouldDangle(pair.value, doomed, depth + 1)) return true;
+        },
+        .sequence => |sq| for (sq.items.items) |item| {
+            if (aliasWouldDangle(item, doomed, depth + 1)) return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// Refuse an edit that would strand an alias. Called for the two edits
+/// that remove a node from the tree; `move` relocates within the same
+/// document, so the anchor survives and is not checked.
+fn refuseIfAnchorReferenced(doc: *Document, doomed: *const Node) Error!void {
+    const root = doc.root orelse return;
+    if (aliasWouldDangle(root, doomed, 0)) return error.AnchorReferenced;
+}
+
 fn collectDescend(allocator: std.mem.Allocator, node: *Node, key: []const u8, out: *std.ArrayList(*Node), depth: usize) Error!void {
     // Pre-order walk collecting every `key` match, bounded by
     // `max_walk_depth`. The bound is load-bearing rather than defensive:
@@ -336,12 +398,22 @@ pub const Editor = struct {
     fn applyOne(doc: *Document, edit: Edit) Error!void {
         var ed = Editor{ .doc = doc };
         switch (edit) {
-            .set => |s| try applySet(doc, s.path, s.value),
+            .set => |s| {
+                // Replacing the node that CARRIES an anchor strands any
+                // alias to it. A no-op set is exempt: it replaces
+                // nothing, so nothing is stranded.
+                if (ed.one(s.path)) |existing| {
+                    if (!sameScalarPresentation(existing, s.value))
+                        try refuseIfAnchorReferenced(doc, existing);
+                } else |_| {}
+                try applySet(doc, s.path, s.value);
+            },
             .delete => |path| {
-                _ = ed.one(path) catch |err| {
+                const target = ed.one(path) catch |err| {
                     try noopOrOOM(err);
                     return; // no match: no-op
                 };
+                try refuseIfAnchorReferenced(doc, target);
                 try applyDelete(doc, path);
             },
             .insert => |ins| try applyInsert(doc, ins),
@@ -1582,6 +1654,102 @@ test "cloneTreeInto a second document cannot copy the wrong source bytes" {
     defer again.deinit();
     try testing.expectEqualStrings("42", again.pathGet(&.{ "other", "x" }).?.scalarValue().?);
     try testing.expectEqualStrings("1", again.pathGet(&.{"small"}).?.scalarValue().?);
+}
+
+test "an edit that would strand an alias is refused, not silently corrupting" {
+    const allocator = std.testing.allocator;
+
+    // Found by the fuzz harness's edited-output-must-reparse oracle
+    // (seed 2001, iteration 15828, input `- &v 42\r- *v\r`).
+    //
+    // An anchor lives on the node that defines it. Deleting or replacing
+    // that node while `*v` survives emitted a document that does not
+    // parse — `error.UnknownAlias` on the way back in. Silent corruption
+    // through a public API. The preservation sweep knew about the shape
+    // and *skipped* those positions ("deleting it would leave the
+    // aliases dangling") rather than asserting anything, so nothing
+    // caught that the output was unreadable.
+    const refused = [_]struct { input: []const u8, path: []const u8 }{
+        .{ .input = "- &v 42\n- *v\n", .path = "$[0]" },
+        .{ .input = "a: &v 42\nb: *v\n", .path = "$.a" },
+        .{ .input = "a: &v [1, 2]\nb: *v\n", .path = "$.a" },
+        .{ .input = "a: &v 42\nb: *v\nc: *v\n", .path = "$.a" },
+    };
+    for (refused) |c| {
+        {
+            var doc = try Document.parse(allocator, c.input);
+            defer doc.deinit();
+            var ed = Editor.init(&doc);
+            try std.testing.expectError(error.AnchorReferenced, ed.delete(c.path));
+            // Refused means unchanged, not half-applied.
+            const out = try doc.write(allocator);
+            defer allocator.free(out);
+            try std.testing.expectEqualStrings(c.input, out);
+        }
+        {
+            var doc = try Document.parse(allocator, c.input);
+            defer doc.deinit();
+            var ed = Editor.init(&doc);
+            const v = try doc.createScalar("9", .plain);
+            try std.testing.expectError(error.AnchorReferenced, ed.set(c.path, v));
+        }
+    }
+
+    // What must still be allowed.
+    {
+        // Deleting the ALIAS is fine — the anchor stays.
+        var doc = try Document.parse(allocator, "- &v 42\n- *v\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete("$[1]");
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        var re = try Document.parse(allocator, out);
+        defer re.deinit();
+    }
+    {
+        // An anchor nothing references can go.
+        var doc = try Document.parse(allocator, "a: &v 42\nb: 1\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete("$.a");
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings("b: 1\n", out);
+    }
+    {
+        // Setting a REFERENCED anchored node to a bare scalar is not a
+        // no-op: `sameScalarPresentation` compares anchors, so `&v 42`
+        // and a plain `42` differ and the set really would replace the
+        // node and drop the anchor. Refusing is correct.
+        //
+        // The consequence is a real limitation, and it is the builder's,
+        // not this guard's: `createScalar` cannot attach an anchor, so
+        // there is no way to construct a replacement carrying `&v`.
+        // Every set on a referenced anchor is therefore refused. That is
+        // strictly better than the previous behaviour, which accepted it
+        // and emitted a document that would not parse.
+        var doc = try Document.parse(allocator, "a: &v 42\nb: *v\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const bare = try doc.createScalar("42", .plain);
+        try std.testing.expectError(error.AnchorReferenced, ed.set("$.a", bare));
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings("a: &v 42\nb: *v\n", out);
+    }
+    {
+        // An anchored node NOTHING references can be replaced freely,
+        // anchor and all.
+        var doc = try Document.parse(allocator, "a: &v 42\nb: 1\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.set("$.a", try doc.createScalar("9", .plain));
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        var re = try Document.parse(allocator, out);
+        defer re.deinit();
+    }
 }
 
 test "deleting a sibling keeps the line break before a synthetic-key entry" {
