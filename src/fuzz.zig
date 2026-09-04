@@ -294,6 +294,63 @@ fn fuzzPaths(allocator: std.mem.Allocator, input: []const u8) !void {
         }
         break;
     }
+
+    try editedIsFixpoint(allocator, input);
+}
+
+/// Emission must still be a fixpoint AFTER an edit.
+///
+/// `fuzzOnce` asserts write/reparse/write stability for documents that
+/// were never touched, but a modified document travels a different path
+/// through the emitter: spans are stale, tombstones are live, and
+/// modified subtrees re-emit normalized in place. The two unbounded
+/// growth bugs this release fixed were violations of exactly this
+/// property on the *unedited* path — nothing was checking the edited
+/// one.
+fn editedIsFixpoint(allocator: std.mem.Allocator, input: []const u8) !void {
+    var doc = yaml.parse(allocator, input) catch return;
+    defer doc.deinit();
+    const root = doc.root orelse return;
+
+    var hits: std.ArrayList(PathHit) = .empty;
+    defer {
+        for (hits.items) |h| allocator.free(h.path);
+        hits.deinit(allocator);
+    }
+    collectPaths(allocator, root, "$", &hits, 0) catch return;
+    if (hits.items.len == 0) return;
+
+    var ed = yaml.edit.Editor.init(&doc);
+    // A delete is the sharpest edit for this: it leaves a tombstone the
+    // verbatim walk has to skip, which is where span arithmetic bites.
+    ed.delete(hits.items[0].path) catch |err| {
+        try expectTypedError(err);
+        return;
+    };
+
+    const w1 = doc.write(allocator) catch |err| {
+        try expectTypedError(err);
+        return;
+    };
+    defer allocator.free(w1);
+
+    var re = yaml.parse(allocator, w1) catch |err| {
+        // An edit must not produce bytes this library cannot read back.
+        std.debug.print("fuzz: edited output does not reparse: {s}\n  input={any}\n  out  ={any}\n", .{ @errorName(err), input, w1 });
+        return error.FuzzEditedOutputUnparsable;
+    };
+    defer re.deinit();
+
+    const w2 = re.write(allocator) catch |err| {
+        try expectTypedError(err);
+        return;
+    };
+    defer allocator.free(w2);
+
+    if (!std.mem.eql(u8, w1, w2)) {
+        std.debug.print("fuzz: edited output is not a fixpoint\n  input={any}\n  w1   ={any}\n  w2   ={any}\n", .{ input, w1, w2 });
+        return error.FuzzEditedNotIdempotent;
+    }
 }
 
 /// Conversion, and the Value round trip back into a node.

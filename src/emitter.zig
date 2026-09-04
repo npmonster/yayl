@@ -456,6 +456,23 @@ pub const Emitter = struct {
                     try self.writeGap(container, gap_start, s.entry_start);
                 }
                 try self.breakBeforeEntry(entry_col);
+            } else {
+                // A SYNTHETIC key has no bytes of its own — its span is
+                // a point borrowed from the following token — but the
+                // entry still occupies a line, and the gap in front of
+                // that point is real: it holds the terminator that
+                // separates this entry from the previous one.
+                //
+                // Skipping the gap entirely (which is what this branch
+                // used to do by falling through) dropped that
+                // terminator as soon as any sibling was deleted, so
+                // `a: 1\nb:\n  - y: z\n: 1\n` minus `$.a` emitted
+                // `b:\n  - y: z: 1\n` — two lines joined into one, and
+                // output this library cannot reparse. Only the edited
+                // path reaches here; an untouched region is emitted
+                // verbatim in one slice.
+                try self.writeGap(container, gap_start, s.entry_start);
+                try self.breakBeforeEntry(entry_col);
             }
         } else if (pair_end == null) {
             // Brand-new pair. While the previous entry's line is still

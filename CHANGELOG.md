@@ -17,6 +17,17 @@ document structure. `setTrailingComment` already refused CR outright;
 the leading side has to permit CRLF between lines, so it now refuses the
 lone form specifically.
 
+**Deleting a sibling could corrupt a document into unparseable bytes.**
+An entry whose key is a synthesized empty scalar (`: 1`) has no bytes of
+its own — its span is a point borrowed from the following token — and
+`emitPairEdited` skipped the whole leading-gap block for such a key. The
+gap is where the terminator separating it from the previous entry lives,
+so deleting any sibling dropped that terminator and joined two lines:
+`a: 1\nb:\n  - y: z\n: 1\n` minus `$.a` emitted `b:\n  - y: z: 1\n`,
+which this library cannot reparse. Only the edited path reaches that
+code — an untouched region is emitted verbatim in one slice — so no
+round-trip gate could see it.
+
 **A wholly CR-terminated stream was neither byte-faithful nor a
 fixpoint.** Three sites knew only `\n` and a lone-CR document hit them
 together: `Emitter.endsWithNewline` read a trailing `\r` as "not at a
@@ -37,6 +48,15 @@ emitter's terminator convention only matters when a whole document uses
 it. Every seed now also runs with its line endings rewritten to CR and
 to CRLF, taking the long run from 381 seeds to 1143 and reaching that
 class deliberately rather than by luck.
+
+**The fuzz harness checks that an edited document still reparses and is
+still a fixpoint.** `fuzzOnce` asserted write/reparse/write stability for
+untouched documents only, but a modified document travels a different
+path through the emitter — stale spans, live tombstones, subtrees
+re-emitted normalized in place. The two unbounded-growth bugs fixed in
+0.15.0 were violations of exactly that property on the untouched path;
+nothing was checking the edited one. It found the delete corruption
+above on its first run.
 
 **The fuzz harness derives edit paths from the parsed tree.** It used
 eight literal paths, which on a mutated non-mapping input resolve to

@@ -1584,6 +1584,51 @@ test "cloneTreeInto a second document cannot copy the wrong source bytes" {
     try testing.expectEqualStrings("1", again.pathGet(&.{"small"}).?.scalarValue().?);
 }
 
+test "deleting a sibling keeps the line break before a synthetic-key entry" {
+    const allocator = std.testing.allocator;
+
+    // Found by the fuzz harness's edited-output-must-reparse oracle
+    // (smoke iteration 94).
+    //
+    // `: 1` is an entry whose key is a synthesized empty scalar, so its
+    // span is a point borrowed from the following token rather than
+    // bytes of its own. `emitPairEdited` skipped the whole leading-gap
+    // block for such a key, and the gap is where the terminator
+    // separating it from the previous entry lives. Delete any sibling
+    // and that terminator vanished, joining two lines: the document
+    // below emitted as `b:\n  - y: z: 1\n`, which does not reparse.
+    //
+    // Only the edited path reaches this — an untouched region is
+    // emitted verbatim in one slice — so the round-trip gates could not
+    // see it.
+    const cases = [_]struct { input: []const u8, path: []const u8 }{
+        .{ .input = "a: 1\nb:\n  - y: z\n: 1\n", .path = "$.a" },
+        .{ .input = "a: 1\nb:\n  - y: z\n: 1\n", .path = "$.b" },
+        .{ .input = "a: 1\nb:\n  y: z\n: 1\n", .path = "$.a" },
+        .{ .input = "z: 0\na: 1\nb:\n  - y: z\n: 1\n", .path = "$.a" },
+        .{ .input = "a: 1\nb:\n  - x\n  - y: z\n: 1\n", .path = "$.a" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(allocator, c.input);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete(c.path);
+
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+
+        // The point of the test: an edit must never produce bytes this
+        // library cannot read back.
+        var re = try Document.parse(allocator, out);
+        defer re.deinit();
+
+        // And emission stays a fixpoint after the edit.
+        const again = try re.write(allocator);
+        defer allocator.free(again);
+        try std.testing.expectEqualStrings(out, again);
+    }
+}
+
 test "an alias to an enclosing anchor is a parsed cycle, and cannot abort the process" {
     const allocator = std.testing.allocator;
 
