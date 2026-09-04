@@ -1048,9 +1048,12 @@ test "alias expansion is bounded, and the bound is configurable" {
 }
 
 /// A linear chain of `depth` nested sequences, built through the public
-/// document API. Parsed input cannot produce this — the scanner caps
-/// nesting at 200 — which is exactly why the depth bound exists: it is
-/// for trees a consumer builds itself.
+/// document API. Parsed input does not reach this depth at default
+/// limits — `max_nesting` is 200 per style — but "parsed input is safe"
+/// would be too strong: an alias naming an enclosing anchor is a parsed
+/// cycle of unbounded depth, and a caller who raises `max_nesting` can
+/// parse past the bound too. The depth bound is not only for built
+/// trees; this helper just exercises the simplest way to reach it.
 fn deepChain(doc: *Document, depth: usize) !*Node {
     const root = try doc.createSequence();
     var cur = root;
