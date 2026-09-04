@@ -270,7 +270,7 @@ boundary is required and absent, and nothing where one already exists,
 which is what keeps the round trip byte-exact.
 
 The round-trip gate runs through `writeAll` over the whole corpus, so
-that byte-exactness is checked against 265 real streams rather than a
+that byte-exactness is checked against 269 real streams rather than a
 handful of shapes.
 
 ## Editing: paths, batches, moves

@@ -23,13 +23,16 @@ const Skip = struct {
 /// Known round-trip gaps. A skipped case that starts passing fails the
 /// gate (stale skip), so this table cannot outlive a fix.
 const skips = [_]Skip{
-    // Streams with no document at all (indicators/comments only): the
-    // parse yields nothing, so there is nothing to re-emit. This
-    // matches libfyaml, which also produces no output for these.
-    .{ .id = "HWV9", .reason = "no document in stream (lone '...')" },
-    .{ .id = "8G76", .reason = "no document in stream (comments + blank lines)" },
-    .{ .id = "98YD", .reason = "no document in stream (comment only)" },
-    .{ .id = "QT73", .reason = "no document in stream (comment + '...')" },
+    // Empty. The four entries that lived here — HWV9, 8G76, 98YD, QT73,
+    // all "no document in stream" (comments, blank lines, a lone `...`)
+    // — round trip correctly as of the fix that gives a content-free
+    // stream a rootless document carrying its bytes. They were skipped
+    // on the grounds that libfyaml emits nothing for them either, but
+    // libfyaml does not promise byte-faithful round trips and this
+    // library does: erasing a fully commented-out file is the one
+    // answer a library whose pitch is "the others eat your comments"
+    // cannot give. The stale-skip assertion below is what caught that
+    // the entries had outlived the bug.
 };
 
 fn findSkip(id: []const u8) ?Skip {

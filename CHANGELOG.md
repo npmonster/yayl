@@ -17,6 +17,30 @@ document structure. `setTrailingComment` already refused CR outright;
 the leading side has to permit CRLF between lines, so it now refuses the
 lone form specifically.
 
+**A comment-only file was erased by a round trip.** A stream with no node
+content produced no document, so there was nothing to re-emit and
+`writeAll(parseAll("# c\n"))` returned the empty string. For a library
+whose pitch is that the others eat your comments, silently emptying a
+fully commented-out config file is the one answer it cannot give.
+
+Such a stream now yields **one document with a null root** whose region
+carries those bytes, and the faithful emitter writes them back verbatim.
+Genuinely empty input still yields no documents — there are no bytes to
+preserve.
+
+This removed the last four entries from the round-trip skip table
+(`HWV9`, `8G76`, `98YD`, `QT73`, all "no document in stream"), taking the
+corpus round trip from **265 pass / 4 skip to 269 pass / 0 skip**. The
+table's own stale-skip assertion is what caught that they had outlived
+the bug.
+
+**Behaviour change worth checking before upgrading:** `parseAll` now
+returns 1 rather than 0 for a stream of only comments, blank lines, or a
+lone `...`. Consumers that iterate documents must tolerate
+`root == null` — which `parse` could already return. The previous
+behaviour matched libfyaml, but libfyaml does not promise byte-faithful
+round trips and this library does.
+
 **An edit that would strand an alias is refused instead of corrupting.**
 An anchor lives on the node that defines it, so deleting or replacing
 that node while `*name` survives emitted a document that does not parse

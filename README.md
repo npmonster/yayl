@@ -247,7 +247,7 @@ The gates, in both Debug and ReleaseSafe:
 | Gate | Result |
 | --- | --- |
 | yaml-test-suite conformance | 351/351, zero skips |
-| byte-faithful round trips | 265/269 (4 skips: streams containing no document, so there is nothing to re-emit) plus real-world fixtures |
+| byte-faithful round trips | 269/269, no skips, plus real-world fixtures |
 | edit preservation | every addressable edit position across the real-world fixtures |
 | event-tree parity vs libfyaml | 269/269 compared, zero mismatches |
 | allocation-failure injection | zero leaks |

@@ -461,7 +461,29 @@ pub const Document = struct {
         defer p.deinit();
         var docs = try parseStream(allocator, &p, 1, input);
         defer docs.deinit(allocator);
-        if (docs.items.len == 0) return Document.init(allocator);
+        if (docs.items.len == 0) {
+            // A stream with no node content is still bytes. An input
+            // that is entirely comments and blank lines produces no
+            // document_start event, so the loop above builds nothing —
+            // and returning a bare empty Document dropped those bytes:
+            // `# c\n` re-emitted as the empty string. For a library
+            // whose promise is that untouched bytes come back verbatim,
+            // silently erasing a fully commented-out config file is the
+            // worst possible answer.
+            //
+            // Carry them as a rootless document whose region is the
+            // whole input. `emitFaithful` already handles `root == null`
+            // by writing [region_start, body_start) verbatim; it simply
+            // had an empty region to write.
+            var empty = Document.init(allocator);
+            errdefer empty.deinit();
+            empty.source = try empty.pool.dupe(input);
+            empty.region_start = 0;
+            empty.body_start = input.len;
+            empty.body_end = input.len;
+            empty.region_end = input.len;
+            return empty;
+        }
         return docs.items[0];
     }
 
@@ -549,6 +571,25 @@ pub const Document = struct {
                         // its `...`) stay in its region.
                         if (docs.items.len > 0) {
                             docs.items[docs.items.len - 1].region_end = input.len;
+                        } else if (input.len > 0) {
+                            // No document at all, but the stream still
+                            // has bytes: it is entirely comments and
+                            // blank lines. `writeAll(parseAll(x)) == x`
+                            // is a documented promise, and with no
+                            // document to carry them those bytes were
+                            // silently erased — a fully commented-out
+                            // config file came back empty. Carry them
+                            // as one rootless document; the faithful
+                            // emitter re-emits a null root's region
+                            // verbatim.
+                            var only = Document.init(allocator);
+                            errdefer only.deinit();
+                            only.source = try only.pool.dupe(input);
+                            only.region_start = 0;
+                            only.body_start = input.len;
+                            only.body_end = input.len;
+                            only.region_end = input.len;
+                            try docs.append(allocator, only);
                         }
                     }
                 },

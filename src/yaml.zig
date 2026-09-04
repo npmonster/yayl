@@ -636,9 +636,54 @@ test "document marker streams" {
         try std.testing.expectEqualStrings("", docs.items[1].root.?.scalarValue().?);
     }
 
-    // A lone '...' produces no document at all (HWV9).
+    // A lone '...' carries no NODE content (HWV9), but it is still
+    // bytes, and `writeAll(parseAll(x)) == x` is a documented promise.
+    // So the stream yields one document with a null root whose region is
+    // those bytes, rather than nothing at all.
+    //
+    // This is a deliberate divergence from "a stream with no document
+    // produces no documents". Returning nothing meant a file that is
+    // entirely comments — a fully commented-out config — came back
+    // EMPTY, which is the one answer a library whose pitch is "the
+    // others eat your comments" cannot give. Consumers that iterate
+    // documents must tolerate `root == null`, which `parse` has always
+    // been able to return anyway.
     {
         var docs = try parseAll(allocator, "...\n");
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        try std.testing.expectEqual(@as(usize, 1), docs.items.len);
+        try std.testing.expect(docs.items[0].root == null);
+
+        const out = try writeAll(allocator, docs.items);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings("...\n", out);
+    }
+
+    // The same for a comment-only stream, which is the shape that
+    // matters in practice.
+    {
+        const inputs = [_][]const u8{ "# just a comment\n", "# a\n\n# b\n", "\n\n" };
+        for (inputs) |input| {
+            var docs = try parseAll(allocator, input);
+            defer {
+                for (docs.items) |*d| d.deinit();
+                docs.deinit(allocator);
+            }
+            try std.testing.expectEqual(@as(usize, 1), docs.items.len);
+            try std.testing.expect(docs.items[0].root == null);
+            const out = try writeAll(allocator, docs.items);
+            defer allocator.free(out);
+            try std.testing.expectEqualStrings(input, out);
+        }
+    }
+
+    // Genuinely empty input still yields nothing: there are no bytes to
+    // preserve, so there is nothing to carry.
+    {
+        var docs = try parseAll(allocator, "");
         defer {
             for (docs.items) |*d| d.deinit();
             docs.deinit(allocator);
