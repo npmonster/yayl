@@ -144,6 +144,156 @@ fn fuzzOnce(allocator: std.mem.Allocator, input: []const u8) !void {
         try fuzzSchema(allocator, root);
         try fuzzEdit(allocator, doc);
     }
+
+    // Path addressing, checked against the tree it was derived from.
+    // Unlike the fixed paths above this is an oracle rather than a
+    // smoke test: a path built by walking the document MUST resolve
+    // back, so a failure is a real addressing defect and not a miss.
+    if (docs.items.len > 0) try fuzzPaths(allocator, input);
+}
+
+/// One derived path and the node it was built for.
+const PathHit = struct { path: []u8, node: *yaml.Node };
+
+/// Append an addressable path for every reachable node, depth- and
+/// count-bounded. Aliases are recorded but never descended into, so a
+/// parsed alias cycle cannot make this loop.
+fn collectPaths(
+    allocator: std.mem.Allocator,
+    node: *yaml.Node,
+    prefix: []const u8,
+    out: *std.ArrayList(PathHit),
+    depth: usize,
+) !void {
+    if (depth > 5 or out.items.len >= 48) return;
+    switch (node.data) {
+        .mapping => |m| {
+            for (m.pairs.items) |pair| {
+                const key = pair.key.scalarValue() orelse continue;
+                // A duplicated key is not uniquely addressable: YAML
+                // permits duplicates, this library keeps them, and
+                // `lookup` returns the first by documented design. So
+                // the second one has no path of its own — skip it
+                // rather than assert a resolution that cannot hold.
+                var seen: usize = 0;
+                for (m.pairs.items) |other| {
+                    const ok = other.key.scalarValue() orelse continue;
+                    if (std.mem.eql(u8, ok, key)) seen += 1;
+                }
+                if (seen != 1) continue;
+                const seg = segmentFor(allocator, key) catch continue orelse continue;
+                defer allocator.free(seg);
+                const path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, seg });
+                try out.append(allocator, .{ .path = path, .node = pair.value });
+                try collectPaths(allocator, pair.value, path, out, depth + 1);
+            }
+        },
+        .sequence => |sq| {
+            for (sq.items.items, 0..) |item, i| {
+                const path = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ prefix, i });
+                try out.append(allocator, .{ .path = path, .node = item });
+                try collectPaths(allocator, item, path, out, depth + 1);
+            }
+        },
+        else => {},
+    }
+}
+
+/// The path segment addressing `key`, or null when the grammar cannot
+/// express it. The dotted form splits on `.` and `[`; the quoted forms
+/// have no escapes, so a key holding BOTH quote characters is
+/// unaddressable — documented in `Path.parse`, and not a defect.
+fn segmentFor(allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+    const dotted = std.mem.indexOfAny(u8, key, ".[") == null;
+    if (dotted and key.len > 0) return try std.fmt.allocPrint(allocator, ".{s}", .{key});
+    const has_dq = std.mem.indexOfScalar(u8, key, '"') != null;
+    const has_sq = std.mem.indexOfScalar(u8, key, '\'') != null;
+    if (has_dq and has_sq) return null;
+    if (has_dq) return try std.fmt.allocPrint(allocator, "['{s}']", .{key});
+    return try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{key});
+}
+
+/// Two oracles over the edit surface.
+///
+///   1. A path derived by walking the document resolves to the node it
+///      was derived FOR. Pointer equality, so an addressing bug cannot
+///      hide behind a coincidental match.
+///   2. Setting a scalar to the value it already has re-emits the
+///      document byte for byte. The preservation sweep asserts this
+///      over 13 fixtures; here it runs over every mutated corpus input
+///      the fuzzer produces.
+fn fuzzPaths(allocator: std.mem.Allocator, input: []const u8) !void {
+    var doc = yaml.parse(allocator, input) catch return;
+    defer doc.deinit();
+    const root = doc.root orelse return;
+
+    var hits: std.ArrayList(PathHit) = .empty;
+    defer {
+        for (hits.items) |h| allocator.free(h.path);
+        hits.deinit(allocator);
+    }
+    collectPaths(allocator, root, "$", &hits, 0) catch |err| {
+        try expectTypedError(err);
+        return;
+    };
+
+    const before = doc.write(allocator) catch |err| {
+        try expectTypedError(err);
+        return;
+    };
+    defer allocator.free(before);
+
+    var ed = yaml.edit.Editor.init(&doc);
+    for (hits.items) |h| {
+        const got = ed.one(h.path) catch |err| {
+            // A derived path must resolve. Anything else is a defect in
+            // the path grammar or in resolution, not a fuzz miss.
+            std.debug.print("fuzz: derived path {s} failed to resolve: {s}\n", .{ h.path, @errorName(err) });
+            return error.FuzzPathUnresolvable;
+        };
+        if (got != h.node) {
+            std.debug.print("fuzz: derived path {s} resolved to the wrong node\n", .{h.path});
+            return error.FuzzPathWrongNode;
+        }
+    }
+
+    // Set-to-same on the first addressable scalar: byte-identical.
+    //
+    // Same exclusions the preservation sweep documents, for the same
+    // reasons — these are normalizations, not defects:
+    //   - a node carrying an anchor or tag has a property preamble that
+    //     a bare replacement cannot reproduce, so replacing it drops
+    //     those bytes legitimately (`a: !1` -> `a:`)
+    //   - a multi-line value reflows when replaced
+    for (hits.items) |h| {
+        const text = switch (h.node.data) {
+            .scalar => |sc| sc.value,
+            else => continue,
+        };
+        if (h.node.anchor != null or h.node.tag != null) continue;
+        if (std.mem.indexOfAny(u8, text, "\n\r") != null) continue;
+        const style = h.node.data.scalar.style;
+        const same = doc.createScalar(text, style) catch |err| {
+            try expectTypedError(err);
+            return;
+        };
+        ed.set(h.path, same) catch |err| {
+            try expectTypedError(err);
+            return;
+        };
+        const after = doc.write(allocator) catch |err| {
+            try expectTypedError(err);
+            return;
+        };
+        defer allocator.free(after);
+        if (!std.mem.eql(u8, before, after)) {
+            std.debug.print("fuzz: set-to-same changed bytes at {s}\n  anchor={?s} tag={?s} style={s}\n  input ={any}\n  before={any}\n  after ={any}\n", .{
+                h.path, h.node.anchor, h.node.tag, @tagName(style), input, before, after,
+            });
+            return error.FuzzSetSameNotIdentical;
+        }
+        break;
+    }
 }
 
 /// Conversion, and the Value round trip back into a node.
@@ -363,11 +513,32 @@ pub fn runLong(allocator: std.mem.Allocator, io: std.Io, seed: u64, iterations: 
         }
     }
 
+    // Seed TRANSFORMS, not mutations. Byte flips almost never produce a
+    // document that is CONSISTENTLY terminated one way, but that global
+    // shape is exactly what the line-handling code branches on: the
+    // emitter's terminator convention only matters when a whole
+    // document uses it. A wholly CR-terminated stream hit three
+    // `\n`-only sites at once and grew without bound; mutation found it
+    // only by luck, at iteration 224765. Re-running every seed with its
+    // line endings rewritten reaches that class on purpose.
+    const base_count = seeds.items.len;
+    for (0..base_count) |i| {
+        const original = seeds.items[i];
+        for ([_][]const u8{ "\r", "\r\n" }) |eol| {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(allocator);
+            for (original) |c| {
+                if (c == '\n') try out.appendSlice(allocator, eol) else try out.append(allocator, c);
+            }
+            try seeds.append(allocator, try out.toOwnedSlice(allocator));
+        }
+    }
+
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
     var buf: [4096]u8 = undefined;
     var iteration: usize = 0;
-    std.debug.print("fuzz: seed {d}, iterations {d}, seeds {d}\n", .{ seed, iterations, seeds.items.len });
+    std.debug.print("fuzz: seed {d}, iterations {d}, seeds {d} ({d} base + CR/CRLF transforms)\n", .{ seed, iterations, seeds.items.len, base_count });
     while (iteration < iterations) : (iteration += 1) {
         const base = seeds.items[random.uintLessThan(usize, seeds.items.len)];
         const input = mutate(random, base, &buf);

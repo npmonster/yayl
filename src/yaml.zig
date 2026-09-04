@@ -522,6 +522,54 @@ test "a lone CR ends a line, so a document region cannot swallow the next marker
     }
 }
 
+test "a wholly CR-terminated stream round-trips and is a fixpoint" {
+    const allocator = std.testing.allocator;
+
+    // Found by the extended fuzz harness (seed 303, iteration 224765).
+    //
+    // Three sites knew only `\n`, and a document terminated entirely by
+    // lone CRs hit all of them at once:
+    //   - `Emitter.endsWithNewline` read a trailing `\r` as "not at a
+    //     line start", so the caller wrote a second terminator;
+    //   - `Emitter.pendingLine` measured the current column from the
+    //     last `\n`, so it spanned CR-terminated lines;
+    //   - `startsDocument`/`endsStream` split on `\n` before trimming
+    //     `\r`, so `---\r-` was one line, did not read as a marker, and
+    //     `writeAll` injected another `---`.
+    // `-\r---\r-` came back as `-\r\n---\n---\r-` and grew from there.
+    const cases = [_][]const u8{
+        "-\r---\r-",
+        "a\r---\ra",
+        "-\r---\r",
+        "-\r-",
+        "a: 1\rb: 2\r",
+        "# c\ra: 1\r",
+        // Mixed conventions in one stream, which is legal and which the
+        // line-start fixes must not disturb.
+        "-\r---\n-",
+        "a: 1\r\nb: 2\r",
+    };
+    for (cases) |input| {
+        var docs = try parseAll(allocator, input);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        const first = try writeAll(allocator, docs.items);
+        defer allocator.free(first);
+        try std.testing.expectEqualStrings(input, first);
+
+        var again = try parseAll(allocator, first);
+        defer {
+            for (again.items) |*d| d.deinit();
+            again.deinit(allocator);
+        }
+        const second = try writeAll(allocator, again.items);
+        defer allocator.free(second);
+        try std.testing.expectEqualStrings(first, second);
+    }
+}
+
 test "a document region never swallows the next document's marker" {
     const allocator = std.testing.allocator;
 

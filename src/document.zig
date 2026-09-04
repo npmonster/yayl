@@ -812,11 +812,32 @@ pub const Document = struct {
     /// they would break the adjacency that makes the block re-readable.
     fn normalizeLeadingText(raw: []const u8) ![]const u8 {
         var t = raw;
-        if (std.mem.endsWith(u8, t, "\r\n")) t = t[0 .. t.len - 2];
-        if (std.mem.endsWith(u8, t, "\n")) t = t[0 .. t.len - 1];
+        if (std.mem.endsWith(u8, t, "\r\n"))
+            t = t[0 .. t.len - 2]
+        else if (std.mem.endsWith(u8, t, "\n") or std.mem.endsWith(u8, t, "\r"))
+            t = t[0 .. t.len - 1];
         if (t.len == 0) return error.InvalidSyntax;
+
+        // A CR is only ever the first byte of a CRLF separator. A LONE
+        // CR is a YAML line break (§5.4), so it ends the comment and
+        // whatever follows becomes document structure on reparse:
+        // `setLeadingComments(n, "# c\rinjected: yes")` split on `\n`
+        // alone is one "line" starting with `#`, validates, is emitted
+        // raw, and comes back as a real mapping entry. That is caller
+        // input crossing a validation boundary into document structure.
+        // `validateTrailingText` closes the same hole by refusing CR
+        // outright; the leading side has to allow CRLF between lines,
+        // so it refuses the lone form specifically.
+        for (t, 0..) |c, i| {
+            if (c == '\r' and (i + 1 >= t.len or t[i + 1] != '\n')) return error.InvalidSyntax;
+        }
+
         var it = std.mem.splitScalar(u8, t, '\n');
-        while (it.next()) |line| {
+        while (it.next()) |raw_line| {
+            const line = if (std.mem.endsWith(u8, raw_line, "\r"))
+                raw_line[0 .. raw_line.len - 1]
+            else
+                raw_line;
             var i: usize = 0;
             while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
             if (i >= line.len or line[i] != '#') return error.InvalidSyntax;
@@ -1152,10 +1173,40 @@ pub fn writeAllOpts(allocator: std.mem.Allocator, docs: []const Document, option
 /// True when `text` opens a new document — its first line that is not
 /// blank, a comment or a directive is a `---` marker. Directives imply
 /// one, since a directive can only precede a document start.
+/// Iterate lines on any YAML line break — `\n`, `\r\n`, or a lone `\r`
+/// (§5.4 `b-break ::= CRLF | CR | LF`) — yielding each line without its
+/// terminator. Splitting on `\n` alone left a wholly CR-terminated
+/// document as a single "line", so `---\r-` did not read as a marker
+/// and `writeAll` injected a second one.
+const LineIter = struct {
+    src: []const u8,
+    i: usize = 0,
+
+    fn next(self: *LineIter) ?[]const u8 {
+        if (self.i >= self.src.len) return null;
+        const start = self.i;
+        while (self.i < self.src.len) : (self.i += 1) {
+            switch (self.src[self.i]) {
+                '\n' => {
+                    const line = self.src[start..self.i];
+                    self.i += 1;
+                    return line;
+                },
+                '\r' => {
+                    const line = self.src[start..self.i];
+                    self.i += if (self.i + 1 < self.src.len and self.src[self.i + 1] == '\n') 2 else 1;
+                    return line;
+                },
+                else => {},
+            }
+        }
+        return self.src[start..];
+    }
+};
+
 fn startsDocument(text: []const u8) bool {
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |raw| {
-        const line = std.mem.trimEnd(u8, raw, "\r");
+    var it: LineIter = .{ .src = text };
+    while (it.next()) |line| {
         const trimmed = std.mem.trimStart(u8, line, " \t");
         if (trimmed.len == 0) continue;
         if (trimmed[0] == '#') continue;
@@ -1169,10 +1220,9 @@ fn startsDocument(text: []const u8) bool {
 /// True when `text` ends with an explicit `...` end-of-document marker,
 /// which is itself a boundary: the next document needs no `---`.
 fn endsStream(text: []const u8) bool {
-    var it = std.mem.splitScalar(u8, text, '\n');
+    var it: LineIter = .{ .src = text };
     var last: []const u8 = "";
-    while (it.next()) |raw| {
-        const line = std.mem.trimEnd(u8, raw, "\r");
+    while (it.next()) |line| {
         if (std.mem.trim(u8, line, " \t").len == 0) continue;
         last = line;
     }
@@ -2039,6 +2089,71 @@ test "comment write: set, change, delete a trailing comment" {
             "# service configuration\nname: api   # user facing\n# stale, replaced below\nport: 8080\n\n# separated from port by a blank line\ndebug: false\n",
             out,
         );
+    }
+}
+
+test "comment writes cannot smuggle structure through a lone CR" {
+    const allocator = testing.allocator;
+
+    // `validateTrailingText` rejects both `\n` and `\r`, because a
+    // comment that contains a line break stops being a comment on the
+    // next line. `normalizeLeadingText` split on `\n` only, so a lone
+    // CR passed validation as part of one "line" that started with `#`,
+    // was emitted raw, and — a lone CR being a YAML line break — came
+    // back on reparse as a real mapping entry. A validation boundary
+    // that lets the caller inject document structure.
+    {
+        var doc = try Document.parse(allocator, "a: 1\nb: 2\n");
+        defer doc.deinit();
+        const node = doc.pathGet(&.{"b"}).?;
+        try testing.expectError(
+            error.InvalidSyntax,
+            doc.setLeadingComments(node, "# c\rinjected: yes"),
+        );
+    }
+
+    // The trailing side already refused it; assert that it stays so.
+    {
+        var doc = try Document.parse(allocator, "a: 1\n");
+        defer doc.deinit();
+        const node = doc.pathGet(&.{"a"}).?;
+        try testing.expectError(
+            error.InvalidSyntax,
+            doc.setTrailingComment(node, "# c\rinjected: yes"),
+        );
+        try testing.expectError(
+            error.InvalidSyntax,
+            doc.setTrailingComment(node, "# c\ninjected: yes"),
+        );
+    }
+
+    // A CR inside a *multi-line* leading block is refused too, not just
+    // one that happens to be the whole text.
+    {
+        var doc = try Document.parse(allocator, "a: 1\nb: 2\n");
+        defer doc.deinit();
+        const node = doc.pathGet(&.{"b"}).?;
+        try testing.expectError(
+            error.InvalidSyntax,
+            doc.setLeadingComments(node, "# one\n# two\rinjected: yes"),
+        );
+    }
+
+    // Legitimate CRLF-terminated blocks still work: the terminator is
+    // stripped, not treated as smuggled structure.
+    {
+        var doc = try Document.parse(allocator, "a: 1\nb: 2\n");
+        defer doc.deinit();
+        const node = doc.pathGet(&.{"b"}).?;
+        try doc.setLeadingComments(node, "# fine\r\n");
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "# fine") != null);
+
+        // And what came back is still two entries, not three.
+        var again = try Document.parse(allocator, out);
+        defer again.deinit();
+        try testing.expectEqual(@as(usize, 2), again.root.?.pairs().?.len);
     }
 }
 

@@ -3,6 +3,50 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Fixed
+
+**A comment write could smuggle document structure through a lone CR.**
+`setLeadingComments` validated its text by splitting on `\n` and
+requiring each line to start with `#`. A lone `\r` is a YAML line break
+but not a `\n`, so `"# c\rinjected: yes"` was one "line" starting with
+`#`: it passed validation, was emitted raw, and came back on reparse as
+a real mapping entry. Caller input crossing a validation boundary into
+document structure. `setTrailingComment` already refused CR outright;
+the leading side has to permit CRLF between lines, so it now refuses the
+lone form specifically.
+
+**A wholly CR-terminated stream was neither byte-faithful nor a
+fixpoint.** Three sites knew only `\n` and a lone-CR document hit them
+together: `Emitter.endsWithNewline` read a trailing `\r` as "not at a
+line start" and wrote a second terminator; `Emitter.pendingLine`
+measured the current column from the last `\n`, spanning CR-terminated
+lines, which is the column re-emitted blocks are indented against; and
+`startsDocument`/`endsStream` split on `\n` before trimming `\r`, so
+`---\r-` was a single line, did not read as a marker, and `writeAll`
+injected another `---`. `-\r---\r-` re-emitted as `-\r\n---\n---\r-`
+and grew from there. Found at seed 303, iteration 224765.
+
+### Changed
+
+**The fuzz harness applies seed transforms, not just mutations.** Byte
+flips almost never produce a document terminated *consistently* one way,
+but that global shape is what the line-handling code branches on — the
+emitter's terminator convention only matters when a whole document uses
+it. Every seed now also runs with its line endings rewritten to CR and
+to CRLF, taking the long run from 381 seeds to 1143 and reaching that
+class deliberately rather than by luck.
+
+**The fuzz harness derives edit paths from the parsed tree.** It used
+eight literal paths, which on a mutated non-mapping input resolve to
+nothing, so the edit surface saw almost no real positions. Paths are now
+built by walking each document, giving two oracles: a derived path must
+resolve to the node it was derived for (pointer equality), and setting a
+scalar to the value it already has must re-emit byte for byte. Duplicate
+keys and nodes carrying an anchor or tag are excluded, both for
+documented reasons.
+
 ## 0.15.0 — 2026-09-04
 
 ### Fixed

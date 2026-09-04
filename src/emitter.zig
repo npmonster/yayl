@@ -136,16 +136,29 @@ pub const Emitter = struct {
         try self.writeIndent(indent);
     }
 
+    /// Is the output currently positioned at the start of a line? All
+    /// three YAML line breaks count — a chunk emitted verbatim from a
+    /// CR-terminated document ends in `\r`, and treating that as
+    /// "no newline yet" made the caller write a second terminator.
     fn endsWithNewline(self: *const Emitter) bool {
-        return self.out.items.len > 0 and self.out.items[self.out.items.len - 1] == '\n';
+        const items = self.out.items;
+        if (items.len == 0) return false;
+        const last = items[items.len - 1];
+        return last == '\n' or last == '\r';
     }
 
     /// The bytes written since the last line terminator: the partially
-    /// built current line.
+    /// built current line. Measured from any break, for the same reason
+    /// as `endsWithNewline` — measuring from the last `\n` alone made
+    /// the current column wrong across CR-terminated lines, and the
+    /// column is what re-emitted blocks are indented against.
     fn pendingLine(self: *const Emitter) []const u8 {
         const items = self.out.items;
-        const start = if (std.mem.lastIndexOfScalar(u8, items, '\n')) |i| i + 1 else 0;
-        return items[start..];
+        var i = items.len;
+        while (i > 0) : (i -= 1) {
+            if (items[i - 1] == '\n' or items[i - 1] == '\r') return items[i..];
+        }
+        return items;
     }
 
     /// Write the framing bytes a container carries ahead of its first
