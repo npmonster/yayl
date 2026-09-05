@@ -468,6 +468,48 @@ pub const Emitter = struct {
         }
     }
 
+    /// A block scalar's token can swallow trailing empty lines the
+    /// chomping then discards or keeps as value; its slot ends before
+    /// them, so they sit at the start of the next entry's gap. A
+    /// BRAND-NEW entry must write them BEFORE itself — they are the
+    /// block's kept trailing breaks or its separator — or they end up
+    /// after it and a keep-chomped block loses its content (corpus
+    /// K858, found by the preservation sweep). Returns the advanced gap
+    /// offset. Only fires when the sibling ending at `gap` is a block
+    /// scalar; blanks after other scalars stay separator-in-the-gap.
+    fn consumeBlockTrailingBlanks(self: *Emitter, container: *const Node, gap: usize) Error!usize {
+        const src = self.src;
+        var prev_value: ?*const Node = null;
+        switch (container.data) {
+            .mapping => |m| for (m.pairs.items) |p| {
+                if (p.value.src) |vs| {
+                    if (vs.end <= gap) prev_value = p.value;
+                }
+            },
+            .sequence => |sq| for (sq.items.items) |it| {
+                if (it.src) |is| {
+                    if (is.end <= gap) prev_value = it;
+                }
+            },
+            else => {},
+        }
+        const v = prev_value orelse return gap;
+        if (v.kind() != .scalar) return gap;
+        if (v.data.scalar.style != .literal and v.data.scalar.style != .folded) return gap;
+
+        var g = gap;
+        while (g < src.len) {
+            const nl = markup.newlineAt(src, g);
+            if (std.mem.indexOfNone(u8, src[g..nl], " \t\r") != null) break; // content line
+            g = if (nl < src.len) nl + 1 else src.len;
+        }
+        if (g > gap) {
+            try self.write(src[gap..g]);
+            return g;
+        }
+        return gap;
+    }
+
     /// Emit a mapping entry. `gap_start` is where this entry's leading
     /// gap begins in the source; returns where the next gap begins.
     fn emitPair(self: *Emitter, container: *const Node, pair: Pair, entry_col: usize, gap_start: usize) Error!usize {
@@ -571,6 +613,7 @@ pub const Emitter = struct {
                 owed_terminator = true;
             }
             gap = try self.writeContainerFraming(container, gap);
+            gap = try self.consumeBlockTrailingBlanks(container, gap);
             const pending = internal.pairLeadingOverride(src, key, value);
             if (pending != null) {
                 // Written lines terminate themselves and end with the
@@ -752,6 +795,7 @@ pub const Emitter = struct {
                 owed_terminator = true; // see the pair case
             }
             gap = try self.writeContainerFraming(container, gap);
+            gap = try self.consumeBlockTrailingBlanks(container, gap);
             if (item.pending_leading) |pt| {
                 // Written lines terminate themselves and end with the
                 // indentation the entry continues on.
