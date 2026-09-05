@@ -362,6 +362,18 @@ pub const Emitter = struct {
             // into the tail (when the last surviving entry is new).
             const before = self.out.items.len;
             if (doc.root != null and doc.root.?.src != null) {
+                // A tombstone can consume the terminator that separated
+                // the document's last emission from a surviving tail
+                // comment — deleting the only real entry of a document
+                // with a trailing comment emitted `{}# delta`, which
+                // does not parse. When the first LIVE tail byte is a
+                // comment and the cursor is mid-line, re-own the break.
+                // (Surfaced when `parse` stopped dropping the tail.)
+                if (!self.endsWithNewline() and
+                    self.firstLiveTailByte(doc.root.?, stop, doc.region_end) == '#')
+                {
+                    try self.writeByte('\n');
+                }
                 try self.writeGap(doc.root.?, stop, doc.region_end);
             } else {
                 try self.write(src[stop..doc.region_end]);
@@ -1039,6 +1051,25 @@ pub const Emitter = struct {
             try self.write(src[i..to]);
             return;
         }
+    }
+
+    /// The first byte at/after `from` that a tombstone does not cover,
+    /// up to `to`; 0 when the whole range is deleted or empty. Used to
+    /// decide whether the verbatim tail opens with a comment.
+    fn firstLiveTailByte(self: *const Emitter, container: *const Node, from: usize, to: usize) u8 {
+        const src = self.src;
+        var i: usize = from;
+        outer: while (i < to) {
+            for (Document.droppedOf(container)) |d| {
+                if (d[0] < to and d[1] > i) {
+                    if (d[0] > i) return if (d[0] <= to) src[i] else 0;
+                    i = @max(i, d[1]);
+                    continue :outer;
+                }
+            }
+            return src[i];
+        }
+        return 0;
     }
 
     /// True when `offset` falls inside one of `container`'s tombstoned

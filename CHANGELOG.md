@@ -7,6 +7,24 @@ series; APIs may still move, and anything that does is listed here.
 
 ### Fixed
 
+**`parse` kept dropping the document's tail.** The single-document
+entry point stopped before the stream-end bookkeeping that hands the
+last document its tail, so `write(parse("a: 1\n# c\n"))` came back as
+`a: 1\n` — the exact "eats your comments" failure this library exists
+to prevent, through the most common API. `parseAll` was always exact.
+The tail is now claimed when only blank and comment lines follow the
+first document; a `---`, a directive, or a bare document after `...`
+still clamps the region in front of the next one, and a malformed
+second document still cannot fail a successful first parse.
+
+**Deleting the last real entry glued the emptied container to a
+surviving tail comment.** `# head\nkey: value # tail\n# delta` minus
+`$.key` emitted `{}# delta` — the deleted entry's tombstone consumed
+the terminator separating `{}` from the comment. Found by the fuzz
+harness's edit oracle the moment the tail stopped being dropped. The
+tail now re-owns the break when the first live byte after the
+deletions is a comment and the cursor is mid-line.
+
 **A comment write could smuggle document structure through a lone CR.**
 `setLeadingComments` validated its text by splitting on `\n` and
 requiring each line to start with `#`. A lone `\r` is a YAML line break
@@ -16,29 +34,6 @@ a real mapping entry. Caller input crossing a validation boundary into
 document structure. `setTrailingComment` already refused CR outright;
 the leading side has to permit CRLF between lines, so it now refuses the
 lone form specifically.
-
-**A `move` could put an alias ahead of its anchor.** The dangling-alias
-guard covered `delete` and `set` but exempted `move`, on the grounds
-that the anchor survives. It survives, but an alias needs the anchor to
-come *before* it, and a move only appends at the destination — so
-`- &x 1` moved to the end of `- &x 1\n- *x\n` emitted `- *x\n- &x 1\n`,
-which does not parse. `move` now returns `error.AnchorReferenced` when
-an anchor/alias pair crosses the moved subtree's boundary in either
-direction. A move whose anchor and alias travel together preserves their
-order and stays allowed.
-
-**A mutation through an alias path failed dishonestly.** Reads forward
-through aliases and `docs/USAGE.md` says so; writes did not.
-`mappingReplace`/`mappingRemove` switch on the node's own data, hit
-`.alias`, and the caller reported `error.InvalidSyntax` — which blames
-the path — or, for `delete`, swallowed it as "matched nothing" and
-returned **success while changing nothing**. `set`, `delete`, `append`
-and `insert` on an alias container now return `error.AliasPath`.
-
-Editing the shared target through the *anchor* side works and is the
-supported route. Whether writes should forward through an alias the way
-reads do is a semantic decision, deliberately left open rather than
-settled by accident.
 
 **An edit in a CR-terminated document duplicated an entry.**
 `markup.entryStart` walks back from a key to find the `-` or `?` that

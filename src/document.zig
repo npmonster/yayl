@@ -580,7 +580,21 @@ pub const Document = struct {
                     try docs.append(allocator, d);
                     doc = null;
                     if (docs.items.len > 0) cursor = docs.items[docs.items.len - 1].region_end;
-                    if (limit) |l| if (docs.items.len >= l) break;
+                    if (limit) |l| if (docs.items.len >= l) {
+                        // Stopping here skips the stream_end arm below,
+                        // which is where the last document claims its
+                        // tail. Claim it now when only blank and comment
+                        // lines remain; a directive or any content means
+                        // another document follows (`a: 1\n...\nb: 2\n`
+                        // needs no `---`), and the clamped region already
+                        // stops in front of it. Decided on the bytes, not
+                        // by peeking the parser: a malformed second
+                        // document must not fail, or diagnose, a
+                        // successful single-document parse.
+                        const last = &docs.items[docs.items.len - 1];
+                        if (isTrailer(input[last.region_end..])) last.region_end = input.len;
+                        break;
+                    };
                 },
                 .stream_start, .stream_end => {
                     if (ev.data == .stream_end) {
@@ -1276,6 +1290,19 @@ fn startsDocument(text: []const u8) bool {
     return false;
 }
 
+/// True when `text` is nothing but blank and comment lines: the tail a
+/// document may own after its content. A directive line is not one; it
+/// opens the next document.
+fn isTrailer(text: []const u8) bool {
+    var it: LineIter = .{ .src = text };
+    while (it.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (trimmed.len == 0) continue;
+        if (trimmed[0] != '#') return false;
+    }
+    return true;
+}
+
 /// True when `text` ends with an explicit `...` end-of-document marker,
 /// which is itself a boundary: the next document needs no `---`.
 fn endsStream(text: []const u8) bool {
@@ -1875,6 +1902,46 @@ fn editWrite(allocator: std.mem.Allocator) !void {
     defer allocator.free(out);
 }
 
+test "parse keeps the document's tail: trailing comments and blank lines round-trip" {
+    // `parse` stops after the first document and used to skip the
+    // stream_end bookkeeping that hands the last document its tail, so
+    // `a: 1\n# c\n` came back as `a: 1\n` — through the single-document
+    // API only; `writeAll(parseAll(x))` was already exact.
+    const kept = [_][]const u8{
+        "a: 1\n# c\n",
+        "a: 1\n\n\n",
+        "a: 1\n\n# c\n\n",
+        "a: 1 # t\n\n",
+        "a: 1\r\n\r\n",
+        "a: 1\r\r# c\r",
+        "- 1\n\n",
+        "a:\n  b: 1\n\n",
+        "a: 1\n...\n\n# after the end marker\n",
+        "x\n\n",
+    };
+    for (kept) |input| {
+        var doc = try Document.parse(std.testing.allocator, input);
+        defer doc.deinit();
+        const out = try doc.write(std.testing.allocator);
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(input, out);
+    }
+    // Whatever follows the first document is not its tail: a `---`, a
+    // directive, or a bare document after `...` all stay out.
+    const clamped = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "a: 1\n---\nb: 2\n\n", .out = "a: 1\n" },
+        .{ .in = "a: 1\n# c\n%YAML 1.2\n---\nb: 2\n", .out = "a: 1\n" },
+        .{ .in = "a: 1\n...\nb: 2\n\n", .out = "a: 1\n...\n" },
+    };
+    for (clamped) |c| {
+        var doc = try Document.parse(std.testing.allocator, c.in);
+        defer doc.deinit();
+        const out = try doc.write(std.testing.allocator);
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualStrings(c.out, out);
+    }
+}
+
 test "writeAll reproduces a parsed stream byte for byte" {
     const allocator = std.testing.allocator;
     const cases = [_][]const u8{
@@ -2406,4 +2473,22 @@ test "read paths walk sequence indices like the edit grammar" {
     try testing.expectEqualStrings("map key", doc.pathGet(&.{"0"}).?.scalarValue().?);
     // Non-numeric segments on a sequence stay null.
     try testing.expect(doc.pathGet(&.{ "items", "first" }) == null);
+}
+
+test "deleting the last entry keeps the tail comment on its own line" {
+    // Fuzz-found (seed 0xF022, iteration 206) the moment parse stopped
+    // dropping the tail: the tombstone consumed the terminator that
+    // separated the emptied container from the surviving comment.
+    var doc = try Document.parse(testing.allocator, "# head\nkey: value # tail\n# delta");
+    defer doc.deinit();
+    try testing.expect(try doc.pathDelete(&.{"key"}));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# head\n{}\n# delta", out);
+
+    var again = try Document.parse(testing.allocator, out);
+    defer again.deinit();
+    const out2 = try again.write(testing.allocator);
+    defer testing.allocator.free(out2);
+    try testing.expectEqualStrings(out, out2);
 }
