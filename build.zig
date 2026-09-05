@@ -97,6 +97,23 @@ pub fn build(b: *std.Build) void {
     dump_step.dependOn(&dump_install.step);
     b.getInstallStep().dependOn(&dump_install.step);
 
+    // Emit CLI for the emission oracle (scripts/emission-oracle.sh):
+    // parse a YAML file, write yayl's emitted bytes, so an INDEPENDENT
+    // parser (libfyaml) can check that it accepts what we produce.
+    const emit_exe = b.addExecutable(.{
+        .name = "emit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/emit.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "yayl", .module = module }},
+        }),
+    });
+    const emit_install = b.addInstallArtifact(emit_exe, .{});
+    const emit_step = b.step("emit", "Build the emission-oracle emit CLI");
+    emit_step.dependOn(&emit_install.step);
+    b.getInstallStep().dependOn(&emit_install.step);
+
     // Throughput benchmark CLI (PLAN-8): measured numbers for the docs.
     const bench_exe = b.addExecutable(.{
         .name = "bench",

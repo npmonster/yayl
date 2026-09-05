@@ -8,7 +8,7 @@ ZIG ?= zig
 .DEFAULT_GOAL := help
 .MAIN: help
 
-.PHONY: help all build check test test-release examples fmt fmt-write docs corpus libfyaml conformance roundtrip preservation differential consume verify clean
+.PHONY: help all build check test test-release examples fmt fmt-write docs corpus libfyaml conformance roundtrip preservation differential emission-oracle consume verify clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' Makefile
@@ -58,6 +58,9 @@ preservation: ## Edit-preservation sweeps over tests/fixtures (edits change only
 
 differential: corpus libfyaml ## Compare yayl vs libfyaml event streams over the corpus (needs a C compiler)
 	sh scripts/differential.sh
+
+emission-oracle: corpus libfyaml ## Assert libfyaml can parse every document yayl emits (needs a C compiler)
+	sh scripts/emission-oracle.sh
 
 # The only gate that consumes the library the way a dependent does:
 # `zig fetch` applies `.paths` from build.zig.zon, so a source file

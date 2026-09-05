@@ -96,6 +96,31 @@ jobs:
       - name: Bench hot paths over fixtures and corpus (ReleaseFast)
         run: sh scripts/bench-corpus.sh 20
 
+  # The emission oracle checks every document yayl emits with an
+  # INDEPENDENT parser (the vendored libfyaml), closing the loop the
+  # round-trip gate cannot: yayl's parser re-reading yayl's output
+  # shares its author's spec misreadings. Report-only while it soaks;
+  # the intent is to gate once it has a clean history.
+  emission-oracle:
+    name: Emission oracle (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Fetch pinned corpora
+        run: |
+          sh scripts/fetch-corpus.sh
+          sh scripts/fetch-libfyaml.sh
+
+      - name: Assert libfyaml parses everything yayl emits
+        run: sh scripts/emission-oracle.sh
+
   # The in-tree gates above all build from the working tree, so they
   # cannot see the one failure mode that breaks every dependent while
   # staying green here: a source file missing from `.paths` in

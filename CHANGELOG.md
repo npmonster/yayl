@@ -5,6 +5,16 @@ series; APIs may still move, and anything that does is listed here.
 
 ## Unreleased
 
+### Added
+
+**The emission oracle.** `make emission-oracle` (and a report-only CI
+job) checks every document yayl emits over the corpus and fixtures with
+an INDEPENDENT parser — the vendored libfyaml — closing the assurance
+gap where yayl's own parser re-read yayl's output and shared its
+author's assumptions. Parseability only: a byte-faithful emitter's
+output is not supposed to match libfyaml's, it is supposed to parse.
+First full run: 277/277 emitted documents accepted.
+
 ### Fixed
 
 **`delete("$..k")` no longer fails backwards on its own grammar.** A
