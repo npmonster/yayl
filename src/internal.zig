@@ -97,6 +97,35 @@ pub fn dropRange(self: *Document, drops: *std.ArrayList([2]usize), from: usize, 
 /// after detaching, it tombstones the wrong bytes silently. Returns
 /// early for flow containers — an emitter gap-walk invariant, not a
 /// document-model one.
+/// The framing an entry's leading bytes [from, to) carry: the offset of
+/// the last `-` sequence-item indicator, and of the `?` explicit-key
+/// indicator after it, when present. Only indentation, indicators, line
+/// breaks and node properties sit there; an indicator is followed by a
+/// blank or a line break (`-\n  name: x` is an item whose dash sits on
+/// its own line), while a `-` inside an anchor or tag name is not.
+const Framing = struct { dash: ?usize = null, question: ?usize = null };
+
+fn entryFraming(src: []const u8, from: usize, to: usize) Framing {
+    var f = Framing{};
+    var i = from;
+    while (i < to) : (i += 1) {
+        const c = src[i];
+        if (c != '-' and c != '?') continue;
+        const followed = i + 1 >= to or switch (src[i + 1]) {
+            ' ', '\t', '\n', '\r' => true,
+            else => false,
+        };
+        if (!followed) continue;
+        if (c == '-') {
+            f.dash = i;
+            f.question = null; // a `?` before this dash belongs to an outer key
+        } else if (f.question == null) {
+            f.question = i;
+        }
+    }
+    return f;
+}
+
 pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
     const src = self.source orelse return;
     const ks = p.key.src orelse return;
@@ -118,10 +147,27 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
             // (`- name: x` + `  port: 1` -> `- port: 1`). Only when
             // nothing but blanks separates them: a comment in
             // between has to stay where the author put it.
-            if (ks.entry_start < ks.start) {
+            //
+            // Only a `-` in those leading bytes is such an indicator.
+            // An explicit key's `? ` sits there too (`? a\n: 1`), but
+            // it is the entry's own: keeping it left a bare `? ` behind,
+            // which reads back as a null key nobody wrote. The LAST dash
+            // is the one that frames this mapping (`- - a: 1` nests two
+            // items).
+            // Scan from the line start, not from `entry_start`: an
+            // explicit key's span begins at its own `?`, and the item's
+            // `- ` ahead of it on the same line is the mapping's.
+            const fr = entryFraming(src, markup.lineStart(src, ks.entry_start), ks.start);
+            if (fr.dash) |dash| {
+                // Everything from the indicator up to the key -- its
+                // blanks, or a line break and the indentation after it
+                // (`-\n  name: x`) -- stays, except an explicit key's
+                // own `?` and what follows it (`- ? a` keeps `- `).
+                const after_dash = dash + 1;
+                const keep = fr.question orelse ks.start;
                 if (nextEntryStart(m, p)) |nx| {
                     if (nx >= to and isBlankRun(src[to..nx])) {
-                        from = ks.start;
+                        from = keep;
                         to = nx;
                     } else {
                         // Something the author wrote — a comment —
@@ -130,8 +176,8 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
                         // move up. Keep the indicator on its own
                         // line (dropping the space after it) and
                         // remove only this entry's own text.
-                        from = ks.start;
-                        while (from > ks.entry_start and src[from - 1] == ' ') from -= 1;
+                        from = keep;
+                        while (from > after_dash and src[from - 1] == ' ') from -= 1;
                         to = markup.newlineAt(src, p.src_end orelse ks.end);
                     }
                 } else {
@@ -143,7 +189,7 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
                     // deletes a sequence entry nobody asked to
                     // delete and leaves the `{}` dangling at the
                     // parent's column, which does not parse.
-                    from = ks.start;
+                    from = keep;
                     to = markup.newlineAt(src, p.src_end orelse ks.end);
                 }
             }

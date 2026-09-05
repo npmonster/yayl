@@ -495,10 +495,26 @@ pub const Emitter = struct {
             // bytes to the wrong line.
             var gap = gap_start;
             var owed_terminator = false;
-            if (!self.endsWithNewline() and markup.newlineAt(src, gap) > gap) {
-                gap = try self.writeRemainder(gap);
-                // `writeRemainder` took the line terminator along with
-                // the remainder; this entry now owes the line ending.
+            // "Still open" means a previous ENTRY is on the pending
+            // line — not that the output happens not to end in a
+            // newline. Nothing written yet, or only indentation and
+            // `- ` framing, is this entry's own line, and the source
+            // bytes ahead of the gap are then the container's FIRST
+            // line: when every original entry was deleted, that line
+            // is a tombstone. Copying it verbatim resurrected the
+            // deleted entry (`a: 1` minus `$.a` plus `$.b` came back as
+            // `a: 1\nb: Z\n`), and at the first item of a sequence
+            // glued the new key after the old one, which did not parse.
+            // The remainder is written through the tombstone-aware gap
+            // walk for the same reason.
+            const open = self.pendingLine();
+            if (open.len > 0 and !isEntryFraming(open) and markup.newlineAt(src, gap) > gap) {
+                const le = markup.lineEnd(src, gap);
+                try self.writeGap(container, gap, le);
+                gap = le;
+                // The remainder took the line terminator along with it
+                // (or a tombstone did); this entry now owes the line
+                // ending either way.
                 owed_terminator = true;
             }
             gap = try self.writeContainerFraming(container, gap);

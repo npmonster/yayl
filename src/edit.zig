@@ -2150,3 +2150,69 @@ fn crossDocumentClone(allocator: std.mem.Allocator) !void {
     defer allocator.free(out);
     try testing.expectEqualStrings("small: 1\nimported:\n  x: [1, 2]\n  y: {z: 3}\n", out);
 }
+
+/// Delete `del`, then set `add` to a plain `Z`, both in memory, and
+/// return the emitted bytes.
+fn deleteThenSet(allocator: std.mem.Allocator, input: []const u8, del: []const u8, add: []const u8) ![]u8 {
+    var doc = try Document.parse(allocator, input);
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.delete(del);
+    try ed.set(add, try doc.createScalar("Z", .plain));
+    return doc.write(allocator);
+}
+
+test "a deleted entry stays deleted when its emptied container gets a new one" {
+    // Deleting the sole entry of a mapping empties it (`{}`); adding an
+    // entry afterwards, without a reparse in between, re-emitted the
+    // deleted line ahead of the new one -- the brand-new-entry path
+    // copied "the rest of the open line" verbatim, and at the start of
+    // a container that line is the tombstone. At the root the deleted
+    // entry came back (`a: 1\nb: Z\n`); at the first item of a sequence
+    // the new key was glued after the old one and did not parse.
+    const cases = [_]struct { in: []const u8, del: []const u8, add: []const u8, out: []const u8 }{
+        .{ .in = "a: 1\n", .del = "$.a", .add = "$.b", .out = "b: Z\n" },
+        .{ .in = "a: 1\n", .del = "$.a", .add = "$.a", .out = "a: Z\n" },
+        .{ .in = "a:\n  b:\n    c: 1\n  e: 3\n", .del = "$.a", .add = "$.a", .out = "a: Z\n" },
+        .{ .in = "- c: 3\n- a: 1\n", .del = "$[0].c", .add = "$[0].c", .out = "- c: Z\n- a: 1\n" },
+        .{ .in = "- a: 1\n  b: 2\n- c: 3\n", .del = "$[1].c", .add = "$[1].c", .out = "- a: 1\n  b: 2\n- c: Z\n" },
+        .{ .in = "nav:\n  - Home: index.md\n  - Other: o.md\n", .del = "$.nav[0].Home", .add = "$.nav[0].Home", .out = "nav:\n  - Home: Z\n  - Other: o.md\n" },
+        .{ .in = "a:\n  b: 1\nc: 2\n", .del = "$.a.b", .add = "$.a.b", .out = "a:\n  b: Z\nc: 2\n" },
+        .{ .in = "# head\na: 1 # t\n# tail\n", .del = "$.a", .add = "$.b", .out = "# head\nb: Z\n# tail\n" },
+    };
+    for (cases) |c| {
+        const out = try deleteThenSet(testing.allocator, c.in, c.del, c.add);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+        // And what was written reads back as exactly that tree.
+        var re = try Document.parse(testing.allocator, out);
+        defer re.deinit();
+        const again = try re.write(testing.allocator);
+        defer testing.allocator.free(again);
+        try testing.expectEqualStrings(out, again);
+    }
+}
+
+test "deleting an explicit-key entry removes its `? ` indicator too" {
+    // The tombstone kept everything up to the key text, treating `? `
+    // like a sequence item's `- ` indicator that outlives the entry. It
+    // does not: a bare `? ` left behind reads back as a null key.
+    const cases = [_]struct { in: []const u8, del: []const u8, out: []const u8 }{
+        .{ .in = "? a\n: 1\n? b\n: 2\n", .del = "$.b", .out = "? a\n: 1\n" },
+        .{ .in = "? a\n: 1\n? b\n: 2\n", .del = "$.a", .out = "? b\n: 2\n" },
+        .{ .in = "? a\n: 1\nb: 2\n", .del = "$.a", .out = "b: 2\n" },
+        .{ .in = "a: 1\n? b\n: 2\n", .del = "$.b", .out = "a: 1\n" },
+        .{ .in = "? a\n: 1\n", .del = "$.a", .out = "{}\n" },
+        // A `- ` in front of an explicit key still belongs to the item.
+        .{ .in = "- ? a\n  : 1\n- b\n", .del = "$[0].a", .out = "- {}\n- b\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete(c.del);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+}

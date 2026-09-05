@@ -25,6 +25,26 @@ harness's edit oracle the moment the tail stopped being dropped. The
 tail now re-owns the break when the first live byte after the
 deletions is a comment and the cursor is mid-line.
 
+**A deleted entry came back when its emptied container gained a new
+one.** Deleting the sole entry of a mapping empties it (`{}`); adding an
+entry afterwards, in the same session, re-emitted the deleted line ahead
+of the new one: `a: 1` minus `$.a` plus `$.b` wrote `a: 1\nb: Z\n`. The
+brand-new-entry path copied "the rest of the open line" verbatim,
+without consulting tombstones — and at the start of a container that
+line *is* the tombstone. At the root the deleted entry resurrected; at
+the first item of a sequence the new key was glued after the old one
+(`- c: 3\nc: Z`), which does not parse. Found by a compose probe (two
+edits in memory versus edit, write, reparse, edit). The remainder is
+now written only when a previous *entry* holds the line open, and
+through the tombstone-aware gap walk.
+
+**Deleting an explicit-key entry left a null key behind.** The pair
+tombstone treated the `? ` of an explicit key like a sequence item's
+`- ` indicator — framing that outlives the entry — so `? a\n: 1\n? b\n:
+2\n` minus `$.b` emitted `? a\n: 1\n? \n`, which reads back as
+`{a: 1, null: null}`. Only a `- ` ahead of the key on its line is kept
+now (`- ? a` still keeps its `- `).
+
 **A comment write could smuggle document structure through a lone CR.**
 `setLeadingComments` validated its text by splitting on `\n` and
 requiring each line to start with `#`. A lone `\r` is a YAML line break
