@@ -17,6 +17,29 @@ document structure. `setTrailingComment` already refused CR outright;
 the leading side has to permit CRLF between lines, so it now refuses the
 lone form specifically.
 
+**A `move` could put an alias ahead of its anchor.** The dangling-alias
+guard covered `delete` and `set` but exempted `move`, on the grounds
+that the anchor survives. It survives, but an alias needs the anchor to
+come *before* it, and a move only appends at the destination — so
+`- &x 1` moved to the end of `- &x 1\n- *x\n` emitted `- *x\n- &x 1\n`,
+which does not parse. `move` now returns `error.AnchorReferenced` when
+an anchor/alias pair crosses the moved subtree's boundary in either
+direction. A move whose anchor and alias travel together preserves their
+order and stays allowed.
+
+**A mutation through an alias path failed dishonestly.** Reads forward
+through aliases and `docs/USAGE.md` says so; writes did not.
+`mappingReplace`/`mappingRemove` switch on the node's own data, hit
+`.alias`, and the caller reported `error.InvalidSyntax` — which blames
+the path — or, for `delete`, swallowed it as "matched nothing" and
+returned **success while changing nothing**. `set`, `delete`, `append`
+and `insert` on an alias container now return `error.AliasPath`.
+
+Editing the shared target through the *anchor* side works and is the
+supported route. Whether writes should forward through an alias the way
+reads do is a semantic decision, deliberately left open rather than
+settled by accident.
+
 **An edit in a CR-terminated document duplicated an entry.**
 `markup.entryStart` walks back from a key to find the `-` or `?` that
 introduces it, and stepped back TWO bytes over a `\r`, assuming it was
