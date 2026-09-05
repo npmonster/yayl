@@ -25,6 +25,16 @@ harness's edit oracle the moment the tail stopped being dropped. The
 tail now re-owns the break when the first live byte after the
 deletions is a comment and the cursor is mid-line.
 
+**Emptying a nested block sequence deleted the outer item too.**
+`dropItemSpan` kept the outer `- ` only when a successor could move up
+onto its line; deleting the LAST inner item took the whole line,
+indicator included. `- - x` minus `$[0][0]` emitted a bare `[]`, and
+under a key the `[]` landed at the parent's column, which does not
+parse. Mappings already got this right (`- a: 1` minus `$[0].a` is
+`- {}`); sequences now mirror the three cases: successor moves up, a
+comment in between keeps the indicator on its own line, no successor
+leaves `- []`.
+
 **A modified scalar or flow sequence item lost its `- `.** The item
 indicator lives in the bytes ahead of the item's content. A block
 collection's slot walk re-emits it with the first entry, but a scalar,

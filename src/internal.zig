@@ -237,12 +237,30 @@ pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
             // to the outer item and outlives this one, so leave it
             // and consume the successor's indentation instead
             // (see dropPairSpan for the mapping equivalent).
-            if (std.mem.indexOfScalar(u8, src[from..is.entry_start], '-') != null) {
+            if (std.mem.lastIndexOfScalar(u8, src[from..is.entry_start], '-')) |od| {
+                const after_outer = from + od + 1;
                 if (nextItemStart(s, item)) |nx| {
                     if (nx >= to and isBlankRun(src[to..nx])) {
                         from = is.entry_start;
                         to = nx;
+                    } else {
+                        // A comment between the two items keeps the
+                        // successor from moving up: the outer indicator
+                        // stays on its own line (dropping the blanks
+                        // after it) and only this item's text goes.
+                        from = is.entry_start;
+                        while (from > after_outer and src[from - 1] == ' ') from -= 1;
+                        to = markup.newlineAt(src, is.end);
                     }
+                } else {
+                    // No successor: this sequence empties and re-emits
+                    // as `[]`, but the OUTER item survives as `- []`.
+                    // Taking the whole line deleted an item nobody asked
+                    // to delete and left `[]` dangling at the parent's
+                    // column, which does not parse (`- - x` minus
+                    // `$[0][0]` emitted a bare `[]`).
+                    from = is.entry_start;
+                    to = markup.newlineAt(src, is.end);
                 }
             }
             if (to <= from) return;

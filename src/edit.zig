@@ -2282,6 +2282,35 @@ test "a leading comment written on the first item does not open with a blank lin
     try testing.expectEqualStrings("# lead\n- {a: 1, b: Z}\n- b\n", out);
 }
 
+test "emptying a nested block sequence keeps the outer item's `- `" {
+    // `dropItemSpan` kept the outer indicator only when a successor could
+    // move up onto its line. Deleting the LAST inner item took the whole
+    // line, outer `- ` included: `- - x` minus `$[0][0]` emitted a bare
+    // `[]`, and nested under a key the `[]` landed at the parent's
+    // column, which does not parse.
+    const cases = [_]struct { in: []const u8, dels: []const []const u8, out: []const u8 }{
+        .{ .in = "- - x\n", .dels = &.{"$[0][0]"}, .out = "- []\n" },
+        .{ .in = "- - x\n- z\n", .dels = &.{"$[0][0]"}, .out = "- []\n- z\n" },
+        .{ .in = "- - x\n  - y\n", .dels = &.{ "$[0][1]", "$[0][0]" }, .out = "- []\n" },
+        .{ .in = "k:\n  - - x\n    - y\n  - z\n", .dels = &.{ "$.k[0][1]", "$.k[0][0]" }, .out = "k:\n  - []\n  - z\n" },
+        .{ .in = "list:\n  - a\n  - - nested\n    - sequence\n", .dels = &.{ "$.list[1][1]", "$.list[1][0]" }, .out = "list:\n  - a\n  - []\n" },
+        // A comment between the inner items: the outer `-` stays on
+        // its own line and the successor stays put under the comment.
+        .{ .in = "- - x\n  # c\n  - y\n", .dels = &.{"$[0][0]"}, .out = "-\n  # c\n  - y\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        for (c.dels) |d| try ed.delete(d);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+        var re = try Document.parse(testing.allocator, out);
+        defer re.deinit();
+    }
+}
+
 test "deleting an explicit-key entry removes its `? ` indicator too" {
     // The tombstone kept everything up to the key text, treating `? `
     // like a sequence item's `- ` indicator that outlives the entry. It
