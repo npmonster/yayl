@@ -128,6 +128,19 @@ pub fn entryStart(source: []const u8, content_start: usize) usize {
             for (source[ls .. j - 1]) |c| {
                 if (c != ' ' and c != '\t') return content_start;
             }
+            // And only when the content is actually indented UNDER the
+            // indicator. A block entry's content sits deeper than its
+            // `-`/`?`; content at the same or a lower column belongs to
+            // an enclosing collection, not to this indicator.
+            //
+            // Without this, `a: 1\nb:\n  - \nc: 1\n` gave key `c`
+            // (column 0) the entry_start of the `-` at column 2, because
+            // that line holds nothing but the indicator and a trailing
+            // blank. Emitting `c` then re-wrote the item: deleting `$.a`
+            // produced `b:\n  - \n- \nc: 1\n`, which does not reparse.
+            if (content_start - lineStart(source, content_start) <= (j - 1) - ls) {
+                return content_start;
+            }
             return j - 1;
         }
     }

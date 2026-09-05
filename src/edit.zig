@@ -1879,6 +1879,77 @@ test "a mutation through an alias path is refused, not silently dropped" {
     }
 }
 
+test "a following entry is not captured by an indicator-only line above it" {
+    const allocator = std.testing.allocator;
+
+    // Found by the fuzz harness's edited-output-must-reparse oracle
+    // (seed 3004 and others), and NOT CR-specific despite first
+    // appearing that way — plain LF reproduces identically.
+    //
+    // `markup.entryStart` walks back from a key to the `-`/`?` that
+    // introduces it, and accepts an indicator sitting alone on the
+    // previous line (the `-\n  content` shape). It required only that
+    // nothing but blanks precede the indicator, never that the content
+    // be indented UNDER it. So in
+    //
+    //     a: 1
+    //     b:
+    //       - <- trailing blank, nothing else on the line
+    //     c: 1
+    //
+    // key `c` at column 0 was given the entry_start of the `-` at
+    // column 2. Emitting `c` then re-wrote the item, and deleting `$.a`
+    // produced `b:\n  - \n- \nc: 1\n`, which does not reparse.
+    //
+    // A block entry's content always sits deeper than its indicator, so
+    // content at the same or a lower column belongs to an enclosing
+    // collection instead.
+    const cases = [_]struct { input: []const u8, path: []const u8 }{
+        .{ .input = "a: 1\nb:\n  - \nc: 1\n", .path = "$.a" },
+        .{ .input = "a: 1\nb:\n  - x\n  - \nc: 1\n", .path = "$.a" },
+        .{ .input = "a: \rb:\r  - \rc:\r", .path = "$.a" },
+        .{ .input = "a: 1\nb:\n  ? \nc: 1\n", .path = "$.a" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(allocator, c.input);
+        defer doc.deinit();
+
+        // Unedited round trip was always exact; assert it stays so.
+        const plain = try doc.write(allocator);
+        defer allocator.free(plain);
+        try std.testing.expectEqualStrings(c.input, plain);
+
+        var ed = Editor.init(&doc);
+        ed.delete(c.path) catch |err| {
+            // A shape this parser rejects is not this test's business.
+            if (err == error.UnknownPath) continue;
+            return err;
+        };
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+
+        var re = try Document.parse(allocator, out);
+        defer re.deinit();
+        const again = try re.write(allocator);
+        defer allocator.free(again);
+        try std.testing.expectEqualStrings(out, again);
+        try std.testing.expect(re.pathGet(&.{"a"}) == null);
+    }
+
+    // The genuine indicator-alone shape still resolves to the
+    // indicator: content indented under it belongs to it.
+    {
+        var doc = try Document.parse(allocator, "x:\n  -\n    k: 1\ny: 2\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete("$.y");
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        var re = try Document.parse(allocator, out);
+        defer re.deinit();
+    }
+}
+
 test "an edit in a CR-terminated document does not duplicate an entry" {
     const allocator = std.testing.allocator;
 
