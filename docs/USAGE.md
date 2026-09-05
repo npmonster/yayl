@@ -109,6 +109,14 @@ Anchors and aliases are first-class nodes: `- &v 42` followed by
 `- *v` produces a distinct alias node resolving to the anchor target
 (`node.isAlias()`, `node.resolveAlias()`).
 
+The anchor lives on the node, so deleting or replacing the node an alias
+still names is refused with `error.AnchorReferenced`. To give an
+anchored value a new value, build the replacement, give it the same
+anchor with `doc.setAnchor(node, "v")`, and `set` it over the old node:
+the anchor moves with the slot and every `*v` follows it. `setAnchor`
+also clears (`null`) or defines an anchor on any node; clearing or
+renaming one an alias still names is refused the same way.
+
 An alias may name an *enclosing* anchor, which makes the document
 cyclic — `&a [*a]` parses. The recursive walks are depth-bounded so this
 is `error.NestingTooDeep` rather than a crash, but if you resolve

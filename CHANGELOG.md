@@ -7,6 +7,25 @@ series; APIs may still move, and anything that does is listed here.
 
 ### Added
 
+**`Document.setAnchor(node, name)`.** Define or clear a node's anchor.
+Clearing or renaming one an alias still names is refused with
+`error.AnchorReferenced`; a name must use the YAML anchor alphabet (no
+blanks, no `,[]{}`). This closes the last gap in the alias story: an
+aliased SCALAR was immutable while referenced, because the anchor lives
+on the node, `set` refused to replace that node, and no API could build
+a replacement carrying an anchor. Now `set` treats a replacement that
+carries the replaced node's anchor as the anchor moving with the slot,
+and points the document's aliases at the new node:
+
+    const two = try doc.createScalar("2", .plain);
+    try doc.setAnchor(two, "x");
+    try ed.set("$.a", two);      // a: &x 2 -- and $.b (*x) reads 2
+
+A replacement without the anchor, or with a different one, is still
+refused. Alongside, `apply`'s clone now re-registers scalar anchors as it
+already did for collections, so an alias to an anchored scalar points
+into the clone rather than at the pre-clone node.
+
 **The emission oracle.** `make emission-oracle` (and a report-only CI
 job) checks every document yayl emits over the corpus and fixtures with
 an INDEPENDENT parser — the vendored libfyaml — closing the assurance

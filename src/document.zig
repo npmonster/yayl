@@ -663,6 +663,84 @@ pub const Document = struct {
         return n;
     }
 
+    /// Define or clear the anchor on `node`. `name` null clears it.
+    ///
+    /// Clearing (or renaming) an anchor that an alias in this document
+    /// still names would strand that alias, so it is refused with
+    /// `error.AnchorReferenced`; delete the aliases first. Defining a
+    /// name a second time is allowed, as it is in YAML (`&a` twice:
+    /// the later definition shadows the earlier for aliases after it)
+    /// -- and it is how an aliased scalar gets a new value, since the
+    /// anchor lives on the node: build the replacement, give it the same
+    /// name, and `set` it over the old node. The edit surface treats a
+    /// replacement carrying the replaced node's anchor as the anchor
+    /// moving with the slot, and re-points the aliases at it.
+    ///
+    /// A name must be one or more non-blank characters with no flow
+    /// indicator (`,[]{}`), the YAML anchor alphabet.
+    pub fn setAnchor(self: *Document, node: *Node, name: ?[]const u8) !void {
+        if (name) |n| {
+            if (n.len == 0) return error.InvalidSyntax;
+            for (n) |c| switch (c) {
+                ' ', '\t', '\n', '\r', ',', '[', ']', '{', '}' => return error.InvalidSyntax,
+                else => {},
+            };
+            if (node.anchor) |cur| {
+                if (std.mem.eql(u8, cur, n)) return;
+            }
+        } else if (node.anchor == null) return;
+        if (node.anchor) |cur| {
+            if (self.root) |root| {
+                if (aliasNamed(root, cur, 0)) return error.AnchorReferenced;
+            }
+        }
+        node.anchor = if (name) |n| try self.pool.dupe(n) else null;
+        self.markModified(node);
+    }
+
+    /// Point every alias in this document named `name` at `target`.
+    /// Used when the node carrying an anchor is replaced by one that
+    /// carries the same name: the aliases follow the anchor.
+    pub fn retargetAliases(self: *Document, name: []const u8, target: *Node) void {
+        const root = self.root orelse return;
+        retarget(root, name, target, 0);
+    }
+
+    fn retarget(node: *Node, name: []const u8, target: *Node, depth: usize) void {
+        if (depth >= max_alias_walk) return;
+        switch (node.data) {
+            .alias => |*a| if (std.mem.eql(u8, a.name, name)) {
+                a.target = target;
+            },
+            .mapping => |m| for (m.pairs.items) |p| {
+                retarget(p.key, name, target, depth + 1);
+                retarget(p.value, name, target, depth + 1);
+            },
+            .sequence => |s| for (s.items.items) |item| retarget(item, name, target, depth + 1),
+            .scalar => {},
+        }
+    }
+
+    /// Does any alias under `node` name `name`? Aliases are leaves here
+    /// -- never followed -- so a parsed alias cycle cannot recurse.
+    fn aliasNamed(node: *const Node, name: []const u8, depth: usize) bool {
+        if (depth >= max_alias_walk) return false;
+        return switch (node.data) {
+            .alias => |a| std.mem.eql(u8, a.name, name),
+            .mapping => |m| for (m.pairs.items) |p| {
+                if (aliasNamed(p.key, name, depth + 1) or aliasNamed(p.value, name, depth + 1)) break true;
+            } else false,
+            .sequence => |s| for (s.items.items) |item| {
+                if (aliasNamed(item, name, depth + 1)) break true;
+            } else false,
+            .scalar => false,
+        };
+    }
+
+    /// Structural walks over the tree stop here; matches the edit
+    /// surface's `max_walk_depth`.
+    const max_alias_walk: usize = 1000;
+
     // ------------------------------------------------------------------
     // Mutation (fy_node_* insert equivalents)
     // ------------------------------------------------------------------

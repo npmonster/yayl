@@ -305,6 +305,16 @@ fn aliasWouldDangle(node: *const Node, doomed: *const Node, depth: usize) bool {
     return false;
 }
 
+/// The anchor name that `replacement` takes over from `existing`, when
+/// both carry the same one -- null otherwise. Only the node's OWN anchor
+/// moves; an anchor defined deeper inside a replaced subtree is still a
+/// stranding.
+fn anchorMovesWith(existing: *const Node, replacement: *const Node) ?[]const u8 {
+    const from = existing.anchor orelse return null;
+    const to = replacement.anchor orelse return null;
+    return if (std.mem.eql(u8, from, to)) from else null;
+}
+
 /// Refuse an edit that removes a node an alias still needs.
 fn refuseIfAnchorReferenced(doc: *Document, doomed: *const Node) Error!void {
     const root = doc.root orelse return;
@@ -457,9 +467,21 @@ pub const Editor = struct {
                 // Replacing the node that CARRIES an anchor strands any
                 // alias to it. A no-op set is exempt: it replaces
                 // nothing, so nothing is stranded.
+                //
+                // Unless the replacement carries the SAME anchor: then
+                // the anchor moves with the slot and the aliases follow
+                // it. That is the sanctioned way to give an aliased
+                // scalar a new value (see `Document.setAnchor`), and it
+                // keeps the in-memory tree honest -- the aliases point
+                // at the node that will be emitted under `&name`.
                 if (ed.one(s.path)) |existing| {
-                    if (!sameScalarPresentation(existing, s.value))
-                        try refuseIfAnchorReferenced(doc, existing);
+                    if (!sameScalarPresentation(existing, s.value)) {
+                        if (anchorMovesWith(existing, s.value)) |name| {
+                            doc.retargetAliases(name, s.value);
+                        } else {
+                            try refuseIfAnchorReferenced(doc, existing);
+                        }
+                    }
                 } else |_| {}
                 try applySet(doc, s.path, s.value);
             },
@@ -811,7 +833,14 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
         .data = undefined,
     };
     switch (node.data) {
-        .scalar => |s| n.data = .{ .scalar = .{ .value = try doc.pool.dupe(s.value), .style = s.style } },
+        .scalar => |s| {
+            n.data = .{ .scalar = .{ .value = try doc.pool.dupe(s.value), .style = s.style } };
+            // Register scalar anchors like the collection arms do, so a
+            // cloned alias to an anchored scalar points into the clone
+            // -- not at the pre-clone node, where a later replacement
+            // of the scalar would never reach it.
+            if (node.anchor) |a| try anchors.put(try doc.pool.dupe(a), n);
+        },
         .alias => |a| {
             const target = anchors.get(a.name) orelse a.target;
             n.data = .{ .alias = .{ .name = try doc.pool.dupe(a.name), .target = target } };
@@ -2430,6 +2459,115 @@ test "emptying a nested block sequence keeps the outer item's `- `" {
         var re = try Document.parse(testing.allocator, out);
         defer re.deinit();
     }
+}
+
+test "an aliased scalar gets a new value through a replacement carrying its anchor" {
+    // The anchor lives on the node, so replacing an anchored scalar used
+    // to be refused outright (AnchorReferenced) -- an aliased scalar was
+    // immutable while referenced, and nothing could build a replacement
+    // with an anchor. `setAnchor` builds one; `set` treats a replacement
+    // carrying the replaced node's anchor as the anchor moving with the
+    // slot, and points the aliases at it.
+    {
+        var doc = try Document.parse(testing.allocator, "a: &x 1\nb: *x\nc: 3\n");
+        defer doc.deinit();
+        const two = try doc.createScalar("2", .plain);
+        try doc.setAnchor(two, "x");
+        var ed = Editor.init(&doc);
+        try ed.set("$.a", two);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("a: &x 2\nb: *x\nc: 3\n", out);
+        // The in-memory alias follows: no stale pre-replacement target.
+        try testing.expectEqualStrings("2", (try ed.one("$.b")).scalarValue().?);
+        try testing.expect((try ed.one("$.b")).resolveAlias() == try ed.one("$.a"));
+        var re = try Document.parse(testing.allocator, out);
+        defer re.deinit();
+        var red = Editor.init(&re);
+        try testing.expectEqualStrings("2", (try red.one("$.b")).scalarValue().?);
+    }
+    // Same at a sequence index, and for an anchored mapping's own anchor.
+    {
+        var doc = try Document.parse(testing.allocator, "- &x 1\n- *x\n");
+        defer doc.deinit();
+        const two = try doc.createScalar("2", .plain);
+        try doc.setAnchor(two, "x");
+        var ed = Editor.init(&doc);
+        try ed.set("$[0]", two);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("- &x 2\n- *x\n", out);
+    }
+    {
+        var doc = try Document.parse(testing.allocator, "a: &m\n  k: 1\nb: *m\n");
+        defer doc.deinit();
+        const fresh = try doc.createMapping();
+        try doc.mappingAppend(fresh, try doc.createScalar("j", .plain), try doc.createScalar("2", .plain));
+        try doc.setAnchor(fresh, "m");
+        var ed = Editor.init(&doc);
+        try ed.set("$.a", fresh);
+        try testing.expectEqualStrings("2", (try ed.one("$.b.j")).scalarValue().?);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        var re = try Document.parse(testing.allocator, out);
+        defer re.deinit();
+        var red = Editor.init(&re);
+        try testing.expectEqualStrings("2", (try red.one("$.b.j")).scalarValue().?);
+    }
+    // A replacement WITHOUT the anchor is still a stranding, refused.
+    {
+        var doc = try Document.parse(testing.allocator, "a: &x 1\nb: *x\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try testing.expectError(error.AnchorReferenced, ed.set("$.a", try doc.createScalar("2", .plain)));
+        // A different anchor name does not move it either.
+        const other = try doc.createScalar("2", .plain);
+        try doc.setAnchor(other, "y");
+        try testing.expectError(error.AnchorReferenced, ed.set("$.a", other));
+    }
+}
+
+test "setAnchor defines, clears and refuses what would strand an alias" {
+    var doc = try Document.parse(testing.allocator, "a: &x 1\nb: *x\nc: 3\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    const a = try ed.one("$.a");
+    const c = try ed.one("$.c");
+    // Clearing or renaming a referenced anchor strands `*x`.
+    try testing.expectError(error.AnchorReferenced, doc.setAnchor(a, null));
+    try testing.expectError(error.AnchorReferenced, doc.setAnchor(a, "y"));
+    // Re-setting the same name is a no-op, byte for byte.
+    try doc.setAnchor(a, "x");
+    const same = try doc.write(testing.allocator);
+    defer testing.allocator.free(same);
+    try testing.expectEqualStrings("a: &x 1\nb: *x\nc: 3\n", same);
+    // Defining one on an unanchored node re-emits it with the anchor.
+    try doc.setAnchor(c, "k");
+    const defined = try doc.write(testing.allocator);
+    defer testing.allocator.free(defined);
+    try testing.expectEqualStrings("a: &x 1\nb: *x\nc: &k 3\n", defined);
+    // ... and clearing an unreferenced one takes it away again.
+    try doc.setAnchor(c, null);
+    const cleared = try doc.write(testing.allocator);
+    defer testing.allocator.free(cleared);
+    try testing.expectEqualStrings("a: &x 1\nb: *x\nc: 3\n", cleared);
+    // The anchor alphabet: no blanks, no flow indicators, not empty.
+    try testing.expectError(error.InvalidSyntax, doc.setAnchor(c, ""));
+    try testing.expectError(error.InvalidSyntax, doc.setAnchor(c, "a b"));
+    try testing.expectError(error.InvalidSyntax, doc.setAnchor(c, "a,b"));
+    try testing.expectError(error.InvalidSyntax, doc.setAnchor(c, "[a]"));
+}
+
+test "an alias to an anchored scalar survives a clone pointing into the clone" {
+    // `cloneNode` re-registered anchors only for collections, so after
+    // any `apply` an alias to a SCALAR still pointed at the pre-clone
+    // node -- harmless while scalars were immutable, wrong the moment a
+    // replacement could carry the anchor over.
+    var doc = try Document.parse(testing.allocator, "a: &x 1\nb: *x\nc: 3\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.set("$.c", try doc.createScalar("4", .plain));
+    try testing.expect((try ed.one("$.b")).resolveAlias() == try ed.one("$.a"));
 }
 
 test "deleting an explicit-key entry removes its `? ` indicator too" {
