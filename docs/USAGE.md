@@ -156,7 +156,11 @@ _ = try doc.pathDelete(&.{"legacy"});
 ~~~
 
 `pathSet` creates missing intermediate mappings; its components are
-mapping keys, not sequence indices.
+mapping keys, not sequence indices. Reads can address sequence
+positions: a `pathGet`/`Node.byPath` segment that parses as a decimal
+number indexes into a sequence (`pathGet(&.{ "items", "0" })`), mirroring
+the edit grammar's `[N]`. On a mapping the same segment stays an
+ordinary key.
 
 ## Byte-faithful round trips
 
@@ -336,6 +340,9 @@ instead, and the alias reflects the change. A move that would reorder
 an alias ahead of its anchor is refused with `error.AnchorReferenced`;
 a move where the anchor and its aliases travel together is allowed.
 
+`ed.one` returns a borrowed node; `ed.all` and `yaml.edit.resolve`
+return a caller-owned slice — free it with the same allocator.
+
 To copy a subtree into a *different* document, use
 `yaml.edit.cloneTreeInto(&target_doc, node)`: it deep-clones the node
 into the target document's pool with presentation spans cleared, so the
@@ -514,6 +521,16 @@ The full descriptor set:
 | `map(fields)`, `mapStrict(fields)` | a mapping; `mapStrict` rejects undeclared keys |
 | `nullable(inner)` | null, or `inner` |
 | `allOf(b)`, `anyOf(b)`, `oneOf(b)` | every branch, at least one, exactly one |
+
+Compose schemas through pointers, and keep intermediate composites in
+a `const` binding so they outlive the call:
+
+~~~zig
+const items = yaml.schema.Schema.seq(&yaml.schema.Schema.str);
+const server = yaml.schema.Schema.map(&.{
+    .{ .key = "tags", .schema = &items, .required = true },
+});
+~~~
 
 `nullable` is not the same as a non-required field: `required = false`
 lets the key be absent, `nullable` requires the key and lets its value

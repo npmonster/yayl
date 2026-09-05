@@ -202,11 +202,17 @@ pub const Node = struct {
     }
 
     /// Resolve a node by a path of mapping keys, e.g. `&.{ "a", "b" }`.
-    /// Alias nodes are followed.
+    /// Alias nodes are followed. A segment that parses as a decimal
+    /// number also indexes into a sequence — `&.{ "items", "0" }` is
+    /// the first item — so a read path can mirror the edit grammar's
+    /// `$[N]` without a second API. A numeric segment on a mapping is
+    /// still an ordinary key; only sequences take the index reading.
+    /// Out-of-range indices and non-numeric segments on a sequence
+    /// return null.
     pub fn byPath(self: *const Node, path: []const []const u8) ?*Node {
         var cur: *const Node = self;
         for (path) |seg| {
-            cur = cur.lookup(seg) orelse return null;
+            cur = walkReadSegment(cur, seg) orelse return null;
         }
         return @constCast(cur);
     }
@@ -266,6 +272,18 @@ pub const Node = struct {
         return doc_src[span[0]..span[1]];
     }
 };
+
+/// One `byPath` segment: a decimal number indexes a sequence, anything
+/// else is a mapping key. The accessors forward through aliases, so an
+/// alias in the middle resolves either way.
+fn walkReadSegment(node: *const Node, seg: []const u8) ?*const Node {
+    if (node.items()) |list| {
+        const ix = std.fmt.parseInt(usize, seg, 10) catch return null;
+        if (ix >= list.len) return null;
+        return list[ix];
+    }
+    return node.lookup(seg);
+}
 
 /// The Core Schema tag a plain scalar resolves to, in the spec's
 /// shorthand form (`tag:yaml.org,2002:int` is `.int`). Distinct from
@@ -2365,4 +2383,27 @@ fn commentWrite(allocator: std.mem.Allocator) !void {
     const out = try doc.write(allocator);
     defer allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "# rewritten") != null);
+}
+
+test "read paths walk sequence indices like the edit grammar" {
+    var doc = try Document.parse(testing.allocator,
+        \\items:
+        \\  - first
+        \\  - second
+        \\"0": map key
+        \\deep:
+        \\  - k: [a, b]
+        \\
+    );
+    defer doc.deinit();
+    // Numeric segments index sequences at any depth.
+    try testing.expectEqualStrings("first", doc.pathGet(&.{ "items", "0" }).?.scalarValue().?);
+    try testing.expectEqualStrings("second", doc.pathGet(&.{ "items", "1" }).?.scalarValue().?);
+    try testing.expectEqualStrings("b", doc.pathGet(&.{ "deep", "0", "k", "1" }).?.scalarValue().?);
+    // Out of range: null, not a crash.
+    try testing.expect(doc.pathGet(&.{ "items", "2" }) == null);
+    // A numeric key on a MAPPING is still an ordinary key.
+    try testing.expectEqualStrings("map key", doc.pathGet(&.{"0"}).?.scalarValue().?);
+    // Non-numeric segments on a sequence stay null.
+    try testing.expect(doc.pathGet(&.{ "items", "first" }) == null);
 }

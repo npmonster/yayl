@@ -164,10 +164,7 @@ fn demo(allocator: std.mem.Allocator, io: std.Io, file: []const u8, out_path: []
     defer check.deinit();
     // The edit landed...
     try expectEqualStrings("100", check.pathGet(&.{ "MD013", "line_length" }).?.scalarValue().?);
-    try expectEqualStrings(
-        "line-length",
-        check.pathGet(&.{"dogfood"}).?.lookup("rules").?.items().?[0].scalarValue().?,
-    );
+    try expectEqualStrings("line-length", check.pathGet(&.{ "dogfood", "rules", "0" }).?.scalarValue().?);
     // ...the deletion happened...
     if (check.pathGet(&.{"MD024"}) != null) return error.DemoDeleteDidNotApply;
     // ...and the untouched bytes are exactly the author's: comments, the
