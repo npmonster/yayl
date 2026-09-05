@@ -3,7 +3,7 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
-## Unreleased
+## 0.16.0 — 2026-09-05
 
 ### Fixed
 
@@ -181,6 +181,13 @@ injected another `---`. `-\r---\r-` re-emitted as `-\r\n---\n---\r-`
 and grew from there. Found at seed 303, iteration 224765.
 
 ### Changed
+
+**Read paths walk sequence indices.** A `pathGet`/`Node.byPath`
+segment that parses as a decimal number now indexes into a sequence —
+`pathGet(&.{ "items", "0" })` is the first item — mirroring the edit
+grammar's `[N]`, so a read no longer needs to drop to
+`lookup(...).items()[...]` by hand. On a mapping the same segment stays
+an ordinary key; `pathSet`/`pathDelete` remain key-walkers.
 
 **The fuzz harness applies seed transforms, not just mutations.** Byte
 flips almost never produce a document terminated *consistently* one way,
