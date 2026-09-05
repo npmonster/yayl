@@ -40,8 +40,27 @@ pub const Error = error{
     NestingTooDeep,
     WouldCycle,
     AnchorReferenced,
+    AliasPath,
     OutOfMemory,
 };
+
+/// Refuse a MUTATION whose container is an alias node.
+///
+/// Reads forward through aliases — `lookup`, `pathGet` and `Editor.one`
+/// all resolve — and `docs/USAGE.md` says so. Writes did not, but failed
+/// dishonestly: `mappingReplace`/`mappingRemove` switch on the node's
+/// own `.data`, hit `.alias`, and the caller turned that into
+/// `error.InvalidSyntax` (which blames the path) or, for delete, into a
+/// no-op that reported SUCCESS while changing nothing.
+///
+/// Refusing with a typed error keeps reads and writes honest about
+/// disagreeing. Editing the shared target through the anchor side works
+/// and is the supported route; whether writes should forward through an
+/// alias the way reads do is a semantic decision, not something to
+/// settle by accident.
+fn refuseAliasContainer(container: *const Node) Error!void {
+    if (container.data == .alias) return error.AliasPath;
+}
 
 /// Deepest node nesting the recursive edit walks will follow before
 /// returning `error.NestingTooDeep`. Matches `value.Limits.max_depth`,
@@ -286,12 +305,48 @@ fn aliasWouldDangle(node: *const Node, doomed: *const Node, depth: usize) bool {
     return false;
 }
 
-/// Refuse an edit that would strand an alias. Called for the two edits
-/// that remove a node from the tree; `move` relocates within the same
-/// document, so the anchor survives and is not checked.
+/// Refuse an edit that removes a node an alias still needs.
 fn refuseIfAnchorReferenced(doc: *Document, doomed: *const Node) Error!void {
     const root = doc.root orelse return;
     if (aliasWouldDangle(root, doomed, 0)) return error.AnchorReferenced;
+}
+
+/// Does `node`, or anything under it, alias an anchor defined OUTSIDE
+/// `subtree`? Aliases are leaves; the walk never follows one.
+fn dependsOnOutsideAnchor(subtree: *const Node, node: *const Node, depth: usize) bool {
+    if (depth >= max_walk_depth) return false;
+    switch (node.data) {
+        .alias => |a| return !anchorDefinedIn(subtree, a.name, 0),
+        .mapping => |m| for (m.pairs.items) |pair| {
+            if (dependsOnOutsideAnchor(subtree, pair.key, depth + 1)) return true;
+            if (dependsOnOutsideAnchor(subtree, pair.value, depth + 1)) return true;
+        },
+        .sequence => |sq| for (sq.items.items) |item| {
+            if (dependsOnOutsideAnchor(subtree, item, depth + 1)) return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// Refuse a move that would put an alias ahead of its anchor.
+///
+/// `delete` and `set` strand an alias by removing the anchor outright.
+/// A move keeps it in the document, which is why this was originally
+/// exempt — but an alias needs the anchor to come BEFORE it, and a move
+/// only ever appends at the destination. So `- &x 1\n- *x\n` with
+/// `$[0]` moved to the root emits `- *x\n- &x 1\n`, which does not
+/// parse.
+///
+/// The test is whether an anchor/alias pair CROSSES the subtree
+/// boundary, in either direction: an anchor inside referenced from
+/// outside, or an alias inside whose anchor is outside. When both ends
+/// travel together their relative order is preserved, so a
+/// self-contained move stays allowed.
+fn refuseIfMoveStrandsAlias(doc: *Document, subtree: *const Node) Error!void {
+    const root = doc.root orelse return;
+    if (aliasWouldDangle(root, subtree, 0)) return error.AnchorReferenced;
+    if (dependsOnOutsideAnchor(subtree, subtree, 0)) return error.AnchorReferenced;
 }
 
 fn collectDescend(allocator: std.mem.Allocator, node: *Node, key: []const u8, out: *std.ArrayList(*Node), depth: usize) Error!void {
@@ -419,6 +474,7 @@ pub const Editor = struct {
             .insert => |ins| try applyInsert(doc, ins),
             .append => |app| {
                 const seq = try ed.one(app.sequence);
+                try refuseAliasContainer(seq);
                 if (!seq.isSequence()) return error.NotASequence;
                 try doc.sequenceAppend(seq, app.value);
             },
@@ -470,6 +526,7 @@ pub const Editor = struct {
             // it exists, appended when it does not.
             .key => |last| {
                 const cur = try setContainer(doc, parent, true);
+                try refuseAliasContainer(cur);
                 if (!cur.isMapping()) return error.NotAMapping;
                 if (cur.lookup(last)) |existing| {
                     // An exact scalar-presentation match is a no-op:
@@ -489,6 +546,7 @@ pub const Editor = struct {
             // nothing sensible to auto-create at a position.
             .index => |ix| {
                 const cur = try setContainer(doc, parent, false);
+                try refuseAliasContainer(cur);
                 if (!cur.isSequence()) return error.NotASequence;
                 if (cur.items()) |items| {
                     if (ix < items.len) {
@@ -550,6 +608,11 @@ pub const Editor = struct {
                 else => return error.AmbiguousOperation,
             }
         }
+        // Before the removal, not after: `mappingRemove` rejects a
+        // non-mapping and `noopOrOOM` swallowed that as "matched
+        // nothing", so `delete("$.b.k")` through an alias reported
+        // SUCCESS and deleted nothing.
+        try refuseAliasContainer(cur);
         switch (p.segments[p.segments.len - 1]) {
             .key => |k| _ = doc.mappingRemove(cur, k) catch |err| try noopOrOOM(err),
             .index => |ix| _ = doc.sequenceRemove(cur, ix) catch |err| try noopOrOOM(err),
@@ -570,6 +633,7 @@ pub const Editor = struct {
     fn applyInsert(doc: *Document, ins: Insert) Error!void {
         var ed = Editor{ .doc = doc };
         const seq = try ed.one(ins.sequence);
+        try refuseAliasContainer(seq);
         const items = seq.items() orelse return error.NotASequence;
         const anchor = try ed.one(ins.position);
         var index: usize = items.len;
@@ -587,6 +651,7 @@ pub const Editor = struct {
         var ed = Editor{ .doc = doc };
         const node = try ed.one(from);
         const target = try ed.one(to);
+        try refuseIfMoveStrandsAlias(doc, node);
         // Reject moving a node into its own subtree.
         var anc: ?*Node = target;
         while (anc) |a| : (anc = a.parent) {
@@ -1654,6 +1719,114 @@ test "cloneTreeInto a second document cannot copy the wrong source bytes" {
     defer again.deinit();
     try testing.expectEqualStrings("42", again.pathGet(&.{ "other", "x" }).?.scalarValue().?);
     try testing.expectEqualStrings("1", again.pathGet(&.{"small"}).?.scalarValue().?);
+}
+
+test "a move cannot put an alias ahead of its anchor" {
+    const allocator = std.testing.allocator;
+
+    // Reported by wild-gecko. `delete` and `set` strand an alias by
+    // removing the anchor; a move keeps it in the document, which is
+    // why this was exempt. But an alias needs the anchor to come
+    // BEFORE it, and a move only appends at the destination — so
+    // `- &x 1\n- *x\n` moving `$[0]` to the root emitted
+    // `- *x\n- &x 1\n`, which does not parse.
+    const refused = [_]struct {
+        input: []const u8,
+        from: []const u8,
+        to: []const u8,
+        key: ?[]const u8,
+    }{
+        // Anchor moved past the alias that needs it.
+        .{ .input = "- &x 1\n- *x\n", .from = "$[0]", .to = "$", .key = null },
+        .{ .input = "a: &x 1\nb: *x\n", .from = "$.a", .to = "$", .key = "c" },
+        .{ .input = "a: &x\n  k: 1\nb: *x\n", .from = "$.a", .to = "$", .key = "c" },
+        // The alias moved into a container that precedes the anchor.
+        .{ .input = "m:\n  - 1\na: &x 1\nb: *x\n", .from = "$.b", .to = "$.m", .key = null },
+    };
+    for (refused) |c| {
+        var doc = try Document.parse(allocator, c.input);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try std.testing.expectError(
+            error.AnchorReferenced,
+            ed.apply(&.{.{ .move = .{ .from = c.from, .to = c.to, .key = c.key } }}),
+        );
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings(c.input, out);
+    }
+
+    // A move whose anchor and alias travel TOGETHER keeps their order,
+    // so it stays allowed — the test is whether the pair crosses the
+    // moved subtree's boundary, not whether an alias is present.
+    {
+        var doc = try Document.parse(allocator, "m:\n  - &x 1\n  - *x\nz: 1\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .move = .{ .from = "$.m", .to = "$", .key = "q" } }});
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        var re = try Document.parse(allocator, out);
+        defer re.deinit();
+    }
+}
+
+test "a mutation through an alias path is refused, not silently dropped" {
+    const allocator = std.testing.allocator;
+
+    // Reported by wild-gecko. Reads forward through aliases (USAGE says
+    // so, and `Editor.one` resolves), but writes did not — and failed
+    // dishonestly. `mappingReplace`/`mappingRemove` switch on the node's
+    // own `.data`, hit `.alias`, and the caller turned that into
+    // `error.InvalidSyntax`, which blames the path. Worse, for delete
+    // `noopOrOOM` swallowed it as "matched nothing", so
+    // `delete("$.b.k")` reported SUCCESS and changed nothing — a
+    // successful delete that deleted nothing is the worst outcome of
+    // the group.
+    const map = "a: &x\n  k: 1\nb: *x\n";
+    const seq = "a: &x\n  - 1\nb: *x\n";
+
+    {
+        var doc = try Document.parse(allocator, map);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const v = try doc.createScalar("2", .plain);
+        try std.testing.expectError(error.AliasPath, ed.set("$.b.k", v));
+        try std.testing.expectError(error.AliasPath, ed.delete("$.b.k"));
+        try std.testing.expectError(error.AliasPath, ed.set("$.b.new", v));
+
+        // Refused means untouched.
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings(map, out);
+    }
+    {
+        var doc = try Document.parse(allocator, seq);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const v = try doc.createScalar("2", .plain);
+        try std.testing.expectError(error.AliasPath, ed.set("$.b[0]", v));
+        try std.testing.expectError(
+            error.AliasPath,
+            ed.apply(&.{.{ .append = .{ .sequence = "$.b", .value = v } }}),
+        );
+    }
+
+    // The anchor side is the supported route and still works: the
+    // target is shared, so the alias reflects the change.
+    {
+        var doc = try Document.parse(allocator, map);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.set("$.a.k", try doc.createScalar("2", .plain));
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings("a: &x\n  k: 2\nb: *x\n", out);
+
+        var re = try Document.parse(allocator, out);
+        defer re.deinit();
+        try std.testing.expectEqualStrings("2", re.pathGet(&.{ "b", "k" }).?.scalarValue().?);
+    }
 }
 
 test "an edit in a CR-terminated document does not duplicate an entry" {

@@ -329,6 +329,13 @@ convention; its structure and values survive, its internal comments
 and blank lines do not. Untouched siblings stay verbatim. Moving a
 node into its own subtree is rejected (`error.MoveIntoSubtree`).
 
+Reads forward through aliases; writes do not. A mutation whose
+container is an alias (`$.b.k` where `b` is a `*ref`) is refused with
+`error.AliasPath` rather than misreported — edit the anchor's side
+instead, and the alias reflects the change. A move that would reorder
+an alias ahead of its anchor is refused with `error.AnchorReferenced`;
+a move where the anchor and its aliases travel together is allowed.
+
 To copy a subtree into a *different* document, use
 `yaml.edit.cloneTreeInto(&target_doc, node)`: it deep-clones the node
 into the target document's pool with presentation spans cleared, so the

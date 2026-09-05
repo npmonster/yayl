@@ -71,6 +71,24 @@ now always refused, because `createScalar` cannot attach an anchor and
 so no replacement carrying `&name` can be constructed — a real builder
 limitation, and still strictly better than emitting a broken document.
 
+**Mutating through an alias path is refused instead of failing
+dishonestly.** Reads forward through aliases; writes did not, and their
+failures lied: `set`/`append`/`insert` through an alias container
+surfaced as `error.InvalidSyntax`, blaming the path, and `delete`
+through one reported SUCCESS while changing nothing. Every mutation
+entry point now refuses an alias container with the new
+`error.AliasPath`. Editing the anchor's side remains the supported
+route — the target is shared, so the alias reflects the change.
+
+**A move can no longer put an alias ahead of its anchor.** `move` was
+exempt from the anchor-stranding check because it keeps both nodes in
+the document — but an alias needs its anchor to come before it, and a
+move only ever appends at the destination, so moving `- &x 1` to the
+root of `- &x 1\n- *x` emitted `- *x` first: unparseable. A move is now
+refused (`error.AnchorReferenced`) when an anchor/alias pair crosses the
+moved subtree's boundary in either direction; a move where both ends
+travel together keeps working.
+
 **Deleting a sibling could corrupt a document into unparseable bytes.**
 An entry whose key is a synthesized empty scalar (`: 1`) has no bytes of
 its own — its span is a point borrowed from the following token — and
