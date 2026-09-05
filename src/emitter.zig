@@ -187,6 +187,59 @@ pub const Emitter = struct {
         _ = try self.writeContainerFraming(node, cs.entry_start);
     }
 
+    /// An emptied BLOCK collection's source still holds the comment and
+    /// blank lines that sat between its deleted entries. Writing `{}` /
+    /// `[]` alone ate them (`a: 1\n# note\nb: 2` minus both entries came
+    /// back as `{}`), although deleting the entries one at a time kept
+    /// the comment. Write what the tombstones leave, each line with its
+    /// own indentation, and put the `{}` on a fresh line at the value's
+    /// column. Blank lines alone are not worth a line of their own.
+    fn writeEmptiedInterior(self: *Emitter, node: *Node, indent: usize) Error!void {
+        const cs = node.src orelse return;
+        if (cs.synthetic or cs.end <= cs.start) return;
+        switch (node.data) {
+            .mapping => |m| if (m.style == .flow) return,
+            .sequence => |s| if (s.style == .flow) return,
+            else => return,
+        }
+        // Indentation the caller laid down to place the value: the
+        // surviving lines carry their own, so it comes back out. A `- `
+        // framing is not indentation and stays.
+        const pending = self.pendingLine();
+        const placed = if (pending.len > 0 and std.mem.indexOfNone(u8, pending, " ") == null) pending.len else 0;
+        const before = self.out.items.len;
+        try self.writeGap(node, cs.start, cs.end);
+        const kept = self.out.items[before..];
+        // Only comment lines are worth keeping, and only they are safe
+        // to: an entry with a synthesized key (`:` alone) leaves no
+        // tombstone behind, so its bytes survive the walk although the
+        // entry is gone. Anything but comments and blanks means the
+        // interior is not ours to re-emit; blanks alone are not worth
+        // a line of their own.
+        var worth_keeping = false;
+        var lines = std.mem.splitScalar(u8, kept, '\n');
+        while (lines.next()) |line| {
+            const t = std.mem.trim(u8, line, " \t\r");
+            if (t.len == 0) continue;
+            if (t[0] != '#') {
+                self.out.shrinkRetainingCapacity(before);
+                return;
+            }
+            worth_keeping = true;
+        }
+        if (!worth_keeping) {
+            self.out.shrinkRetainingCapacity(before);
+            return;
+        }
+        if (placed > 0) {
+            const start = before - placed;
+            std.mem.copyForwards(u8, self.out.items[start..], self.out.items[before..]);
+            self.out.shrinkRetainingCapacity(self.out.items.len - placed);
+        }
+        if (!self.endsWithNewline()) try self.writeByte('\n');
+        try self.writeIndent(indent);
+    }
+
     /// True when the pending line holds nothing but block-entry framing:
     /// indentation and `- ` indicators. The cursor then already sits
     /// where an entry belongs (`- ` left behind by a deleted first
@@ -746,6 +799,19 @@ pub const Emitter = struct {
         if (!s.synthetic) {
             if (try self.writeCleanSlice(item, s.entry_start)) |end| return end;
             try self.emitted.put(item, {});
+            // [entry_start, start) is the item's `- ` framing. A block
+            // collection's slot walk re-emits it (the walk starts at
+            // entry_start, and its first entry carries the indicator),
+            // and the emptied-collection path writes it on its own.
+            // Everything else -- a scalar, an alias, a flow collection
+            // with entries -- is emitted from `start`, so the indicator
+            // went missing and the item stopped being one: `- {a: 1}`
+            // with `$[0].a` set wrote `{a: Z}` at the parent's column,
+            // and a refilled `- {}` did not parse at all. A written
+            // leading block re-assembled the line above already.
+            if (item.pending_leading == null and !framingOwnedByContent(item)) {
+                try self.write(src[s.entry_start..s.start]);
+            }
             const stop = try self.emitContent(item, markup.columnOf(src, s.start));
             // A container walk that re-emitted its last entry already
             // consumed the line terminator; writing the remainder on top
@@ -783,7 +849,10 @@ pub const Emitter = struct {
                 if (m.style == .flow or m.pairs.items.len == 0) {
                     // Flow-styled in the source, or emptied in place:
                     // block layout cannot express an empty mapping.
-                    if (m.pairs.items.len == 0) try self.writeEmptiedFraming(node);
+                    if (m.pairs.items.len == 0) {
+                        try self.writeEmptiedFraming(node);
+                        try self.writeEmptiedInterior(node, indent);
+                    }
                     if (self.flowLayoutRecoverable(node)) {
                         try self.emitFlowFaithful(node);
                         return node.src.?.end;
@@ -815,7 +884,10 @@ pub const Emitter = struct {
             },
             .sequence => |*sq| {
                 if (sq.style == .flow or sq.items.items.len == 0) {
-                    if (sq.items.items.len == 0) try self.writeEmptiedFraming(node);
+                    if (sq.items.items.len == 0) {
+                        try self.writeEmptiedFraming(node);
+                        try self.writeEmptiedInterior(node, indent);
+                    }
                     if (self.flowLayoutRecoverable(node)) {
                         try self.emitFlowFaithful(node);
                         return node.src.?.end;
@@ -872,6 +944,19 @@ pub const Emitter = struct {
         if (pending.len > 0 and std.mem.indexOfNone(u8, pending, " ") != null) return;
         if (pending.len > key_col) return;
         try self.writeIndent(key_col + self.indent_step - pending.len);
+    }
+
+    /// True when re-emitting `node`'s content also re-emits the framing
+    /// bytes ahead of it ([entry_start, start), a sequence item's `- `):
+    /// a block collection's slot walk starts at entry_start, and an
+    /// emptied collection writes its framing explicitly. A scalar, an
+    /// alias, or a flow collection with entries is written from `start`.
+    fn framingOwnedByContent(node: *const Node) bool {
+        return switch (node.data) {
+            .mapping => |m| m.style != .flow or m.pairs.items.len == 0,
+            .sequence => |s| s.style != .flow or s.items.items.len == 0,
+            .scalar, .alias => false,
+        };
     }
 
     /// A collection every entry of which has been removed. It re-emits
@@ -1153,7 +1238,9 @@ pub const Emitter = struct {
     fn writePendingLeadingText(self: *Emitter, pending: ?[]const u8, col: usize, term: []const u8) Error!void {
         const t = pending orelse return;
         if (t.len == 0) return;
-        if (!self.endsWithNewline()) try self.writeByte('\n');
+        // An empty output is at a line start already: breaking here put
+        // a blank line ahead of a comment written on the first item.
+        if (self.out.items.len > 0 and !self.endsWithNewline()) try self.writeByte('\n');
         var it = std.mem.splitScalar(u8, t, '\n');
         while (it.next()) |line| {
             try self.writeIndent(col);

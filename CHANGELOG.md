@@ -25,6 +25,27 @@ harness's edit oracle the moment the tail stopped being dropped. The
 tail now re-owns the break when the first live byte after the
 deletions is a comment and the cursor is mid-line.
 
+**A modified scalar or flow sequence item lost its `- `.** The item
+indicator lives in the bytes ahead of the item's content. A block
+collection's slot walk re-emits it with the first entry, but a scalar,
+an alias, or a flow collection is written from the content start, and
+nothing wrote the indicator: `- {a: 1}` with `$[0].a` set came out as
+`{a: Z}` at the parent's column, a trailing comment written on `- a`
+produced `a # c`, and a refilled `- {}` emitted `{c: Z}`, which does
+not parse. `emitItem` writes the framing for those items now.
+
+**Emptying a container ate the comments between its entries.**
+Deleting every entry re-emits `{}` / `[]` straight from the tree, and
+that skipped the container's source entirely — `a: 1\n# note\nb: 2`
+minus both entries came back as `{}`, although deleting them one at a
+time kept the comment. The lines the tombstones leave are written
+verbatim, then the empty collection follows on its own line at the
+value's column (`# note\n{}`; nested, `m:\n  # note\n  {}`).
+
+**A leading comment written on the first item opened the file with a
+blank line.** `writePendingLeadingText` broke the line whenever the
+output did not end in a newline, which an empty output does not.
+
 **A deleted entry came back when its emptied container gained a new
 one.** Deleting the sole entry of a mapping empties it (`{}`); adding an
 entry afterwards, in the same session, re-emitted the deleted line ahead

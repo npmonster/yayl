@@ -2193,6 +2193,95 @@ test "a deleted entry stays deleted when its emptied container gets a new one" {
     }
 }
 
+test "a modified scalar or flow sequence item keeps its `- `" {
+    // The item's `- ` lives in [entry_start, start). A block collection's
+    // slot walk re-emits it with its first entry; a scalar or a flow
+    // collection is written from `start`, and the indicator was simply
+    // never written: `- {a: 1}` with `$[0].a` set came out as `{a: Z}`
+    // at the parent's column, and a refilled `- {}` did not parse.
+    const Case = struct { in: []const u8, edit: Edit, out: []const u8 };
+    var docs: [6]Document = undefined;
+    const cases = [_]Case{
+        .{ .in = "- a: 1\n- {}\n", .edit = .{ .set = .{ .path = "$[1].c", .value = undefined } }, .out = "- a: 1\n- {c: Z}\n" },
+        .{ .in = "- {a: 1}\n- b\n", .edit = .{ .set = .{ .path = "$[0].a", .value = undefined } }, .out = "- {a: Z}\n- b\n" },
+        .{ .in = "- {a: 1}\n- b\n", .edit = .{ .set = .{ .path = "$[0].b", .value = undefined } }, .out = "- {a: 1, b: Z}\n- b\n" },
+        .{ .in = "- [1]\n- b\n", .edit = .{ .append = .{ .sequence = "$[0]", .value = undefined } }, .out = "- [1, Z]\n- b\n" },
+        .{ .in = "- - {}\n", .edit = .{ .set = .{ .path = "$[0][0].c", .value = undefined } }, .out = "- - {c: Z}\n" },
+        .{ .in = "k:\n  - {}\n  - x\n", .edit = .{ .set = .{ .path = "$.k[0].c", .value = undefined } }, .out = "k:\n  - {c: Z}\n  - x\n" },
+    };
+    for (cases, 0..) |c, i| {
+        docs[i] = try Document.parse(testing.allocator, c.in);
+        var doc = &docs[i];
+        defer doc.deinit();
+        const z = try doc.createScalar("Z", .plain);
+        var e = c.edit;
+        switch (e) {
+            .set => |*s| s.value = z,
+            .append => |*a| a.value = z,
+            else => unreachable,
+        }
+        var ed = Editor.init(doc);
+        try ed.apply(&.{e});
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+    // A trailing comment written on a scalar item takes the same path.
+    var doc = try Document.parse(testing.allocator, "- a\n- b\n");
+    defer doc.deinit();
+    try doc.setTrailingComment(doc.root.?.items().?[0], "# c");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("- a # c\n- b\n", out);
+}
+
+test "emptying a container keeps the comments between its entries" {
+    // `{}` / `[]` alone ate every comment line the deleted entries had
+    // between them, although deleting the entries one at a time kept
+    // every one of them. The surviving lines are written verbatim and
+    // the empty collection follows on its own line at the value's column.
+    const cases = [_]struct { in: []const u8, dels: []const []const u8, out: []const u8 }{
+        .{ .in = "a: 1\n# note\nb: 2\n", .dels = &.{ "$.a", "$.b" }, .out = "# note\n{}\n" },
+        .{ .in = "a: 1\n# note\nb: 2\n", .dels = &.{ "$.b", "$.a" }, .out = "# note\n{}\n" },
+        .{ .in = "# lead a\na: 1\n# lead b\nb: 2\n", .dels = &.{ "$.b", "$.a" }, .out = "# lead a\n# lead b\n{}\n" },
+        .{ .in = "m:\n  a: 1\n  # note\n  b: 2\nn: 3\n", .dels = &.{ "$.m.a", "$.m.b" }, .out = "m:\n  # note\n  {}\nn: 3\n" },
+        .{ .in = "- 1\n# note\n- 2\n", .dels = &.{ "$[1]", "$[0]" }, .out = "# note\n[]\n" },
+        .{ .in = "s:\n  - 1\n  # note\n  - 2\nn: 3\n", .dels = &.{ "$.s[1]", "$.s[0]" }, .out = "s:\n  # note\n  []\nn: 3\n" },
+        // The item's `-` stays on its own line (the comment between the
+        // entries kept the successor from moving up), then the comment,
+        // then the `{}` at the entries' column.
+        .{ .in = "- a: 1\n  # note\n  b: 2\n- x\n", .dels = &.{ "$[0].a", "$[0].b" }, .out = "-\n  # note\n  {}\n- x\n" },
+        // Blank lines alone are not worth keeping around an empty value.
+        .{ .in = "a: 1\n\nb: 2\n", .dels = &.{ "$.a", "$.b" }, .out = "{}\n" },
+        .{ .in = "a: 1 # c\n", .dels = &.{"$.a"}, .out = "{}\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        for (c.dels) |d| try ed.delete(d);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+        var re = try Document.parse(testing.allocator, out);
+        defer re.deinit();
+        const again = try re.write(testing.allocator);
+        defer testing.allocator.free(again);
+        try testing.expectEqualStrings(out, again);
+    }
+}
+
+test "a leading comment written on the first item does not open with a blank line" {
+    var doc = try Document.parse(testing.allocator, "- {a: 1}\n- b\n");
+    defer doc.deinit();
+    try doc.setLeadingComments(doc.root.?.items().?[0], "# lead");
+    var ed = Editor.init(&doc);
+    try ed.set("$[0].b", try doc.createScalar("Z", .plain));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# lead\n- {a: 1, b: Z}\n- b\n", out);
+}
+
 test "deleting an explicit-key entry removes its `? ` indicator too" {
     // The tombstone kept everything up to the key text, treating `? `
     // like a sequence item's `- ` indicator that outlives the entry. It
