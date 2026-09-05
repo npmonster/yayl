@@ -500,9 +500,17 @@ pub const Emitter = struct {
         var g = gap;
         while (g < src.len) {
             const nl = markup.newlineAt(src, g);
+            if (nl < g) break; // never slice inverted (defensive)
+            if (nl == g) {
+                // The cursor sits ON a line break: an empty line, which
+                // the blank run consumes like any other.
+                g = g + 1;
+                continue;
+            }
             if (std.mem.indexOfNone(u8, src[g..nl], " \t\r") != null) break; // content line
             g = if (nl < src.len) nl + 1 else src.len;
         }
+        if (g > src.len) g = src.len;
         if (g > gap) {
             try self.write(src[gap..g]);
             return g;
