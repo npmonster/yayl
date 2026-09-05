@@ -343,6 +343,14 @@ a move where the anchor and its aliases travel together is allowed.
 `ed.one` returns a borrowed node; `ed.all` and `yaml.edit.resolve`
 return a caller-owned slice — free it with the same allocator.
 
+A delete whose final segment is a recursive descent removes EVERY node
+it matches, in document order (`delete("$..k")` deletes every `k`
+anywhere beneath the root), atomically: if any removal would strand an
+alias the whole delete is refused with `error.AnchorReferenced` and
+nothing changes. The prefix resolves through the full grammar, so
+`$..in..k` reaches every `k` beneath every `in`. Descent deletes that
+match nothing are a no-op, like every delete.
+
 To copy a subtree into a *different* document, use
 `yaml.edit.cloneTreeInto(&target_doc, node)`: it deep-clones the node
 into the target document's pool with presentation spans cleared, so the

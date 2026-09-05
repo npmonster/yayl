@@ -464,6 +464,15 @@ pub const Editor = struct {
                 try applySet(doc, s.path, s.value);
             },
             .delete => |path| {
+                // A trailing descent deletes EVERY match: unlike `set`
+                // there is no single deterministic target to require,
+                // and the old behaviour — an error on one match, a
+                // silent no-op on several — was exactly backwards.
+                var p = try Path.parse(doc.allocator, path);
+                defer p.deinit(doc.allocator);
+                if (p.segments.len > 0 and p.segments[p.segments.len - 1] == .descend) {
+                    return applyDescendDelete(doc, p.segments);
+                }
                 const target = ed.one(path) catch |err| {
                     try noopOrOOM(err);
                     return; // no match: no-op
@@ -586,6 +595,47 @@ pub const Editor = struct {
         if (a == null and b == null) return true;
         if (a == null or b == null) return false;
         return std.mem.eql(u8, a.?, b.?);
+    }
+
+    /// A trailing `..key` descent deletes every node the whole path
+    /// matches, in document order, atomically (the batch machinery
+    /// clones first). The prefix resolves through the full query
+    /// grammar, so `$..in..k` deletes every `k` beneath every `in`.
+    /// A victim whose removal would strand an alias refuses the WHOLE
+    /// delete.
+    fn applyDescendDelete(doc: *Document, segments: []const Segment) Error!void {
+        const k = segments[segments.len - 1].descend;
+        const root = doc.root orelse return;
+        const containers = try resolve(doc.allocator, root, .{ .segments = segments[0 .. segments.len - 1] });
+        defer doc.allocator.free(containers);
+
+        // Pre-flight every victim's anchor obligations before removing
+        // anything: a refusal must not leave a half-deleted document.
+        var victims: std.ArrayList(*Node) = .empty;
+        defer victims.deinit(doc.allocator);
+        for (containers) |container| {
+            try collectDescend(doc.allocator, container, k, &victims, 0);
+        }
+        if (victims.items.len == 0) return;
+        for (victims.items) |victim| {
+            try refuseIfAnchorReferenced(doc, victim);
+        }
+
+        // Remove the outermost match, then re-collect: an outer match's
+        // subtree can contain further matches, and their pointers do
+        // not survive its removal. Each pass removes at least one pair,
+        // so the loop terminates.
+        while (true) {
+            victims.clearRetainingCapacity();
+            for (containers) |container| {
+                try collectDescend(doc.allocator, container, k, &victims, 0);
+            }
+            if (victims.items.len == 0) break; // all matches removed
+            const victim = victims.items[0];
+            const parent = victim.parent orelse break; // detached with an earlier removal
+            if (parent.kind() != .mapping) break;
+            _ = doc.mappingRemove(parent, k) catch |err| try noopOrOOM(err);
+        }
     }
 
     fn applyDelete(doc: *Document, path: []const u8) Error!void {
@@ -2333,4 +2383,80 @@ test "deleting an explicit-key entry removes its `? ` indicator too" {
         defer testing.allocator.free(out);
         try testing.expectEqualStrings(c.out, out);
     }
+}
+
+test "a trailing descent delete removes every match" {
+    var doc = try Document.parse(testing.allocator,
+        \\k: 1
+        \\inner:
+        \\  k: 2
+        \\  deep:
+        \\    k: 3
+        \\other: 4
+        \\
+    );
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{.{ .delete = "$..k" }});
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    // `deep` empties into `{}`, stepped in from its key like every
+    // emptied container.
+    try testing.expectEqualStrings("inner:\n  deep:\n    {}\nother: 4\n", out);
+
+    // Re-parse: the value tree holds exactly what survived.
+    var re = try Document.parse(testing.allocator, out);
+    defer re.deinit();
+    try testing.expect(re.pathGet(&.{"k"}) == null);
+    try testing.expect(re.pathGet(&.{ "inner", "k" }) == null);
+    try testing.expectEqualStrings("4", re.pathGet(&.{"other"}).?.scalarValue().?);
+}
+
+test "descent delete with one match is a delete, not an error" {
+    var doc = try Document.parse(testing.allocator, "a: 1\ninner:\n  k: 1\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.delete("$..k");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a: 1\ninner:\n  {}\n", out);
+}
+
+test "descent delete with no match stays a no-op" {
+    const src = "a: 1\n";
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.delete("$..missing");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(src, out);
+}
+
+test "descent delete refuses atomically when a victim would strand an alias" {
+    const src = "keep: 1\nk: &x 2\nref: *x\nother:\n  k: 3\n";
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try testing.expectError(error.AnchorReferenced, ed.delete("$..k"));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    // Nothing was removed: the batch rolled back whole.
+    try testing.expectEqualStrings(src, out);
+}
+
+test "descent delete under a prefix removes matches only within it" {
+    var doc = try Document.parse(testing.allocator,
+        \\out:
+        \\  k: 1
+        \\in:
+        \\  k: 2
+        \\
+    );
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.delete("$..in..k");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("out:\n  k: 1\nin:\n  {}\n", out);
 }

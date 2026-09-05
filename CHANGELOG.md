@@ -3,6 +3,20 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Fixed
+
+**`delete("$..k")` no longer fails backwards on its own grammar.** A
+recursive-descent delete matched one node and errored
+(`error.AmbiguousOperation`), and matched several and silently did
+NOTHING — reported success while changing nothing. A trailing descent
+now deletes every node it matches, in document order, atomically: any
+victim whose removal would strand an alias refuses the whole delete,
+and the prefix resolves through the full query grammar, so
+`$..in..k` deletes every `k` beneath every `in`. USAGE documents the
+semantics.
+
 ## 0.16.0 — 2026-09-05
 
 ### Fixed
