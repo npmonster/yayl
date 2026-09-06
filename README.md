@@ -159,7 +159,7 @@ try doc.pathSet(
 );
 ```
 
-The full set: `createScalar`, `createMapping`, `createSequence`, `mappingAppend`, `mappingRemove`, `sequenceAppend`, `sequenceInsert`, `sequenceRemove`, `pathSet`, `pathDelete`.
+The full set: `createScalar`, `createMapping`, `createSequence`, `mappingAppend`, `mappingRemove`, `sequenceAppend`, `sequenceInsert`, `sequenceRemove`, `pathSet`, `pathDelete`, `setAnchor`, `setTrailingComment`, `setLeadingComments`.
 
 ## Write: byte-faithful round trips
 
@@ -237,6 +237,7 @@ make roundtrip     # emit(parse(x)) == x over corpus + fixtures
 make preservation  # an edit changes only the lines it should (fixtures only)
 make consume       # build a package against the packaged library (.paths check)
 make differential  # event-stream parity vs libfyaml (needs a C compiler)
+make emission-oracle  # libfyaml parses everything yayl emits (report-only; needs a C compiler)
 make examples      # compile-checked example programs (zig-out/bin)
 zig build bench    # throughput CLI (scripts/bench-corpus.sh: fixtures + corpus)
 zig build fuzz     # deterministic long-run fuzz harness (smoke runs in `test`)
@@ -248,7 +249,7 @@ The gates, in both Debug and ReleaseSafe:
 | --- | --- |
 | yaml-test-suite conformance | 351/351, zero skips |
 | byte-faithful round trips | 269/269, no skips, plus real-world fixtures |
-| edit preservation | every addressable edit position across the real-world fixtures |
+| edit preservation | every addressable edit position across the real-world fixtures, plus a bounded pass over the corpus |
 | event-tree parity vs libfyaml | 269/269 compared, zero mismatches |
 | allocation-failure injection | zero leaks |
 

@@ -96,6 +96,10 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 | `fy-tag.c`            | in `parser.zig`        | 🟡 shorthand resolution done; no `fy_tag` cache                    |
 | `fy-wpool.c`          | —                      | ⬜ out of scope for v1 (threading)                                 |
 | `fy-markup.c`         | `src/markup.zig`       | ✅ done — source-span arithmetic behind byte-faithful round trips  |
+| — (yayl-original)     | `src/edit.zig`         | ✅ path grammar, atomic edit batches, clone                        |
+| — (yayl-original)     | `src/value.zig`        | ✅ semantic `Value` trees, `toZig`/`fromZig`                       |
+| — (yayl-original)     | `src/schema.zig`       | ✅ opt-in validation descriptors                                   |
+| — (yayl-original)     | `src/file.zig`         | ✅ bounded reads, atomic replacement writes                        |
 
 ### Scanner status
 
@@ -143,6 +147,11 @@ measured indent width.
   real-world fixtures — `make roundtrip`.
 - **Differential gate**: event streams vs the compiled vendored
   libfyaml over the corpus — `make differential`.
+- **Edit-preservation gate**: an edit changes only the lines it should,
+  over the fixtures and a bounded corpus pass — `make preservation`.
+- **Emission oracle**: the vendored libfyaml parses every document yayl
+  emits — `make emission-oracle` (report-only in CI until it has
+  soaked).
 
 ## Zig 0.16 gotchas already paid for (don't re-learn these)
 
@@ -173,8 +182,21 @@ src/{pool,diag,utf8,ctype}.zig     foundations
 src/{token,scanner}.zig            tokenizer
 src/{event,parser}.zig             event parser
 src/document.zig                   node model, builder, path/mutation API
+src/edit.zig                       path grammar, atomic edit batches, clone
 src/emitter.zig                    serializer
+src/markup.zig                     source-span arithmetic behind round trips
+src/value.zig                      semantic Value trees, toZig/fromZig
+src/schema.zig                     opt-in validation descriptors
+src/file.zig                       bounded reads, atomic writes
+src/{fuzz,internal}.zig            fuzz harness; shared internals
+tests/                             gate harnesses (conformance, roundtrip,
+                                   preservation, bench, dump) + fixtures
+docs/                              USAGE.md, design notes
+scripts/                           gate drivers (corpus/libfyaml fetch,
+                                   differential, emission-oracle, bench)
+examples/                          compile-checked example programs
 README.md                          user-facing docs
+CHANGELOG.md                       release notes; CONTRIBUTING.md; AGENTS.md
 ```
 
 ## Definition of done for a conversion task

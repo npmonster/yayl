@@ -24,11 +24,13 @@ re-emits every corpus case and the `tests/fixtures` files, and requires
 the output to equal the input byte for byte. Results land in
 `zig-out/roundtrip-report.json`, one record per case.
 
-This harness keeps its **own** `skips` table, and unlike the conformance
-one it is not empty: four cases (`HWV9`, `8G76`, `98YD`, `QT73`) are
-streams containing no document at all, so there is nothing to re-emit.
-libfyaml produces no output for them either. A skipped case that starts
-passing fails the gate, so the table cannot outlive a fix.
+This harness keeps its **own** `skips` table. Like the conformance one
+it is currently empty: the four cases that lived here (`HWV9`, `8G76`,
+`98YD`, `QT73` — streams containing no document at all) round trip since
+the fix that gives a content-free stream a rootless document carrying
+its bytes, so a fully commented-out file comes back whole. A skipped
+case that starts passing fails the gate, so the table cannot outlive a
+fix.
 
 Quote round-trip numbers as `pass/total` from a fresh report — the
 denominator includes the skips.

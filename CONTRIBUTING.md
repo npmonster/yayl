@@ -51,7 +51,7 @@ GitHub Pages on every `v*` tag.
    `scripts/differential.sh` with `vendor/` copied in.
 4. Commit as `release: X.Y.Z`, push `main`, then tag the pushed
    commit by explicit sha (`git tag -a vX.Y.Z <sha>`) and push the tag.
-5. Publish the GitHub Release: `gh release create vX.Y.Z --title ... 
+5. Publish the GitHub Release: `gh release create vX.Y.Z --title ...
    --notes-file ...`, the notes being a short summary paragraph plus
    the new changelog section — that is the convention every existing
    release follows.
