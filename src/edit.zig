@@ -216,7 +216,10 @@ pub fn resolve(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*N
                         for (pairs) |p| try next.append(allocator, p.value);
                     }
                 },
-                .descend => |k| try collectDescend(allocator, node, k, &next, 0),
+                .descend => |k| {
+                    try collectDescend(allocator, node, k, &next, 0);
+                    try dedupeNodes(allocator, &next);
+                },
                 .filter => |f| {
                     // Sequences: every item whose mapping carries
                     // key == value. Mappings: every value that does.
@@ -357,6 +360,23 @@ fn refuseIfMoveStrandsAlias(doc: *Document, subtree: *const Node) Error!void {
     const root = doc.root orelse return;
     if (aliasWouldDangle(root, subtree, 0)) return error.AnchorReferenced;
     if (dependsOnOutsideAnchor(subtree, subtree, 0)) return error.AnchorReferenced;
+}
+
+/// Keep the first occurrence of every node, in order. A descent walk
+/// resolves aliases, so a subtree reachable both directly and through a
+/// `*ref` is walked twice and its matches would be reported twice — and
+/// a caller applying one edit per match would apply it twice.
+fn dedupeNodes(allocator: std.mem.Allocator, list: *std.ArrayList(*Node)) Error!void {
+    var seen: std.AutoHashMapUnmanaged(*Node, void) = .empty;
+    defer seen.deinit(allocator);
+    var w: usize = 0;
+    for (list.items) |node| {
+        const entry = try seen.getOrPut(allocator, node);
+        if (entry.found_existing) continue;
+        list.items[w] = node;
+        w += 1;
+    }
+    list.shrinkRetainingCapacity(w);
 }
 
 fn collectDescend(allocator: std.mem.Allocator, node: *Node, key: []const u8, out: *std.ArrayList(*Node), depth: usize) Error!void {
@@ -638,6 +658,7 @@ pub const Editor = struct {
         for (containers) |container| {
             try collectDescend(doc.allocator, container, k, &victims, 0);
         }
+        try dedupeNodes(doc.allocator, &victims);
         if (victims.items.len == 0) return;
         for (victims.items) |victim| {
             try refuseIfAnchorReferenced(doc, victim);
@@ -2226,8 +2247,15 @@ test "an alias to an enclosing anchor is a parsed cycle, and cannot abort the pr
         var ed = Editor.init(&doc);
         const hits = try ed.all("$..k");
         defer allocator.free(hits);
-        // Once under `base`, once through the alias under `use`.
-        try std.testing.expectEqual(@as(usize, 2), hits.len);
+        // Walked under `base` and again through the alias under `use`,
+        // but it is one node, so it is one match.
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expect(hits[0] == doc.pathGet(&.{ "base", "k" }).?);
+        // Through the alias prefix alone, the walk must still reach it.
+        const via = try ed.all("$.use..k");
+        defer allocator.free(via);
+        try std.testing.expectEqual(@as(usize, 1), via.len);
+        try std.testing.expect(via[0] == hits[0]);
     }
 }
 
@@ -2619,6 +2647,34 @@ test "a trailing descent delete removes every match" {
     try testing.expect(re.pathGet(&.{"k"}) == null);
     try testing.expect(re.pathGet(&.{ "inner", "k" }) == null);
     try testing.expectEqualStrings("4", re.pathGet(&.{"other"}).?.scalarValue().?);
+}
+
+test "descent reports a node reached through an alias once" {
+    // `$..k` walks `a` directly and again through `b: *x`; the `k`
+    // under `a` is one node and must be one match, or a per-match edit
+    // over `ed.all` double-applies. Under the alias prefix (`$.b..k`)
+    // the walk still has to go through the alias to find it at all.
+    var doc = try Document.parse(testing.allocator, "a: &x\n  k: 1\nb: *x\nc:\n  k: 2\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+
+    const all = try ed.all("$..k");
+    defer testing.allocator.free(all);
+    try testing.expectEqual(@as(usize, 2), all.len);
+    try testing.expect(all[0] != all[1]);
+    try testing.expectEqualStrings("1", all[0].scalarValue().?);
+    try testing.expectEqualStrings("2", all[1].scalarValue().?);
+
+    const via_alias = try ed.all("$.b..k");
+    defer testing.allocator.free(via_alias);
+    try testing.expectEqual(@as(usize, 1), via_alias.len);
+    try testing.expect(via_alias[0] == all[0]);
+
+    // And a descent delete over the same tree removes each once.
+    try ed.delete("$..k");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a: &x {}\nb: *x\nc:\n  {}\n", out);
 }
 
 test "descent delete with one match is a delete, not an error" {

@@ -115,7 +115,11 @@ anchored value a new value, build the replacement, give it the same
 anchor with `doc.setAnchor(node, "v")`, and `set` it over the old node:
 the anchor moves with the slot and every `*v` follows it. `setAnchor`
 also clears (`null`) or defines an anchor on any node; clearing or
-renaming one an alias still names is refused the same way.
+renaming one an alias still names is refused the same way. The check
+is by name, not by position: with `- &x 1`, `- &x 2`, `- *x`, deleting
+the first item is refused even though the alias resolves to the second
+(later anchors shadow earlier ones). The refusal errs on the safe side;
+replace the alias with a plain value if the shadowed node has to go.
 
 An alias may name an *enclosing* anchor, which makes the document
 cyclic — `&a [*a]` parses. The recursive walks are depth-bounded so this
@@ -351,6 +355,10 @@ a move where the anchor and its aliases travel together is allowed.
 `ed.one` returns a borrowed node; `ed.all` and `yaml.edit.resolve`
 return a caller-owned slice — free it with the same allocator.
 
+Recursive descent resolves aliases as it walks, and reports each node
+once: a `k` reachable both directly and through a `*ref` is one match,
+not two, so a per-match edit over `ed.all("$..k")` is applied once.
+
 A delete whose final segment is a recursive descent removes EVERY node
 it matches, in document order (`delete("$..k")` deletes every `k`
 anywhere beneath the root), atomically: if any removal would strand an
@@ -419,7 +427,12 @@ emission time: comment text that is not one raw comment (no `#`, or a
 line break in a trailing comment), trailing comments on block
 collections (address the last entry), on the pair's key (the comment
 follows the value), on literal/folded or multi-line scalars (the value
-owns its lines), and anything inside a flow collection.
+owns its lines), and anything inside a flow collection. Bytes the
+scanner would refuse on re-parse are refused on the way in, so a write
+never produces a document `parse` cannot read back: malformed UTF-8 is
+`error.InvalidUtf8`, a NUL is `error.InvalidSyntax`. Everything the
+scanner accepts inside a comment — NEL, LS, PS, a BOM, control
+characters, a bare `#` — is accepted and round-trips unchanged.
 
 Out of scope, deliberately: free-floating comments — separated from
 content by a blank line, or in the document head before `---` — and

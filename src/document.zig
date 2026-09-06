@@ -951,11 +951,23 @@ pub const Document = struct {
         try internal.dropRange(self, drops, from, to);
     }
 
+    /// Refuse comment bytes the scanner refuses on input: a write that
+    /// `write` would emit raw and `parse` would then reject is not a
+    /// write. Invalid UTF-8 fails the way the scanner fails it
+    /// (error.InvalidUtf8); a NUL is a syntax error there too. The rest
+    /// of what §5.1 leaves printable — NEL, LS, PS, a BOM, C0 controls,
+    /// DEL — the scanner accepts inside a comment, so it stays accepted.
+    fn validateCommentBytes(t: []const u8) !void {
+        if (!std.unicode.utf8ValidateSlice(t)) return error.InvalidUtf8;
+        if (std.mem.indexOfScalar(u8, t, 0) != null) return error.InvalidSyntax;
+    }
+
     fn validateTrailingText(t: []const u8) !void {
         if (t.len == 0 or t[0] != '#') return error.InvalidSyntax;
         for (t) |c| {
             if (c == '\n' or c == '\r') return error.InvalidSyntax;
         }
+        try validateCommentBytes(t);
     }
 
     /// Strip one optional trailing newline and require every line to be
@@ -968,6 +980,7 @@ pub const Document = struct {
         else if (std.mem.endsWith(u8, t, "\n") or std.mem.endsWith(u8, t, "\r"))
             t = t[0 .. t.len - 1];
         if (t.len == 0) return error.InvalidSyntax;
+        try validateCommentBytes(t);
 
         // A CR is only ever the first byte of a CRLF separator. A LONE
         // CR is a YAML line break (§5.4), so it ends the comment and
@@ -2358,6 +2371,63 @@ test "comment writes cannot smuggle structure through a lone CR" {
         var again = try Document.parse(allocator, out);
         defer again.deinit();
         try testing.expectEqual(@as(usize, 2), again.root.?.pairs().?.len);
+    }
+}
+
+test "comment writes refuse bytes the scanner would refuse on re-parse" {
+    const allocator = testing.allocator;
+
+    // Same boundary as the lone-CR case, different failure: text that
+    // is not valid UTF-8, or carries a NUL, passed validation, was
+    // emitted raw, and the written document then failed its own
+    // `parse` (error.InvalidUtf8 / error.InvalidSyntax). A write the
+    // library cannot read back is not a write; refuse it up front.
+    // Everything else the scanner accepts in a comment — NEL, LS, PS,
+    // a BOM, C0 controls, DEL — stays accepted and round-trips.
+    const bad = [_]struct { text: []const u8, err: anyerror }{
+        .{ .text = "# x\xFFy", .err = error.InvalidUtf8 },
+        .{ .text = "# x\x85y", .err = error.InvalidUtf8 }, // latin-1 NEL, not UTF-8
+        .{ .text = "# x\xC2", .err = error.InvalidUtf8 }, // truncated sequence
+        .{ .text = "# x\xED\xA0\x80y", .err = error.InvalidUtf8 }, // surrogate
+        .{ .text = "# x\x00y", .err = error.InvalidSyntax },
+    };
+    for (bad) |case| {
+        var doc = try Document.parse(allocator, "a: 1\nb: 2\n");
+        defer doc.deinit();
+        const node = doc.pathGet(&.{"a"}).?;
+        try testing.expectError(case.err, doc.setTrailingComment(node, case.text));
+        try testing.expectError(case.err, doc.setLeadingComments(node, case.text));
+        // A refused write leaves the document byte-identical.
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings("a: 1\nb: 2\n", out);
+    }
+
+    const good = [_][]const u8{
+        "# x\xC2\x85y: z", // NEL
+        "# x\xE2\x80\xA8y: z", // LS
+        "# x\xE2\x80\xA9y: z", // PS
+        "# x\xEF\xBB\xBFy", // BOM
+        "# x\x01y", // C0 control
+        "# x\x7Fy", // DEL
+        "#", // bare indicator
+        "#\t",
+        "#no-space",
+    };
+    for (good) |text| {
+        var doc = try Document.parse(allocator, "a: 1\nb: 2\n");
+        defer doc.deinit();
+        try doc.setTrailingComment(doc.pathGet(&.{"a"}).?, text);
+        try doc.setLeadingComments(doc.pathGet(&.{"b"}).?, text);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        var re = try Document.parse(allocator, out);
+        defer re.deinit();
+        try testing.expectEqual(@as(usize, 2), re.root.?.pairs().?.len);
+        try testing.expectEqualStrings("1", re.pathGet(&.{"a"}).?.scalarValue().?);
+        try testing.expectEqualStrings("2", re.pathGet(&.{"b"}).?.scalarValue().?);
+        try testing.expectEqualStrings(text, re.pathGet(&.{"a"}).?.trailingComment(&re).?);
+        try testing.expectEqualStrings(text, re.pathGet(&.{"b"}).?.leadingComments(&re).?);
     }
 }
 
