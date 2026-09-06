@@ -3,7 +3,11 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
-## Unreleased
+## 0.17.0 — 2026-09-06
+
+If you are on 0.16.0 and delete entries, move to this release: 0.16.0
+shipped with the indicator-only-line bug below, which makes a delete
+next to an empty `- ` item write a document that does not re-parse.
 
 ### Added
 
@@ -45,6 +49,45 @@ victim whose removal would strand an alias refuses the whole delete,
 and the prefix resolves through the full query grammar, so
 `$..in..k` deletes every `k` beneath every `in`. USAGE documents the
 semantics.
+
+**An indicator-only line captured the entry below it.** `markup.entryStart`
+walks back from a key to the `-`/`?` that introduces it and accepts an
+indicator sitting alone on the previous line (the `-\n  content` shape).
+It required only that nothing but blanks precede the indicator, never
+that the content be indented UNDER it. So in `a: 1\nb:\n  - \nc: 1\n`,
+key `c` at column 0 was handed the entry_start of the `-` at column 2;
+emitting `c` re-wrote the item, and deleting `$.a` produced
+`b:\n  - \n- \nc: 1\n`, which does not reparse. A block entry's content
+always sits deeper than its indicator, so content at the same or a lower
+column belongs to an enclosing collection. Not CR-specific — plain LF
+reproduces identically; `? ` behaves the same way and is covered. The
+long-run fuzzer, which had 7 of 8 seeds failing on this shape, is clean
+at 100k iterations on all 8.
+
+**Comment writes refuse bytes the scanner refuses.** `setTrailingComment`
+and `setLeadingComments` validated for `#` and line breaks only, so text
+that was not valid UTF-8 (or carried a NUL) was accepted, emitted raw,
+and the written document then failed its own `parse` with
+`error.InvalidUtf8`. The same boundary the lone-CR fix closed in 0.16.0,
+from the other side: a write the library cannot read back is now refused
+up front, `error.InvalidUtf8` for malformed UTF-8 and `error.InvalidSyntax`
+for a NUL, leaving the document byte-identical. Everything the scanner
+does accept inside a comment — NEL, LS, PS, a BOM, C0 controls, DEL, a
+bare `#` — is still accepted and round-trips to the same tree.
+
+**Recursive descent reported a node twice when an alias also reached
+it.** `$..k` resolves aliases as it walks, so with `a: &x {k: 1}` and
+`b: *x` the one `k` came back as two matches from `ed.all`, and a
+caller applying one edit per match applied it twice. Each query now
+reports every node once, first occurrence in document order; the
+descent delete collects its victims the same way. `$.b..k`, where the
+walk has to go through the alias to find anything, still finds it.
+
+### Documentation
+
+Anchor-obligation checks are by name, not position: with a shadowed
+anchor (`- &x 1`, `- &x 2`, `- *x`) deleting the first item is refused
+although the alias resolves to the second. Safe side; USAGE says so.
 
 ## 0.16.0 — 2026-09-05
 
