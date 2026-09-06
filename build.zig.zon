@@ -6,10 +6,12 @@
     .description = "A YAML 1.2 parser, document model and emitter for Zig. Edits re-emit byte-faithfully: untouched bytes, comments and layout survive.",
     .license = "MIT",
     .paths = .{
+        "AGENTS.md",
         "build.zig",
         "build.zig.zon",
         "CHANGELOG.md",
         "CONTRIBUTING.md",
+        "docs/design/comments.md",
         "docs/USAGE.md",
         "examples",
         "LICENSE",
