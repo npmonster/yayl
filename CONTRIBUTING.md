@@ -33,6 +33,29 @@ allocation-failure injection (`std.testing.checkAllAllocationFailures`).
 Everything is merged to `main`; work happens on the pauta board, one
 card per change, with evidence logged on the card.
 
+## Cutting a release
+
+Releases are cut from `main` by hand — there is no release workflow;
+`ci.yml` gates the tag and `docs.yml` republishes the API reference to
+GitHub Pages on every `v*` tag.
+
+1. Turn the changelog's pending notes into a `## X.Y.Z — date` section
+   in [CHANGELOG.md](CHANGELOG.md), bump `.version` in
+   `build.zig.zon`, and update the `zig fetch --save` pin in the
+   README to the new tag.
+2. Run the whole suite **before** cutting the release commit, not
+   after — a change can invalidate a test that encoded the old
+   behavior.
+3. Gate in a detached worktree (a shared checkout may hold another
+   session's uncommitted work): `make verify`, plus
+   `scripts/differential.sh` with `vendor/` copied in.
+4. Commit as `release: X.Y.Z`, push `main`, then tag the pushed
+   commit by explicit sha (`git tag -a vX.Y.Z <sha>`) and push the tag.
+5. Publish the GitHub Release: `gh release create vX.Y.Z --title ... 
+   --notes-file ...`, the notes being a short summary paragraph plus
+   the new changelog section — that is the convention every existing
+   release follows.
+
 ## Reporting issues
 
 Include a minimal YAML input and what you expected. Parser/emitter
