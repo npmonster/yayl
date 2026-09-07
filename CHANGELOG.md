@@ -3,6 +3,90 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Fixed
+
+**Cross-document clones no longer point into the document they came
+from.** `edit.cloneTreeInto` copied a node's anchor, tag and written
+comments by SLICE. Every one of those is duped into the SOURCE
+document's pool, so the copy dangled the moment that document was
+freed — reading the clone's anchor, or emitting it, was a use-after-free.
+All four are now duped into the destination's pool. An alias whose
+anchor lives outside the cloned subtree was worse: it kept a `*Node`
+belonging to the other document (`resolveAlias` dereferences it
+unconditionally, so every `isScalar`/`pairs`/`scalarValue` call on the
+clone was a use-after-free) and emitted `*name` with no `&name` to match,
+which does not parse. Such an alias is now FOLLOWED for its value, which
+is what the function already documented; a second alias to the same name
+still clones as an alias, pointing at the copy. The pair `src_end` and
+the collection tombstones are byte offsets into the source, so they are
+cleared with the rest of the spans instead of travelling to a document
+where they mean nothing.
+
+**A string that looks like another type survives a `yaml.value` round
+trip.** `value.toNode` builds string scalars (and mapping keys) with
+style `.any` — "emitter, you pick" — and the emitter picked plain
+whenever the text was syntactically safe. So `Value{ .string = "90210" }`
+went out as bare `90210` and came back a `.int`; a postal code became a
+number, and `toZig` into a `[]const u8` field failed with
+`error.TypeMismatch`. `.any` now quotes anything that would resolve to a
+non-`str` core tag. `.plain` still means "the author wrote it bare" and
+is untouched, so nothing about faithful re-emission changes.
+
+**Plain scalars inside flow collections are quoted when they hold a flow
+indicator.** `plainSafe` only inspected the FIRST byte for `,[]{}`, so an
+edited flow item whose text contained one was emitted bare: setting an
+item of `a: [x, y]` to `hello, world` produced `[hello, world, y]`, which
+re-parses as three items, and a value containing `]` closed the sequence
+early and left a syntax error behind. Flow context now disqualifies a
+plain scalar holding any of `,[]{}` anywhere in the value.
+
+**Block scalars the literal form cannot express fall back to quoting.**
+`literalSafe` checked only `value[0]`, so `writeLiteral` produced blocks
+that do not re-parse: content that is nothing but line breaks, a first
+content line the reader would take the block's indentation from (leaving
+every later line under-indented), and a line starting with a tab where
+indentation is read. Found by the new emission-oracle mode below.
+
+**`!!int` is no longer less capable than the bare form.** An untagged
+integer too wide for `i64` kept its exact digits as `Value.bigint`;
+adding the tag — which says MORE about the value — turned it into
+`error.TypeMismatch`. Both paths now widen. `!!int abc` is still an
+error: the tag has to be true.
+
+**`value.fromZig` widens instead of failing.** A `u64` or `u128` past
+`maxInt(i64)` — a byte count, a hash, a snowflake id — returned
+`error.TypeMismatch` rather than using the `Value.bigint` that exists for
+exactly this. A `comptime_int` past the range widened too, where it
+previously would not compile.
+
+**A non-scalar mapping key no longer walks past `deny_unknown`.**
+`schema` skipped complex keys (`[a]: v`, spec 7.4.2) entirely, so a
+strict map never reported them. No declared field can name one, so it is
+unknown by construction and is now reported as such. Its value stays
+unvalidated, exactly like the value under an unknown scalar key.
+
+**`file.writeBytesAtomic` no longer refuses deep paths.** The temp name
+went into a fixed 512-byte buffer, so a path longer than ~495 bytes —
+well inside `PATH_MAX` on every platform — failed an otherwise valid
+atomic write with `error.NoSpaceLeft`. The buffer is now sized from
+`std.fs.max_path_bytes`, and a path the platform itself cannot represent
+returns `error.NameTooLong`.
+
+### Changed
+
+**The emission oracle checks two emission paths, not one.** It only ever
+re-emitted PARSED documents, where every scalar carries the style its
+author wrote — so the emitter's own style-choosing code (`.any`, and the
+block-scalar decisions) had never been seen by an independent parser. A
+`value` mode now rebuilds each document through `yaml.value` before
+emitting, which forces that decision for every scalar. Its first run
+found three defects, all fixed above. 539 emitted documents across the
+two modes, 0 findings. `tests/emit.zig` also returns the exit statuses it
+always documented (3 = yayl rejected the input, 4 = mode not applicable);
+both previously came out as 1, so the oracle could not tell them apart.
+
 ## 0.17.0 — 2026-09-06
 
 If you are on 0.16.0 and delete entries, move to this release: 0.16.0

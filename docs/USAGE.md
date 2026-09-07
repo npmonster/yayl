@@ -371,7 +371,13 @@ To copy a subtree into a *different* document, use
 `yaml.edit.cloneTreeInto(&target_doc, node)`: it deep-clones the node
 into the target document's pool with presentation spans cleared, so the
 copy re-emits normalized there (structure and values survive, internal
-layout and comments do not — the moved-subtree contract).
+layout and comments do not — the moved-subtree contract). The clone owns
+every string it carries, so it outlives the document it came from. An
+alias inside the subtree whose anchor is defined *outside* it cannot
+travel as an alias — the target belongs to the other document, and
+`*name` would name an anchor the destination never defines — so it is
+followed and its value inlined; a second alias to the same name then
+points at that copy.
 `yaml.edit.cloneTree` is the same-document form used by the editor's
 atomic batches; it keeps spans, and attaching its result anywhere but
 the source document would make the emitter copy bytes from the wrong

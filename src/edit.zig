@@ -837,20 +837,37 @@ pub fn cloneTreeInto(doc: *Document, root: *Node) Error!*Node {
 fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), clear_spans: bool, depth: usize) Error!*Node {
     // Structural recursion only — an alias is copied as an alias, never
     // followed — so a cycle cannot reach here, but a deep built tree can.
+    // The one exception is the cross-document alias below, which is
+    // followed and so counts against the same depth budget.
     if (depth >= max_walk_depth) return error.NestingTooDeep;
+
+    // An alias whose anchor lives OUTSIDE the cloned subtree cannot
+    // survive a cross-document clone as an alias: its target node
+    // belongs to the source document's pool (a dangling pointer once
+    // that document is freed) and `*name` would name an anchor this
+    // document never defines. Follow it for its value instead — the
+    // contract `cloneTreeInto` documents. Following registers the
+    // target's own anchor, so a second alias to the same name still
+    // clones as an alias, pointing at the copy.
+    if (clear_spans and node.data == .alias and anchors.get(node.data.alias.name) == null) {
+        return cloneNode(doc, node.data.alias.target, anchors, clear_spans, depth + 1);
+    }
+
     const n = try doc.pool.create(Node);
     n.* = .{
         .parent = null,
         .mark = node.mark,
-        .anchor = node.anchor,
-        .tag = node.tag,
+        // Every string is duped into THIS document's pool. Sharing the
+        // source node's slices is safe only within one document; for a
+        // cross-document clone they dangle the moment the source
+        // document is freed.
+        .anchor = if (node.anchor) |a| try doc.pool.dupe(a) else null,
+        .tag = if (node.tag) |t| try doc.pool.dupe(t) else null,
         .src = if (clear_spans) null else node.src,
         .modified = node.modified,
-        // Written comments travel with the clone: they are pool-owned
-        // slices like everything else, so sharing the slice between the
-        // original and the clone is fine.
-        .pending_trailing = node.pending_trailing,
-        .pending_leading = node.pending_leading,
+        // Written comments travel with the clone.
+        .pending_trailing = if (node.pending_trailing) |t| try doc.pool.dupe(t) else null,
+        .pending_leading = if (node.pending_leading) |t| try doc.pool.dupe(t) else null,
         .data = undefined,
     };
     switch (node.data) {
@@ -860,38 +877,49 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
             // cloned alias to an anchored scalar points into the clone
             // -- not at the pre-clone node, where a later replacement
             // of the scalar would never reach it.
-            if (node.anchor) |a| try anchors.put(try doc.pool.dupe(a), n);
+            if (n.anchor) |a| try anchors.put(a, n);
         },
         .alias => |a| {
+            // Reached only for an anchor defined inside the clone, or
+            // for a same-document clone where the source node is a
+            // legitimate target.
             const target = anchors.get(a.name) orelse a.target;
             n.data = .{ .alias = .{ .name = try doc.pool.dupe(a.name), .target = target } };
         },
         .mapping => |m| {
             n.data = .{ .mapping = .{ .style = m.style } };
-            if (node.anchor) |a| try anchors.put(try doc.pool.dupe(a), n);
+            if (n.anchor) |a| try anchors.put(a, n);
             for (m.pairs.items) |p| {
                 const k = try cloneNode(doc, p.key, anchors, clear_spans, depth + 1);
                 const v = try cloneNode(doc, p.value, anchors, clear_spans, depth + 1);
                 try internal.attachPair(doc, n, k, v);
-                // Preserve the pair's original extent.
-                if (n.data == .mapping) {
+                // Preserve the pair's original extent -- but only for a
+                // same-document clone. `src_end` indexes the source the
+                // tree was parsed from, so it is a span like any other
+                // and goes when the spans go.
+                if (!clear_spans and n.data == .mapping) {
                     const pairs = n.data.mapping.pairs.items;
                     if (pairs.len > 0) pairs[pairs.len - 1].src_end = p.src_end;
                 }
             }
-            for (m.dropped.items) |d| {
-                try n.data.mapping.dropped.append(doc.pool.allocator(), d);
+            // Tombstones are source byte ranges: same rule as spans.
+            if (!clear_spans) {
+                for (m.dropped.items) |d| {
+                    try n.data.mapping.dropped.append(doc.pool.allocator(), d);
+                }
             }
         },
         .sequence => |sq| {
             n.data = .{ .sequence = .{ .style = sq.style } };
-            if (node.anchor) |a| try anchors.put(try doc.pool.dupe(a), n);
+            if (n.anchor) |a| try anchors.put(a, n);
             for (sq.items.items) |item| {
                 const child = try cloneNode(doc, item, anchors, clear_spans, depth + 1);
                 try internal.attachItem(doc, n, child);
             }
-            for (sq.dropped.items) |d| {
-                try n.data.sequence.dropped.append(doc.pool.allocator(), d);
+            if (!clear_spans) {
+                for (sq.dropped.items) |d| {
+                    try n.data.sequence.dropped.append(doc.pool.allocator(), d);
+                }
             }
         },
     }
@@ -1819,6 +1847,91 @@ test "cloneTreeInto a second document cannot copy the wrong source bytes" {
     defer again.deinit();
     try testing.expectEqualStrings("42", again.pathGet(&.{ "other", "x" }).?.scalarValue().?);
     try testing.expectEqualStrings("1", again.pathGet(&.{"small"}).?.scalarValue().?);
+}
+
+test "cloneTreeInto keeps no pointers into the source document" {
+    // Anchor, tag and written comments were copied by SLICE, and every
+    // one of them is duped into the *source* document's pool -- so the
+    // clone dangled the moment that document was freed.
+    var b = try Document.parse(testing.allocator, "small: 1\n");
+    defer b.deinit();
+
+    const copy = blk: {
+        var a = try Document.parse(testing.allocator,
+            \\subtree: &keep !!map
+            \\  x: 42
+            \\
+        );
+        defer a.deinit();
+        const node = a.pathGet(&.{"subtree"}).?;
+        const inner = a.pathGet(&.{ "subtree", "x" }).?;
+        try a.setTrailingComment(inner, "# trailing");
+        try a.setLeadingComments(inner, "# leading");
+        const clone = try cloneTreeInto(&b, node);
+
+        // Checked while `a` is still alive, so this is a statement about
+        // OWNERSHIP and not about whether the allocator happens to have
+        // recycled the bytes yet: no string on the clone may point at
+        // the other document's pool.
+        try testing.expect(clone.anchor.?.ptr != node.anchor.?.ptr);
+        try testing.expect(clone.tag.?.ptr != node.tag.?.ptr);
+        const cloned_value = clone.data.mapping.pairs.items[0].value;
+        try testing.expect(cloned_value.pending_trailing.?.ptr != inner.pending_trailing.?.ptr);
+        try testing.expect(cloned_value.pending_leading.?.ptr != inner.pending_leading.?.ptr);
+        break :blk clone;
+    };
+    // `a` and its pool are gone. Nothing below may read through it.
+    try testing.expectEqualStrings("keep", copy.anchor.?);
+    try testing.expectEqualStrings("tag:yaml.org,2002:map", copy.tag.?);
+    const value = copy.data.mapping.pairs.items[0].value;
+    try testing.expectEqualStrings("# trailing", value.pending_trailing.?);
+    try testing.expectEqualStrings("# leading", value.pending_leading.?);
+    // Spans are cleared, and `src_end` is a span like any other.
+    try testing.expect(copy.src == null);
+    try testing.expect(copy.data.mapping.pairs.items[0].src_end == null);
+
+    try b.pathSet(&.{"imported"}, copy);
+    const out = try b.write(testing.allocator);
+    defer testing.allocator.free(out);
+    var rt = try Document.parse(testing.allocator, out);
+    defer rt.deinit();
+    try testing.expectEqualStrings("42", rt.pathGet(&.{ "imported", "x" }).?.scalarValue().?);
+}
+
+test "cloneTreeInto follows an alias anchored outside the subtree" {
+    // `*shared` names an anchor `cloneTreeInto` never copies, so keeping
+    // it as an alias left a pointer into the other document's pool AND
+    // emitted `*shared` with no `&shared` to match. The documented
+    // contract is to follow it for its value.
+    var b = try Document.parse(testing.allocator, "small: 1\n");
+    defer b.deinit();
+
+    const copy = blk: {
+        var a = try Document.parse(testing.allocator,
+            \\base: &shared [1, 2]
+            \\subtree:
+            \\  first: *shared
+            \\  second: *shared
+            \\
+        );
+        defer a.deinit();
+        break :blk try cloneTreeInto(&b, a.pathGet(&.{"subtree"}).?);
+    };
+    try b.pathSet(&.{"imported"}, copy);
+    const out = try b.write(testing.allocator);
+    defer testing.allocator.free(out);
+
+    // The output has to be valid YAML on its own terms: re-parse it and
+    // read the values back rather than pinning the exact layout.
+    var rt = try Document.parse(testing.allocator, out);
+    defer rt.deinit();
+    for ([_][]const u8{ "first", "second" }) |key| {
+        const seq = rt.pathGet(&.{ "imported", key }).?.resolveAlias();
+        const got = seq.items().?;
+        try testing.expectEqual(@as(usize, 2), got.len);
+        try testing.expectEqualStrings("1", got[0].scalarValue().?);
+        try testing.expectEqualStrings("2", got[1].scalarValue().?);
+    }
 }
 
 test "a move cannot put an alias ahead of its anchor" {

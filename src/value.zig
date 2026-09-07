@@ -238,10 +238,21 @@ fn taggedScalarToValue(allocator: std.mem.Allocator, node: *const Node) Error!Va
             .bool => .{ .bool = s.value[0] == 't' or s.value[0] == 'T' },
             else => error.TypeMismatch,
         },
-        .int => .{ .int = std.fmt.parseInt(i64, s.value, 0) catch return error.TypeMismatch },
+        .int => try taggedInt(allocator, s.value),
         .float => .{ .float = std.fmt.parseFloat(f64, s.value) catch
             document_mod.floatSpecial(s.value) orelse return error.TypeMismatch },
     };
+}
+
+/// `!!int` on a value too wide for `i64` keeps its exact digits, the
+/// same answer `scalarToValue` gives the untagged form. Tagging a big
+/// number is MORE explicit than leaving it bare, so it must not be less
+/// capable. Text that is not an integer at all is still `TypeMismatch`:
+/// `!!int abc` says one thing and means another.
+fn taggedInt(allocator: std.mem.Allocator, text: []const u8) Error!Value {
+    if (std.fmt.parseInt(i64, text, 0)) |i| return .{ .int = i } else |_| {}
+    if (document_mod.resolveCoreTag(text, .plain) != .int) return error.TypeMismatch;
+    return .{ .bigint = try allocator.dupe(u8, text) };
 }
 
 /// Interpret a scalar's text under its style (core schema: only plain
@@ -660,8 +671,21 @@ pub fn fromZig(allocator: std.mem.Allocator, value: anytype) Error!Value {
     const info = @typeInfo(T);
     switch (info) {
         .bool => return .{ .bool = value },
-        .int => return .{ .int = std.math.cast(i64, value) orelse return error.TypeMismatch },
-        .comptime_int => return .{ .int = value },
+        .int => |int_info| {
+            if (std.math.cast(i64, value)) |i| return .{ .int = i };
+            // Wider than i64 -- a byte count, a hash, a snowflake id.
+            // `Value.bigint` exists precisely so the exact digits
+            // survive; failing here would lose data the type can hold.
+            var buf: [int_info.bits / 3 + 3]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{d}", .{value}) catch unreachable;
+            return .{ .bigint = try allocator.dupe(u8, text) };
+        },
+        .comptime_int => {
+            if (value >= std.math.minInt(i64) and value <= std.math.maxInt(i64)) {
+                return .{ .int = value };
+            }
+            return .{ .bigint = try allocator.dupe(u8, std.fmt.comptimePrint("{d}", .{value})) };
+        },
         .float, .comptime_float => return .{ .float = @floatCast(value) },
         .optional => return if (value) |v| fromZig(allocator, v) else .null,
         .@"enum" => return .{ .string = try allocator.dupe(u8, @tagName(value)) },
@@ -1439,4 +1463,93 @@ test "a defaulted map field is cloned, not aliased" {
     var second = try toZig(Config, allocator, v);
     defer deinitZig(Config, allocator, second);
     try testing.expectEqual(@as(usize, 0), second.labels.count());
+}
+
+test "a string that looks like another type survives the document round trip" {
+    // `.any` let the emitter pick plain for a value the caller holds as
+    // a STRING, so `90210` went out bare and came back an int -- a
+    // postal code silently retyped, and `toZig` into a `[]const u8`
+    // field failing with TypeMismatch.
+    const allocator = testing.allocator;
+    const looks_typed = [_][]const u8{
+        "true",  "True", "false", "null",  "Null", "~",
+        "90210", "-42",  "0x1F",  "1.5e3", ".nan", ".inf",
+    };
+    for (looks_typed) |text| {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        doc.root = try doc.createMapping();
+        try doc.pathSet(&.{"code"}, try toNode(&doc, .{ .string = text }));
+
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+
+        var rt = try Document.parse(allocator, out);
+        defer rt.deinit();
+        const back = try nodeToValue(allocator, rt.pathGet(&.{"code"}).?);
+        defer freeValue(allocator, back);
+        try testing.expect(back == .string);
+        try testing.expectEqualStrings(text, back.string);
+    }
+}
+
+test "a mapping key that looks like another type keeps its text" {
+    // `toNode` builds keys with `.any` too.
+    const allocator = testing.allocator;
+    var doc = Document.init(allocator);
+    defer doc.deinit();
+    doc.root = try toNode(&doc, .{ .mapping = &.{
+        .{ .key = "true", .value = .{ .string = "yes" } },
+        .{ .key = "123", .value = .{ .string = "no" } },
+    } });
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("'true': yes\n'123': no\n", out);
+}
+
+test "an integer wider than i64 keeps its digits instead of failing" {
+    const allocator = testing.allocator;
+
+    // fromZig: `Value.bigint` exists to hold these; refusing them lost
+    // data the Zig type could carry.
+    const wide = try fromZig(allocator, @as(u64, std.math.maxInt(u64)));
+    defer freeValue(allocator, wide);
+    try testing.expectEqualStrings("18446744073709551615", wide.bigint);
+
+    const wider = try fromZig(allocator, @as(u128, std.math.maxInt(u128)));
+    defer freeValue(allocator, wider);
+    try testing.expectEqualStrings("340282366920938463463374607431768211455", wider.bigint);
+
+    // Still an ordinary int when it fits.
+    const fits = try fromZig(allocator, @as(u64, 42));
+    defer freeValue(allocator, fits);
+    try testing.expectEqual(@as(i64, 42), fits.int);
+
+    // And a comptime_int past the range widens rather than failing to
+    // compile.
+    const big_literal = try fromZig(allocator, 99999999999999999999);
+    defer freeValue(allocator, big_literal);
+    try testing.expectEqualStrings("99999999999999999999", big_literal.bigint);
+}
+
+test "an explicit !!int is no less capable than the bare form" {
+    // Untagged, an out-of-range integer became `.bigint`; adding the
+    // tag -- which says MORE about the value -- turned it into
+    // error.TypeMismatch.
+    const allocator = testing.allocator;
+    var doc = try Document.parse(allocator,
+        \\bare: 99999999999999999999
+        \\tagged: !!int 99999999999999999999
+        \\bad: !!int abc
+        \\
+    );
+    defer doc.deinit();
+
+    for ([_][]const u8{ "bare", "tagged" }) |key| {
+        const v = try nodeToValue(allocator, doc.pathGet(&.{key}).?);
+        defer freeValue(allocator, v);
+        try testing.expectEqualStrings("99999999999999999999", v.bigint);
+    }
+    // A tag that lies is still an error.
+    try testing.expectError(error.TypeMismatch, nodeToValue(allocator, doc.pathGet(&.{"bad"}).?));
 }

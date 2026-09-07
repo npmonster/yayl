@@ -251,6 +251,7 @@ The gates, in both Debug and ReleaseSafe:
 | byte-faithful round trips | 269/269, no skips, plus real-world fixtures |
 | edit preservation | every addressable edit position across the real-world fixtures, plus a bounded pass over the corpus |
 | event-tree parity vs libfyaml | 269/269 compared, zero mismatches |
+| emission oracle (libfyaml parses what we emit) | 539 documents across both emission paths, zero findings |
 | allocation-failure injection | zero leaks |
 
 ## License

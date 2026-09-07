@@ -151,7 +151,12 @@ measured indent width.
   over the fixtures and a bounded corpus pass — `make preservation`.
 - **Emission oracle**: the vendored libfyaml parses every document yayl
   emits — `make emission-oracle` (report-only in CI until it has
-  soaked).
+  soaked). It sweeps TWO emission paths: `faithful` replays the author's
+  bytes and styles, and `value` rebuilds each document through
+  `yaml.value` first, so the emitter has to choose every scalar's form.
+  The second is the only gate that sees the style-choosing code at all —
+  every other gate starts from parsed documents, where the styles come
+  from the source.
 
 ## Zig 0.16 gotchas already paid for (don't re-learn these)
 

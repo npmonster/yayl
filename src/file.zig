@@ -96,14 +96,20 @@ pub fn writeFile(doc: *const Document, allocator: std.mem.Allocator, io: std.Io,
 
 /// Atomically write raw bytes to `path` (temp file + rename).
 pub fn writeBytesAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
-    var buf: [512]u8 = undefined;
+    // The temp name is `path` plus a fixed suffix, so the buffer has to
+    // hold a full-length path and then some: a 512-byte buffer refused
+    // deeply nested but perfectly valid paths with error.NoSpaceLeft.
+    // A path the platform itself cannot represent is named as such.
+    const tmp_suffix_max = ".yayl-tmp-".len + 10; // u32, widest decimal
+    var buf: [std.fs.max_path_bytes + tmp_suffix_max]u8 = undefined;
     const cwd = std.Io.Dir.cwd();
     var attempt: usize = 0;
     while (true) {
         attempt += 1;
         var rand_bytes: [4]u8 = undefined;
         io.random(&rand_bytes);
-        const tmp_path = try std.fmt.bufPrint(&buf, "{s}.yayl-tmp-{d}", .{ path, std.mem.readInt(u32, &rand_bytes, .little) });
+        const tmp_path = std.fmt.bufPrint(&buf, "{s}.yayl-tmp-{d}", .{ path, std.mem.readInt(u32, &rand_bytes, .little) }) catch
+            return error.NameTooLong;
         var file = cwd.createFile(io, tmp_path, .{ .truncate = true, .exclusive = true }) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 if (attempt >= 4) return err;
@@ -249,4 +255,45 @@ fn expectNoTempFiles(io: std.Io, path: []const u8) !void {
             return error.TempFileLeftBehind;
         }
     }
+}
+
+test "a deep but valid path is not refused by the temp-name buffer" {
+    // The temp name went into a fixed 512-byte buffer, so a path longer
+    // than ~495 bytes -- well inside PATH_MAX on every platform -- failed
+    // an otherwise perfectly good atomic write with error.NoSpaceLeft.
+    const allocator = testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+
+    // 13 nested 40-char directories: ~540 bytes of path, plus the file
+    // name -- comfortably inside PATH_MAX, comfortably past 512.
+    const segment = "zig-out-test-deep-0123456789012345678901";
+    var path_buf: std.ArrayList(u8) = .empty;
+    defer path_buf.deinit(allocator);
+    for (0..13) |_| {
+        try path_buf.appendSlice(allocator, segment);
+        try path_buf.append(allocator, '/');
+        cwd.createDir(io, path_buf.items[0 .. path_buf.items.len - 1], .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    try path_buf.appendSlice(allocator, "deep.yaml");
+    const path = path_buf.items;
+    try testing.expect(path.len > 512);
+
+    defer {
+        cwd.deleteFile(io, path) catch {};
+        var end = path.len - "deep.yaml".len;
+        while (end > 0) : (end -= segment.len + 1) {
+            cwd.deleteDir(io, path[0 .. end - 1]) catch {};
+        }
+    }
+
+    try writeBytesAtomic(io, path, "a: 1\n");
+    const round = try readFile(allocator, io, path, max_bytes_default);
+    defer allocator.free(round);
+    try testing.expectEqualStrings("a: 1\n", round);
 }

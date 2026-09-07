@@ -889,7 +889,7 @@ pub const Emitter = struct {
             .scalar => |s| {
                 const props = try self.writeProperties(node);
                 if (props) try self.writeByte(' ');
-                try self.emitScalarValue(s.value, s.style, indent, true);
+                try self.emitScalarValue(s.value, s.style, indent, true, false);
                 return if (node.src) |sn| sn.end else 0;
             },
             .alias => |a| {
@@ -1331,7 +1331,7 @@ pub const Emitter = struct {
                 if (node.anchor) |a| try self.seen.put(node, a);
                 const props = try self.writeProperties(node);
                 if (props) try self.writeByte(' ');
-                try self.emitScalarValue(s.value, s.style, indent, true);
+                try self.emitScalarValue(s.value, s.style, indent, true, false);
             },
             .mapping => |*m| {
                 if (m.pairs.items.len == 0 or m.style == .flow) {
@@ -1371,7 +1371,7 @@ pub const Emitter = struct {
     fn emitEntry(self: *Emitter, key: *Node, value: *Node, indent: usize) Error!void {
         switch (key.data) {
             .scalar => |s| {
-                try self.emitScalarValue(s.value, s.style, indent, false);
+                try self.emitScalarValue(s.value, s.style, indent, false, false);
                 try self.writeByte(':');
             },
             else => {
@@ -1606,7 +1606,7 @@ pub const Emitter = struct {
             try self.writeByte(' ');
         }
         switch (node.data) {
-            .scalar => |s| try self.emitScalarValue(s.value, s.style, 0, false),
+            .scalar => |s| try self.emitScalarValue(s.value, s.style, 0, false, true),
             .alias => |a| {
                 try self.writeByte('*');
                 try self.write(a.name);
@@ -1616,7 +1616,7 @@ pub const Emitter = struct {
                 for (m.pairs.items, 0..) |pair, i| {
                     if (i > 0) try self.write(", ");
                     switch (pair.key.data) {
-                        .scalar => |s| try self.emitScalarValue(s.value, s.style, 0, false),
+                        .scalar => |s| try self.emitScalarValue(s.value, s.style, 0, false, true),
                         else => try self.emitFlowNode(pair.key),
                     }
                     try self.write(": ");
@@ -1673,8 +1673,8 @@ pub const Emitter = struct {
     // Scalars
     // ------------------------------------------------------------------
 
-    fn emitScalarValue(self: *Emitter, value: []const u8, prefer: ScalarStyle, indent: usize, block_ok: bool) Error!void {
-        const style = chooseScalarStyle(value, prefer, block_ok);
+    fn emitScalarValue(self: *Emitter, value: []const u8, prefer: ScalarStyle, indent: usize, block_ok: bool, flow: bool) Error!void {
+        const style = chooseScalarStyle(value, prefer, block_ok, flow);
         switch (style) {
             .plain => try self.write(value),
             .single_quoted => {
@@ -1760,7 +1760,7 @@ pub const Emitter = struct {
         for (0..s.trailing) |_| try self.writeByte('\n');
     }
 
-    fn chooseScalarStyle(value: []const u8, prefer: ScalarStyle, block_ok: bool) ScalarStyle {
+    fn chooseScalarStyle(value: []const u8, prefer: ScalarStyle, block_ok: bool, flow: bool) ScalarStyle {
         if (value.len == 0) {
             // An empty PLAIN scalar is YAML's null -- `key:` with
             // nothing after it -- and null is not the empty string.
@@ -1783,14 +1783,58 @@ pub const Emitter = struct {
             .literal, .folded => return .double_quoted,
             .any, .plain => {},
         }
-        if (plainSafe(value)) return .plain;
+        // `.any` is "you pick" for a value the caller holds as a STRING
+        // -- it is what `yaml.value` builds string scalars with. Picking
+        // plain is only safe when the text does not resolve to some
+        // other core tag: emitted bare, `true` re-parses as a bool and
+        // `90210` as an int, so a postal code comes back as a number and
+        // `toZig` into a `[]const u8` field fails. `.plain` keeps
+        // meaning "the author wrote it bare", and is left alone.
+        if (prefer == .any and document_mod.resolveCoreTag(value, .plain) != .str) {
+            return .single_quoted;
+        }
+        if (plainSafe(value) and (!flow or flowPlainSafe(value))) return .plain;
         return .single_quoted;
     }
 
+    /// Inside `[...]` or `{...}` the flow indicators end the entry or the
+    /// collection wherever they appear -- not only as the first byte,
+    /// which is all `plainSafe` inspects. A sequence item whose text is
+    /// `x, y` emitted bare re-parses as TWO items; one containing `]`
+    /// closes the sequence early and leaves a syntax error behind.
+    fn flowPlainSafe(value: []const u8) bool {
+        return std.mem.indexOfAny(u8, value, ",[]{}") == null;
+    }
+
+    /// A literal re-emission must re-parse to exactly `value` -- and the
+    /// block it writes has to be a block at all. `writeLiteral` never
+    /// writes an explicit indentation indicator, so three shapes are out
+    /// of its reach (all found by the emission oracle's `value` mode):
+    ///
+    ///   - Content that is nothing but line breaks. No run of block
+    ///     lines reads back as `"\n"`: the header alone gives `""`, and
+    ///     a lone blank line is the block's own terminator.
+    ///   - A first non-empty line that starts with a space. The reader
+    ///     takes THAT line's indentation as the block's, so every later
+    ///     line is under-indented and closes the block early. Saying
+    ///     otherwise needs an explicit indicator (`|2`).
+    ///   - Any line starting with a tab. Emitted at indent 0 -- a root
+    ///     scalar, or a shallow one -- the tab lands exactly where
+    ///     indentation is read, and a tab is never valid indentation.
+    ///
+    /// Each falls back to double-quoted, which can always express the
+    /// value.
     fn literalSafe(value: []const u8) bool {
-        if (value.len == 0) return false;
-        // A leading space would need an explicit indentation indicator.
-        if (value[0] == ' ') return false;
+        const s = stripTrailingNewlines(value);
+        if (s.core.len == 0) return false;
+        var it = std.mem.splitScalar(u8, s.core, '\n');
+        var first_content = true;
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            if (line[0] == '\t') return false;
+            if (first_content and line[0] == ' ') return false;
+            first_content = false;
+        }
         return true;
     }
 
@@ -2184,4 +2228,74 @@ test "the depth bound is a bound, and nesting under it still emits" {
     // And the emitted text re-parses, so the bound did not truncate it.
     var again = try Document.parse(testing.allocator, out);
     defer again.deinit();
+}
+
+test "a plain scalar in a flow collection is quoted when it holds a flow indicator" {
+    // `plainSafe` only inspects value[0], so an edited flow item whose
+    // text contains `,` went out bare: `[hello, world, y]` re-parsed as
+    // THREE items, and a `]` in the text closed the sequence early.
+    const cases = [_]struct { value: []const u8, want: []const u8 }{
+        .{ .value = "hello, world", .want = "a: ['hello, world', y]\n" },
+        .{ .value = "item]close", .want = "a: ['item]close', y]\n" },
+        .{ .value = "{braced}", .want = "a: ['{braced}', y]\n" },
+        // Nothing to escape: the plain form is still preferred.
+        .{ .value = "plain text", .want = "a: [plain text, y]\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, "a: [x, y]\n");
+        defer doc.deinit();
+        const seq = doc.pathGet(&.{"a"}).?;
+        try testing.expect(internal.sequenceReplace(&doc, seq, 0, try doc.createScalar(c.value, .plain)));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+
+        // And the emitted text has to re-parse to the value we set.
+        var rt = try Document.parse(testing.allocator, out);
+        defer rt.deinit();
+        const items = rt.pathGet(&.{"a"}).?.items().?;
+        try testing.expectEqual(@as(usize, 2), items.len);
+        try testing.expectEqualStrings(c.value, items[0].scalarValue().?);
+    }
+}
+
+test "a block scalar the literal form cannot express falls back to quoting" {
+    // Found by the emission oracle's `value` mode: `literalSafe` only
+    // looked at value[0], so `writeLiteral` produced blocks libfyaml
+    // (and the spec) reject -- a body of blank lines only, a first
+    // content line the reader would take the block's indentation from,
+    // and a tab where indentation is read.
+    const values = [_][]const u8{
+        "\n", // nothing but a line break
+        "\n\n more indented\nregular\n", // first content line is indented
+        "literal\n\ttext\n", // a line starting with a tab
+        "a\n\tb\n", // ... at any depth
+    };
+    // Both the styles that can reach `literalSafe`.
+    for ([_]ScalarStyle{ .literal, .folded, .any }) |style| {
+        for (values) |v| {
+            var doc = Document.init(testing.allocator);
+            defer doc.deinit();
+            doc.root = try doc.createMapping();
+            try doc.pathSet(&.{"k"}, try doc.createScalar(v, style));
+
+            const out = try doc.write(testing.allocator);
+            defer testing.allocator.free(out);
+
+            var rt = try Document.parse(testing.allocator, out);
+            defer rt.deinit();
+            try testing.expectEqualStrings(v, rt.pathGet(&.{"k"}).?.scalarValue().?);
+        }
+    }
+}
+
+test "a literal block is still chosen when it can express the value" {
+    // The fallback must not swallow the ordinary case.
+    var doc = Document.init(testing.allocator);
+    defer doc.deinit();
+    doc.root = try doc.createMapping();
+    try doc.pathSet(&.{"k"}, try doc.createScalar("line one\nline two\n", .literal));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("k: |\n  line one\n  line two\n", out);
 }

@@ -112,7 +112,14 @@ def decode(text: str) -> str:
             out.append(c); i += 1
     return "".join(out)
 
-checked = rejected = findings = no_document = 0
+# Two emission paths, checked independently. `faithful` replays the
+# author's bytes and styles; `value` rebuilds each document through
+# yaml.value, so the emitter must CHOOSE every scalar's form. The second
+# is a different decision procedure, and until it was gated here nothing
+# with an independent parser ever looked at it.
+MODES = ("faithful", "value")
+
+checked = rejected = findings = no_document = not_applicable = 0
 
 def has_document_content(text: str) -> bool:
     """False for streams made only of blank lines, comments and
@@ -136,9 +143,19 @@ def has_document_content(text: str) -> bool:
     return False
 
 def oracle(path: str, label: str) -> None:
-    global checked, rejected, findings, no_document
+    for mode in MODES:
+        oracle_one(path, f"{label} [{mode}]", mode)
+
+def oracle_one(path: str, label: str, mode: str) -> None:
+    global checked, rejected, findings, no_document, not_applicable
     tmp = os.path.join(work, "emitted.yaml")
-    r = subprocess.run([emit, path, tmp], capture_output=True, text=True)
+    r = subprocess.run([emit, path, tmp, mode], capture_output=True, text=True)
+    if r.returncode == 4:
+        # The mode does not apply to this input (a complex key has no
+        # string form; alias expansion is bounded). A documented limit,
+        # not an emission defect.
+        not_applicable += 1
+        return
     if r.returncode != 0:
         rejected += 1
         return  # yayl rejected its own input: nothing emitted to check
@@ -181,7 +198,7 @@ for cid in ids:
     open(tmp, "w", encoding="utf-8").write(decoded)
     oracle(tmp, f"corpus:{cid}")
 
-print(f"emission-oracle: {checked} emitted documents checked, {findings} findings, {rejected} inputs yayl rejected, {no_document} streams without a document")
+print(f"emission-oracle: {checked} emitted documents checked across {len(MODES)} modes, {findings} findings, {rejected} inputs yayl rejected, {no_document} streams without a document, {not_applicable} mode not applicable")
 if findings:
     sys.exit(1)
 EOF

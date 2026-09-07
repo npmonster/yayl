@@ -435,7 +435,21 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
             }
             // Per-field and unknown-key checks.
             for (pairs) |p| {
-                const kv = p.key.scalarValue() orelse continue;
+                const kv = p.key.scalarValue() orelse {
+                    // A sequence or mapping key (`[a]: v`, spec 7.4.2).
+                    // No declared field can name one, so it is unknown by
+                    // construction -- and skipping it silently let it
+                    // walk straight past `deny_unknown`. Its value is not
+                    // validated, exactly like the value under an unknown
+                    // scalar key: no field claims it, so no schema
+                    // applies.
+                    if (map_spec.deny_unknown) {
+                        const child_path = try std.fmt.allocPrint(allocator, "{s}.?", .{path});
+                        defer allocator.free(child_path);
+                        try appendViolation(allocator, out, child_path, "unknown", "unknown non-scalar key (a {s})", .{@tagName(p.key.resolveAlias().kind())});
+                    }
+                    continue;
+                };
                 const child_path = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ path, kv });
                 defer allocator.free(child_path);
                 var matched = false;
@@ -872,4 +886,29 @@ test "a composition branch cannot escape the node budget" {
         "$",
         .{ .max_nodes = 8 },
     ));
+}
+
+test "a non-scalar key does not walk past deny_unknown" {
+    // `p.key.scalarValue() orelse continue` skipped complex keys
+    // entirely, so `[a]: v` slipped through a strict map without
+    // producing an unknown violation.
+    const allocator = testing.allocator;
+    const schema = Schema.mapStrict(&.{
+        .{ .key = "name", .schema = &Schema.str },
+    });
+
+    var doc = try document_mod.Document.parse(allocator,
+        \\name: api
+        \\? [a, b]
+        \\: value
+        \\
+    );
+    defer doc.deinit();
+
+    const violations = try schema.validate(allocator, doc.root.?, "$");
+    defer freeViolations(allocator, violations);
+    try testing.expectEqual(@as(usize, 1), violations.len);
+    try testing.expectEqualStrings("unknown", violations[0].rule);
+    try testing.expectEqualStrings("$.?", violations[0].path);
+    try testing.expectEqualStrings("unknown non-scalar key (a sequence)", violations[0].detail);
 }
