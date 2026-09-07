@@ -53,7 +53,7 @@ conformance: corpus ## Run the pinned YAML Test Suite corpus through yayl
 roundtrip: corpus ## Byte-faithful round trip over the corpus and tests/fixtures
 	$(ZIG) build roundtrip --summary all
 
-preservation: ## Edit-preservation sweeps over tests/fixtures (edits change only what they should)
+preservation: ## Edit-preservation sweeps over fixtures and corpus (edits change only what they should)
 	$(ZIG) build preservation --summary all
 
 differential: corpus libfyaml ## Compare yayl vs libfyaml event streams over the corpus (needs a C compiler)

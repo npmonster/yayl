@@ -865,7 +865,10 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
         .tag = if (node.tag) |t| try doc.pool.dupe(t) else null,
         .src = if (clear_spans) null else node.src,
         .modified = node.modified,
-        // Written comments travel with the clone.
+        // Written comments travel on the node fields (readable via
+        // trailingComment/leadingComments), but note that a span-less
+        // cloned subtree (clear_spans=true) re-emits normalized without
+        // comments per the moved-subtree contract.
         .pending_trailing = if (node.pending_trailing) |t| try doc.pool.dupe(t) else null,
         .pending_leading = if (node.pending_leading) |t| try doc.pool.dupe(t) else null,
         .data = undefined,

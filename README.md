@@ -234,7 +234,7 @@ Deliberate for v1:
 make verify        # every gate below except differential
 make conformance   # yaml-test-suite corpus
 make roundtrip     # emit(parse(x)) == x over corpus + fixtures
-make preservation  # an edit changes only the lines it should (fixtures only)
+make preservation  # an edit changes only the lines it should (fixtures + corpus)
 make consume       # build a package against the packaged library (.paths check)
 make differential  # event-stream parity vs libfyaml (needs a C compiler)
 make emission-oracle  # libfyaml parses everything yayl emits (report-only; needs a C compiler)
