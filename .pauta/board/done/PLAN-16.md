@@ -2,7 +2,7 @@
 id: PLAN-16
 title: Resolve YAML merge keys (<<)
 created: 2026-09-11T14:01:44Z
-updated: 2026-09-14T05:44:59Z
+updated: 2026-09-14T06:01:36Z
 tags: [yaml, merge-keys, design]
 deps: []
 skills: []
@@ -34,3 +34,4 @@ Open decisions in the note (value rule, exposure, naming, anchor purge) need a h
 - 2026-09-14T05:13:51Z 2026-09-11: reviewer marble-owl surfaced a pre-existing emitter bug via a probe while reviewing this card: the laid-out path wrote `? K: V` on one line, which re-reads as a mapping key with a null value; reachable through merge resolution copying a complex key. Fixed by marble-owl in e91d04e (emitEntry puts the indicator on its own line) with three round-trip tests; make verify green on e91d04e. I added the merge-side integration test (complex key out of a merge source, copied and re-read). marble-owl also recorded an owed fix in tests/preservation.zig: the explicit_key target category is skipped outright and should be un-skipped -- that is the gap that hid this bug.
 - 2026-09-14T05:44:59Z 2026-09-11: reviewer marble-owl returned PASS on all six review questions (atomicity, clone alias targets, emission, precedence, bounds/recursion, untested). Its two code corrections plus the emitter bug it found are all closed: MergeKeyRecursive comment corrected + parsed-input test added; cloneTreeWhole refuses a forward alias instead of pointing the clone at the pre-clone tree; mappingHasKey note added; CRLF-under-merge test added and it found a second pre-existing emitter bug (structural breaks hardcoded LF) now fixed via Emitter.defaultTerminator; explicit_key preservation targets moved from outright-skipped to weakly swept (8 corpus targets swept, gate green). Commits: a2ba956 (emitter CRLF + review cleanups), plus the preservation un-skip commit. All gates green: make verify, make differential (269/0), make emission-oracle (539/0).
 - 2026-09-14T05:44:59Z review passed
+- 2026-09-14T06:01:36Z 2026-09-11 follow-up (reviewer marble-owl): my explicit_key un-skip was an operation gap — delete/set reuse the key's source span, so the laid-out explicit-key arm was never reached. Added a complex-key map-add (one-item flow-sequence key) on every container the add sweep touches. First red-proof still passed 9/9: assertsSemanticRoundTrip uses yaml.value, which returns error.TypeMismatch for a non-scalar key and silently skips, so the assertion was blind too. Now asserts the reparsed container structurally (sequence key [9] -> value added). Red-proved in a detached worktree with only the emitEntry line reverted: 322 failures, gate 6/9; green with the fix. Commits 2106cc9, b1aeef7. Counter moved from skipped: to 'weak (semantic-only): N explicit-key targets'.
