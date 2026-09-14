@@ -1288,7 +1288,33 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
                 defer allocator.free(cout);
                 stats.complex_map_adds += 1;
                 assertsReparse(allocator, name, c.path, cout, failures);
-                assertsSemanticRoundTrip(allocator, name, "complex map add under", c.path, &cdoc, cout, failures);
+                // `assertsSemanticRoundTrip` goes through `yaml.value`,
+                // which cannot represent a non-scalar key (it returns
+                // error.TypeMismatch) and so silently skips every
+                // complex-key document. Assert the round trip
+                // STRUCTURALLY instead: the reparsed container must
+                // hold a SEQUENCE key `[9]` whose value is `added`.
+                // Without the emitEntry fix the key comes back a
+                // MAPPING with an empty value and this fails.
+                var routed = false;
+                {
+                    var re = yaml.parse(allocator, cout) catch {
+                        failures.add("{s}: complex map add under {s}: output does not re-parse", .{ name, c.path });
+                        continue;
+                    };
+                    defer re.deinit();
+                    var red = yaml.edit.Editor.init(&re);
+                    const rcontainer = red.one(c.path) catch continue;
+                    for (rcontainer.pairs() orelse &.{}) |p| {
+                        if (p.key.kind() != .sequence) continue;
+                        const items = p.key.items() orelse continue;
+                        if (items.len != 1) continue;
+                        const text = items[0].scalarValue() orelse continue;
+                        if (!std.mem.eql(u8, text, "9")) continue;
+                        if (std.mem.eql(u8, p.value.scalarValue() orelse "", "added")) routed = true;
+                    }
+                }
+                if (!routed) failures.add("{s}: complex map add under {s}: the added complex key did not round-trip", .{ name, c.path });
             }
         } else {
             if (seq_budget == 0) {
