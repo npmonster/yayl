@@ -2,7 +2,7 @@
 id: PLAN-16
 title: Resolve YAML merge keys (<<)
 created: 2026-09-11T14:01:44Z
-updated: 2026-09-14T05:13:51Z
+updated: 2026-09-14T05:44:59Z
 tags: [yaml, merge-keys, design]
 deps: []
 skills: []
@@ -10,6 +10,7 @@ review_rounds: 0
 priority: 1
 reviewer: marble-owl (plumb peer session)
 auto_review: false
+blocked: ""
 ---
 
 ## Plan
@@ -31,3 +32,5 @@ Open decisions in the note (value rule, exposure, naming, anchor purge) need a h
 - 2026-09-14T04:01:36Z 2026-09-11: implementation complete on main. Commits 3c12954 (feature + tests + docs) and the follow-up coverage commit. Gates: make verify green (fmt, check, Debug+ReleaseSafe tests, examples, conformance 351/351, roundtrip 269/269, preservation all pass, consumer smoke); make differential 269 compared/0 mismatches; make emission-oracle 539 documents/0 findings. 12 merge-key tests in src/document.zig + 1 in src/value.zig. Moved to review; reviewer marble-owl (plumb peer) asked via plumb chat but has not read the request yet. Remaining follow-up recorded in docs/design/merge-keys.md: differential against libfyaml FYPCF_RESOLVE_DOCUMENT.
 - 2026-09-14T04:02:21Z Correction to the previous entry: the merge-key suite is 23 tests in src/document.zig plus 1 in src/value.zig (counted with grep), not 12. Second commit is 3d2f92a.
 - 2026-09-14T05:13:51Z 2026-09-11: reviewer marble-owl surfaced a pre-existing emitter bug via a probe while reviewing this card: the laid-out path wrote `? K: V` on one line, which re-reads as a mapping key with a null value; reachable through merge resolution copying a complex key. Fixed by marble-owl in e91d04e (emitEntry puts the indicator on its own line) with three round-trip tests; make verify green on e91d04e. I added the merge-side integration test (complex key out of a merge source, copied and re-read). marble-owl also recorded an owed fix in tests/preservation.zig: the explicit_key target category is skipped outright and should be un-skipped -- that is the gap that hid this bug.
+- 2026-09-14T05:44:59Z 2026-09-11: reviewer marble-owl returned PASS on all six review questions (atomicity, clone alias targets, emission, precedence, bounds/recursion, untested). Its two code corrections plus the emitter bug it found are all closed: MergeKeyRecursive comment corrected + parsed-input test added; cloneTreeWhole refuses a forward alias instead of pointing the clone at the pre-clone tree; mappingHasKey note added; CRLF-under-merge test added and it found a second pre-existing emitter bug (structural breaks hardcoded LF) now fixed via Emitter.defaultTerminator; explicit_key preservation targets moved from outright-skipped to weakly swept (8 corpus targets swept, gate green). Commits: a2ba956 (emitter CRLF + review cleanups), plus the preservation un-skip commit. All gates green: make verify, make differential (269/0), make emission-oracle (539/0).
+- 2026-09-14T05:44:59Z review passed
