@@ -763,12 +763,77 @@ fn assertsSemanticRoundTrip(
         return;
     };
     defer re.deinit();
-    const v_edited = yaml.value.nodeToValue(allocator, edited.root orelse return) catch return;
-    defer yaml.value.freeValue(allocator, v_edited);
-    const v_out = yaml.value.nodeToValue(allocator, re.root orelse return) catch return;
-    defer yaml.value.freeValue(allocator, v_out);
-    if (!valueEql(v_edited, v_out)) {
-        failures.add("{s}: " ++ what ++ " {s}: re-parsed output does not match the edited document", .{ name, path });
+
+    const edited_root = edited.root;
+    const out_root = re.root;
+    if (edited_root == null or out_root == null) {
+        // One side rootless and the other not is itself a difference.
+        if (edited_root != null or out_root != null) {
+            failures.add("{s}: " ++ what ++ " {s}: re-parsed output does not match the edited document (root presence differs)", .{ name, path });
+        }
+        return;
+    }
+
+    // `yaml.value` is the primary comparison: it normalizes styles and
+    // follows aliases, so it sees "valid YAML that lost data".
+    //
+    // It cannot represent every document, though, and this used to
+    // `catch return` when it could not -- silently passing EVERY
+    // document that holds a non-scalar key, because `nodeToValue`
+    // answers `error.TypeMismatch` for one. That is the assertion being
+    // a no-op for exactly the inputs it most needed to check, and it hid
+    // a real emitter bug (`? K: V` on one line) until someone went
+    // looking. Fall back to a structural comparison instead of giving up.
+    if (yaml.value.nodeToValue(allocator, edited_root.?)) |v_edited| {
+        defer yaml.value.freeValue(allocator, v_edited);
+        if (yaml.value.nodeToValue(allocator, out_root.?)) |v_out| {
+            defer yaml.value.freeValue(allocator, v_out);
+            if (!valueEql(v_edited, v_out)) {
+                failures.add("{s}: " ++ what ++ " {s}: re-parsed output does not match the edited document", .{ name, path });
+            }
+            return;
+        } else |_| {}
+    } else |_| {}
+
+    // Structural fallback. Compares kind, scalar text, alias name and
+    // child counts pairwise. Aliases are compared BY NAME rather than
+    // followed: the two trees are the same document either side of an
+    // emit/re-parse, so their aliases correspond one to one -- and not
+    // following them means a cyclic anchor cannot make this recurse
+    // forever.
+    if (!structuralEql(edited_root.?, out_root.?, 0)) {
+        failures.add("{s}: " ++ what ++ " {s}: re-parsed output does not match the edited document (structural)", .{ name, path });
+    }
+}
+
+/// Bound for `structuralEql`. Deeper than any corpus document; a tree
+/// past it compares unequal rather than overflowing the stack, which
+/// reports as a failure and is the safe direction for a gate.
+const max_structural_depth: usize = 512;
+
+fn structuralEql(a: *const yaml.Node, b: *const yaml.Node, depth: usize) bool {
+    if (depth >= max_structural_depth) return false;
+    if (a.kind() != b.kind()) return false;
+    switch (a.data) {
+        .scalar => |s| return std.mem.eql(u8, s.value, b.data.scalar.value),
+        .alias => |al| return std.mem.eql(u8, al.name, b.data.alias.name),
+        .sequence => |s| {
+            const bs = b.data.sequence;
+            if (s.items.items.len != bs.items.items.len) return false;
+            for (s.items.items, bs.items.items) |x, y| {
+                if (!structuralEql(x, y, depth + 1)) return false;
+            }
+            return true;
+        },
+        .mapping => |m| {
+            const bm = b.data.mapping;
+            if (m.pairs.items.len != bm.pairs.items.len) return false;
+            for (m.pairs.items, bm.pairs.items) |x, y| {
+                if (!structuralEql(x.key, y.key, depth + 1)) return false;
+                if (!structuralEql(x.value, y.value, depth + 1)) return false;
+            }
+            return true;
+        },
     }
 }
 
@@ -1288,33 +1353,16 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
                 defer allocator.free(cout);
                 stats.complex_map_adds += 1;
                 assertsReparse(allocator, name, c.path, cout, failures);
-                // `assertsSemanticRoundTrip` goes through `yaml.value`,
-                // which cannot represent a non-scalar key (it returns
-                // error.TypeMismatch) and so silently skips every
-                // complex-key document. Assert the round trip
-                // STRUCTURALLY instead: the reparsed container must
-                // hold a SEQUENCE key `[9]` whose value is `added`.
-                // Without the emitEntry fix the key comes back a
-                // MAPPING with an empty value and this fails.
-                var routed = false;
-                {
-                    var re = yaml.parse(allocator, cout) catch {
-                        failures.add("{s}: complex map add under {s}: output does not re-parse", .{ name, c.path });
-                        continue;
-                    };
-                    defer re.deinit();
-                    var red = yaml.edit.Editor.init(&re);
-                    const rcontainer = red.one(c.path) catch continue;
-                    for (rcontainer.pairs() orelse &.{}) |p| {
-                        if (p.key.kind() != .sequence) continue;
-                        const items = p.key.items() orelse continue;
-                        if (items.len != 1) continue;
-                        const text = items[0].scalarValue() orelse continue;
-                        if (!std.mem.eql(u8, text, "9")) continue;
-                        if (std.mem.eql(u8, p.value.scalarValue() orelse "", "added")) routed = true;
-                    }
-                }
-                if (!routed) failures.add("{s}: complex map add under {s}: the added complex key did not round-trip", .{ name, c.path });
+                // This used to carry a bespoke structural check, because
+                // `assertsSemanticRoundTrip` went through `yaml.value`
+                // and silently skipped every complex-key document. The
+                // helper now falls back to a structural comparison when
+                // `yaml.value` cannot represent a tree, so the general
+                // assertion covers this case exactly -- verified: with
+                // the emitEntry fix reverted and the bespoke check
+                // removed, this line alone reports the same 322
+                // failures. One implementation of the rule, not two.
+                assertsSemanticRoundTrip(allocator, name, "complex map add under", c.path, &cdoc, cout, failures);
             }
         } else {
             if (seq_budget == 0) {
