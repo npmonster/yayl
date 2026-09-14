@@ -203,8 +203,15 @@ const Target = struct {
     /// behind the entries — counted, never swept.
     props_preamble: bool,
     /// The entry was written with an explicit key indicator (`? key`).
-    /// Edits re-emit it as a two-line entry, so line-shape assertions
-    /// do not apply; the semantic ones still run.
+    /// Edits re-emit it as a two-line entry and the tombstone arithmetic
+    /// does not yet cover the `? ` line, so the target is skipped
+    /// OUTRIGHT -- counted, never swept, semantic assertions included.
+    /// That blind spot hid a real emitter bug: the laid-out path used to
+    /// write `? K: V` on one line, which re-reads as an explicit key that
+    /// is the mapping `{K: V}` with a null value. Fixed in emitter.zig
+    /// `emitEntry`, covered by its own round-trip tests -- but only
+    /// because someone went looking, not because this sweep failed.
+    /// Un-skipping this category is the real fix and is still owed.
     explicit_key: bool,
     /// The parent container is flow-styled: the emitter's documented
     /// normalization reflows the collection, so line-shape assertions

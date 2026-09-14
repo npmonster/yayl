@@ -1375,9 +1375,18 @@ pub const Emitter = struct {
                 try self.writeByte(':');
             },
             else => {
-                // Explicit key (spec 7.4.2) in compact flow form.
+                // Explicit key (spec 7.4.2). The key itself is written in
+                // compact flow form, but the value indicator MUST open a
+                // line of its own at the key's own column. `? K: V` on one
+                // line is not the entry it looks like: a block mapping
+                // reads it as an explicit key that is the mapping `{K: V}`,
+                // with a null value — silently changing both the key and
+                // the value on a round trip. Only this laid-out path is
+                // affected; an unmodified entry re-emits from its source
+                // span (`explicitKeySpan`) and keeps whatever shape it had.
                 try self.write("? ");
                 try self.emitFlowNode(key);
+                try self.newlineAt(indent);
                 try self.writeByte(':');
             },
         }
@@ -2298,4 +2307,108 @@ test "a literal block is still chosen when it can express the value" {
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("k: |\n  line one\n  line two\n", out);
+}
+
+test "a laid-out explicit key puts the value indicator on its own line" {
+    // `? K: V` on one line is read back as an explicit key that IS the
+    // mapping `{K: V}`, with a null value -- so the key and the value
+    // both change on a round trip. The entry must be two lines.
+    var doc = Document.init(testing.allocator);
+    defer doc.deinit();
+    const root = try doc.createMapping();
+    doc.root = root;
+    const key = try doc.createSequence();
+    try doc.sequenceAppend(key, try doc.createScalar("1", .plain));
+    try doc.sequenceAppend(key, try doc.createScalar("2", .plain));
+    try doc.mappingAppend(root, key, try doc.createScalar("pair", .plain));
+    try doc.mappingAppend(root, try doc.createScalar("a", .plain), try doc.createScalar("1", .plain));
+
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("? [1, 2]\n: pair\na: 1\n", out);
+
+    var rt = try Document.parse(testing.allocator, out);
+    defer rt.deinit();
+    const pairs = rt.root.?.data.mapping.pairs.items;
+    try testing.expectEqual(@as(usize, 2), pairs.len);
+    try testing.expectEqual(document_mod.NodeKind.sequence, pairs[0].key.kind());
+    try testing.expectEqualStrings("pair", pairs[0].value.scalarValue().?);
+    try testing.expectEqualStrings("a", pairs[1].key.scalarValue().?);
+}
+
+test "an explicit key with a mapping key and with a null value both re-read" {
+    // A mapping as the key is the case `? K: V` corrupts most visibly,
+    // and a null value must not leave a dangling `: ` either.
+    var doc = Document.init(testing.allocator);
+    defer doc.deinit();
+    const root = try doc.createMapping();
+    doc.root = root;
+    const mkey = try doc.createMapping();
+    try doc.mappingAppend(mkey, try doc.createScalar("x", .plain), try doc.createScalar("1", .plain));
+    try doc.mappingAppend(root, mkey, try doc.createScalar("pair", .plain));
+    const nkey = try doc.createSequence();
+    try doc.sequenceAppend(nkey, try doc.createScalar("n", .plain));
+    try doc.mappingAppend(root, nkey, try doc.createScalar("", .plain));
+
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("? {x: 1}\n: pair\n? [n]\n:\n", out);
+
+    var rt = try Document.parse(testing.allocator, out);
+    defer rt.deinit();
+    const pairs = rt.root.?.data.mapping.pairs.items;
+    try testing.expectEqual(@as(usize, 2), pairs.len);
+    try testing.expectEqual(document_mod.NodeKind.mapping, pairs[0].key.kind());
+    try testing.expectEqualStrings("pair", pairs[0].value.scalarValue().?);
+    try testing.expectEqual(document_mod.NodeKind.sequence, pairs[1].key.kind());
+}
+
+test "an explicit key whose value is a block collection re-reads" {
+    var doc = Document.init(testing.allocator);
+    defer doc.deinit();
+    const root = try doc.createMapping();
+    doc.root = root;
+    const key = try doc.createSequence();
+    try doc.sequenceAppend(key, try doc.createScalar("k", .plain));
+    const value = try doc.createMapping();
+    try doc.mappingAppend(value, try doc.createScalar("deep", .plain), try doc.createScalar("v", .plain));
+    try doc.mappingAppend(root, key, value);
+
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+
+    var rt = try Document.parse(testing.allocator, out);
+    defer rt.deinit();
+    const pairs = rt.root.?.data.mapping.pairs.items;
+    try testing.expectEqual(@as(usize, 1), pairs.len);
+    try testing.expectEqual(document_mod.NodeKind.sequence, pairs[0].key.kind());
+    try testing.expectEqualStrings("v", pairs[0].value.lookup("deep").?.scalarValue().?);
+}
+
+test "an explicit key appended to a parsed document keeps the neighbours verbatim" {
+    var doc = try Document.parse(testing.allocator, "a: 1  # kept\n");
+    defer doc.deinit();
+    const key = try doc.createSequence();
+    try doc.sequenceAppend(key, try doc.createScalar("x", .plain));
+    try doc.mappingAppend(doc.root.?, key, try doc.createScalar("pair", .plain));
+
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a: 1  # kept\n? [x]\n: pair\n", out);
+
+    var rt = try Document.parse(testing.allocator, out);
+    defer rt.deinit();
+    const pairs = rt.root.?.data.mapping.pairs.items;
+    try testing.expectEqual(@as(usize, 2), pairs.len);
+    try testing.expectEqual(document_mod.NodeKind.sequence, pairs[1].key.kind());
+    try testing.expectEqualStrings("pair", pairs[1].value.scalarValue().?);
+}
+
+test "an unmodified explicit key still re-emits from its source span" {
+    // The fix touches only the laid-out path; a parsed entry nobody
+    // edited keeps its original bytes, whatever shape they had.
+    const src = "? [1, 2]\n: pair\nkeep: me\n";
+    const out = try roundTrip(testing.allocator, src);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(src, out);
 }
