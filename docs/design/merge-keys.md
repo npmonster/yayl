@@ -1,8 +1,11 @@
 # Design: resolving merge keys (`<<`)
 
-**Status:** scoping note — not approved, not implemented. Drafted 2026-09-11.
+**Status:** implemented 2026-09-11. This note stays as the record of the
+reference behaviour and the decisions taken; the code lives in
+`Document.resolveMergeKeys`, `ParseOptions.resolve_merge_keys` and
+`value.parseToValueResolved`.
 **Author:** quiet-reef (dsh session). Reviewed by: —
-**Tracking:** PLAN-16 (backlog).
+**Tracking:** PLAN-16.
 
 ## Why
 
@@ -37,7 +40,8 @@ Two separate, both opt-in, implementations:
 **Detection.** `fy_node_pair_is_merge_key` (`fy-doc.c:2744`): the pair key is
 a scalar, style `plain`, atom text exactly `<<`. The parser primes the flag
 when the atom bytes are `<<` and its length is 2 (`fy-parse.c:4901`, `:4945`);
-a quoted or tagged `<<` is not a merge key.
+a quoted `<<` is not a merge key, but a *plain* `<<` carrying an explicit
+tag still is, because the check is style and text, not the tag.
 
 **Value rules differ between the two paths.** This is a real libfyaml
 inconsistency, not a misreading:
@@ -110,7 +114,8 @@ to (`value`, `schema`), and there is no reason to widen this into the libfyaml
 ## Proposed semantics
 
 - **Detection.** The raw key node is a scalar, style `.plain`, value `<<`. Do
-  not follow aliases for the key; quoted or tagged `<<` is not a merge key.
+  not follow aliases for the key; a quoted `<<` is not a merge key (a plain
+  one with an explicit tag still is, matching libfyaml).
 - **Values.** Alias-to-mapping, direct mapping, or a sequence of either — the
   YAML 1.1 rule (the libfyaml event path). This diverges from the libfyaml
   document path, so mark it with a `PORT NOTE`.
@@ -123,41 +128,60 @@ to (`value`, `schema`), and there is no reason to widen this into the libfyaml
 - **Nesting and recursion.** Resolve depth-first and to a fixpoint under a
   bound: a merged mapping may itself contain `<<`, and a source may be reached
   through an alias. A merge that reaches itself is `error.MergeKeyRecursive`.
-- **Copying.** Deep-copy keys and values into the document pool; re-register
-  anchors and retarget intra-document aliases the way `edit.cloneTreeInto`
-  does. Do not purge anchors, unlike libfyaml: aliases outside the mapping
-  remain.
+- **Copying.** Deep-copy keys and values into the document pool with
+  `cloneMergeNode`: strings are duped, spans and comments drop, and a copied
+  node drops its own anchor so it cannot become a second definition of a name
+  the source still anchors. Aliases are copied as aliases, so references stay
+  valid. Anchors are never purged, unlike libfyaml.
 - **Failure.** Any invalid value, non-mapping source, recursion or bound trip
   leaves the document byte-identical to before the call.
-- **Bounds.** Reuse `max_nesting`/`max_alias_depth` and add an explicit
-  expansion budget so a merge bomb errors rather than exhausting memory.
+- **Bounds.** A single `max_merge_depth` (1000) caps both the walk and the
+  copy, so a hand-built deep tree errors instead of overflowing the stack;
+  parsed input is already capped by `max_nesting`.
 
-## Open decisions (need the human)
+## Decisions taken (2026-09-11)
 
-1. Value rule: spec-permissive (inline mappings allowed, recommended) or the
-   strict libfyaml document path (aliases only)?
-2. Exposure: mutating pass + parse flag (recommended), or clone-only, or
-   `value`-layer only?
-3. Naming: `resolve_merge_keys` (recommended, describes exactly what it does)
-   or `resolve_document` (implies alias inlining too)?
-4. Anchors on merged sources: keep (recommended) or purge as libfyaml does?
+All four recommended options were taken, and the work is implemented:
 
-## Test plan
+1. **Value rule: spec-permissive.** Inline mappings and sequences of them are
+   accepted, matching the libfyaml event path and the YAML 1.1 text. The
+   divergence from `fy_document_resolve` is marked with a `PORT NOTE`.
+2. **Exposure: mutating pass + parse flag**, plus the parse-based read-only
+   convenience. No clone-only `Document` variant was added; a caller holding
+   a document calls `resolveMergeKeys` on it.
+3. **Naming: `resolve_merge_keys` / `resolveMergeKeys`.** It resolves merge
+   keys and nothing else — aliases are not inlined and anchors are not purged
+   (unlike `fy_document_resolve`), so `resolve_document` would overstate it.
+4. **Anchors on copies are dropped**, not the document's anchors. A copied
+   node must not become a second definition of a name the source still
+   anchors; the original anchor and every alias to it are untouched.
 
-- Unit tests (`src/document.zig`, or a new `src/merge.zig` pulled into the root
-  test block): single alias; explicit-key-wins; sequence precedence (first
-  wins); inline mapping; sequence of inline mappings; nested merge; merge
-  reached through an alias; quoted `<<` is not a key; `<<` with an explicit
-  tag; non-mapping source errors; sequence with a non-mapping item errors;
-  recursive merge errors; atomic failure leaves the tree unchanged; option-off
-  output is byte-identical to today.
-- Differential: extend the vendored-libfyaml harness in
-  `scripts/differential.sh` to build with `FYPCF_RESOLVE_DOCUMENT` and compare
-  resolved mappings; skip or record the inline-mapping cases where the two
-  libfyaml paths disagree.
-- Fixtures: resolve `tests/fixtures/gitlab-anchors.yaml` and assert the three
-  jobs gain `image`/`before_script`/`retry` from `.defaults` while their own
-  `stage`/`script` survive.
-- Gates: `make preservation` and `make roundtrip` stay green with the option
-  off; `make emission-oracle` covers resolved output; `make verify` green
-  before the release commit.
+## What shipped
+
+`Document.resolveMergeKeys` in `src/document.zig`, wired to
+`ParseOptions.resolve_merge_keys` (parse and parseAll), plus
+`value.parseToValueResolved`. Resolution runs on a same-document deep clone
+and swaps it in only on success, so a failed resolve leaves the document
+byte-identical; a document with no `<<` is returned without a clone.
+
+Unit tests in `src/document.zig` cover: an aliased source merged and the `<<`
+key removed; explicit-key-wins; earliest-sequence-source-wins; inline mapping
+and a sequence of inline mappings; a source that itself merges; a quoted `<<`
+left as an ordinary key; invalid value and non-mapping sequence item refused
+with `error.InvalidMergeKey`; a self-merge refused with
+`error.MergeKeyRecursive`; a document without merge keys byte-identical; the
+parse option and `parseAllOpts`; resolved output that re-parses; and
+allocation-failure injection. `src/value.zig` covers the read-only path.
+
+## Still open
+
+- **Differential against libfyaml.** The vendored-libfyaml harness
+  (`scripts/differential.sh`) does not yet build the reference with
+  `FYPCF_RESOLVE_DOCUMENT`, so resolution is checked by unit tests, not by a
+  cross-implementation oracle. The inline-mapping cases would need skipping
+  or recording, since the two libfyaml paths disagree there.
+- **The GitLab fixture is not a named gate.** Resolution of
+  `tests/fixtures/gitlab-anchors.yaml` is covered in spirit by the unit
+  tests; a dedicated assertion on the three jobs is not wired into `make`.
+- `make emission-oracle` with resolution is not part of the default sweep
+  (it needs a C compiler and is report-only by design).

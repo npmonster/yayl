@@ -8,6 +8,7 @@
 const std = @import("std");
 const ctype = @import("ctype.zig");
 const diag = @import("diag.zig");
+const edit = @import("edit.zig");
 const event_mod = @import("event.zig");
 const internal = @import("internal.zig");
 const markup = @import("markup.zig");
@@ -502,7 +503,14 @@ pub const Document = struct {
             empty.region_end = input.len;
             return empty;
         }
-        return docs.items[0];
+        var doc = docs.items[0];
+        if (options.resolve_merge_keys) {
+            doc.resolveMergeKeys() catch |err| {
+                doc.deinit();
+                return err;
+            };
+        }
+        return doc;
     }
 
     /// Parse every document in `input`.
@@ -526,7 +534,14 @@ pub const Document = struct {
     ) !std.ArrayList(Document) {
         var p = try Parser.initOpts(allocator, d, input, options);
         defer p.deinit();
-        return parseStream(allocator, &p, null, input);
+        var docs = try parseStream(allocator, &p, null, input);
+        if (!options.resolve_merge_keys) return docs;
+        errdefer {
+            for (docs.items) |*doc| doc.deinit();
+            docs.deinit(allocator);
+        }
+        for (docs.items) |*doc| try doc.resolveMergeKeys();
+        return docs;
     }
 
     fn parseStream(allocator: std.mem.Allocator, p: *Parser, limit: ?usize, input: []const u8) !std.ArrayList(Document) {
@@ -813,6 +828,265 @@ pub const Document = struct {
             },
             else => return error.InvalidSyntax,
         }
+    }
+    // ------------------------------------------------------------------
+    // Merge keys (<<) — opt-in resolution (PLAN-16,
+    // docs/design/merge-keys.md)
+    //
+    // PORT NOTE: libfyaml has two merge implementations that disagree on
+    // the value rule. `fy_document_resolve` (the FYPCF_RESOLVE_DOCUMENT
+    // path) requires the value to be an alias (or aliases) to a mapping;
+    // the event path (`fy_parser_get_merge_key_document`) also accepts a
+    // direct mapping and direct mappings inside a sequence. yayl follows
+    // the permissive YAML 1.1 rule (the event path), in one place. It is
+    // merge-only: aliases outside the merged mapping are kept, unlike
+    // fy_document_resolve, which also inlines every alias and purges all
+    // anchors.
+    // ------------------------------------------------------------------
+
+    /// Deepest resolution this pass will walk before returning
+    /// `error.NestingTooDeep`. Parsed input is already capped at
+    /// `max_nesting`; this bounds a tree that was built by hand.
+    const max_merge_depth: usize = 1000;
+
+    /// Resolution state for one mapping node. `active` is a mapping the
+    /// walk is currently inside; reaching it again as a merge source is a
+    /// self-referential merge.
+    const MergeVisit = enum { active, done };
+
+    /// Error vocabulary of the merge-resolution walk. Explicit because
+    /// the helpers are mutually recursive and Zig cannot infer an error
+    /// set through a cycle.
+    const MergeResolveError = error{
+        InvalidMergeKey,
+        MergeKeyRecursive,
+        NestingTooDeep,
+        InvalidSyntax,
+        OutOfMemory,
+    };
+
+    /// Resolve YAML 1.1 merge keys (`<<`) in place.
+    ///
+    /// A mapping pair whose key is a plain scalar `<<` contributes the
+    /// pairs of its value: a mapping, an alias to one, or a sequence of
+    /// those. A key the mapping already has wins; among sequence sources
+    /// the earliest wins. The `<<` pair is removed afterwards.
+    ///
+    /// The work runs on a deep clone that is swapped in only on success
+    /// (the `edit.apply` contract), so a document that fails to resolve —
+    /// an invalid value, a merge that reaches itself, a depth or
+    /// allocation failure — is left byte-identical, spans included. A
+    /// document with no `<<` is returned untouched, without a clone.
+    ///
+    /// `ParseOptions.resolve_merge_keys` calls this after each document
+    /// is built. Resolution re-emits the mappings it touches normalized,
+    /// exactly like any other structural mutation.
+    pub fn resolveMergeKeys(self: *Document) !void {
+        const old_root = self.root orelse return;
+        if (!treeHasMergeKey(old_root, 0)) return;
+        const new_root = try edit.cloneTree(self, old_root);
+        self.root = new_root;
+        var ok = false;
+        defer if (!ok) {
+            self.root = old_root;
+        };
+        var seen = std.AutoHashMap(*Node, MergeVisit).init(self.allocator);
+        defer seen.deinit();
+        try self.resolveMergeNode(new_root, &seen, 0);
+        ok = true;
+    }
+
+    /// True when any mapping pair in `node` is a merge key. Structural
+    /// only: an alias is not followed, because a mapping reachable by
+    /// alias is also present structurally.
+    fn treeHasMergeKey(node: *const Node, depth: usize) bool {
+        if (depth >= max_merge_depth) return true; // let the pass report it
+        switch (node.data) {
+            .scalar, .alias => return false,
+            .sequence => |s| {
+                for (s.items.items) |item| {
+                    if (treeHasMergeKey(item, depth + 1)) return true;
+                }
+                return false;
+            },
+            .mapping => |m| {
+                for (m.pairs.items) |p| {
+                    if (isMergeKeyPair(p)) return true;
+                    if (treeHasMergeKey(p.key, depth + 1)) return true;
+                    if (treeHasMergeKey(p.value, depth + 1)) return true;
+                }
+                return false;
+            },
+        }
+    }
+
+    /// A merge key is a pair whose key is a *plain* scalar `<<`
+    /// (`fy_node_pair_is_merge_key`); a quoted `<<` is an ordinary key.
+    fn isMergeKeyPair(p: Pair) bool {
+        const k = p.key;
+        return k.data == .scalar and
+            k.data.scalar.style == .plain and
+            std.mem.eql(u8, k.data.scalar.value, "<<");
+    }
+
+    fn resolveMergeNode(
+        self: *Document,
+        node: *Node,
+        seen: *std.AutoHashMap(*Node, MergeVisit),
+        depth: usize,
+    ) MergeResolveError!void {
+        if (depth >= max_merge_depth) return error.NestingTooDeep;
+        switch (node.data) {
+            .scalar, .alias => {},
+            .sequence => |s| {
+                for (s.items.items) |item| try self.resolveMergeNode(item, seen, depth + 1);
+            },
+            .mapping => {
+                if (seen.get(node)) |state| {
+                    if (state == .done) return;
+                    return error.MergeKeyRecursive;
+                }
+                try seen.put(node, .active);
+                // Nested mappings first, so a merge source is fully
+                // expanded by the time its pairs are copied.
+                const m = &node.data.mapping;
+                for (m.pairs.items) |p| {
+                    try self.resolveMergeNode(p.key, seen, depth + 1);
+                    try self.resolveMergeNode(p.value, seen, depth + 1);
+                }
+                try self.resolveMappingMerges(node, seen, depth);
+                try seen.put(node, .done);
+            },
+        }
+    }
+
+    /// Expand every `<<` entry of `map`, earliest first, so an explicit
+    /// key wins and the first merge wins among duplicates. Every merge
+    /// value is collected before any pair is removed, so an appended pair
+    /// can never be mistaken for a merge entry.
+    fn resolveMappingMerges(
+        self: *Document,
+        map: *Node,
+        seen: *std.AutoHashMap(*Node, MergeVisit),
+        depth: usize,
+    ) MergeResolveError!void {
+        const m = &map.data.mapping;
+        var values: std.ArrayList(*Node) = .empty;
+        defer values.deinit(self.allocator);
+        for (m.pairs.items) |p| {
+            if (isMergeKeyPair(p)) try values.append(self.allocator, p.value);
+        }
+        if (values.items.len == 0) return;
+        // Remove the entries before merging: an explicit key then wins the
+        // duplicate check, and `<<` cannot shadow a source key.
+        var i: usize = m.pairs.items.len;
+        while (i > 0) {
+            i -= 1;
+            const p = m.pairs.items[i];
+            if (!isMergeKeyPair(p)) continue;
+            try internal.dropPairSpan(self, map, p);
+            _ = m.pairs.orderedRemove(i);
+            p.key.parent = null;
+            p.value.parent = null;
+        }
+        for (values.items) |value| try self.mergeValueInto(map, value, seen, depth);
+        self.markModified(map);
+    }
+
+    /// Add the pairs a merge value contributes to `map`, in source order,
+    /// skipping keys the mapping already has.
+    fn mergeValueInto(
+        self: *Document,
+        map: *Node,
+        value: *Node,
+        seen: *std.AutoHashMap(*Node, MergeVisit),
+        depth: usize,
+    ) MergeResolveError!void {
+        const resolved = value.resolveAlias();
+        switch (resolved.data) {
+            .mapping => try self.mergeOneInto(map, @constCast(resolved), seen, depth),
+            .sequence => |s| {
+                for (s.items.items) |item| {
+                    const src = item.resolveAlias();
+                    if (src.kind() != .mapping) return error.InvalidMergeKey;
+                    try self.mergeOneInto(map, @constCast(src), seen, depth);
+                }
+            },
+            else => return error.InvalidMergeKey,
+        }
+    }
+
+    fn mergeOneInto(
+        self: *Document,
+        map: *Node,
+        source: *Node,
+        seen: *std.AutoHashMap(*Node, MergeVisit),
+        depth: usize,
+    ) MergeResolveError!void {
+        // Resolve the source before copying from it; a source that is
+        // still `active` is a merge cycle.
+        try self.resolveMergeNode(source, seen, depth + 1);
+        for (source.data.mapping.pairs.items) |p| {
+            if (mappingHasKey(map, p.key)) continue;
+            const key = try self.cloneMergeNode(p.key, 0);
+            const value = try self.cloneMergeNode(p.value, 0);
+            // Raw attach: a freshly cloned node is detached, so it
+            // cannot cycle, and resolveMappingMerges marks the mapping.
+            try internal.attachPair(self, map, key, value);
+        }
+    }
+
+    /// True when `map` already has a scalar key with the same text as
+    /// `key`. Non-scalar keys never collide: they cannot match a merge
+    /// source key by text, matching how `lookup` reads keys.
+    fn mappingHasKey(map: *const Node, key: *const Node) bool {
+        const want = key.scalarValue() orelse return false;
+        for (map.data.mapping.pairs.items) |p| {
+            const have = p.key.scalarValue() orelse continue;
+            if (std.mem.eql(u8, have, want)) return true;
+        }
+        return false;
+    }
+
+    /// Copy one node into this document's pool for insertion at a new
+    /// place: strings are duped, presentation spans and written comments
+    /// are dropped (the pair re-emits normalized), and an anchor is NOT
+    /// carried, so the copy never becomes a second definition of a name
+    /// the source already anchors. An alias is copied as an alias: its
+    /// target stays in this document, so the reference remains valid and
+    /// the document keeps its anchors.
+    fn cloneMergeNode(self: *Document, node: *Node, depth: usize) !*Node {
+        if (depth >= max_merge_depth) return error.NestingTooDeep;
+        const n = try self.pool.create(Node);
+        n.* = .{
+            .mark = node.mark,
+            .tag = if (node.tag) |t| try self.pool.dupe(t) else null,
+            .modified = true,
+            .data = undefined,
+        };
+        switch (node.data) {
+            .scalar => |s| {
+                n.data = .{ .scalar = .{ .value = try self.pool.dupe(s.value), .style = s.style } };
+            },
+            .alias => |a| {
+                n.data = .{ .alias = .{ .name = try self.pool.dupe(a.name), .target = a.target } };
+            },
+            .sequence => |s| {
+                n.data = .{ .sequence = .{ .style = s.style } };
+                for (s.items.items) |item| {
+                    try internal.attachItem(self, n, try self.cloneMergeNode(item, depth + 1));
+                }
+            },
+            .mapping => |m| {
+                n.data = .{ .mapping = .{ .style = m.style } };
+                for (m.pairs.items) |p| {
+                    const key = try self.cloneMergeNode(p.key, depth + 1);
+                    const value = try self.cloneMergeNode(p.value, depth + 1);
+                    try internal.attachPair(self, n, key, value);
+                }
+            },
+        }
+        return n;
     }
 
     // ------------------------------------------------------------------
@@ -2639,4 +2913,340 @@ test "deleting the last entry keeps the tail comment on its own line" {
     const out2 = try again.write(testing.allocator);
     defer testing.allocator.free(out2);
     try testing.expectEqualStrings(out, out2);
+}
+
+test "merge keys: an aliased mapping is merged and its key removed" {
+    var doc = try Document.parse(testing.allocator,
+        \\base: &base
+        \\  a: 1
+        \\  b: 2
+        \\use:
+        \\  <<: *base
+        \\  c: 3
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const use = doc.pathGet(&.{"use"}).?;
+    try testing.expectEqualStrings("1", use.lookup("a").?.scalarValue().?);
+    try testing.expectEqualStrings("2", use.lookup("b").?.scalarValue().?);
+    try testing.expectEqualStrings("3", use.lookup("c").?.scalarValue().?);
+    try testing.expect(use.lookup("<<") == null);
+}
+
+test "merge keys: an explicit key wins over the merged one" {
+    var doc = try Document.parse(testing.allocator,
+        \\base: &base
+        \\  a: 1
+        \\  b: 2
+        \\use:
+        \\  <<: *base
+        \\  a: 9
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const use = doc.pathGet(&.{"use"}).?;
+    try testing.expectEqualStrings("9", use.lookup("a").?.scalarValue().?);
+    try testing.expectEqualStrings("2", use.lookup("b").?.scalarValue().?);
+}
+
+test "merge keys: the earliest sequence source wins" {
+    var doc = try Document.parse(testing.allocator,
+        \\a: &a
+        \\  k: from-a
+        \\  x: 1
+        \\b: &b
+        \\  k: from-b
+        \\  y: 2
+        \\use:
+        \\  <<: [*a, *b]
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const use = doc.pathGet(&.{"use"}).?;
+    try testing.expectEqualStrings("from-a", use.lookup("k").?.scalarValue().?);
+    try testing.expectEqualStrings("1", use.lookup("x").?.scalarValue().?);
+    try testing.expectEqualStrings("2", use.lookup("y").?.scalarValue().?);
+}
+
+test "merge keys: inline mapping and a sequence of inline mappings" {
+    var doc = try Document.parse(testing.allocator,
+        \\one:
+        \\  <<: { a: 1 }
+        \\many:
+        \\  <<: [{ a: 1, x: 9 }, { b: 2, a: 8 }]
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const one = doc.pathGet(&.{"one"}).?;
+    try testing.expectEqualStrings("1", one.lookup("a").?.scalarValue().?);
+    const many = doc.pathGet(&.{"many"}).?;
+    try testing.expectEqualStrings("1", many.lookup("a").?.scalarValue().?);
+    try testing.expectEqualStrings("2", many.lookup("b").?.scalarValue().?);
+    try testing.expect(many.lookup("x") != null);
+}
+
+test "merge keys: a source that itself merges is expanded first" {
+    var doc = try Document.parse(testing.allocator,
+        \\root: &root
+        \\  r: 0
+        \\mid: &mid
+        \\  <<: *root
+        \\  m: 1
+        \\use:
+        \\  <<: *mid
+        \\  u: 2
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const use = doc.pathGet(&.{"use"}).?;
+    try testing.expectEqualStrings("0", use.lookup("r").?.scalarValue().?);
+    try testing.expectEqualStrings("1", use.lookup("m").?.scalarValue().?);
+    try testing.expectEqualStrings("2", use.lookup("u").?.scalarValue().?);
+    const mid = doc.pathGet(&.{"mid"}).?;
+    try testing.expectEqualStrings("0", mid.lookup("r").?.scalarValue().?);
+}
+
+test "merge keys: a quoted << is an ordinary key" {
+    var doc = try Document.parse(testing.allocator,
+        \\base: &base
+        \\  a: 1
+        \\use:
+        \\  "<<": *base
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const use = doc.pathGet(&.{"use"}).?;
+    try testing.expect(use.lookup("<<") != null);
+    try testing.expect(use.lookup("a") == null);
+}
+
+test "merge keys: an invalid value refuses and changes nothing" {
+    var doc = try Document.parse(testing.allocator, "use:\n  <<: 5\n");
+    defer doc.deinit();
+    const before = try doc.write(testing.allocator);
+    defer testing.allocator.free(before);
+    try testing.expectError(error.InvalidMergeKey, doc.resolveMergeKeys());
+    const after = try doc.write(testing.allocator);
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+    try testing.expect(doc.pathGet(&.{"use"}).?.lookup("<<") != null);
+}
+
+test "merge keys: a sequence item that is not a mapping is refused" {
+    var doc = try Document.parse(testing.allocator, "use:\n  <<: [1]\n");
+    defer doc.deinit();
+    try testing.expectError(error.InvalidMergeKey, doc.resolveMergeKeys());
+}
+
+test "merge keys: a merge into itself is refused" {
+    // A parsed document cannot express this: an alias has to name an
+    // anchor defined before it, and the builder registers an anchor
+    // only once its collection is complete, so a self-reference is
+    // UnknownAlias at parse time. Build the cycle directly instead;
+    // the guard is what keeps a hand-built tree from looping forever.
+    var doc = Document.init(testing.allocator);
+    defer doc.deinit();
+    const map = try doc.createMapping();
+    doc.root = map;
+    try doc.setAnchor(map, "s");
+    const alias = try doc.pool.create(Node);
+    alias.* = .{ .data = .{ .alias = .{ .name = "s", .target = map } } };
+    try doc.mappingAppend(map, try doc.createScalar("<<", .plain), alias);
+    try testing.expectError(error.MergeKeyRecursive, doc.resolveMergeKeys());
+}
+
+test "merge keys: a document without them is untouched" {
+    const src = "a: 1\nb:\n  - x\n  - y\n";
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(src, out);
+}
+
+test "merge keys: parse option resolves, default leaves them alone" {
+    const src =
+        \\base: &base
+        \\  a: 1
+        \\use:
+        \\  <<: *base
+        \\
+    ;
+    var plain = try Document.parse(testing.allocator, src);
+    defer plain.deinit();
+    try testing.expect(plain.pathGet(&.{"use"}).?.lookup("<<") != null);
+
+    var doc = try Document.parseOpts(testing.allocator, src, null, .{ .resolve_merge_keys = true });
+    defer doc.deinit();
+    try testing.expectEqualStrings("1", doc.pathGet(&.{"use"}).?.lookup("a").?.scalarValue().?);
+
+    var docs = try Document.parseAllOpts(testing.allocator, src, null, .{ .resolve_merge_keys = true });
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(testing.allocator);
+    }
+    try testing.expectEqualStrings("1", docs.items[0].pathGet(&.{"use"}).?.lookup("a").?.scalarValue().?);
+}
+
+test "merge keys: resolved output re-parses with the merged values" {
+    var doc = try Document.parse(testing.allocator,
+        \\defaults: &defaults
+        \\  image: rust:1.79
+        \\  retry:
+        \\    max: 2
+        \\build:
+        \\  <<: *defaults
+        \\  stage: build
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "<<") == null);
+    var again = try Document.parse(testing.allocator, out);
+    defer again.deinit();
+    const build = again.pathGet(&.{"build"}).?;
+    try testing.expectEqualStrings("rust:1.79", build.lookup("image").?.scalarValue().?);
+    try testing.expectEqualStrings("build", build.lookup("stage").?.scalarValue().?);
+    try testing.expectEqualStrings("2", again.pathGet(&.{ "build", "retry", "max" }).?.scalarValue().?);
+}
+
+test "merge keys: allocation failures leak nothing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, mergeResolve, .{});
+}
+
+fn mergeResolve(allocator: std.mem.Allocator) !void {
+    var doc = try Document.parse(allocator,
+        \\base: &base { a: 1, b: 2 }
+        \\use: { <<: *base, c: 3 }
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+}
+
+test "merge keys: the earliest of duplicate merge keys wins" {
+    var doc = try Document.parse(testing.allocator,
+        \\a: &a { k: from-a }
+        \\b: &b { k: from-b }
+        \\use:
+        \\  <<: *a
+        \\  <<: *b
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    try testing.expectEqualStrings("from-a", doc.pathGet(&.{"use"}).?.lookup("k").?.scalarValue().?);
+}
+
+test "merge keys: a merge inside a sequence item is resolved" {
+    var doc = try Document.parse(testing.allocator,
+        \\base: &base { a: 1 }
+        \\list:
+        \\  - <<: *base
+        \\    own: 2
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const item = doc.pathGet(&.{ "list", "0" }).?;
+    try testing.expectEqualStrings("1", item.lookup("a").?.scalarValue().?);
+    try testing.expectEqualStrings("2", item.lookup("own").?.scalarValue().?);
+}
+
+test "merge keys: a plain << with an explicit tag is still a merge key" {
+    var doc = try Document.parse(testing.allocator,
+        \\base: &base { a: 1 }
+        \\use:
+        \\  !!str <<: *base
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const use = doc.pathGet(&.{"use"}).?;
+    try testing.expectEqualStrings("1", use.lookup("a").?.scalarValue().?);
+    try testing.expect(use.lookup("<<") == null);
+}
+
+test "merge keys: a copied node drops its anchor but the source keeps it" {
+    var doc = try Document.parse(testing.allocator,
+        \\base: &base
+        \\  x: &n 7
+        \\alias: *n
+        \\use:
+        \\  <<: *base
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const use = doc.pathGet(&.{"use"}).?;
+    try testing.expectEqualStrings("7", use.lookup("x").?.scalarValue().?);
+    try testing.expectEqualStrings("7", doc.pathGet(&.{"alias"}).?.scalarValue().?);
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    // The copy must not define a second &n.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "&n"));
+    var again = try Document.parse(testing.allocator, out);
+    defer again.deinit();
+    try testing.expectEqualStrings("7", again.pathGet(&.{"alias"}).?.scalarValue().?);
+    try testing.expectEqualStrings("7", again.pathGet(&.{ "use", "x" }).?.scalarValue().?);
+}
+
+test "merge keys: an alias inside a merged value stays an alias" {
+    var doc = try Document.parse(testing.allocator,
+        \\other: &o
+        \\  v: 1
+        \\base: &base
+        \\  ref: *o
+        \\use:
+        \\  <<: *base
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const ref = doc.pathGet(&.{"use"}).?.lookup("ref").?;
+    try testing.expect(ref.isAlias());
+    try testing.expectEqualStrings("1", ref.lookup("v").?.scalarValue().?);
+}
+
+test "merge keys: parseAllOpts resolves every document" {
+    var docs = try Document.parseAllOpts(testing.allocator,
+        \\base: &b { a: 1 }
+        \\use: { <<: *b }
+        \\---
+        \\base: &c { x: 2 }
+        \\use: { <<: *c }
+        \\
+    , null, .{ .resolve_merge_keys = true });
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(testing.allocator);
+    }
+    try testing.expectEqual(@as(usize, 2), docs.items.len);
+    try testing.expectEqualStrings("1", docs.items[0].pathGet(&.{"use"}).?.lookup("a").?.scalarValue().?);
+    try testing.expectEqualStrings("2", docs.items[1].pathGet(&.{"use"}).?.lookup("x").?.scalarValue().?);
+}
+
+test "merge keys: a hand-built tree past the depth bound is refused" {
+    var doc = Document.init(testing.allocator);
+    defer doc.deinit();
+    const root = try doc.createMapping();
+    doc.root = root;
+    var cur = root;
+    var i: usize = 0;
+    while (i < 1001) : (i += 1) {
+        const child = try doc.createMapping();
+        try doc.mappingAppend(cur, try doc.createScalar("k", .plain), child);
+        cur = child;
+    }
+    try doc.mappingAppend(cur, try doc.createScalar("<<", .plain), try doc.createScalar("x", .plain));
+    try testing.expectError(error.NestingTooDeep, doc.resolveMergeKeys());
 }

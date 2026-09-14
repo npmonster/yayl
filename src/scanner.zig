@@ -69,6 +69,12 @@ pub const Options = struct {
 
     /// How a NUL byte in the input is handled.
     embedded_nul: EmbeddedNul = .reject,
+
+    /// Resolve YAML 1.1 merge keys (`<<`) after each document is
+    /// built, by calling `Document.resolveMergeKeys`. Off by default:
+    /// the bytes YAML 1.2 gives you are preserved exactly, and
+    /// resolution re-emits the mappings it touches normalized.
+    resolve_merge_keys: bool = false,
 };
 
 /// Position of byte `offset` in `input`, for a diagnostic raised before

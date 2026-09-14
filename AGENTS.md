@@ -90,7 +90,7 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 | `fy-scan.c`           | `src/scanner.zig`      | ✅ done — full corpus green (351/351, zero skips)                  |
 | `fy-parse.c`          | `src/parser.zig`       | ✅ done — event streams byte-identical to libfyaml (differential)  |
 | `fy-event.c`          | `src/event.zig`        | ✅ done                                                            |
-| `fy-doc.c` `fy-node.c` `fy-docbuilder.c` | `src/document.zig` | ✅ done — semantic model + per-node/entry spans (comments and blank lines round-trip) |
+| `fy-doc.c` `fy-node.c` `fy-docbuilder.c` | `src/document.zig` | ✅ done — semantic model + per-node/entry spans (comments and blank lines round-trip); merge keys (`<<`) resolved on request |
 | `fy-emit.c`           | `src/emitter.zig`      | ✅ done — faithful (untouched bytes exact) + normalized emit; modified subtrees normalize internal layout, new/moved ones re-emit block at the measured indent |
 | `fy-atom.c`           | —                      | ⬜ not ported (atom interning; optional optimization)              |
 | `fy-tag.c`            | in `parser.zig`        | 🟡 shorthand resolution done; no `fy_tag` cache                    |
@@ -135,6 +135,10 @@ measured indent width.
 - **Parse cache**: none in v1 (same note).
 - **Threading (`fy-wpool`)** and **atom interning (`fy-atom`)** remain
   optional, out of scope.
+- **Merge keys (`<<`)** are opt-in via `ParseOptions.resolve_merge_keys`
+  or `Document.resolveMergeKeys` (YAML 1.1; see
+  `docs/design/merge-keys.md`). Off by default, so the round-trip and
+  preservation gates keep pinning YAML 1.2 bytes.
 
 ## Verification strategy
 

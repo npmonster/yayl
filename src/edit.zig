@@ -44,6 +44,16 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// Errors a structural clone can actually return. Narrower than
+/// `Error`: cloning copies a tree, it never resolves a path, so the
+/// path and query errors cannot occur. Exposed so `document.zig` can
+/// call `cloneTree` without widening its own public error set.
+pub const CloneError = error{
+    NestingTooDeep,
+    InvalidSyntax,
+    OutOfMemory,
+};
+
 /// Refuse a MUTATION whose container is an alias node.
 ///
 /// Reads forward through aliases — `lookup`, `pathGet` and `Editor.one`
@@ -815,7 +825,7 @@ fn clearSpans(node: *Node) void {
 /// shorter. For a tree that will live in a different document, use
 /// `cloneTreeInto`, which clears spans so the copy re-emits normalized
 /// (the same contract as `move`).
-pub fn cloneTree(doc: *Document, root: *Node) Error!*Node {
+pub fn cloneTree(doc: *Document, root: *Node) CloneError!*Node {
     var anchors = std.StringHashMap(*Node).init(doc.allocator);
     defer anchors.deinit();
     return cloneNode(doc, root, &anchors, false, 0);
@@ -828,13 +838,13 @@ pub fn cloneTree(doc: *Document, root: *Node) Error!*Node {
 /// subtree's contract). Alias targets pointing outside the cloned
 /// subtree are followed for their values; anchors are rebuilt within
 /// the clone.
-pub fn cloneTreeInto(doc: *Document, root: *Node) Error!*Node {
+pub fn cloneTreeInto(doc: *Document, root: *Node) CloneError!*Node {
     var anchors = std.StringHashMap(*Node).init(doc.allocator);
     defer anchors.deinit();
     return cloneNode(doc, root, &anchors, true, 0);
 }
 
-fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), clear_spans: bool, depth: usize) Error!*Node {
+fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), clear_spans: bool, depth: usize) CloneError!*Node {
     // Structural recursion only — an alias is copied as an alias, never
     // followed — so a cycle cannot reach here, but a deep built tree can.
     // The one exception is the cross-document alias below, which is

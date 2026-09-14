@@ -123,6 +123,20 @@ pub fn parseToValueLimited(allocator: std.mem.Allocator, input: []const u8, limi
     return nodeToValueLimited(allocator, root, limits);
 }
 
+/// `parseToValue` with YAML 1.1 merge keys (`<<`) resolved before the
+/// conversion. The document is parsed with
+/// `ParseOptions.resolve_merge_keys` and is not returned, so this is the
+/// read-only route; a caller that already holds a `Document` should call
+/// `Document.resolveMergeKeys` instead. Parse failures keep their real
+/// error, and an invalid or recursive merge surfaces as
+/// `error.InvalidMergeKey` / `error.MergeKeyRecursive`.
+pub fn parseToValueResolved(allocator: std.mem.Allocator, input: []const u8) Error!Value {
+    var doc = try document_mod.Document.parseOpts(allocator, input, null, .{ .resolve_merge_keys = true });
+    defer doc.deinit();
+    const root = doc.root orelse return .null;
+    return nodeToValue(allocator, root);
+}
+
 /// Convert a document subtree into a Value under the default `Limits`.
 /// Strings are duplicated into `allocator`; the tree is untouched.
 pub fn nodeToValue(allocator: std.mem.Allocator, node: *const Node) Error!Value {
@@ -807,6 +821,27 @@ test "parse to value and inspect" {
     // Quoted "42" stays a string: no silent type inference.
     try testing.expectEqualStrings("42", v.get("note").?.string);
     try testing.expect(v.get("missing").? == .null);
+}
+
+test "parseToValueResolved expands merge keys" {
+    const v = try parseToValueResolved(testing.allocator,
+        \\base: &b { a: 1, b: 2 }
+        \\use: { <<: *b, c: 3 }
+        \\
+    );
+    defer freeValue(testing.allocator, v);
+    const use = v.get("use").?;
+    try testing.expectEqual(@as(i64, 1), use.get("a").?.int);
+    try testing.expectEqual(@as(i64, 3), use.get("c").?.int);
+
+    // The default parse keeps the merge key as an ordinary entry.
+    const plain = try parseToValue(testing.allocator,
+        \\base: &b { a: 1 }
+        \\use: { <<: *b }
+        \\
+    );
+    defer freeValue(testing.allocator, plain);
+    try testing.expect(plain.get("use").?.get("<<") != null);
 }
 
 test "value round trip through the document model" {

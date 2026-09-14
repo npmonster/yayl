@@ -130,6 +130,33 @@ Building a cycle through the document API is refused: `sequenceAppend`
 and `mappingAppend` return `error.WouldCycle` if the child is the target
 or one of its ancestors.
 
+### Merge keys (`<<`)
+
+Merge keys are a YAML 1.1 extension that YAML 1.2 dropped, but they are
+common in Kubernetes, GitLab CI and Ansible files. A default parse keeps
+`<<` as an ordinary plain key whose value is the alias, so the bytes
+round-trip unchanged. Resolution is opt-in:
+
+~~~zig
+var doc = try yaml.Document.parseOpts(allocator, input, null, .{ .resolve_merge_keys = true });
+// or, on a document you already hold:
+try doc.resolveMergeKeys();
+~~~
+
+The value may be a mapping, an alias to one, or a sequence of those (the
+YAML 1.1 rule; libfyaml's `fy_document_resolve` is stricter and takes
+aliases only — see `docs/design/merge-keys.md`). An explicit key in the
+mapping wins over a merged one, and among sequence sources the earliest
+wins. A quoted `"<<"` is an ordinary key. The `<<` entry is removed.
+
+Resolution runs on a deep clone that is swapped in only on success, so a
+document that fails — an invalid value (`error.InvalidMergeKey`), a merge
+that reaches itself (`error.MergeKeyRecursive`), a depth or allocation
+failure — keeps its original bytes. It is merge-only: aliases outside the
+merged mapping are not inlined and anchors are not purged. For a read-only
+path, `yaml.value.parseToValueResolved` parses with the option on before
+converting.
+
 ## Build a document
 
 Create a root node, assign it to `doc.root`, then connect children

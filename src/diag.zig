@@ -86,6 +86,12 @@ pub const YamlError = error{
     /// A codepoint being encoded has no UTF-8 representation (a
     /// surrogate half or a value above U+10FFFF).
     InvalidCodepoint,
+    /// A merge key (`<<`) value is not a mapping, an alias to one, or
+    /// a sequence of those. Raised by `Document.resolveMergeKeys`.
+    InvalidMergeKey,
+    /// A merge key reaches the mapping it is defined in, directly or
+    /// through a chain of aliases, so it would merge into itself.
+    MergeKeyRecursive,
 };
 
 /// Diagnostic collector — the fy_diag equivalent.

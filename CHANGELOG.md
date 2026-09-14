@@ -3,6 +3,25 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Added
+
+**Opt-in merge-key (`<<`) resolution.** YAML 1.2 dropped merge keys, but
+Kubernetes, GitLab CI and Ansible files use them, so yayl expands them on
+request. `ParseOptions.resolve_merge_keys = true` — or
+`Document.resolveMergeKeys` on an existing document — treats a mapping pair
+whose key is a plain `<<` as a merge: the value may be a mapping, an alias
+to one, or a sequence of those; an explicit key in the mapping wins over a
+merged one, and among sequence sources the earliest wins. The `<<` entry is
+removed. `yaml.value.parseToValueResolved` is the read-only route. Off by
+default, so a plain parse still reproduces the YAML 1.2 bytes exactly and
+the round-trip and preservation gates are unchanged. Resolution is
+merge-only: aliases outside the merged mapping are kept and anchors are not
+purged, unlike libfyaml's `fy_document_resolve`. An invalid value is
+`error.InvalidMergeKey`; a merge that reaches itself is
+`error.MergeKeyRecursive`. See `docs/design/merge-keys.md`.
+
 ## 0.18.0 — 2026-09-07
 
 ### Fixed
