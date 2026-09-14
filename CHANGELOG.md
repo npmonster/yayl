@@ -3,6 +3,41 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## 0.19.2 — 2026-09-14
+
+No library code changed. This release is the result of an independent
+review of 0.19.1's assurance work, which found two real defects in it.
+
+### Fixed
+
+**`make merge-differential` crashed on a block scalar.** The comparator
+split the canonical dump into lines and ignored the scalar length
+prefix, so any merge source containing a multi-line value — `script: |`,
+the ordinary case in the CI and Ansible configs merge keys exist for —
+desynchronized the reader and aborted the gate. The grammar was
+length-prefixed; the code that read it was not. It now parses by byte
+offset and consumes exactly `len`. `tests/fixtures/merge/block-scalar.yaml`
+covers it (and broke the old reader), and the compared floor rises to 8.
+
+**The delete and set sweeps skipped complex-key documents.** Both routed
+through `yaml.value`, which answers `error.TypeMismatch` for a non-scalar
+key, so those documents had their semantic check silently dropped — the
+same class of blind spot 0.19.1 fixed in `assertsSemanticRoundTrip`, in
+the sweeps that call it. `nodeMinusEql` and `nodeSetEql` apply the same
+rules to the node trees, comparing keys structurally. Semantic skips are
+now 0 in all three sets (corpus was 3), and the corpus makes 95
+structural comparisons where it made 92.
+
+### Changed
+
+**The preservation sweep reports which comparison ran.** Every run now
+prints `semantic comparison: N via yaml.value, M via structural fallback`
+and `semantic skips (yaml.value cannot represent): K` per set, so the
+question "is the weaker path quietly becoming the common case?" is
+answered by the gate instead of re-argued from a code reading. The
+measured answer: the structural fallback is entered by the complex-key
+operations and nothing else.
+
 ## 0.19.1 — 2026-09-14
 
 No library code changed in this release: every entry below is assurance
