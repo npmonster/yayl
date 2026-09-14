@@ -3,6 +3,52 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## 0.19.1 — 2026-09-14
+
+No library code changed in this release: every entry below is assurance
+work. The version moves so the gates that now exist are pinned to a tag.
+
+### Added
+
+**`make merge-differential` — a semantic differential for merge keys.**
+The emission oracle's `merged` mode proves libfyaml can *parse* what yayl
+emits after resolution; it cannot prove the resolved *values* agree,
+because a merge that picks the wrong source still emits valid YAML. The
+new gate dumps both sides in one canonical, length-prefixed form — yayl
+through a `dump-merged` mode on the emit CLI, libfyaml through
+`FYPCF_RESOLVE_DOCUMENT` — over `tests/fixtures/merge/`: 7 compared, 0
+mismatches. Anchors, aliases and mapping entry order are normalized away
+(see `docs/design/merge-keys.md` for why each is not part of a value);
+sequence order is not. PORT NOTE: libfyaml's document path is alias-only
+and rejects a repeated key, so three fixtures cannot be compared — they
+are named and counted on every run, never silently skipped, and each must
+still resolve under yayl.
+
+**The GitLab CI fixture is a named gate.** `tests/fixtures/gitlab-anchors.yaml`
+resolution is asserted in the unit suite: build-job and test-job gain the
+template's `image`/`before_script`/`retry` and keep their own entries,
+test-job's explicit `image` override survives the merge, and deploy-job —
+which has no merge key — is the negative control proving resolution does
+not leak into a mapping that never asked for it.
+
+### Fixed
+
+**The preservation sweep's semantic assertion was a no-op for complex
+keys.** `assertsSemanticRoundTrip` did `nodeToValue(...) catch return`,
+and `yaml.value` answers `error.TypeMismatch` for a non-scalar key — so
+the assertion silently passed every document holding one, which is why
+the `? K: V` emitter bug survived as long as it did. It now falls back to
+a structural comparison of the edited and re-parsed trees; no
+`catch return` remains, and a rootless/rooted mismatch is a failure.
+The complex-add sweep's bespoke check is collapsed into it, verified
+equivalent rather than assumed.
+
+**CRLF documents are swept by the add and insert sweeps.** Those sweeps
+skipped every CRLF document on grounds that predate
+`Emitter.defaultTerminator`; the skip was stale and was hiding 314
+targets in the variants set. Removed, at full line-shape strength rather
+than routed through the weak branch. All three sets report 0 crlf skips.
+
 ## 0.19.0 — 2026-09-14
 
 ### Added
