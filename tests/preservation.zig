@@ -628,6 +628,11 @@ const Stats = struct {
     same_sets: usize = 0,
     map_adds: usize = 0,
     complex_map_adds: usize = 0,
+    /// Which comparison `assertsSemanticRoundTrip` actually took. The
+    /// structural fallback is weaker than `yaml.value`; if it is the
+    /// common case, the add/append/insert sweeps are weaker than they look.
+    semantic_value: usize = 0,
+    semantic_structural: usize = 0,
     seq_appends: usize = 0,
     inserts: usize = 0,
     moves: usize = 0,
@@ -756,6 +761,7 @@ fn assertsSemanticRoundTrip(
     edited: *yaml.Document,
     out: []const u8,
     failures: *Failures,
+    stats: *Stats,
 ) void {
     var re = yaml.parse(allocator, out) catch {
         failures.add("{s}: " ++ what ++ " {s}: emitted output is not valid YAML", .{ name, path });
@@ -790,10 +796,12 @@ fn assertsSemanticRoundTrip(
             if (!valueEql(v_edited, v_out)) {
                 failures.add("{s}: " ++ what ++ " {s}: re-parsed output does not match the edited document", .{ name, path });
             }
+            stats.semantic_value += 1;
             return;
         } else |_| {}
     } else |_| {}
 
+    stats.semantic_structural += 1;
     // Structural fallback. Compares kind, scalar text, alias name and
     // child counts pairwise. Aliases are compared BY NAME rather than
     // followed: the two trees are the same document either side of an
@@ -886,6 +894,7 @@ fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats)
     // re-emits as two lines, so line-shape assertions do not apply. They
     // are deliberately not in the `skipped:` line.
     std.debug.print("  weak (semantic-only, no line-shape assertions): {d} explicit-key targets\n", .{stats.weak_explicit_key});
+    std.debug.print("  semantic comparison: {d} via yaml.value, {d} via structural fallback\n", .{ stats.semantic_value, stats.semantic_structural });
 }
 
 // ----------------------------------------------------------------------
@@ -1317,7 +1326,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
                 if (std.mem.indexOf(u8, line, "zz_added") != null) hit = true;
             }
             if (!hit) failures.add("{s}: map add under {s}: inserted lines do not carry the new key", .{ name, c.path });
-            assertsSemanticRoundTrip(allocator, name, "map add under", c.path, &doc, out, failures);
+            assertsSemanticRoundTrip(allocator, name, "map add under", c.path, &doc, out, failures, stats);
             // A span-less entry with a NON-SCALAR key is the only
             // operation that drives the emitter's laid-out explicit-key
             // arm. `Editor.set` always uses a scalar key and re-emits
@@ -1349,7 +1358,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
                 // the emitEntry fix reverted and the bespoke check
                 // removed, this line alone reports the same 322
                 // failures. One implementation of the rule, not two.
-                assertsSemanticRoundTrip(allocator, name, "complex map add under", c.path, &cdoc, cout, failures);
+                assertsSemanticRoundTrip(allocator, name, "complex map add under", c.path, &cdoc, cout, failures, stats);
             }
         } else {
             if (seq_budget == 0) {
@@ -1372,7 +1381,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             if (pureInsertion(orig_lines, out_lines) == null) {
                 failures.add("{s}: seq append to {s}: not a pure line insertion", .{ name, c.path });
             }
-            assertsSemanticRoundTrip(allocator, name, "seq append to", c.path, &doc, out, failures);
+            assertsSemanticRoundTrip(allocator, name, "seq append to", c.path, &doc, out, failures, stats);
         }
     }
 
@@ -1439,7 +1448,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             failures.add("{s}: insert before {s}: the inserted lines do not carry the new item", .{ name, t.path });
             continue;
         }
-        assertsSemanticRoundTrip(allocator, name, "insert before", t.path, &doc, out, failures);
+        assertsSemanticRoundTrip(allocator, name, "insert before", t.path, &doc, out, failures, stats);
         var re = yaml.parse(allocator, out) catch continue;
         defer re.deinit();
         var re_ed = yaml.edit.Editor.init(&re);
