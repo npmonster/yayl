@@ -1,0 +1,7 @@
+base: &base
+  script: |
+    line one
+    line two
+use:
+  <<: *base
+  stage: build

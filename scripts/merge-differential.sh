@@ -180,59 +180,67 @@ UNCOMPARABLE = {
 # about VALUES -- a merge that picked the wrong source still changes the
 # value bound to a key, which no amount of reordering can hide.
 # Sequence order is NOT normalized: there, order is the value.
-def parse(lines, i):
-    line = lines[i]
-    tag = line[0]
+# Parse by BYTE OFFSET, never by lines: a scalar is length-prefixed and
+# may contain newlines -- a block scalar is the normal case in the CI and
+# Ansible configs this feature exists for. A line-based reader that
+# ignored the length crashed with AssertionError on the second line of
+# such a value, so the grammar's "no byte needs escaping" claim held only
+# for values that happened to be one line. Both dumpers emit raw bytes;
+# consume exactly the declared length.
+def parse_node(text, i):
+    assert i < len(text), i
+    tag = text[i]
     if tag == "S":
-        return ("S", line), i + 1
+        j = text.index(":", i)
+        n = int(text[i + 1:j])
+        start = j + 1
+        body = text[start:start + n]
+        assert len(body) == n, (n, body)
+        i = start + n
+        assert text[i] == "\n", repr(text[i:i + 10])
+        return ("S", "S" + str(n) + ":" + body), i + 1
     if tag == "N":
-        return ("N", line), i + 1
-    if tag == "[":
-        n = int(line[1:])
-        i += 1
-        items = []
-        for _ in range(n):
-            node, i = parse(lines, i)
-            items.append(node)
-        assert lines[i] == "]", lines[i]
-        return ("[", items), i + 1
-    if tag == "{":
-        n = int(line[1:])
-        i += 1
-        pairs = []
-        for _ in range(n):
-            k, i = parse(lines, i)
-            v, i = parse(lines, i)
-            pairs.append((k, v))
-        assert lines[i] == "}", lines[i]
-        return ("{", pairs), i + 1
-    raise ValueError(f"bad canonical dump line: {line!r}")
+        assert text[i + 1] == "\n"
+        return ("N", "N"), i + 2
+    if tag == "[" or tag == "{":
+        j = text.index("\n", i)
+        n = int(text[i + 1:j])
+        i = j + 1
+        parts = []
+        for _ in range(n if tag == "[" else 2 * n):
+            node, i = parse_node(text, i)
+            parts.append(node)
+        close = "]" if tag == "[" else "}"
+        assert text[i] == close and text[i + 1] == "\n", repr(text[i:i + 10])
+        if tag == "[":
+            return ("[", parts), i + 2
+        return ("{", [(parts[k], parts[k + 1]) for k in range(0, len(parts), 2)]), i + 2
+    raise ValueError(f"bad canonical dump tag at {i}: {text[i:i + 40]!r}")
 
 def render(node):
     tag, body = node
-    if tag in ("S", "N"):
-        return [body]
+    if tag == "S":
+        return body + "\n"
+    if tag == "N":
+        return "N\n"
     if tag == "[":
-        out = [f"[{len(body)}"]
-        for item in body:
-            out += render(item)
-        return out + ["]"]
-    out = [f"{{{len(body)}"]
-    for k, v in sorted(body, key=lambda kv: "\n".join(render(kv[0]))):
-        out += render(k)
-        out += render(v)
-    return out + ["}"]
+        return f"[{len(body)}\n" + "".join(render(x) for x in body) + "]\n"
+    out = f"{{{len(body)}\n"
+    for k, v in sorted(body, key=lambda kv: render(kv[0])):
+        out += render(k) + render(v)
+    return out + "}\n"
 
 def normalize(text: str) -> str:
-    lines = [l for l in text.split("\n") if l]
-    assert lines[0].startswith("D"), lines[0] if lines else "<empty>"
-    ndocs = int(lines[0][1:])
-    out = [lines[0]]
-    i = 1
+    assert text.startswith("D"), text[:40]
+    nl = text.index("\n")
+    ndocs = int(text[1:nl])
+    i = nl + 1
+    out = ""
     for _ in range(ndocs):
-        node, i = parse(lines, i)
+        node, i = parse_node(text, i)
         out += render(node)
-    return "\n".join(out)
+    assert i == len(text), (i, len(text))
+    return out
 
 names = sorted(f for f in os.listdir(fixtures) if f.endswith(".yaml"))
 compared = mismatch = skipped = 0
@@ -281,7 +289,7 @@ print(f"merge-differential: {compared} compared, {mismatch} mismatches, "
 
 # A gate that compared nothing must not report success -- same floor rule
 # as scripts/differential.sh. Raise this when fixtures are added.
-MIN_COMPARED = 7
+MIN_COMPARED = 8
 if compared < MIN_COMPARED:
     print(f"merge-differential: FAILED -- only {compared} fixtures compared, "
           f"expected at least {MIN_COMPARED}")
