@@ -884,7 +884,7 @@ pub const Document = struct {
     pub fn resolveMergeKeys(self: *Document) !void {
         const old_root = self.root orelse return;
         if (!treeHasMergeKey(old_root, 0)) return;
-        const new_root = try edit.cloneTree(self, old_root);
+        const new_root = try edit.cloneTreeWhole(self, old_root);
         self.root = new_root;
         var ok = false;
         defer if (!ok) {
@@ -1039,6 +1039,12 @@ pub const Document = struct {
     /// True when `map` already has a scalar key with the same text as
     /// `key`. Non-scalar keys never collide: they cannot match a merge
     /// source key by text, matching how `lookup` reads keys.
+    ///
+    /// Comparison is on the RESOLVED text, while `isMergeKeyPair` is
+    /// style-sensitive: a quoted `"a": 9` is not a merge key, but it does
+    /// block a merged plain `a`. That asymmetry is deliberate — detection
+    /// follows the spec form of `<<`, equality follows how a reader reads
+    /// a key.
     fn mappingHasKey(map: *const Node, key: *const Node) bool {
         const want = key.scalarValue() orelse return false;
         for (map.data.mapping.pairs.items) |p| {
@@ -3044,12 +3050,27 @@ test "merge keys: a sequence item that is not a mapping is refused" {
     try testing.expectError(error.InvalidMergeKey, doc.resolveMergeKeys());
 }
 
-test "merge keys: a merge into itself is refused" {
-    // A parsed document cannot express this: an alias has to name an
-    // anchor defined before it, and the builder registers an anchor
-    // only once its collection is complete, so a self-reference is
-    // UnknownAlias at parse time. Build the cycle directly instead;
-    // the guard is what keeps a hand-built tree from looping forever.
+test "merge keys: a parsed self-referential merge is refused" {
+    // yayl accepts recursive anchors, so a parsed document CAN express
+    // this: the alias names an enclosing anchor. Refusing is right —
+    // copying `parent`'s pairs into `child` would copy `child` itself.
+    // (This corrects an earlier comment that claimed the parser rejects
+    // every self-reference; it does not, for this shape.)
+    var doc = try Document.parse(testing.allocator,
+        \\parent: &p
+        \\  a: 1
+        \\  child:
+        \\    <<: *p
+        \\
+    );
+    defer doc.deinit();
+    try testing.expectError(error.MergeKeyRecursive, doc.resolveMergeKeys());
+}
+
+test "merge keys: a hand-built self-merge is refused" {
+    // The built-tree form of the same guard: an alias node whose target
+    // is the mapping being resolved. Built directly because a parser
+    // shape for this one is not needed to reach the guard.
     var doc = Document.init(testing.allocator);
     defer doc.deinit();
     const map = try doc.createMapping();
@@ -3131,6 +3152,33 @@ fn mergeResolve(allocator: std.mem.Allocator) !void {
     );
     defer doc.deinit();
     try doc.resolveMergeKeys();
+}
+
+test "merge keys: a CRLF document keeps its convention" {
+    const src = "base: &b\r\n  a: 1\r\nuse:\r\n  <<: *b\r\n  c: 3\r\n";
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    try testing.expectEqualStrings("1", doc.pathGet(&.{"use"}).?.lookup("a").?.scalarValue().?);
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    // Every break the resolved mapping writes is CRLF too.
+    try testing.expect(std.mem.count(u8, out, "\n") == std.mem.count(u8, out, "\r\n"));
+    var again = try Document.parse(testing.allocator, out);
+    defer again.deinit();
+    try testing.expectEqualStrings("1", again.pathGet(&.{"use"}).?.lookup("a").?.scalarValue().?);
+}
+
+test "appending to a CRLF mapping keeps the document convention" {
+    // The general form of the bug merge resolution surfaced: a brand-new
+    // entry's line break came from a hardcoded '\n', so the entry
+    // before it ended with a bare LF in a CRLF document.
+    var doc = try Document.parse(testing.allocator, "a: 1\r\nb: 2\r\n");
+    defer doc.deinit();
+    try doc.mappingAppend(doc.root.?, try doc.createScalar("c", .plain), try doc.createScalar("3", .plain));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a: 1\r\nb: 2\r\nc: 3\r\n", out);
 }
 
 test "merge keys: the earliest of duplicate merge keys wins" {

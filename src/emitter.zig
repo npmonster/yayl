@@ -132,7 +132,7 @@ pub const Emitter = struct {
     fn newlineAt(self: *Emitter, indent: usize) Error!void {
         // A literal block scalar already ends on a fresh line; avoid a blank
         // line in that case.
-        if (!self.endsWithNewline()) try self.writeByte('\n');
+        if (!self.endsWithNewline()) try self.write(self.defaultTerminator());
         try self.writeIndent(indent);
     }
 
@@ -236,7 +236,7 @@ pub const Emitter = struct {
             std.mem.copyForwards(u8, self.out.items[start..], self.out.items[before..]);
             self.out.shrinkRetainingCapacity(self.out.items.len - placed);
         }
-        if (!self.endsWithNewline()) try self.writeByte('\n');
+        if (!self.endsWithNewline()) try self.write(self.defaultTerminator());
         try self.writeIndent(indent);
     }
 
@@ -274,7 +274,7 @@ pub const Emitter = struct {
         // Indentation, or an indicator left by a deleted entry, already
         // in place: keep the original bytes.
         if (isEntryFraming(pending)) return false;
-        try self.writeByte('\n');
+        try self.write(self.defaultTerminator());
         try self.writeIndent(col);
         return false;
     }
@@ -295,7 +295,7 @@ pub const Emitter = struct {
         while (k > 0 and pending[k - 1] == ' ') k -= 1;
         if (k == pending.len) {
             // No indentation was written either: supply the whole prefix.
-            try self.writeByte('\n');
+            try self.write(self.defaultTerminator());
             return self.writeIndent(col);
         }
         try self.out.insert(self.allocator, self.out.items.len - (pending.len - k), '\n');
@@ -354,7 +354,7 @@ pub const Emitter = struct {
             try self.write(td.handle);
             try self.writeByte(' ');
             try self.write(td.prefix);
-            try self.writeByte('\n');
+            try self.write(self.defaultTerminator());
             have_directives = true;
         }
 
@@ -365,7 +365,7 @@ pub const Emitter = struct {
 
         if (have_directives or doc.explicit_start) try self.write("---\n");
         try self.emitNode(root, 0);
-        if (!self.endsWithNewline()) try self.writeByte('\n');
+        if (!self.endsWithNewline()) try self.write(self.defaultTerminator());
         if (doc.explicit_end) try self.write("...\n");
     }
 
@@ -425,7 +425,7 @@ pub const Emitter = struct {
                 if (!self.endsWithNewline() and
                     self.firstLiveTailByte(doc.root.?, stop, doc.region_end) == '#')
                 {
-                    try self.writeByte('\n');
+                    try self.write(self.defaultTerminator());
                 }
                 try self.writeGap(doc.root.?, stop, doc.region_end);
             } else {
@@ -437,7 +437,7 @@ pub const Emitter = struct {
                 self.out.items[self.out.items.len - 1] != '\n' and
                 src.len > 0 and src[src.len - 1] == '\n')
             {
-                try self.writeByte('\n');
+                try self.write(self.defaultTerminator());
             }
         }
     }
@@ -638,7 +638,7 @@ pub const Emitter = struct {
                     try self.write(tt);
                 }
             }
-            if (owed_terminator and !self.endsWithNewline()) try self.writeByte('\n');
+            if (owed_terminator and !self.endsWithNewline()) try self.write(self.defaultTerminator());
             return gap;
         }
 
@@ -820,7 +820,7 @@ pub const Emitter = struct {
                     try self.write(tt);
                 }
             }
-            if (owed_terminator and !self.endsWithNewline()) try self.writeByte('\n');
+            if (owed_terminator and !self.endsWithNewline()) try self.write(self.defaultTerminator());
             return gap;
         };
         if (self.emitted.contains(item)) {
@@ -1260,6 +1260,24 @@ pub const Emitter = struct {
         return "\n";
     }
 
+    /// The document's own line-break convention, for a structural break
+    /// the emitter lays out itself (a brand-new entry's line, a restored
+    /// line break, a written comment). `terminatorAt` answers this for a
+    /// known source offset; this is the document-wide fallback, taken from
+    /// the source's first break. A programmatic or single-line source
+    /// breaks with `\n`, as it always did.
+    fn defaultTerminator(self: *const Emitter) []const u8 {
+        const src = self.src;
+        var i: usize = 0;
+        while (i < src.len) : (i += 1) {
+            if (src[i] == '\n') return "\n";
+            if (src[i] == '\r') {
+                return if (i + 1 < src.len and src[i + 1] == '\n') "\r\n" else "\r";
+            }
+        }
+        return "\n";
+    }
+
     /// Write the tail of an entry's line: the trailing comment and the
     /// terminator. A node with a pending trailing override (see
     /// `Document.setTrailingComment`) gets the canonical ` # text` —
@@ -1292,7 +1310,7 @@ pub const Emitter = struct {
         if (t.len == 0) return;
         // An empty output is at a line start already: breaking here put
         // a blank line ahead of a comment written on the first item.
-        if (self.out.items.len > 0 and !self.endsWithNewline()) try self.writeByte('\n');
+        if (self.out.items.len > 0 and !self.endsWithNewline()) try self.write(self.defaultTerminator());
         var it = std.mem.splitScalar(u8, t, '\n');
         while (it.next()) |line| {
             try self.writeIndent(col);
@@ -1303,7 +1321,7 @@ pub const Emitter = struct {
     }
 
     fn writeNewlineIndent(self: *Emitter, indent: usize) Error!void {
-        try self.writeByte('\n');
+        try self.write(self.defaultTerminator());
         try self.writeIndent(indent);
     }
 

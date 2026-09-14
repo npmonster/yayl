@@ -22,6 +22,27 @@ purged, unlike libfyaml's `fy_document_resolve`. An invalid value is
 `error.InvalidMergeKey`; a merge that reaches itself is
 `error.MergeKeyRecursive`. See `docs/design/merge-keys.md`.
 
+### Fixed
+
+**A laid-out explicit key put its value indicator on the key's own line.**
+`? K: V` re-reads as an explicit key that IS the mapping `{K: V}`, with a
+null value, so a complex key and its value were both changed by a round
+trip. `Emitter.emitEntry` now writes `? K`, a newline at the key's column,
+then `:`. Only the laid-out path was affected; an unmodified entry still
+re-emits from its source span. Reachable from any programmatic complex key,
+and from merge resolution, which copies complex keys out of a merge source.
+Found during review of the merge-key work.
+
+**Structural line breaks ignored the document's CRLF convention.** The
+emitter's laid-out paths — a brand-new entry's line, a restored break, a
+written comment, an explicit-key indicator — hardcoded `\n`, so appending a
+pair to a CRLF mapping left the previous entry terminated by a bare LF, and
+merge resolution rewrote a CRLF mapping the same way.
+`Emitter.defaultTerminator` now takes the convention from the source's first
+break and every structural break uses it; a programmatic or single-line
+source still breaks with `\n`. Found while adding CRLF coverage to the
+merge-key tests.
+
 ## 0.18.0 — 2026-09-07
 
 ### Fixed

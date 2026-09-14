@@ -41,6 +41,10 @@ pub const Error = error{
     WouldCycle,
     AnchorReferenced,
     AliasPath,
+    /// A whole-tree clone met a forward alias (an alias whose anchor is
+    /// defined later). `cloneTreeWhole` refuses it rather than pointing
+    /// the clone back at the pre-clone tree.
+    UnknownAlias,
     OutOfMemory,
 };
 
@@ -52,6 +56,7 @@ pub const CloneError = error{
     NestingTooDeep,
     InvalidSyntax,
     OutOfMemory,
+    UnknownAlias,
 };
 
 /// Refuse a MUTATION whose container is an alias node.
@@ -828,7 +833,21 @@ fn clearSpans(node: *Node) void {
 pub fn cloneTree(doc: *Document, root: *Node) CloneError!*Node {
     var anchors = std.StringHashMap(*Node).init(doc.allocator);
     defer anchors.deinit();
-    return cloneNode(doc, root, &anchors, false, 0);
+    return cloneNode(doc, root, &anchors, false, false, 0);
+}
+
+/// Same-document clone of a WHOLE tree, for a caller that will swap the
+/// result in as the document's new root. Unlike `cloneTree`, every anchor
+/// a correct tree can name is inside the clone, so an alias whose anchor
+/// has not been seen yet is a forward alias: invalid in parsed input and
+/// reachable only from a hand-built tree. It is refused rather than left
+/// pointing at the pre-clone node — a merge source that reached back into
+/// the tree being replaced could mutate it, and the caller's rollback
+/// (restore `root`) would then be a lie.
+pub fn cloneTreeWhole(doc: *Document, root: *Node) CloneError!*Node {
+    var anchors = std.StringHashMap(*Node).init(doc.allocator);
+    defer anchors.deinit();
+    return cloneNode(doc, root, &anchors, false, true, 0);
 }
 
 /// Deep-clone a subtree from ANOTHER document into `doc`'s pool.
@@ -841,10 +860,10 @@ pub fn cloneTree(doc: *Document, root: *Node) CloneError!*Node {
 pub fn cloneTreeInto(doc: *Document, root: *Node) CloneError!*Node {
     var anchors = std.StringHashMap(*Node).init(doc.allocator);
     defer anchors.deinit();
-    return cloneNode(doc, root, &anchors, true, 0);
+    return cloneNode(doc, root, &anchors, true, false, 0);
 }
 
-fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), clear_spans: bool, depth: usize) CloneError!*Node {
+fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), clear_spans: bool, require_anchor: bool, depth: usize) CloneError!*Node {
     // Structural recursion only — an alias is copied as an alias, never
     // followed — so a cycle cannot reach here, but a deep built tree can.
     // The one exception is the cross-document alias below, which is
@@ -860,7 +879,7 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
     // target's own anchor, so a second alias to the same name still
     // clones as an alias, pointing at the copy.
     if (clear_spans and node.data == .alias and anchors.get(node.data.alias.name) == null) {
-        return cloneNode(doc, node.data.alias.target, anchors, clear_spans, depth + 1);
+        return cloneNode(doc, node.data.alias.target, anchors, clear_spans, require_anchor, depth + 1);
     }
 
     const n = try doc.pool.create(Node);
@@ -896,15 +915,21 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
             // Reached only for an anchor defined inside the clone, or
             // for a same-document clone where the source node is a
             // legitimate target.
-            const target = anchors.get(a.name) orelse a.target;
+            const target = anchors.get(a.name) orelse blk: {
+                if (require_anchor) return error.UnknownAlias;
+                // A same-document subtree clone may legitimately name an
+                // anchor outside the cloned subtree; the reference stays
+                // in this document and is still valid.
+                break :blk a.target;
+            };
             n.data = .{ .alias = .{ .name = try doc.pool.dupe(a.name), .target = target } };
         },
         .mapping => |m| {
             n.data = .{ .mapping = .{ .style = m.style } };
             if (n.anchor) |a| try anchors.put(a, n);
             for (m.pairs.items) |p| {
-                const k = try cloneNode(doc, p.key, anchors, clear_spans, depth + 1);
-                const v = try cloneNode(doc, p.value, anchors, clear_spans, depth + 1);
+                const k = try cloneNode(doc, p.key, anchors, clear_spans, require_anchor, depth + 1);
+                const v = try cloneNode(doc, p.value, anchors, clear_spans, require_anchor, depth + 1);
                 try internal.attachPair(doc, n, k, v);
                 // Preserve the pair's original extent -- but only for a
                 // same-document clone. `src_end` indexes the source the
@@ -926,7 +951,7 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
             n.data = .{ .sequence = .{ .style = sq.style } };
             if (n.anchor) |a| try anchors.put(a, n);
             for (sq.items.items) |item| {
-                const child = try cloneNode(doc, item, anchors, clear_spans, depth + 1);
+                const child = try cloneNode(doc, item, anchors, clear_spans, require_anchor, depth + 1);
                 try internal.attachItem(doc, n, child);
             }
             if (!clear_spans) {

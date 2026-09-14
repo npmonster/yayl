@@ -173,6 +173,16 @@ with `error.InvalidMergeKey`; a self-merge refused with
 parse option and `parseAllOpts`; resolved output that re-parses; and
 allocation-failure injection. `src/value.zig` covers the read-only path.
 
+## Emitter bugs this surfaced
+
+Two pre-existing emitter bugs were found by testing this feature and are
+fixed on top of it, each with its own round-trip tests:
+
+- a laid-out explicit key wrote `? K: V` on one line, which re-reads as a
+  mapping key with a null value (fixed in `e91d04e`, found by the reviewer);
+- structural line breaks hardcoded `\n`, so rewriting a mapping in a CRLF
+  document lost the convention (`Emitter.defaultTerminator`).
+
 ## Still open
 
 - **Differential against libfyaml.** The vendored-libfyaml harness
