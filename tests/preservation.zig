@@ -203,15 +203,13 @@ const Target = struct {
     /// behind the entries — counted, never swept.
     props_preamble: bool,
     /// The entry was written with an explicit key indicator (`? key`).
-    /// Edits re-emit it as a two-line entry and the tombstone arithmetic
-    /// does not yet cover the `? ` line, so the target is skipped
-    /// OUTRIGHT -- counted, never swept, semantic assertions included.
-    /// That blind spot hid a real emitter bug: the laid-out path used to
-    /// write `? K: V` on one line, which re-reads as an explicit key that
-    /// is the mapping `{K: V}` with a null value. Fixed in emitter.zig
-    /// `emitEntry`, covered by its own round-trip tests -- but only
-    /// because someone went looking, not because this sweep failed.
-    /// Un-skipping this category is the real fix and is still owed.
+    /// Edits re-emit it as a two-line entry, so line-shape assertions do
+    /// not apply; the WEAK invariants do (valid YAML, semantic value tree,
+    /// path resolution), and that is how it is swept now. It used to be
+    /// skipped OUTRIGHT, and that blind spot hid a real emitter bug: the
+    /// laid-out path wrote `? K: V` on one line, which re-reads as an
+    /// explicit key that is the mapping `{K: V}` with a null value. Fixed
+    /// in emitter.zig `emitEntry`, covered by its own round-trip tests.
     explicit_key: bool,
     /// The parent container is flow-styled: the emitter's documented
     /// normalization reflows the collection, so line-shape assertions
@@ -923,25 +921,24 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             stats.skipped_dangling_anchor += 1;
             continue;
         }
-        if (t.explicit_key or t.in_flow) {
-            // An explicit-key entry re-emits as two lines and its
-            // tombstone arithmetic does not yet cover the `? ` line; a
-            // flow collection reflows by design, legitimately changing
+        if (t.in_flow) {
+            // A flow collection reflows by design, legitimately changing
             // even key text. Counted, never swept.
-            stats.skipped_explicit_key += @intFromBool(t.explicit_key);
-            stats.skipped_flow += @intFromBool(t.in_flow);
+            stats.skipped_flow += 1;
             continue;
         }
-        if (t.sole_child or no_final) {
+        if (t.sole_child or no_final or t.explicit_key) {
             // Line-shape assertions do not apply: an emptied container
-            // normalizes to flow style, and a document without a final
+            // normalizes to flow style, a document without a final
             // newline legitimately gains one when its last line is
-            // edited. The WEAK invariants still do — the output must
+            // edited, and an explicit-key entry re-emits as two lines.
+            // The WEAK invariants still do — the output must
             // be valid YAML and the deleted entry must be gone. (A
             // previous regression emitted `key:\n{}` here, which does
             // not re-parse.)
             stats.skipped_sole_child += @intFromBool(t.sole_child);
             stats.skipped_no_final_newline += @intFromBool(no_final);
+            stats.skipped_explicit_key += @intFromBool(t.explicit_key);
             var doc = try yaml.parse(allocator, input);
             defer doc.deinit();
             var ed = yaml.edit.Editor.init(&doc);
@@ -1072,22 +1069,22 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             stats.skipped_tab_span += @intFromBool(t.tab_span);
             continue;
         }
-        if (t.explicit_key or t.in_flow) {
-            // An explicit-key entry re-emits as two lines (`? key` +
-            // `: value`); a flow collection reflows by design and may
-            // legitimately change even key text. Counted, never swept.
-            stats.skipped_explicit_key += @intFromBool(t.explicit_key);
-            stats.skipped_flow += @intFromBool(t.in_flow);
+        if (t.in_flow) {
+            // A flow collection reflows by design and may legitimately
+            // change even key text. Counted, never swept.
+            stats.skipped_flow += 1;
             continue;
         }
-        if (t.multi_line or no_final) {
+        if (t.multi_line or no_final or t.explicit_key) {
             // Replacing a multi-line value legitimately reflows lines,
-            // and a missing final newline terminates on edit: line-
-            // shape assertions do not apply. Weak invariants still do:
+            // a missing final newline terminates on edit, and an
+            // explicit-key entry re-emits as two lines: line-shape
+            // assertions do not apply. Weak invariants still do:
             // valid YAML, sentinel at the path, and the semantic value
             // tree.
             stats.skipped_multiline += @intFromBool(t.multi_line);
             stats.skipped_no_final_newline += @intFromBool(no_final);
+            stats.skipped_explicit_key += @intFromBool(t.explicit_key);
             var doc = try yaml.parse(allocator, input);
             defer doc.deinit();
             var ed = yaml.edit.Editor.init(&doc);
