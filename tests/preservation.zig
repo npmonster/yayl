@@ -633,6 +633,9 @@ const Stats = struct {
     /// common case, the add/append/insert sweeps are weaker than they look.
     semantic_value: usize = 0,
     semantic_structural: usize = 0,
+    /// Comparisons skipped because `yaml.value` cannot represent the
+    /// tree (a non-scalar key). Counted, never silent.
+    value_unrepresentable: usize = 0,
     seq_appends: usize = 0,
     inserts: usize = 0,
     moves: usize = 0,
@@ -746,6 +749,21 @@ fn pureInsertionReframed(orig: [][]const u8, out: [][]const u8) ?usize {
         return at;
     }
     return null;
+}
+
+/// `nodeToValue`, or null when `yaml.value` cannot represent the tree.
+/// A non-scalar key answers `error.TypeMismatch`, and every caller here
+/// does `orelse continue`, so the comparison is skipped. The skip is
+/// COUNTED rather than silent: an unrepresentable tree used to make the
+/// semantic check a no-op, which is how a complex-key document passed a
+/// check that never ran. (2956af2 fixed `assertsSemanticRoundTrip`;
+/// these eight sites were still silent, which its message did not claim
+/// but also did not cover.)
+fn valueOrSkip(allocator: std.mem.Allocator, node: *const yaml.Node, stats: *Stats) ?yaml.value.Value {
+    return yaml.value.nodeToValue(allocator, node) catch {
+        stats.value_unrepresentable += 1;
+        return null;
+    };
 }
 
 /// The strong assertion for every edit without a documented
@@ -895,6 +913,7 @@ fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats)
     // are deliberately not in the `skipped:` line.
     std.debug.print("  weak (semantic-only, no line-shape assertions): {d} explicit-key targets\n", .{stats.weak_explicit_key});
     std.debug.print("  semantic comparison: {d} via yaml.value, {d} via structural fallback\n", .{ stats.semantic_value, stats.semantic_structural });
+    std.debug.print("  semantic skips (yaml.value cannot represent): {d}\n", .{stats.value_unrepresentable});
 }
 
 // ----------------------------------------------------------------------
@@ -1028,9 +1047,9 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
                 defer vin_d.deinit();
                 var vout_d = yaml.parse(allocator, out) catch continue;
                 defer vout_d.deinit();
-                const vin = yaml.value.nodeToValue(allocator, vin_d.root.?) catch continue;
+                const vin = valueOrSkip(allocator, vin_d.root.?, stats) orelse continue;
                 defer yaml.value.freeValue(allocator, vin);
-                const vout = yaml.value.nodeToValue(allocator, vout_d.root.?) catch continue;
+                const vout = valueOrSkip(allocator, vout_d.root.?, stats) orelse continue;
                 defer yaml.value.freeValue(allocator, vout);
                 var p = yaml.edit.Path.parse(allocator, t.path) catch continue;
                 defer p.deinit(allocator);
@@ -1173,9 +1192,9 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
                 defer vin_d.deinit();
                 var vout_d = yaml.parse(allocator, out) catch continue;
                 defer vout_d.deinit();
-                const vin = yaml.value.nodeToValue(allocator, vin_d.root.?) catch continue;
+                const vin = valueOrSkip(allocator, vin_d.root.?, stats) orelse continue;
                 defer yaml.value.freeValue(allocator, vin);
-                const vout = yaml.value.nodeToValue(allocator, vout_d.root.?) catch continue;
+                const vout = valueOrSkip(allocator, vout_d.root.?, stats) orelse continue;
                 defer yaml.value.freeValue(allocator, vout);
                 var p = yaml.edit.Path.parse(allocator, t.path) catch continue;
                 defer p.deinit(allocator);
@@ -1521,13 +1540,13 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
                 defer doc.deinit();
                 var ed = yaml.edit.Editor.init(&doc);
                 const src_node = ed.one(t.path) catch continue;
-                const v_src = yaml.value.nodeToValue(allocator, src_node) catch continue;
+                const v_src = valueOrSkip(allocator, src_node, stats) orelse continue;
                 defer yaml.value.freeValue(allocator, v_src);
                 ed.apply(&.{.{ .move = .{ .from = t.path, .to = c.path, .key = "zz_moved" } }}) catch |err| {
                     failures.add("{s}: move {s} -> {s} failed: {s}", .{ name, t.path, c.path, @errorName(err) });
                     continue;
                 };
-                const v_expected = yaml.value.nodeToValue(allocator, doc.root.?) catch continue;
+                const v_expected = valueOrSkip(allocator, doc.root.?, stats) orelse continue;
                 defer yaml.value.freeValue(allocator, v_expected);
                 const out = try doc.write(allocator);
                 defer allocator.free(out);
@@ -1537,7 +1556,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
                     continue;
                 };
                 defer after.deinit();
-                const v_after = yaml.value.nodeToValue(allocator, after.root.?) catch continue;
+                const v_after = valueOrSkip(allocator, after.root.?, stats) orelse continue;
                 defer yaml.value.freeValue(allocator, v_after);
                 if (!valueEql(v_expected, v_after)) {
                     failures.add("{s}: move {s} -> {s}: output value tree differs from the edited document", .{ name, t.path, c.path });
@@ -1552,7 +1571,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
                     failures.add("{s}: move {s} -> {s}: the moved node is not at its destination", .{ name, t.path, c.path });
                     continue;
                 };
-                const v_moved = yaml.value.nodeToValue(allocator, moved) catch continue;
+                const v_moved = valueOrSkip(allocator, moved, stats) orelse continue;
                 defer yaml.value.freeValue(allocator, v_moved);
                 if (!valueEql(v_src, v_moved)) {
                     failures.add("{s}: move {s} -> {s}: the subtree's value changed in transit", .{ name, t.path, c.path });
