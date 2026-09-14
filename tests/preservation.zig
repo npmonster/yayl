@@ -627,6 +627,7 @@ const Stats = struct {
     sets: usize = 0,
     same_sets: usize = 0,
     map_adds: usize = 0,
+    complex_map_adds: usize = 0,
     seq_appends: usize = 0,
     inserts: usize = 0,
     moves: usize = 0,
@@ -643,7 +644,7 @@ const Stats = struct {
     skipped_no_root: usize = 0,
     skipped_roundtrip_unstable: usize = 0,
     skipped_props_preamble: usize = 0,
-    skipped_explicit_key: usize = 0,
+    weak_explicit_key: usize = 0,
     skipped_tab_span: usize = 0,
     skipped_unsupported: usize = 0,
     skipped_no_final_newline: usize = 0,
@@ -775,13 +776,14 @@ fn assertsSemanticRoundTrip(
 /// every skip and cap category — printed, never silent.
 fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats) void {
     std.debug.print(
-        "preservation[{s}]: {d} deletes, {d} sets, {d} same-value sets, {d} map adds, {d} seq appends, {d} inserts, {d} moves, {d} rollbacks over {d} {s} ({d} documents, {d} without a root)\n",
+        "preservation[{s}]: {d} deletes, {d} sets, {d} same-value sets, {d} map adds, {d} complex map adds, {d} seq appends, {d} inserts, {d} moves, {d} rollbacks over {d} {s} ({d} documents, {d} without a root)\n",
         .{
             label,
             stats.deletes,
             stats.sets,
             stats.same_sets,
             stats.map_adds,
+            stats.complex_map_adds,
             stats.seq_appends,
             stats.inserts,
             stats.moves,
@@ -793,7 +795,7 @@ fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats)
         },
     );
     std.debug.print(
-        "  skipped: {d} sole-child, {d} dangling anchor, {d} multi-line, {d} alias, {d} flow, {d} empty, {d} same non-scalar, {d} explicit-key, {d} tab-span, {d} unsupported constructs, {d} no-final-newline, {d} bom, {d} crlf\n" ++
+        "  skipped: {d} sole-child, {d} dangling anchor, {d} multi-line, {d} alias, {d} flow, {d} empty, {d} same non-scalar, {d} tab-span, {d} unsupported constructs, {d} no-final-newline, {d} bom, {d} crlf\n" ++
             "  skipped: {d} unaddressable paths, {d} round-trip-unstable, {d} property-preamble, {d} move/insert related, {d} unusable destinations; capped: {d} targets, {d} containers\n",
         .{
             stats.skipped_sole_child,
@@ -803,7 +805,6 @@ fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats)
             stats.skipped_flow,
             stats.skipped_empty,
             stats.skipped_same_non_scalar,
-            stats.skipped_explicit_key,
             stats.skipped_tab_span,
             stats.skipped_unsupported,
             stats.skipped_no_final_newline,
@@ -818,6 +819,10 @@ fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats)
             stats.capped_containers,
         },
     );
+    // Explicit-key targets ARE swept, but only weakly: their entry
+    // re-emits as two lines, so line-shape assertions do not apply. They
+    // are deliberately not in the `skipped:` line.
+    std.debug.print("  weak (semantic-only, no line-shape assertions): {d} explicit-key targets\n", .{stats.weak_explicit_key});
 }
 
 // ----------------------------------------------------------------------
@@ -938,7 +943,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             // not re-parse.)
             stats.skipped_sole_child += @intFromBool(t.sole_child);
             stats.skipped_no_final_newline += @intFromBool(no_final);
-            stats.skipped_explicit_key += @intFromBool(t.explicit_key);
+            stats.weak_explicit_key += @intFromBool(t.explicit_key);
             var doc = try yaml.parse(allocator, input);
             defer doc.deinit();
             var ed = yaml.edit.Editor.init(&doc);
@@ -1084,7 +1089,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             // tree.
             stats.skipped_multiline += @intFromBool(t.multi_line);
             stats.skipped_no_final_newline += @intFromBool(no_final);
-            stats.skipped_explicit_key += @intFromBool(t.explicit_key);
+            stats.weak_explicit_key += @intFromBool(t.explicit_key);
             var doc = try yaml.parse(allocator, input);
             defer doc.deinit();
             var ed = yaml.edit.Editor.init(&doc);
@@ -1261,6 +1266,30 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             }
             if (!hit) failures.add("{s}: map add under {s}: inserted lines do not carry the new key", .{ name, c.path });
             assertsSemanticRoundTrip(allocator, name, "map add under", c.path, &doc, out, failures);
+            // A span-less entry with a NON-SCALAR key is the only
+            // operation that drives the emitter's laid-out explicit-key
+            // arm. `Editor.set` always uses a scalar key and re-emits
+            // the key from its source span, so the `? ` path was never
+            // exercised by the add sweep. Without `Emitter.emitEntry`'s
+            // indicator-on-its-own-line fix this emits `? [9]: added`,
+            // which re-reads as a mapping key with an empty value.
+            {
+                var cdoc = try yaml.parse(allocator, input);
+                defer cdoc.deinit();
+                var ced = yaml.edit.Editor.init(&cdoc);
+                const container = ced.one(c.path) catch {
+                    failures.add("{s}: complex map add under {s}: path did not resolve", .{ name, c.path });
+                    continue;
+                };
+                const ckey = try cdoc.createSequence();
+                try cdoc.sequenceAppend(ckey, try cdoc.createScalar("9", .plain));
+                try cdoc.mappingAppend(container, ckey, try cdoc.createScalar("added", .plain));
+                const cout = try cdoc.write(allocator);
+                defer allocator.free(cout);
+                stats.complex_map_adds += 1;
+                assertsReparse(allocator, name, c.path, cout, failures);
+                assertsSemanticRoundTrip(allocator, name, "complex map add under", c.path, &cdoc, cout, failures);
+            }
         } else {
             if (seq_budget == 0) {
                 stats.capped_containers += 1;
