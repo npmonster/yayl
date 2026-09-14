@@ -649,7 +649,6 @@ const Stats = struct {
     skipped_unsupported: usize = 0,
     skipped_no_final_newline: usize = 0,
     skipped_bom: usize = 0,
-    skipped_crlf: usize = 0,
     capped_targets: usize = 0,
     capped_containers: usize = 0,
     unaddressable: usize = 0,
@@ -860,7 +859,7 @@ fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats)
         },
     );
     std.debug.print(
-        "  skipped: {d} sole-child, {d} dangling anchor, {d} multi-line, {d} alias, {d} flow, {d} empty, {d} same non-scalar, {d} tab-span, {d} unsupported constructs, {d} no-final-newline, {d} bom, {d} crlf\n" ++
+        "  skipped: {d} sole-child, {d} dangling anchor, {d} multi-line, {d} alias, {d} flow, {d} empty, {d} same non-scalar, {d} tab-span, {d} unsupported constructs, {d} no-final-newline, {d} bom\n" ++
             "  skipped: {d} unaddressable paths, {d} round-trip-unstable, {d} property-preamble, {d} move/insert related, {d} unusable destinations; capped: {d} targets, {d} containers\n",
         .{
             stats.skipped_sole_child,
@@ -874,7 +873,6 @@ fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats)
             stats.skipped_unsupported,
             stats.skipped_no_final_newline,
             stats.skipped_bom,
-            stats.skipped_crlf,
             stats.unaddressable,
             stats.skipped_roundtrip_unstable,
             stats.skipped_props_preamble,
@@ -965,12 +963,6 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
     // line legitimately terminates it, so line-shape assertions do not
     // apply and the weak ones run instead.
     const no_final = !std.mem.endsWith(u8, input, "\n");
-
-    // CRLF documents: edits that reuse existing line terminators
-    // (delete, set, move, same-value set) are swept; edits that ADD a
-    // line still write a bare LF for it, which is not preserved yet —
-    // counted, never swept.
-    const is_crlf = std.mem.indexOf(u8, input, "\r\n") != null;
 
     // DELETE sweep: input minus one contiguous run that contains the
     // deleted entry.
@@ -1296,11 +1288,6 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             stats.skipped_unsupported += 1;
             continue;
         }
-        if (is_crlf) {
-            // Adding a line writes a bare LF for it on a CRLF file.
-            stats.skipped_crlf += 1;
-            continue;
-        }
         if (c.is_mapping) {
             if (map_budget == 0) {
                 stats.capped_containers += 1;
@@ -1405,11 +1392,6 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
         }
         if (t.unsupported) {
             stats.skipped_unsupported += 1;
-            continue;
-        }
-        if (is_crlf) {
-            // Splicing a line writes a bare LF for it on a CRLF file.
-            stats.skipped_crlf += 1;
             continue;
         }
         const seq_path = sequenceParentOf(t.path) orelse continue;
