@@ -1972,6 +1972,31 @@ test "cloneTreeInto follows an alias anchored outside the subtree" {
     }
 }
 
+test "cloneTreeWhole refuses a forward alias instead of pointing outside" {
+    // The whole-tree clone may only name an anchor it has already
+    // cloned; an alias whose anchor comes LATER in the walk is a forward
+    // alias (invalid in parsed input, reachable from a hand-built tree).
+    // A subtree clone tolerates it because the target may legitimately
+    // live outside the cloned subtree; the whole-tree clone must not,
+    // because the caller swaps it in as the new root and a pointer back
+    // at the pre-clone tree would break the rollback contract.
+    var doc = Document.init(testing.allocator);
+    defer doc.deinit();
+    const root = try doc.createMapping();
+    doc.root = root;
+    const later = try doc.createMapping();
+    try doc.setAnchor(later, "late");
+    const alias = try doc.pool.create(Node);
+    alias.* = .{ .data = .{ .alias = .{ .name = "late", .target = later } } };
+    try doc.mappingAppend(root, try doc.createScalar("a", .plain), alias);
+    try doc.mappingAppend(root, try doc.createScalar("later", .plain), later);
+
+    // The subtree clone still accepts it: the target is in this document.
+    const clone = try cloneTree(&doc, root);
+    try testing.expect(clone != root);
+    try testing.expectError(error.UnknownAlias, cloneTreeWhole(&doc, root));
+}
+
 test "a move cannot put an alias ahead of its anchor" {
     const allocator = std.testing.allocator;
 

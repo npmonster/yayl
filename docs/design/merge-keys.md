@@ -161,8 +161,12 @@ All four recommended options were taken, and the work is implemented:
 `Document.resolveMergeKeys` in `src/document.zig`, wired to
 `ParseOptions.resolve_merge_keys` (parse and parseAll), plus
 `value.parseToValueResolved`. Resolution runs on a same-document deep clone
-and swaps it in only on success, so a failed resolve leaves the document
-byte-identical; a document with no `<<` is returned without a clone.
+(`edit.cloneTreeWhole`) and swaps it in only on success, so a failed resolve
+leaves the document byte-identical; a document with no `<<` is returned
+without a clone. The whole-tree clone refuses a forward alias
+(`error.UnknownAlias`) rather than leaving a clone pointer at the pre-clone
+tree, which would break that rollback; a test in `src/edit.zig` locks the
+refusal and the subtree clone's legitimate outside-anchor fallback.
 
 Unit tests in `src/document.zig` cover: an aliased source merged and the `<<`
 key removed; explicit-key-wins; earliest-sequence-source-wins; inline mapping
