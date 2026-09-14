@@ -3363,3 +3363,69 @@ test "merge keys: a complex source key is copied and re-reads" {
     try testing.expectEqual(NodeKind.mapping, pairs[1].key.kind());
     try testing.expectEqualStrings("map-pair", pairs[1].value.scalarValue().?);
 }
+
+test "merge keys: the GitLab CI fixture resolves its job templates" {
+    // A named gate for tests/fixtures/gitlab-anchors.yaml, the realistic
+    // configuration the merge feature exists for. Read at run time rather
+    // than embedded: `tests/` is deliberately absent from build.zig.zon's
+    // `.paths`, so wiring the fixture into the library module would ship a
+    // dangling import to every dependent (exactly what the consumer-smoke
+    // gate catches).
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const input = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "tests/fixtures/gitlab-anchors.yaml",
+        testing.allocator,
+        .limited(1 << 20),
+    ) catch |err| {
+        // Never a silent skip: a fixture this gate cannot find is a
+        // failure, not a pass.
+        std.debug.print(
+            "gitlab-anchors.yaml unreadable ({s}) -- run from the repository root\n",
+            .{@errorName(err)},
+        );
+        return err;
+    };
+    defer testing.allocator.free(input);
+
+    var doc = try Document.parseOpts(testing.allocator, input, null, .{ .resolve_merge_keys = true });
+    defer doc.deinit();
+
+    // build-job and test-job carry `<<: *defaults`; each must gain the
+    // template's three keys and keep its own.
+    for ([_][]const u8{ "build-job", "test-job" }) |name| {
+        const job = doc.pathGet(&.{name}) orelse return error.TestUnexpectedResult;
+        try testing.expect(job.lookup("<<") == null);
+        const before = job.lookup("before_script") orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(usize, 2), before.data.sequence.items.items.len);
+        const retry = job.lookup("retry") orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("2", retry.lookup("max").?.scalarValue().?);
+        // Its own keys survive the merge.
+        try testing.expect(job.lookup("stage") != null);
+        try testing.expect(job.lookup("script") != null);
+    }
+    try testing.expectEqualStrings("build", doc.pathGet(&.{ "build-job", "stage" }).?.scalarValue().?);
+    try testing.expectEqualStrings("test", doc.pathGet(&.{ "test-job", "stage" }).?.scalarValue().?);
+
+    // Precedence, the half a template with no key overlap cannot test:
+    // build-job takes the template's image, test-job overrides it and
+    // must keep its own. Without this the gate survives a merge that
+    // clobbers explicit keys.
+    try testing.expectEqualStrings("rust:1.79", doc.pathGet(&.{ "build-job", "image" }).?.scalarValue().?);
+    try testing.expectEqualStrings("rust:1.79-slim", doc.pathGet(&.{ "test-job", "image" }).?.scalarValue().?);
+
+    // deploy-job is the negative control: it has NO merge key, so
+    // resolution must not leak the template into it. Without this, a
+    // merge that wrote into every mapping would still pass above.
+    const deploy = doc.pathGet(&.{"deploy-job"}) orelse return error.TestUnexpectedResult;
+    try testing.expect(deploy.lookup("image") == null);
+    try testing.expect(deploy.lookup("before_script") == null);
+    try testing.expect(deploy.lookup("retry") == null);
+    try testing.expectEqualStrings("deploy", deploy.lookup("stage").?.scalarValue().?);
+
+    // The template itself is untouched by being a merge source.
+    const defaults = doc.pathGet(&.{".defaults"}) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("rust:1.79", defaults.lookup("image").?.scalarValue().?);
+}

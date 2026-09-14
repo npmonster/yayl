@@ -32,6 +32,8 @@ build-job:
 test-job:
   <<: *defaults
   stage: test
+  # Overrides the template's image: the merge must not clobber it.
+  image: rust:1.79-slim
   variables:
     RUST_BACKTRACE: "full"
   script:
