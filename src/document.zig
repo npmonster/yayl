@@ -3286,3 +3286,32 @@ test "merge keys: a rootless document is a no-op" {
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("# only a comment\n", out);
 }
+
+test "merge keys: a complex source key is copied and re-reads" {
+    // The path marble-owl's probe reached the emitter bug through: a
+    // merge source with a non-scalar key, copied into the target.
+    var doc = try Document.parse(testing.allocator,
+        \\base: &base
+        \\  ? [1, 2]
+        \\  : pair
+        \\  ? {k: v}
+        \\  : map-pair
+        \\use:
+        \\  <<: *base
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const use = doc.pathGet(&.{"use"}).?;
+    try testing.expectEqual(@as(usize, 2), use.pairs().?.len);
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    var again = try Document.parse(testing.allocator, out);
+    defer again.deinit();
+    const pairs = again.pathGet(&.{"use"}).?.pairs().?;
+    try testing.expectEqual(@as(usize, 2), pairs.len);
+    try testing.expectEqual(NodeKind.sequence, pairs[0].key.kind());
+    try testing.expectEqualStrings("pair", pairs[0].value.scalarValue().?);
+    try testing.expectEqual(NodeKind.mapping, pairs[1].key.kind());
+    try testing.expectEqualStrings("map-pair", pairs[1].value.scalarValue().?);
+}
