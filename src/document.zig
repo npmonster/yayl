@@ -3250,3 +3250,39 @@ test "merge keys: a hand-built tree past the depth bound is refused" {
     try doc.mappingAppend(cur, try doc.createScalar("<<", .plain), try doc.createScalar("x", .plain));
     try testing.expectError(error.NestingTooDeep, doc.resolveMergeKeys());
 }
+
+test "merge keys: an alias to a non-mapping is refused" {
+    var doc = try Document.parse(testing.allocator,
+        \\name: &name hello
+        \\use:
+        \\  <<: *name
+        \\
+    );
+    defer doc.deinit();
+    try testing.expectError(error.InvalidMergeKey, doc.resolveMergeKeys());
+}
+
+test "merge keys: an alias to a sequence of mappings is accepted" {
+    var doc = try Document.parse(testing.allocator,
+        \\seq: &seq
+        \\  - { a: 1 }
+        \\  - { b: 2 }
+        \\use:
+        \\  <<: *seq
+        \\
+    );
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const use = doc.pathGet(&.{"use"}).?;
+    try testing.expectEqualStrings("1", use.lookup("a").?.scalarValue().?);
+    try testing.expectEqualStrings("2", use.lookup("b").?.scalarValue().?);
+}
+
+test "merge keys: a rootless document is a no-op" {
+    var doc = try Document.parse(testing.allocator, "# only a comment\n");
+    defer doc.deinit();
+    try doc.resolveMergeKeys();
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# only a comment\n", out);
+}
