@@ -117,7 +117,7 @@ def decode(text: str) -> str:
 # yaml.value, so the emitter must CHOOSE every scalar's form. The second
 # is a different decision procedure, and until it was gated here nothing
 # with an independent parser ever looked at it.
-MODES = ("faithful", "value")
+MODES = ("faithful", "value", "merged")
 
 checked = rejected = findings = no_document = not_applicable = 0
 

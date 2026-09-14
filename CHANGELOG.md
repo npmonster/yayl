@@ -43,6 +43,14 @@ break and every structural break uses it; a programmatic or single-line
 source still breaks with `\n`. Found while adding CRLF coverage to the
 merge-key tests.
 
+### Changed
+
+**The emission oracle checks a third path: merge resolution.** A `merged`
+mode parses with `ParseOptions.resolve_merge_keys`, re-emits, and has the
+vendored libfyaml parse the result — the first independent check of the
+merge path's output. 816 emitted documents across the three modes, 0
+findings. The oracle stays report-only in CI.
+
 ## 0.18.0 — 2026-09-07
 
 ### Fixed

@@ -197,5 +197,7 @@ fixed on top of it, each with its own round-trip tests:
 - **The GitLab fixture is not a named gate.** Resolution of
   `tests/fixtures/gitlab-anchors.yaml` is covered in spirit by the unit
   tests; a dedicated assertion on the three jobs is not wired into `make`.
-- `make emission-oracle` with resolution is not part of the default sweep
-  (it needs a C compiler and is report-only by design).
+- The emission oracle now has a `merged` mode (resolve, then re-emit), so an
+  independent parser checks the resolved output too: 816 documents across the
+  three modes, 0 findings. It stays report-only in CI and is not part of
+  `make verify`.

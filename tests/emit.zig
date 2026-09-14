@@ -5,6 +5,9 @@
 //!   faithful — re-emit the parsed documents verbatim. This is the
 //!              byte-faithful path, and every scalar carries the style
 //!              the author wrote.
+//!   merged   — parse with `resolve_merge_keys`, then re-emit. The
+//!              resolved mappings are laid out by the emitter, so this is
+//!              the only oracle mode that sees the merge path's output.
 //!   value    — rebuild each document through `yaml.value` and emit the
 //!              result. Nothing here has a source span or a parsed
 //!              style, so the emitter has to CHOOSE every scalar's form
@@ -38,13 +41,19 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    var docs = yaml.parseAll(allocator, input) catch |err| {
-        std.debug.print("emit: yayl rejected {s}: {s}\n", .{ in_path, @errorName(err) });
-        // An explicit status, not a returned error: Zig maps ANY error
-        // from main to exit 1, which would make "yayl rejected this
-        // input" indistinguishable from a genuine failure.
-        std.process.exit(3);
-    };
+    var docs = if (std.mem.eql(u8, mode, "merged"))
+        yaml.Document.parseAllOpts(allocator, input, null, .{ .resolve_merge_keys = true }) catch |err| {
+            std.debug.print("emit: yayl rejected {s}: {s}\n", .{ in_path, @errorName(err) });
+            std.process.exit(3);
+        }
+    else
+        yaml.parseAll(allocator, input) catch |err| {
+            std.debug.print("emit: yayl rejected {s}: {s}\n", .{ in_path, @errorName(err) });
+            // An explicit status, not a returned error: Zig maps ANY error
+            // from main to exit 1, which would make "yayl rejected this
+            // input" indistinguishable from a genuine failure.
+            std.process.exit(3);
+        };
     defer {
         for (docs.items) |*d| d.deinit();
         docs.deinit(allocator);
