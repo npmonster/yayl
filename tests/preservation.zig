@@ -766,6 +766,12 @@ fn valueOrSkip(allocator: std.mem.Allocator, node: *const yaml.Node, stats: *Sta
     };
 }
 
+/// `nodeToValue` or null, with NO skip counted: the caller has a
+/// structural fallback and therefore still makes the comparison.
+fn valueOrNull(allocator: std.mem.Allocator, node: *const yaml.Node) ?yaml.value.Value {
+    return yaml.value.nodeToValue(allocator, node) catch null;
+}
+
 /// The strong assertion for every edit without a documented
 /// normalization: the edited in-memory document and a re-parse of the
 /// emitted bytes must have the same semantic value tree. A re-parse
@@ -1047,14 +1053,25 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
                 defer vin_d.deinit();
                 var vout_d = yaml.parse(allocator, out) catch continue;
                 defer vout_d.deinit();
-                const vin = valueOrSkip(allocator, vin_d.root.?, stats) orelse continue;
-                defer yaml.value.freeValue(allocator, vin);
-                const vout = valueOrSkip(allocator, vout_d.root.?, stats) orelse continue;
-                defer yaml.value.freeValue(allocator, vout);
                 var p = yaml.edit.Path.parse(allocator, t.path) catch continue;
                 defer p.deinit(allocator);
-                if (!valueMinusEql(vin, vout, p.segments)) {
-                    failures.add("{s}: delete {s}: output value tree is not the input minus the entry", .{ name, t.path });
+                // `yaml.value` cannot represent a tree holding a complex
+                // key, and skipping those left the delete sweep asserting
+                // NOTHING for exactly the documents it most needed to
+                // check. Fall back to the node trees instead.
+                if (valueOrNull(allocator, vin_d.root.?)) |vin| {
+                    defer yaml.value.freeValue(allocator, vin);
+                    if (valueOrNull(allocator, vout_d.root.?)) |vout| {
+                        defer yaml.value.freeValue(allocator, vout);
+                        if (!valueMinusEql(vin, vout, p.segments)) {
+                            failures.add("{s}: delete {s}: output value tree is not the input minus the entry", .{ name, t.path });
+                        }
+                        continue;
+                    }
+                }
+                stats.semantic_structural += 1;
+                if (!nodeMinusEql(vin_d.root.?, vout_d.root.?, p.segments, 0)) {
+                    failures.add("{s}: delete {s}: output tree is not the input minus the entry (structural)", .{ name, t.path });
                 }
             }
             if (t.key_text.len > 0) {
@@ -1192,14 +1209,24 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
                 defer vin_d.deinit();
                 var vout_d = yaml.parse(allocator, out) catch continue;
                 defer vout_d.deinit();
-                const vin = valueOrSkip(allocator, vin_d.root.?, stats) orelse continue;
-                defer yaml.value.freeValue(allocator, vin);
-                const vout = valueOrSkip(allocator, vout_d.root.?, stats) orelse continue;
-                defer yaml.value.freeValue(allocator, vout);
                 var p = yaml.edit.Path.parse(allocator, t.path) catch continue;
                 defer p.deinit(allocator);
-                if (!valueSetEql(vin, vout, p.segments, sentinel)) {
-                    failures.add("{s}: set {s}: output value tree is not the input with the target set", .{ name, t.path });
+                // Same fallback as the delete sweep: a complex-key
+                // document is checked on the node trees rather than
+                // skipped.
+                if (valueOrNull(allocator, vin_d.root.?)) |vin| {
+                    defer yaml.value.freeValue(allocator, vin);
+                    if (valueOrNull(allocator, vout_d.root.?)) |vout| {
+                        defer yaml.value.freeValue(allocator, vout);
+                        if (!valueSetEql(vin, vout, p.segments, sentinel)) {
+                            failures.add("{s}: set {s}: output value tree is not the input with the target set", .{ name, t.path });
+                        }
+                        continue;
+                    }
+                }
+                stats.semantic_structural += 1;
+                if (!nodeSetEql(vin_d.root.?, vout_d.root.?, p.segments, sentinel, 0)) {
+                    failures.add("{s}: set {s}: output tree is not the input with the target set (structural)", .{ name, t.path });
                 }
             }
             var re = yaml.parse(allocator, out) catch continue;
@@ -1698,6 +1725,160 @@ fn valueIsEmptySlot(v: yaml.value.Value) bool {
         .mapping => |m| m.len == 0,
         else => false,
     };
+}
+
+/// Scalar-keyed lookup on a NODE mapping. Complex keys never match a
+/// path segment, which is text: they are compared structurally instead.
+fn nodeByKey(node: *const yaml.Node, k: []const u8) ?*const yaml.Node {
+    if (node.kind() != .mapping) return null;
+    for (node.data.mapping.pairs.items) |p| {
+        const kt = p.key.scalarValue() orelse continue;
+        if (std.mem.eql(u8, kt, k)) return p.value;
+    }
+    return null;
+}
+
+/// `valueMinusEql` on the NODE trees, for documents `yaml.value` cannot
+/// represent. Same rule — `vout` is `vin` minus the entry at `segs`,
+/// everything else unchanged and in order — but keys are compared
+/// STRUCTURALLY, so a mapping holding a complex key is checked rather
+/// than skipped. Without this the delete sweep silently asserted nothing
+/// for exactly those documents.
+fn nodeMinusEql(
+    vin: *const yaml.Node,
+    vout: *const yaml.Node,
+    segs: []const yaml.edit.Segment,
+    depth: usize,
+) bool {
+    if (depth >= max_structural_depth) return false;
+    if (segs.len == 0) return false; // root deletion is not swept
+    switch (segs[0]) {
+        .key => |k| {
+            if (vin.kind() != .mapping or vout.kind() != .mapping) return false;
+            const ins = vin.data.mapping.pairs.items;
+            const outs = vout.data.mapping.pairs.items;
+            if (segs.len == 1) {
+                if (nodeByKey(vin, k) == null) return false; // target must exist
+                if (nodeByKey(vout, k) != null) return false; // and be gone
+                var j: usize = 0;
+                for (ins) |m| {
+                    if (m.key.scalarValue()) |kt| {
+                        if (std.mem.eql(u8, kt, k)) continue; // the deleted entry
+                    }
+                    if (j >= outs.len) return false;
+                    if (!structuralEql(m.key, outs[j].key, depth + 1)) return false;
+                    if (!structuralEql(m.value, outs[j].value, depth + 1)) return false;
+                    j += 1;
+                }
+                return j == outs.len;
+            }
+            return nodeMinusEql(
+                nodeByKey(vin, k) orelse return false,
+                nodeByKey(vout, k) orelse return false,
+                segs[1..],
+                depth + 1,
+            );
+        },
+        .index => |ix| {
+            if (vin.kind() != .sequence or vout.kind() != .sequence) return false;
+            const ins = vin.data.sequence.items.items;
+            const outs = vout.data.sequence.items.items;
+            if (ix >= ins.len) return false;
+            if (segs.len == 1) {
+                if (outs.len != ins.len - 1) return false;
+                for (0..ix) |i| {
+                    if (!structuralEql(ins[i], outs[i], depth + 1)) return false;
+                }
+                for (ix..outs.len) |i| {
+                    if (!structuralEql(ins[i + 1], outs[i], depth + 1)) return false;
+                }
+                return true;
+            }
+            if (ix >= outs.len) return false;
+            return nodeMinusEql(ins[ix], outs[ix], segs[1..], depth + 1);
+        },
+        else => return false,
+    }
+}
+
+/// `valueSetEql` on the NODE trees, for the same reason as
+/// `nodeMinusEql`. `vout` is `vin` with exactly the target slot holding
+/// `sentinel_text` — replaced in place if the key existed, appended at
+/// the end if it did not — and nothing else changed.
+fn nodeSetEql(
+    vin: *const yaml.Node,
+    vout: *const yaml.Node,
+    segs: []const yaml.edit.Segment,
+    sentinel_text: []const u8,
+    depth: usize,
+) bool {
+    if (depth >= max_structural_depth) return false;
+    if (segs.len == 0) {
+        const text = vout.scalarValue() orelse return false;
+        return std.mem.eql(u8, text, sentinel_text);
+    }
+    switch (segs[0]) {
+        .key => |k| {
+            if (vin.kind() != .mapping or vout.kind() != .mapping) return false;
+            const ins = vin.data.mapping.pairs.items;
+            const outs = vout.data.mapping.pairs.items;
+            if (segs.len == 1) {
+                var ia: usize = 0;
+                var ib: usize = 0;
+                var seen_target = false;
+                while (ia < ins.len or ib < outs.len) {
+                    const a_ok = ia < ins.len;
+                    const b_ok = ib < outs.len;
+                    const a_key = if (a_ok) ins[ia].key.scalarValue() else null;
+                    const b_key = if (b_ok) outs[ib].key.scalarValue() else null;
+                    const a_is_target = a_key != null and std.mem.eql(u8, a_key.?, k);
+                    const b_is_target = b_key != null and std.mem.eql(u8, b_key.?, k);
+                    if (a_is_target) {
+                        // Existed: replaced in place, position kept.
+                        if (!b_is_target) return false;
+                        const text = outs[ib].value.scalarValue() orelse return false;
+                        if (!std.mem.eql(u8, text, sentinel_text)) return false;
+                        seen_target = true;
+                        ia += 1;
+                        ib += 1;
+                    } else if (b_is_target) {
+                        // New key: appended at the end only.
+                        if (a_ok) return false;
+                        const text = outs[ib].value.scalarValue() orelse return false;
+                        if (!std.mem.eql(u8, text, sentinel_text)) return false;
+                        seen_target = true;
+                        ib += 1;
+                    } else {
+                        if (!a_ok or !b_ok) return false;
+                        if (!structuralEql(ins[ia].key, outs[ib].key, depth + 1)) return false;
+                        if (!structuralEql(ins[ia].value, outs[ib].value, depth + 1)) return false;
+                        ia += 1;
+                        ib += 1;
+                    }
+                }
+                return seen_target;
+            }
+            return nodeSetEql(
+                nodeByKey(vin, k) orelse return false,
+                nodeByKey(vout, k) orelse return false,
+                segs[1..],
+                sentinel_text,
+                depth + 1,
+            );
+        },
+        .index => |ix| {
+            if (vin.kind() != .sequence or vout.kind() != .sequence) return false;
+            const ins = vin.data.sequence.items.items;
+            const outs = vout.data.sequence.items.items;
+            if (ix >= ins.len or ins.len != outs.len) return false;
+            for (ins, outs, 0..) |a, b, i| {
+                if (i == ix) continue;
+                if (!structuralEql(a, b, depth + 1)) return false;
+            }
+            return nodeSetEql(ins[ix], outs[ix], segs[1..], sentinel_text, depth + 1);
+        },
+        else => return false,
+    }
 }
 
 /// `vout` is `vin` with the entry at `segs` removed: everything else
@@ -2527,4 +2708,72 @@ fn inNodeSpan(nodes: []const *yaml.Node, offset: usize) bool {
         if (offset >= sp.start and offset < sp.end) return true;
     }
     return false;
+}
+
+test "nodeMinusEql and nodeSetEql reject a wrong tree" {
+    // The structural fallbacks are only reached by documents yaml.value
+    // cannot represent, which is a handful of corpus cases -- too few to
+    // red-prove by mutating the library, because a mutation broad enough
+    // to reach them aborts the sweep first. Prove the predicates here
+    // instead: each must ACCEPT the correct edit and REJECT a wrong one.
+    const allocator = std.testing.allocator;
+
+    // A document yaml.value cannot represent: the mapping holds a
+    // complex (sequence) key, so nodeToValue answers TypeMismatch and
+    // this is exactly the shape the fallback exists for.
+    const input = "? [1, 2]\n: pair\nkeep: me\ndrop: gone\n";
+    var in_d = try yaml.parse(allocator, input);
+    defer in_d.deinit();
+    try std.testing.expectError(error.TypeMismatch, yaml.value.nodeToValue(allocator, in_d.root.?));
+
+    var p = try yaml.edit.Path.parse(allocator, "$.drop");
+    defer p.deinit(allocator);
+
+    // DELETE: correct output accepted, wrong outputs rejected.
+    {
+        var ok_d = try yaml.parse(allocator, "? [1, 2]\n: pair\nkeep: me\n");
+        defer ok_d.deinit();
+        try std.testing.expect(nodeMinusEql(in_d.root.?, ok_d.root.?, p.segments, 0));
+
+        // Target still present.
+        var still_d = try yaml.parse(allocator, input);
+        defer still_d.deinit();
+        try std.testing.expect(!nodeMinusEql(in_d.root.?, still_d.root.?, p.segments, 0));
+
+        // A sibling silently lost as well.
+        var extra_d = try yaml.parse(allocator, "? [1, 2]\n: pair\n");
+        defer extra_d.deinit();
+        try std.testing.expect(!nodeMinusEql(in_d.root.?, extra_d.root.?, p.segments, 0));
+
+        // The complex key's VALUE changed -- the corruption the
+        // emitEntry bug produced, which a key-text comparison misses.
+        var ckey_d = try yaml.parse(allocator, "? [1, 2]\n: CHANGED\nkeep: me\n");
+        defer ckey_d.deinit();
+        try std.testing.expect(!nodeMinusEql(in_d.root.?, ckey_d.root.?, p.segments, 0));
+
+        // The complex key itself changed kind.
+        var kind_d = try yaml.parse(allocator, "? {a: 1}\n: pair\nkeep: me\n");
+        defer kind_d.deinit();
+        try std.testing.expect(!nodeMinusEql(in_d.root.?, kind_d.root.?, p.segments, 0));
+    }
+
+    // SET: correct output accepted, wrong outputs rejected.
+    {
+        var ok_d = try yaml.parse(allocator, "? [1, 2]\n: pair\nkeep: me\ndrop: SENTINEL\n");
+        defer ok_d.deinit();
+        try std.testing.expect(nodeSetEql(in_d.root.?, ok_d.root.?, p.segments, "SENTINEL", 0));
+
+        // Not set.
+        try std.testing.expect(!nodeSetEql(in_d.root.?, in_d.root.?, p.segments, "SENTINEL", 0));
+
+        // Set, but a sibling lost with it.
+        var lost_d = try yaml.parse(allocator, "? [1, 2]\n: pair\ndrop: SENTINEL\n");
+        defer lost_d.deinit();
+        try std.testing.expect(!nodeSetEql(in_d.root.?, lost_d.root.?, p.segments, "SENTINEL", 0));
+
+        // Set, but the complex key's value quietly changed too.
+        var ckey_d = try yaml.parse(allocator, "? [1, 2]\n: CHANGED\nkeep: me\ndrop: SENTINEL\n");
+        defer ckey_d.deinit();
+        try std.testing.expect(!nodeSetEql(in_d.root.?, ckey_d.root.?, p.segments, "SENTINEL", 0));
+    }
 }
