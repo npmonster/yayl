@@ -1,0 +1,6 @@
+defaults: &defaults
+  image: rust:1.79
+  retry: 2
+build:
+  <<: *defaults
+  stage: build

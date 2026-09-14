@@ -189,15 +189,60 @@ fixed on top of it, each with its own round-trip tests:
 
 ## Still open
 
-- **Differential against libfyaml.** The vendored-libfyaml harness
-  (`scripts/differential.sh`) does not yet build the reference with
-  `FYPCF_RESOLVE_DOCUMENT`, so resolution is checked by unit tests, not by a
-  cross-implementation oracle. The inline-mapping cases would need skipping
-  or recording, since the two libfyaml paths disagree there.
-- **The GitLab fixture is not a named gate.** Resolution of
-  `tests/fixtures/gitlab-anchors.yaml` is covered in spirit by the unit
-  tests; a dedicated assertion on the three jobs is not wired into `make`.
+- Nothing. The two items that stood here — the libfyaml semantic
+  differential and the unwired GitLab fixture — are closed; see
+  "Semantic differential" below and the `gitlab-anchors.yaml` test in
+  `src/document.zig`.
 - The emission oracle now has a `merged` mode (resolve, then re-emit), so an
   independent parser checks the resolved output too: 816 documents across the
   three modes, 0 findings. It stays report-only in CI and is not part of
   `make verify`.
+
+## Semantic differential (`make merge-differential`)
+
+`scripts/merge-differential.sh` compares the VALUES yayl produces under
+`resolve_merge_keys` against the values libfyaml produces under
+`FYPCF_RESOLVE_DOCUMENT`, over `tests/fixtures/merge/`.
+
+This is a different question from the emission oracle's `merged` mode.
+That mode proves libfyaml can *parse* what yayl emits after resolution;
+it cannot see a merge that picked the wrong source or dropped an entry,
+because the wrong answer is still valid YAML. This gate sees exactly that:
+inverting the sequence-source precedence turns it red on
+`sequence-of-aliases.yaml` (`from-a` vs `from-b`).
+
+Both sides emit the canonical, length-prefixed grammar documented at
+`dumpCanonical` in `tests/emit.zig`. Three things are deliberately
+normalized away, because neither library is wrong about them and none is
+part of a document's value:
+
+- **Anchors.** `fy_document_resolve` purges every anchor; yayl's merge is
+  merge-only and keeps them.
+- **Aliases**, which are followed on the yayl side. libfyaml inlines every
+  alias while resolving, so following is what makes the two comparable.
+- **Mapping entry order.** libfyaml puts merged entries before the
+  mapping's own keys; yayl appends them. YAML mappings are unordered and
+  the spec does not place merged entries, so the comparator sorts mapping
+  entries by the key's own canonical dump — in one place, not in each
+  dumper. Sequence order is *not* normalized: there, order is the value.
+
+### Counted skips
+
+PORT NOTE: yayl follows the permissive YAML 1.1 rule that libfyaml's
+*event* path implements — a merge value may be a mapping directly, or a
+sequence holding direct mappings. libfyaml's *document* path is stricter:
+alias-only, and it rejects a mapping that repeats a key. Fixtures that
+land on that divergence cannot be compared. They are named and counted in
+the script's `UNCOMPARABLE` table and printed on every run, never skipped
+silently — and each is still required to resolve under yayl, so a skip
+can never hide a yayl failure.
+
+| Fixture | Why it cannot be compared |
+| --- | --- |
+| `inline-mapping.yaml` | merge value is an inline mapping; libfyaml's document path is alias-only |
+| `inline-in-sequence.yaml` | merge sequence holds inline mappings; same reason |
+| `duplicate-merge-keys.yaml` | two `<<` entries in one mapping; libfyaml's document path rejects a repeated key |
+
+The gate asserts a floor of 7 compared fixtures, for the same reason
+`scripts/differential.sh` does: a gate that compared nothing must not
+report success.

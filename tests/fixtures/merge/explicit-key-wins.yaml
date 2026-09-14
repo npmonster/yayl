@@ -1,0 +1,6 @@
+base: &base
+  a: 1
+  b: 2
+use:
+  <<: *base
+  a: 9

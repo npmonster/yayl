@@ -1,0 +1,6 @@
+base: &base
+  ? [1, 2]
+  : pair
+  a: 1
+use:
+  <<: *base

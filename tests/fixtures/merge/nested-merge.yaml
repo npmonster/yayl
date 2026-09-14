@@ -1,0 +1,8 @@
+root: &root
+  r: 0
+mid: &mid
+  <<: *root
+  m: 1
+use:
+  <<: *mid
+  u: 2

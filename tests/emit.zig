@@ -8,6 +8,12 @@
 //!   merged   — parse with `resolve_merge_keys`, then re-emit. The
 //!              resolved mappings are laid out by the emitter, so this is
 //!              the only oracle mode that sees the merge path's output.
+//!   dump-merged — parse with `resolve_merge_keys`, then write a
+//!              CANONICAL TREE DUMP instead of YAML, for
+//!              scripts/merge-differential.sh to compare against
+//!              libfyaml's `FYPCF_RESOLVE_DOCUMENT` output. See
+//!              `dumpCanonical` for the grammar and for what the form
+//!              deliberately drops.
 //!   value    — rebuild each document through `yaml.value` and emit the
 //!              result. Nothing here has a source span or a parsed
 //!              style, so the emitter has to CHOOSE every scalar's form
@@ -41,7 +47,8 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    var docs = if (std.mem.eql(u8, mode, "merged"))
+    const resolve = std.mem.eql(u8, mode, "merged") or std.mem.eql(u8, mode, "dump-merged");
+    var docs = if (resolve)
         yaml.Document.parseAllOpts(allocator, input, null, .{ .resolve_merge_keys = true }) catch |err| {
             std.debug.print("emit: yayl rejected {s}: {s}\n", .{ in_path, @errorName(err) });
             std.process.exit(3);
@@ -59,7 +66,14 @@ pub fn main(init: std.process.Init) !void {
         docs.deinit(allocator);
     }
 
-    const out = if (std.mem.eql(u8, mode, "value"))
+    const out = if (std.mem.eql(u8, mode, "dump-merged"))
+        dumpCanonical(allocator, docs.items) catch |err| switch (err) {
+            // A cyclic alias has no finite value form. Not a merge
+            // defect: the differential simply cannot compare it.
+            error.NestingTooDeep => std.process.exit(4),
+            else => return err,
+        }
+    else if (std.mem.eql(u8, mode, "value"))
         rebuildThroughValue(allocator, docs.items) catch |err| switch (err) {
             // Not every document survives a Value round trip by design:
             // a complex key has no string form, and alias expansion is
@@ -96,4 +110,80 @@ fn rebuildThroughValue(allocator: std.mem.Allocator, docs: []yaml.Document) ![]u
         try rebuilt.append(allocator, fresh);
     }
     return yaml.writeAll(allocator, rebuilt.items);
+}
+
+/// Write a canonical, order-preserving dump of every resolved document,
+/// in the exact form `scripts/merge-differential.sh`'s C reference emits
+/// from libfyaml's `FYPCF_RESOLVE_DOCUMENT` output.
+///
+/// Grammar (one node per production, length-prefixed so no byte needs
+/// escaping and no delimiter can be forged by content):
+///
+///     stream  := "D" count LF node*
+///     node    := "S" len ":" bytes LF        -- scalar
+///              | "[" count LF node* "]" LF   -- sequence
+///              | "{" count LF (node node)* "}" LF -- mapping, key then value
+///              | "N" LF                      -- absent root
+///
+/// What it deliberately drops, because the two libraries cannot agree on
+/// it and none of it is part of a document's VALUE:
+///
+///   * Anchors. `fy_document_resolve` purges every anchor; yayl's merge
+///     is merge-only and keeps them. Printing them would report a known,
+///     intentional divergence as a value mismatch on every fixture.
+///   * Aliases, which are FOLLOWED on this side. libfyaml inlines every
+///     alias during resolution, so following is what makes the two
+///     comparable — and it is the value either way.
+///   * Tags and scalar style. A tag is a type annotation and a style is
+///     presentation; the emission oracle already covers style, and the
+///     conformance gate covers tag resolution.
+///
+/// PORT NOTE: following aliases means a cyclic anchor (`&a [*a]`, legal
+/// input yayl accepts) has no finite dump. Bounded by `max_dump_depth`
+/// and reported as `error.NestingTooDeep`, which the caller maps to the
+/// "not comparable" exit status rather than a failure.
+fn dumpCanonical(allocator: std.mem.Allocator, docs: []yaml.Document) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator, "D{d}\n", .{docs.len});
+    for (docs) |*doc| {
+        if (doc.root) |root| {
+            try dumpNode(allocator, &out, root, 0);
+        } else {
+            try out.appendSlice(allocator, "N\n");
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+const max_dump_depth: usize = 256;
+
+fn dumpNode(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    node: *const yaml.Node,
+    depth: usize,
+) !void {
+    if (depth >= max_dump_depth) return error.NestingTooDeep;
+    // Follow aliases: libfyaml has already inlined them by this point.
+    const n = node.resolveAlias();
+    switch (n.data) {
+        .scalar => |s| try out.print(allocator, "S{d}:{s}\n", .{ s.value.len, s.value }),
+        .sequence => |s| {
+            try out.print(allocator, "[{d}\n", .{s.items.items.len});
+            for (s.items.items) |item| try dumpNode(allocator, out, item, depth + 1);
+            try out.appendSlice(allocator, "]\n");
+        },
+        .mapping => |m| {
+            try out.print(allocator, "{{{d}\n", .{m.pairs.items.len});
+            for (m.pairs.items) |p| {
+                try dumpNode(allocator, out, p.key, depth + 1);
+                try dumpNode(allocator, out, p.value, depth + 1);
+            }
+            try out.appendSlice(allocator, "}\n");
+        },
+        // resolveAlias only returns an alias node for a cycle it could
+        // not resolve within its own bound; treat it as unrepresentable.
+        .alias => return error.NestingTooDeep,
+    }
 }

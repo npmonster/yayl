@@ -1,0 +1,7 @@
+a: &a
+  k: from-a
+b: &b
+  k: from-b
+use:
+  <<: *a
+  <<: *b

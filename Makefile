@@ -62,6 +62,12 @@ differential: corpus libfyaml ## Compare yayl vs libfyaml event streams over the
 emission-oracle: corpus libfyaml ## Assert libfyaml can parse every document yayl emits (needs a C compiler)
 	sh scripts/emission-oracle.sh
 
+# The emission oracle proves libfyaml can PARSE what yayl emits after
+# merge resolution. It cannot prove the resolved VALUES agree -- a merge
+# that picked the wrong source still emits valid YAML. This is that gate.
+merge-differential: libfyaml ## Compare yayl vs libfyaml RESOLVED merge-key values (needs a C compiler)
+	sh scripts/merge-differential.sh
+
 # The only gate that consumes the library the way a dependent does:
 # `zig fetch` applies `.paths` from build.zig.zon, so a source file
 # missing there keeps every other gate green while every dependent

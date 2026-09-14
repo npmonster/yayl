@@ -1,0 +1,5 @@
+base: &base
+  a: 1
+use:
+  "<<": *base
+  own: 2

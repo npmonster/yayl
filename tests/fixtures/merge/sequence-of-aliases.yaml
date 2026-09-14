@@ -1,0 +1,8 @@
+a: &a
+  k: from-a
+  x: 1
+b: &b
+  k: from-b
+  y: 2
+use:
+  <<: [*a, *b]
