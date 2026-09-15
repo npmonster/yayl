@@ -85,8 +85,12 @@ pub fn main(init: std.process.Init) !void {
         defer d.deinit();
         var ed = yaml.edit.Editor.init(&d);
         if (d.root) |r| {
-            if (r.pairs().?.len > 0) {
-                try ed.set("$.zzz_bench", try d.createScalar("1", .plain));
+            // A non-mapping root (a top-level sequence, say) has no
+            // pairs; the old `pairs().?` panicked on it.
+            if (r.pairs()) |ps| {
+                if (ps.len > 0) {
+                    try ed.set("$.zzz_bench", try d.createScalar("1", .plain));
+                }
             }
         }
         const out = try d.write(allocator);

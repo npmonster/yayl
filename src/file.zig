@@ -67,8 +67,10 @@ fn permissionBits(p: std.Io.File.Permissions) std.Io.File.Permissions {
     return @enumFromInt(@as(u32, @intFromEnum(p)) & 0o7777);
 }
 
-/// I/O failures plus the parse-error vocabulary the document layer
-/// can surface (kept in sync with `diag.YamlError` by construction).
+/// I/O failures plus the parse-error vocabulary the document layer can
+/// surface. A convenience vocabulary for callers, NOT an annotation: the
+/// public functions use inferred error sets, so they can also return
+/// `error.NameTooLong` and the underlying filesystem errors.
 pub const Error = error{ StreamTooLong, FileNotFound, AccessDenied, OutOfMemory } || diag.YamlError;
 
 /// Parse the first document of the file at `path`.
@@ -155,10 +157,7 @@ pub fn writeBytesAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
 /// Read a whole file, bounded. Returns `error.StreamTooLong` past
 /// `max_bytes`.
 pub fn readFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_bytes: usize) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes)) catch |err| switch (err) {
-        error.StreamTooLong => error.StreamTooLong,
-        else => err,
-    };
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
 }
 
 // ----------------------------------------------------------------------

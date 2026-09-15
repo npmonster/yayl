@@ -2285,11 +2285,14 @@ test "preservation sweep: bounded edits over every valid corpus document" {
 
     var valid: usize = 0;
     for (cases.items) |*c| {
-        if (!c.fail) valid += 1;
+        if (c.fail) continue;
+        if (corpus.skipPreservation(c.id)) continue;
+        valid += 1;
     }
-    // The whole yaml-test-suite corpus: the 269 valid documents the
-    // round-trip and conformance gates cover — here under edits.
-    try std.testing.expectEqual(@as(usize, 269), valid);
+    // Every valid document the round-trip and conformance gates cover,
+    // minus the six unnamed sub-cases yayl cannot parse yet (the same
+    // list the other gates track) — here under edits.
+    try std.testing.expectEqual(@as(usize, 296), valid);
 
     var failures: Failures = .{ .allocator = allocator };
     defer {
@@ -2311,12 +2314,13 @@ test "preservation sweep: bounded edits over every valid corpus document" {
     };
     for (cases.items) |*c| {
         if (c.fail) continue;
+        if (corpus.skipPreservation(c.id)) continue;
         try sweepFixture(allocator, c.id, c.input, &failures, &stats, smoke);
     }
 
     // Every valid document accounted for: edited, root-less, or one of
     // the documented round-trip-unstable shapes.
-    try std.testing.expectEqual(@as(usize, 269), stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable + stats.skipped_bom);
+    try std.testing.expectEqual(@as(usize, 296), stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable + stats.skipped_bom);
     // The bounded sweep must still exercise every operation kind.
     try std.testing.expect(stats.deletes > 0);
     try std.testing.expect(stats.sets > 0);

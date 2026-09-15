@@ -60,6 +60,9 @@ jobs:
       - name: Differential gate (event parity vs libfyaml)
         run: make differential
 
+      - name: Merge-key differential (resolved values vs libfyaml)
+        run: make merge-differential
+
       - name: Assert gates are not vacuous
         run: |
           passes=$(grep -c '"status": "pass"' zig-out/conformance-report.json)

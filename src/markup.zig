@@ -229,9 +229,9 @@ pub fn leadingCommentSpan(source: []const u8, entry_start: usize) ?[2]usize {
 }
 
 /// The indentation (in bytes) of the line containing `offset`: the
-/// number of leading spaces. Tabs count as one byte each; the scanner
-/// rejects tab indentation in block context, so this only matters for
-/// re-deriving sibling columns in already-accepted input.
+/// number of leading SPACES. A leading tab stops the count at 0 -- the
+/// scanner rejects tab indentation in block context, so this only matters
+/// for re-deriving sibling columns in already-accepted input.
 pub fn indentOf(source: []const u8, offset: usize) usize {
     const ls = lineStart(source, offset);
     var i: usize = 0;

@@ -50,6 +50,23 @@ pub fn isBlankz(c: u8) bool {
     return c == 0 or isBlank(c) or isBreak(c);
 }
 
+/// True when `bytes` is only spaces, tabs and line breaks — the run
+/// form of `isBlankz` minus the end-of-input case. One home for a rule
+/// the scanner, markup and tombstone paths all need.
+pub fn isBlankRun(bytes: []const u8) bool {
+    for (bytes) |c| {
+        if (!isBlank(c) and !isBreak(c)) return false;
+    }
+    return true;
+}
+
+test "isBlankRun accepts only blanks and breaks" {
+    try std.testing.expect(isBlankRun(""));
+    try std.testing.expect(isBlankRun(" \t\r\n"));
+    try std.testing.expect(!isBlankRun(" x "));
+    try std.testing.expect(!isBlankRun("\x00"));
+}
+
 /// Space only. `std.ascii.isSpace` is not a substitute: it also accepts
 /// \v and \f, which YAML does not treat as blank.
 pub fn isSpace(c: u8) bool {

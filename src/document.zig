@@ -498,27 +498,13 @@ pub const Document = struct {
         var docs = try parseStream(allocator, &p, 1, input);
         defer docs.deinit(allocator);
         if (docs.items.len == 0) {
-            // A stream with no node content is still bytes. An input
-            // that is entirely comments and blank lines produces no
-            // document_start event, so the loop above builds nothing —
-            // and returning a bare empty Document dropped those bytes:
-            // `# c\n` re-emitted as the empty string. For a library
-            // whose promise is that untouched bytes come back verbatim,
-            // silently erasing a fully commented-out config file is the
-            // worst possible answer.
-            //
-            // Carry them as a rootless document whose region is the
-            // whole input. `emitFaithful` already handles `root == null`
-            // by writing [region_start, body_start) verbatim; it simply
-            // had an empty region to write.
-            var empty = Document.init(allocator);
-            errdefer empty.deinit();
-            empty.source = try empty.pool.dupe(input);
-            empty.region_start = 0;
-            empty.body_start = input.len;
-            empty.body_end = input.len;
-            empty.region_end = input.len;
-            return empty;
+            // No node content reached the builder. An input that is
+            // ENTIRELY comments and blank lines is already carried by
+            // `parseStream`'s stream_end arm (it appends a rootless
+            // document there); what arrives here is the genuinely empty
+            // input, which still yields a rootless document so
+            // `parse("")` and `parseAll("")` agree on the shape.
+            return rootlessDocument(allocator, input);
         }
         var doc = docs.items[0];
         if (options.resolve_merge_keys) {
@@ -559,6 +545,21 @@ pub const Document = struct {
         }
         for (docs.items) |*doc| try doc.resolveMergeKeys();
         return docs;
+    }
+
+    /// A document that carries bytes but has no node: an input that is
+    /// entirely comments and blank lines. `emitFaithful` re-emits a null
+    /// root's region verbatim, which is what makes
+    /// `writeAll(parseAll(x)) == x` hold for such a stream.
+    fn rootlessDocument(allocator: std.mem.Allocator, input: []const u8) !Document {
+        var d = Document.init(allocator);
+        errdefer d.deinit();
+        d.source = try d.pool.dupe(input);
+        d.region_start = 0;
+        d.body_start = input.len;
+        d.body_end = input.len;
+        d.region_end = input.len;
+        return d;
     }
 
     fn parseStream(allocator: std.mem.Allocator, p: *Parser, limit: ?usize, input: []const u8) !std.ArrayList(Document) {
@@ -651,13 +652,8 @@ pub const Document = struct {
                             // as one rootless document; the faithful
                             // emitter re-emits a null root's region
                             // verbatim.
-                            var only = Document.init(allocator);
+                            var only = try rootlessDocument(allocator, input);
                             errdefer only.deinit();
-                            only.source = try only.pool.dupe(input);
-                            only.region_start = 0;
-                            only.body_start = input.len;
-                            only.body_end = input.len;
-                            only.region_end = input.len;
                             try docs.append(allocator, only);
                         }
                     }
@@ -3510,4 +3506,14 @@ test "parseCoreInt and parseCoreFloat are the one shared scalar rule" {
     try std.testing.expectEqual(@as(?f64, 1.5), parseCoreFloat("1.5"));
     try std.testing.expectEqual(std.math.inf(f64), parseCoreFloat(".inf").?);
     try std.testing.expectEqual(@as(?f64, null), parseCoreFloat("not a float"));
+}
+
+test "rootlessDocument carries bytes with no node" {
+    const allocator = std.testing.allocator;
+    var d = try Document.rootlessDocument(allocator, "# c\n");
+    defer d.deinit();
+    try std.testing.expect(d.root == null);
+    const out = try d.write(allocator);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("# c\n", out);
 }

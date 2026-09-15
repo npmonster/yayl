@@ -509,7 +509,12 @@ pub const Editor = struct {
     pub fn apply(self: *Editor, edits: []const Edit) Error!void {
         const doc = self.doc;
         const old_root = doc.root;
-        const new_root = if (old_root) |r| try cloneTree(doc, r) else null;
+        // The WHOLE tree is swapped in, so a forward alias (an alias
+        // whose anchor is defined later -- valid only in a hand-built
+        // tree) must be refused rather than left pointing at the
+        // pre-clone tree, which the rollback contract assumes is gone.
+        // `cloneTree` tolerates one; `cloneTreeWhole` does not.
+        const new_root = if (old_root) |r| try cloneTreeWhole(doc, r) else null;
         doc.root = new_root;
         var ok = false;
         defer if (!ok) {
@@ -2975,4 +2980,28 @@ test "deleting or moving an anchored KEY is refused, not silently corrupting" {
         var ed = Editor.init(&doc);
         try testing.expectError(error.AnchorReferenced, ed.delete("$.a"));
     }
+}
+
+test "a batch edit refuses a forward alias instead of stranding it" {
+    const allocator = testing.allocator;
+    // `apply` swaps in a WHOLE-tree clone, so an alias whose anchor is
+    // defined LATER (valid only in a hand-built tree) must be refused:
+    // the clone cannot keep pointing at the pre-clone tree, and the
+    // rollback contract assumes the original is discarded.
+    var doc = Document.init(allocator);
+    defer doc.deinit();
+    const root = try doc.createMapping();
+    doc.root = root;
+
+    const target = try doc.createScalar("v", .plain);
+    const alias = try doc.createScalar("v", .plain);
+    alias.data = .{ .alias = .{ .name = "a", .target = target } };
+    try doc.mappingAppend(root, try doc.createScalar("use", .plain), alias);
+
+    const anchored = try doc.createScalar("v", .plain);
+    try doc.setAnchor(anchored, "a");
+    try doc.mappingAppend(root, try doc.createScalar("def", .plain), anchored);
+
+    var ed = Editor.init(&doc);
+    try testing.expectError(error.UnknownAlias, ed.apply(&.{.{ .delete = "$.def" }}));
 }

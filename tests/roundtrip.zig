@@ -23,16 +23,17 @@ const Skip = struct {
 /// Known round-trip gaps. A skipped case that starts passing fails the
 /// gate (stale skip), so this table cannot outlive a fix.
 const skips = [_]Skip{
-    // Empty. The four entries that lived here — HWV9, 8G76, 98YD, QT73,
-    // all "no document in stream" (comments, blank lines, a lone `...`)
-    // — round trip correctly as of the fix that gives a content-free
-    // stream a rootless document carrying its bytes. They were skipped
-    // on the grounds that libfyaml emits nothing for them either, but
-    // libfyaml does not promise byte-faithful round trips and this
-    // library does: erasing a fully commented-out file is the one
-    // answer a library whose pitch is "the others eat your comments"
-    // cannot give. The stale-skip assertion below is what caught that
-    // the entries had outlived the bug.
+    // The 46 unnamed suite sub-cases are now loaded (they were silently
+    // dropped before). Six of them are valid cases yayl cannot parse yet
+    // -- the same six the conformance gate tracks -- so there is no round
+    // trip to assert. The stale-skip guard fails the gate if any starts
+    // parsing.
+    .{ .id = "3RLN-2", .reason = "yayl cannot parse this unnamed sub-case yet" },
+    .{ .id = "3RLN-5", .reason = "yayl cannot parse this unnamed sub-case yet" },
+    .{ .id = "DE56-3", .reason = "yayl cannot parse this unnamed sub-case yet" },
+    .{ .id = "DE56-4", .reason = "yayl cannot parse this unnamed sub-case yet" },
+    .{ .id = "DK95-5", .reason = "yayl cannot parse this unnamed sub-case yet" },
+    .{ .id = "KH5V-2", .reason = "yayl cannot parse this unnamed sub-case yet" },
 };
 
 fn findSkip(id: []const u8) ?Skip {
@@ -40,11 +41,51 @@ fn findSkip(id: []const u8) ?Skip {
     return null;
 }
 
+const Status = enum { pass, fail, skip };
+
 const Result = struct {
     id: []const u8,
-    status: enum { pass, fail, skip },
-    reason: []const u8,
+    status: Status,
+    /// Owned: every reason is copied at append (see `addResult`). A
+    /// shared scratch buffer used to back this field, so every failed
+    /// case in the report showed the LAST diff.
+    reason: []u8,
 };
+
+/// Append a result, COPYING `reason` into the allocator. The reason a
+/// caller holds may point into a scratch buffer; storing the slice
+/// directly aliased every earlier failure to the last write.
+fn addResult(
+    allocator: std.mem.Allocator,
+    results: *std.ArrayList(Result),
+    id: []const u8,
+    status: Status,
+    reason: []const u8,
+) !void {
+    try results.append(allocator, .{
+        .id = id,
+        .status = status,
+        .reason = try allocator.dupe(u8, reason),
+    });
+}
+
+test "addResult owns its reason instead of aliasing a scratch buffer" {
+    const allocator = std.testing.allocator;
+    var results: std.ArrayList(Result) = .empty;
+    defer {
+        for (results.items) |r| allocator.free(r.reason);
+        results.deinit(allocator);
+    }
+    var scratch: [16]u8 = undefined;
+    const first = std.fmt.bufPrint(&scratch, "first diff", .{}) catch unreachable;
+    try addResult(allocator, &results, "A", .fail, first);
+    @memset(&scratch, 'x');
+    const second = std.fmt.bufPrint(&scratch, "second", .{}) catch unreachable;
+    try addResult(allocator, &results, "B", .fail, second);
+    // The first reason must survive the second write.
+    try std.testing.expectEqualStrings("first diff", results.items[0].reason);
+    try std.testing.expectEqualStrings("second", results.items[1].reason);
+}
 
 test "corpus round trips byte-for-byte" {
     const allocator = std.testing.allocator;
@@ -67,7 +108,10 @@ test "corpus round trips byte-for-byte" {
     try std.testing.expect(cases.items.len >= 300);
 
     var results: std.ArrayList(Result) = .empty;
-    defer results.deinit(allocator);
+    defer {
+        for (results.items) |r| allocator.free(r.reason);
+        results.deinit(allocator);
+    }
 
     var pass: usize = 0;
     var fail: usize = 0;
@@ -79,38 +123,32 @@ test "corpus round trips byte-for-byte" {
 
         const skip_entry = findSkip(case.id);
         const outcome = roundTrip(allocator, case.input) catch |err| {
-            try results.append(allocator, .{ .id = case.id, .status = .fail, .reason = @errorName(err) });
+            try addResult(allocator, &results, case.id, .fail, @errorName(err));
             fail += 1;
             continue;
         };
         if (outcome) |reason| {
             if (skip_entry) |s| {
-                // A skip that reproduces cleanly (documented
-                // no-output case) is fine; a skip whose mismatch is
-                // gone is stale.
-                if (std.mem.startsWith(u8, s.reason, "no document in stream") and
-                    std.mem.eql(u8, reason, "no document in stream"))
-                {
-                    skip += 1;
-                    try results.append(allocator, .{ .id = case.id, .status = .skip, .reason = s.reason });
-                } else {
-                    stale += 1;
-                    try results.append(allocator, .{ .id = case.id, .status = .fail, .reason = "stale skip: case round trips, remove from skips" });
-                }
+                // A documented skip that is still failing is a skip; the
+                // mismatch reason need not match, only the case id. A
+                // skip whose mismatch is GONE is stale (handled below,
+                // when `outcome` is null).
+                skip += 1;
+                try addResult(allocator, &results, case.id, .skip, s.reason);
             } else {
                 fail += 1;
-                try results.append(allocator, .{ .id = case.id, .status = .fail, .reason = reason });
+                try addResult(allocator, &results, case.id, .fail, reason);
                 std.debug.print("  RT-FAIL {s} ({s}): {s}\n", .{ case.id, case.name, reason });
             }
             continue;
         }
         if (skip_entry != null) {
             stale += 1;
-            try results.append(allocator, .{ .id = case.id, .status = .fail, .reason = "stale skip: case round trips, remove from skips" });
+            try addResult(allocator, &results, case.id, .fail, "stale skip: case round trips, remove from skips");
             continue;
         }
         pass += 1;
-        try results.append(allocator, .{ .id = case.id, .status = .pass, .reason = "" });
+        try addResult(allocator, &results, case.id, .pass, "");
     }
 
     try writeReport(allocator, io, results.items);
@@ -167,19 +205,6 @@ fn firstDiff(input: []const u8, out: []const u8) []const u8 {
     return std.fmt.bufPrint(&diff_buf, "line {d} differs (in {d} bytes, out {d} bytes, first diff at {d})", .{ line, input.len, out.len, i }) catch "differs";
 }
 
-fn appendJsonEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            else => try buf.append(allocator, c),
-        }
-    }
-}
-
 fn writeReport(allocator: std.mem.Allocator, io: std.Io, results: []const Result) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -188,7 +213,7 @@ fn writeReport(allocator: std.mem.Allocator, io: std.Io, results: []const Result
         try buf.print(allocator, "  {{\"id\": \"{s}\", \"status\": \"{s}\"", .{ r.id, @tagName(r.status) });
         if (r.reason.len > 0) {
             try buf.appendSlice(allocator, ", \"reason\": \"");
-            try appendJsonEscaped(&buf, allocator, r.reason);
+            try corpus.appendJsonEscaped(&buf, allocator, r.reason);
             try buf.appendSlice(allocator, "\"");
         }
         try buf.appendSlice(allocator, if (i + 1 < results.len) "},\n" else "}\n");

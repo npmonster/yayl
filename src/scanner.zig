@@ -319,6 +319,15 @@ pub const Scanner = struct {
         return true;
     }
 
+    /// True when the cursor sits on a `---` or `...` document indicator:
+    /// column 1, the marker, then a blank/break/EOF. One implementation of
+    /// the rule that was open-coded in seven places.
+    fn atDocumentIndicator(self: *const Scanner) bool {
+        return self.mark.column == 1 and
+            (self.matchAt("---", 0) or self.matchAt("...", 0)) and
+            ctype.isBlankz(self.at(3));
+    }
+
     /// Advance over one codepoint (must not be a line break).
     fn skipCp(self: *Scanner) void {
         // Input is UTF-8-validated in init and the cursor is on a
@@ -571,11 +580,8 @@ pub const Scanner = struct {
         const c = self.at(0);
         if (c == 0) return self.fetchStreamEnd();
         if (c == '%' and self.mark.column == 1 and self.flow_level == 0) return self.fetchDirective();
-        if (self.mark.column == 1 and self.matchAt("---", 0) and ctype.isBlankz(self.at(3))) {
-            return self.fetchDocumentIndicator(.document_start);
-        }
-        if (self.mark.column == 1 and self.matchAt("...", 0) and ctype.isBlankz(self.at(3))) {
-            return self.fetchDocumentIndicator(.document_end);
+        if (self.atDocumentIndicator()) {
+            return self.fetchDocumentIndicator(if (self.matchAt("---", 0)) .document_start else .document_end);
         }
 
         switch (c) {
@@ -1094,10 +1100,7 @@ pub const Scanner = struct {
 
             const col: isize = @intCast(self.mark.column);
             // Document indicators always end a block scalar.
-            if (self.mark.column == 1 and
-                (self.matchAt("---", 0) or self.matchAt("...", 0)) and
-                ctype.isBlankz(self.at(3)))
-            {
+            if (self.atDocumentIndicator()) {
                 self.pos = snap_pos;
                 self.mark = snap_mark;
                 break :outer;
@@ -1235,10 +1238,7 @@ pub const Scanner = struct {
                 breaks += 1;
                 // A document indicator cannot appear inside a quoted
                 // scalar (corpus 5TRB/RXY3).
-                if (self.mark.column == 1 and
-                    (self.matchAt("---", 0) or self.matchAt("...", 0)) and
-                    ctype.isBlankz(self.at(3)))
-                {
+                if (self.atDocumentIndicator()) {
                     return self.fail(self.mark, "found unexpected document indicator while scanning a quoted scalar", .{});
                 }
                 while (ctype.isBlank(self.at(0))) self.skipCp();
@@ -1300,10 +1300,7 @@ pub const Scanner = struct {
             // Escaped line break: content joins directly.
             self.skipLine();
             // A document indicator cannot appear inside a quoted scalar.
-            if (self.mark.column == 1 and
-                (self.matchAt("---", 0) or self.matchAt("...", 0)) and
-                ctype.isBlankz(self.at(3)))
-            {
+            if (self.atDocumentIndicator()) {
                 return self.fail(self.mark, "found unexpected document indicator while scanning a quoted scalar", .{});
             }
             while (ctype.isBlank(self.at(0))) self.skipCp();
@@ -1373,9 +1370,7 @@ pub const Scanner = struct {
         while (true) {
             // Document indicators and comments terminate a plain scalar;
             // pending whitespace is trailing and therefore dropped.
-            if (self.mark.column == 1 and
-                (self.matchAt("---", 0) or self.matchAt("...", 0)) and
-                ctype.isBlankz(self.at(3))) break;
+            if (self.atDocumentIndicator()) break;
             if (self.at(0) == '#') break;
 
             // Scan one run of non-blank characters.
@@ -1428,10 +1423,7 @@ pub const Scanner = struct {
                     self.skipCp();
                 }
             }
-            if (self.mark.column == 1 and
-                (self.matchAt("---", 0) or self.matchAt("...", 0)) and
-                ctype.isBlankz(self.at(3)))
-            {
+            if (self.atDocumentIndicator()) {
                 self.pos = snap_pos;
                 self.mark = snap_mark;
                 break;

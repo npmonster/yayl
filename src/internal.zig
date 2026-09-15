@@ -10,6 +10,7 @@
 //! namespace re-exports were trimmed.
 
 const std = @import("std");
+const ctype = @import("ctype.zig");
 const document_mod = @import("document.zig");
 const markup = @import("markup.zig");
 
@@ -72,11 +73,6 @@ fn nextItemStart(s: anytype, item: *const Node) ?usize {
     return null;
 }
 
-/// True when `s` is only spaces, tabs and line breaks.
-fn isBlankRun(s: []const u8) bool {
-    return std.mem.indexOfNone(u8, s, " \t\r\n") == null;
-}
-
 /// Record a tombstoned byte range, keeping the list ASCENDING by
 /// start. Emission walks a container's bytes in document order and
 /// skips tombstones as it passes them (emitter `writeGap`), so a
@@ -105,6 +101,12 @@ pub fn dropRange(self: *Document, drops: *std.ArrayList([2]usize), from: usize, 
 /// its own line), while a `-` inside an anchor or tag name is not.
 const Framing = struct { dash: ?usize = null, question: ?usize = null };
 
+/// DROP-time counterpart of `markup.entryStart`. `entryStart` is
+/// AUTHORITATIVE: at build time it decides which `-`/`?` frames an entry
+/// (it also requires the content to be indented under the indicator) and
+/// records that in `Node.src.entry_start`. This helper only re-reads the
+/// leading bytes of that already-accepted span to decide which indicator a
+/// tombstone must keep; it must not be read as an independent rule.
 fn entryFraming(src: []const u8, from: usize, to: usize) Framing {
     var f = Framing{};
     var i = from;
@@ -166,7 +168,7 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
                 const after_dash = dash + 1;
                 const keep = fr.question orelse ks.start;
                 if (nextEntryStart(m, p)) |nx| {
-                    if (nx >= to and isBlankRun(src[to..nx])) {
+                    if (nx >= to and ctype.isBlankRun(src[to..nx])) {
                         from = keep;
                         to = nx;
                     } else {
@@ -240,7 +242,7 @@ pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
             if (std.mem.lastIndexOfScalar(u8, src[from..is.entry_start], '-')) |od| {
                 const after_outer = from + od + 1;
                 if (nextItemStart(s, item)) |nx| {
-                    if (nx >= to and isBlankRun(src[to..nx])) {
+                    if (nx >= to and ctype.isBlankRun(src[to..nx])) {
                         from = is.entry_start;
                         to = nx;
                     } else {

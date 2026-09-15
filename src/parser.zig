@@ -911,9 +911,12 @@ test "tag shorthand unescapes RFC 2396 escapes" {
 
 test "unknown directives are ignored with a warning" {
     // YAML 1.2.2 6.8: unknown directives are skipped, not an error
-    // (corpus 2LFX).
+    // (corpus 2LFX) -- and a real Diag records the warning. Without a
+    // collector this test asserted nothing about the warning at all.
     const allocator = testing.allocator;
-    var p = try Parser.init(allocator, null, "%FOO bar baz\n---\nfoo\n");
+    var d: diag.Diag = .{ .allocator = allocator };
+    defer d.deinit();
+    var p = try Parser.init(allocator, &d, "%FOO bar baz\n---\nfoo\n");
     defer p.deinit();
     var found = false;
     while (try p.nextEvent()) |ev| {
@@ -923,6 +926,9 @@ test "unknown directives are ignored with a warning" {
         }
     }
     try testing.expect(found);
+    try testing.expectEqual(@as(usize, 1), d.list.items.len);
+    try testing.expectEqual(diag.Level.warning, d.list.items[0].level);
+    try testing.expect(std.mem.indexOf(u8, d.list.items[0].message, "FOO") != null);
 }
 
 test "flow mapping empty key" {

@@ -24,6 +24,41 @@ pub fn freeCase(allocator: std.mem.Allocator, c: *const Case) void {
     if (c.tree) |t| allocator.free(t);
 }
 
+/// Unnamed suite sub-cases yayl cannot PARSE yet. They are the same six
+/// the conformance and round-trip gates track; sharing the list keeps the
+/// three gates from disagreeing about what a known parse gap is.
+pub const unparseable_subcases = [_][]const u8{
+    "3RLN-2", "3RLN-5", "DE56-3", "DE56-4", "DK95-5", "KH5V-2",
+};
+
+pub fn isUnparseableSubcase(id: []const u8) bool {
+    for (unparseable_subcases) |g| if (std.mem.eql(u8, g, id)) return true;
+    return false;
+}
+
+/// Valid sub-cases whose EDIT PRESERVATION is not asserted yet. They still
+/// parse and round-trip; only the line-level edit sweep is skipped, so a
+/// stale-skip here cannot hide a parse or round-trip regression.
+pub const preservation_gaps = [_][]const u8{"L24T-2"};
+
+pub fn isPreservationGap(id: []const u8) bool {
+    for (preservation_gaps) |g| if (std.mem.eql(u8, g, id)) return true;
+    return false;
+}
+
+/// The cases the preservation sweep must not edit-assert: unparseable
+/// ones, plus the preservation gaps above.
+pub fn skipPreservation(id: []const u8) bool {
+    return isUnparseableSubcase(id) or isPreservationGap(id);
+}
+
+test "unparseable sub-cases are a shared, explicit list" {
+    try std.testing.expect(isUnparseableSubcase("3RLN-2"));
+    try std.testing.expect(isUnparseableSubcase("KH5V-2"));
+    try std.testing.expect(!isUnparseableSubcase("3RLN-1"));
+    try std.testing.expect(!isUnparseableSubcase(""));
+}
+
 pub fn loadCases(allocator: std.mem.Allocator, io: std.Io, cases: *std.ArrayList(Case)) !void {
     var dir = try std.Io.Dir.cwd().openDir(io, corpus_dir, .{ .iterate = true });
     defer dir.close(io);
@@ -62,26 +97,73 @@ pub fn loadCases(allocator: std.mem.Allocator, io: std.Io, cases: *std.ArrayList
         var index: usize = 0;
         for (records) |record| {
             index += 1;
-            const name_val = record.lookup("name") orelse continue;
             const yaml_val = record.lookup("yaml") orelse continue;
             const tree_node = record.lookup("tree");
             const fail_node = record.lookup("fail");
+            // A record with neither an expected tree nor a `fail` flag is
+            // an informational entry in the suite, not a test (the various
+            // `%YAML 1.12345` spellings, for example): loading it would
+            // compare against an empty tree. Everything else is a case,
+            // even when it carries no `name` -- those were silently
+            // dropped before.
+            if (tree_node == null and fail_node == null) continue;
+            const name_node = record.lookup("name");
 
             const case_id = if (records.len > 1)
                 try std.fmt.allocPrint(allocator, "{s}-{d}", .{ id, index })
             else
                 try allocator.dupe(u8, id);
             errdefer allocator.free(case_id);
+            // Free every field on a LATER allocation's failure: the old
+            // code registered only case_id, so an OOM here leaked
+            // name/input/tree.
+            const case_name = try allocator.dupe(u8, if (name_node) |n| n.scalarValue() orelse "?" else "?");
+            errdefer allocator.free(case_name);
+            const case_input = try replaceMarker(allocator, yaml_val.scalarValue() orelse "");
+            errdefer allocator.free(case_input);
+            const case_tree: ?[]const u8 = if (tree_node) |t|
+                try replaceMarker(allocator, t.scalarValue() orelse "")
+            else
+                null;
+            errdefer if (case_tree) |t| allocator.free(t);
 
             try cases.append(allocator, .{
                 .id = case_id,
-                .name = try allocator.dupe(u8, name_val.scalarValue() orelse "?"),
-                .input = try replaceMarker(allocator, yaml_val.scalarValue() orelse ""),
-                .tree = if (tree_node) |t| try replaceMarker(allocator, t.scalarValue() orelse "") else null,
+                .name = case_name,
+                .input = case_input,
+                .tree = case_tree,
                 .fail = if (fail_node) |f| std.mem.eql(u8, f.scalarValue() orelse "", "true") else false,
             });
         }
     }
+}
+
+/// Append `s` as the body of a JSON string literal: escapes the quote,
+/// the backslash and the C0 controls. Shared by both report writers, so a
+/// case name or reason containing a control byte cannot make the JSON
+/// invalid -- the two copies had already drifted.
+pub fn appendJsonEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => try buf.print(allocator, "\\u{x:0>4}", .{c}),
+            else => try buf.append(allocator, c),
+        }
+    }
+}
+
+test "appendJsonEscaped covers the JSON metacharacters" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const input = [_]u8{ 0x01, '"', '\\', '\n' };
+    try appendJsonEscaped(&buf, allocator, &input);
+    const want = [_]u8{ '\\', 'u', '0', '0', '0', '1', '\\', '"', '\\', '\\', '\\', 'n' };
+    try std.testing.expectEqualSlices(u8, &want, buf.items);
 }
 
 /// The corpus encodes invisible characters with visible markers (see the

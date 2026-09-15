@@ -199,6 +199,10 @@ for cid in ids:
     oracle(tmp, f"corpus:{cid}")
 
 print(f"emission-oracle: {checked} emitted documents checked across {len(MODES)} modes, {findings} findings, {rejected} inputs yayl rejected, {no_document} streams without a document, {not_applicable} mode not applicable")
+MIN_CHECKED = 400
+if checked < MIN_CHECKED:
+    print(f"emission-oracle: FAILED -- only {checked} documents checked, expected at least {MIN_CHECKED}")
+    sys.exit(1)
 if findings:
     sys.exit(1)
 EOF

@@ -11,6 +11,12 @@ const std = @import("std");
 const yaml = @import("yayl");
 const corpus = @import("corpus_common.zig");
 
+// Pull corpus_common's own tests (the shared JSON escaper) into this
+// binary: Zig only collects tests from files referenced by a test block.
+test {
+    _ = corpus;
+}
+
 const corpus_dir = corpus.corpus_dir;
 const report_path = "zig-out/conformance-report.json";
 
@@ -22,10 +28,33 @@ const Skip = struct {
     target: []const u8,
 };
 
-/// Cases yayl does not handle yet: none. The pinned corpus passes in
-/// full (351/351 as of 2026-08-29). The stale-skip guard keeps this
-/// table honest if it ever grows again.
-const skips: []const Skip = &.{};
+/// Cases yayl does not handle yet.
+///
+/// The pinned corpus has 397 records; 351 carry a `name` and 46 are
+/// unnamed sub-cases of a named parent (tabs in various contexts, split
+/// scalars, ...). The loader used to drop every unnamed record, which
+/// silently hid the 15 failures below. They are now loaded and tracked
+/// here; the stale-skip guard fails the gate if any starts passing.
+const skips: []const Skip = &.{
+    // Unnamed sub-cases of 3RLN / DE56 / KH5V / DK95 (all "tabs in
+    // various contexts"). The suite's hard-tab marker interacts with a
+    // preceding backslash; yayl's escape handling diverges.
+    .{ .id = "3RLN-2", .reason = "yayl rejects a double-quoted escape the suite accepts", .target = "corpus unnamed sub-cases" },
+    .{ .id = "3RLN-5", .reason = "yayl rejects a double-quoted escape the suite accepts", .target = "corpus unnamed sub-cases" },
+    .{ .id = "DE56-3", .reason = "yayl rejects a double-quoted escape the suite accepts", .target = "corpus unnamed sub-cases" },
+    .{ .id = "DE56-4", .reason = "yayl rejects a double-quoted escape the suite accepts", .target = "corpus unnamed sub-cases" },
+    .{ .id = "KH5V-2", .reason = "yayl rejects a double-quoted escape the suite accepts", .target = "corpus unnamed sub-cases" },
+    .{ .id = "DK95-2", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
+    .{ .id = "DK95-5", .reason = "yayl rejects the indentation this case accepts", .target = "corpus unnamed sub-cases" },
+    .{ .id = "L24T-2", .reason = "event tree differs for this unnamed sub-case", .target = "corpus unnamed sub-cases" },
+    .{ .id = "Y79Y-4", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
+    .{ .id = "Y79Y-5", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
+    .{ .id = "Y79Y-6", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
+    .{ .id = "Y79Y-7", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
+    .{ .id = "Y79Y-8", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
+    .{ .id = "Y79Y-9", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
+    .{ .id = "Y79Y-10", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
+};
 
 fn findSkip(id: []const u8) ?Skip {
     for (skips) |s| if (std.mem.eql(u8, s.id, id)) return s;
@@ -54,10 +83,47 @@ fn isDebugId(id: []const u8) bool {
     return false;
 }
 
+/// True when `err` is a rejection the suite expects for a `fail: true`
+/// case. OutOfMemory and harness faults are NOT rejections: treating them
+/// as one let a `fail` case pass for the wrong reason.
+fn isExpectedRejection(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidSyntax,
+        error.InvalidUtf8,
+        error.InvalidEscape,
+        error.InvalidIndentation,
+        error.UnknownAlias,
+        error.UnsupportedVersion,
+        error.Unterminated,
+        error.NestingTooDeep,
+        error.InputTooLarge,
+        error.AliasCycle,
+        error.InvalidCodepoint,
+        error.InvalidMergeKey,
+        error.MergeKeyRecursive,
+        => true,
+        else => false,
+    };
+}
+
+test "rejection classification excludes harness faults" {
+    try std.testing.expect(isExpectedRejection(error.InvalidSyntax));
+    try std.testing.expect(isExpectedRejection(error.UnsupportedVersion));
+    try std.testing.expect(!isExpectedRejection(error.OutOfMemory));
+    try std.testing.expect(!isExpectedRejection(error.Unexpected));
+}
+
 fn runCase(allocator: std.mem.Allocator, case: corpus.Case, verbose: bool) !Outcome {
     if (case.fail) {
+        var unexpected: ?anyerror = null;
         const ok = blk: {
-            var docs = yaml.parseAll(allocator, case.input) catch break :blk true;
+            var docs = yaml.parseAll(allocator, case.input) catch |err| {
+                if (!isExpectedRejection(err)) {
+                    unexpected = err;
+                    break :blk false;
+                }
+                break :blk true;
+            };
             defer {
                 for (docs.items) |*d| d.deinit();
                 docs.deinit(allocator);
@@ -65,6 +131,7 @@ fn runCase(allocator: std.mem.Allocator, case: corpus.Case, verbose: bool) !Outc
             break :blk false;
         };
         if (ok) return .{ .status = .pass, .reason = "rejected as expected" };
+        if (unexpected) |err| return .{ .status = .fail, .reason = @errorName(err) };
         return .{ .status = .fail, .reason = "expected parse error, got success" };
     }
 
@@ -103,14 +170,6 @@ fn firstMismatch(expected: []const u8, actual: []const u8) []const u8 {
     }
 }
 
-fn appendJsonEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            else => try buf.append(allocator, c),
-        }
-    }
-}
 fn writeReport(allocator: std.mem.Allocator, io: std.Io, results: []const Result) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -118,11 +177,11 @@ fn writeReport(allocator: std.mem.Allocator, io: std.Io, results: []const Result
     try buf.appendSlice(allocator, "[\n");
     for (results, 0..) |r, i| {
         try buf.print(allocator, "  {{\"id\": \"{s}\", \"name\": \"", .{r.id});
-        try appendJsonEscaped(&buf, allocator, r.name);
+        try corpus.appendJsonEscaped(&buf, allocator, r.name);
         try buf.print(allocator, "\", \"status\": \"{s}\"", .{@tagName(r.status)});
         if (r.reason.len > 0) {
             try buf.appendSlice(allocator, ", \"reason\": \"");
-            try appendJsonEscaped(&buf, allocator, r.reason);
+            try corpus.appendJsonEscaped(&buf, allocator, r.reason);
             try buf.append(allocator, '"');
         }
         try buf.appendSlice(allocator, if (i + 1 < results.len) "},\n" else "}\n");
@@ -170,9 +229,9 @@ test "yaml test suite corpus" {
     for (cases.items) |case| {
         const skip = findSkip(case.id);
         const outcome = runCase(allocator, case, skip == null) catch |err| {
-            var reason_buf: [128]u8 = undefined;
-            const reason = std.fmt.bufPrint(&reason_buf, "harness error: {}", .{err}) catch "harness error";
-            try results.append(allocator, .{ .id = case.id, .name = case.name, .status = .fail, .reason = reason });
+            // `@errorName` is static; a stack-formatted reason would
+            // dangle once this block ends.
+            try results.append(allocator, .{ .id = case.id, .name = case.name, .status = .fail, .reason = @errorName(err) });
             continue;
         };
         if (skip) |s| {

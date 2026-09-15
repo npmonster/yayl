@@ -123,18 +123,26 @@ pub fn parseToValueLimited(allocator: std.mem.Allocator, input: []const u8, limi
     return nodeToValueLimited(allocator, root, limits);
 }
 
-/// `parseToValue` with YAML 1.1 merge keys (`<<`) resolved before the
-/// conversion. The document is parsed with
-/// `ParseOptions.resolve_merge_keys` and is not returned, so this is the
-/// read-only route; a caller that already holds a `Document` should call
-/// `Document.resolveMergeKeys` instead. Parse failures keep their real
-/// error, and an invalid or recursive merge surfaces as
-/// `error.InvalidMergeKey` / `error.MergeKeyRecursive`.
+/// `parseToValueResolved` under the default `Limits`.
 pub fn parseToValueResolved(allocator: std.mem.Allocator, input: []const u8) Error!Value {
+    return parseToValueResolvedLimited(allocator, input, .{});
+}
+
+/// `parseToValue` with YAML 1.1 merge keys (`<<`) resolved before the
+/// conversion, under an explicit expansion bound. The document is parsed
+/// with `ParseOptions.resolve_merge_keys` and is not returned, so this is
+/// the read-only route; a caller that already holds a `Document` should
+/// call `Document.resolveMergeKeys` instead. Parse failures keep their
+/// real error, and an invalid or recursive merge surfaces as
+/// `error.InvalidMergeKey` / `error.MergeKeyRecursive`.
+///
+/// Merge resolution can amplify far beyond the input, so this path needs
+/// the same bound the non-merge one has.
+pub fn parseToValueResolvedLimited(allocator: std.mem.Allocator, input: []const u8, limits: Limits) Error!Value {
     var doc = try document_mod.Document.parseOpts(allocator, input, null, .{ .resolve_merge_keys = true });
     defer doc.deinit();
     const root = doc.root orelse return .null;
-    return nodeToValue(allocator, root);
+    return nodeToValueLimited(allocator, root, limits);
 }
 
 /// Convert a document subtree into a Value under the default `Limits`.
@@ -1104,6 +1112,20 @@ test "float Values emit a form that reparses to the same float" {
         // and losing that distinction is part of what this pins.
         try testing.expectEqual(@as(u64, @bitCast(f)), @as(u64, @bitCast(back.float)));
     }
+}
+
+test "parseToValueResolved can be bounded" {
+    const allocator = testing.allocator;
+    // Merge resolution amplifies: the source is tiny, the resolved tree is
+    // not. This path used to have no way to set or lift a bound.
+    const src = "base: &b\n  a: 1\n  b: 2\nx:\n  <<: *b\n";
+    try testing.expectError(
+        error.LimitExceeded,
+        parseToValueResolvedLimited(allocator, src, .{ .max_values = 2 }),
+    );
+    const v = try parseToValueResolved(allocator, src);
+    defer freeValue(allocator, v);
+    try testing.expect(v == .mapping);
 }
 
 // The amplification this bound exists for: each level aliases the one

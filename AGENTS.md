@@ -87,7 +87,7 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 | `fy-diag.c`           | `src/diag.zig`         | ✅ core — levels/marks/render done; source excerpts not yet        |
 | `fy-utf8.c`           | `src/utf8.zig`         | ✅ done — strict decode/encode/validate                            |
 | `fy-ctype.c`          | `src/ctype.zig`        | ✅ done — byte-level classes (indicators are ASCII)                |
-| `fy-scan.c`           | `src/scanner.zig`      | ✅ done — full corpus green (351/351, zero skips)                  |
+| `fy-scan.c`           | `src/scanner.zig`      | ✅ done — corpus green (382/397; 15 unnamed sub-cases tracked)      |
 | `fy-parse.c`          | `src/parser.zig`       | ✅ done — event streams byte-identical to libfyaml (differential)  |
 | `fy-event.c`          | `src/event.zig`        | ✅ done                                                            |
 | `fy-doc.c` `fy-node.c` `fy-docbuilder.c` | `src/document.zig` | ✅ done — semantic model + per-node/entry spans (comments and blank lines round-trip); merge keys (`<<`) resolved on request |
@@ -103,11 +103,13 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 
 ### Scanner status
 
-The full pinned yaml-test-suite corpus passes (351/351, zero skips):
-explicit keys, tab strictness (column-0 tabs indenting constructs are
-rejected; separation tabs are fine), flow/quoted continuation
-indentation bounds, block scalar folding/indentation indicators.
-`make verify` and `make roundtrip` keep it honest (stale-skip guard).
+The pinned yaml-test-suite corpus is green: 382 pass, 15 tracked skips
+(the unnamed sub-cases of the tab-marker tests, listed in
+`tests/conformance.zig`), 0 fail. The named cases all pass: explicit
+keys, tab strictness (column-0 tabs indenting constructs are rejected;
+separation tabs are fine), flow/quoted continuation indentation bounds,
+block scalar folding/indentation indicators. `make verify` and
+`make roundtrip` keep it honest (stale-skip guards).
 
 ### Parser status
 
@@ -145,8 +147,9 @@ measured indent width.
 - **Unit tests**: token streams, event streams, scalar values, emitter
   quoting, round trips, editing, value conversion, schemas, file I/O,
   allocation-failure injection — `zig build test`.
-- **Conformance gate**: full yaml-test-suite corpus, event-tree
-  comparison, zero skips — `make conformance`.
+- **Conformance gate**: full yaml-test-suite corpus (397 records),
+  event-tree comparison, 15 tracked unnamed-sub-case skips, 0 fail —
+  `make conformance`.
 - **Round-trip gate**: `emit(parseAll(x)) == x` over the corpus and
   real-world fixtures — `make roundtrip`.
 - **Differential gate**: event streams vs the compiled vendored

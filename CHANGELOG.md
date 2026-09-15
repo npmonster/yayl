@@ -47,6 +47,48 @@ directive copy. It is now published before the first allocation, and the
 allocation-failure sweep carries a custom `%TAG` case so the window is
 actually exercised.
 
+### Medium and low findings (second pass)
+
+The same review's medium and low findings are fixed too, each with a
+regression test:
+
+- **Emitter M1/M2.** A scalar mapping key dropped its own `&anchor`/`!tag`
+  in the normalized paths (non-scalar keys kept theirs); and
+  `inferIndentStep` recursed the whole tree before the depth-checked walk,
+  so a deep grafted subtree segfaulted instead of returning
+  `error.NestingTooDeep`.
+- **Scanner M3/M13, L12.** `max_nesting` bounded flow levels and block
+  indents separately, admitting twice the documented cap; a control byte in
+  an anchor/alias name silently truncated it; and `markOf` counted only LF,
+  so a NUL diagnostic after a lone CR named the wrong line.
+- **Schema M4/M5, value M6.** `strEnum`/`strLen` bypassed the core-tag
+  gate; an integer too wide for `i64` was reported as "expected an integer"
+  rather than a range violation; and `value`/`schema` now share one scalar
+  interpreter (`parseCoreInt` / `parseCoreFloat`).
+- **File M12.** Atomic writes took the umask default for the temp file, so
+  rewriting a 0o600 secret widened it; the target's permission bits are now
+  carried across the rename.
+- **Parser M14.** `%TAG` handles/prefixes are validated (`%TAG foo bar` and
+  `%TAG !e tag:x` were accepted before).
+- **Harness.** Two report writers share one JSON escaper; the round-trip
+  report no longer stores every failure reason in one scratch buffer; a
+  `fail: true` conformance case is only "rejected" for the declared error
+  vocabulary (not `OutOfMemory`); the corpus loader frees every field on a
+  partial allocation failure; the bench CLI no longer panics on a
+  non-mapping root; `merge-differential` runs in CI; `bench-corpus.sh`
+  globs the flat corpus; the emission oracle has a coverage floor; and
+  `build.zig.zon` ships the merge-keys design doc and `SECURITY.md`.
+
+### Corpus coverage correction
+
+`tests/corpus_common.zig` dropped every corpus record without a `name`
+field, which silently hid 46 real sub-cases. They are loaded now. Fifteen
+of them fail (tab-marker escapes, tab strictness, one tree diff) and are
+tracked as skips in `tests/conformance.zig` -- the round-trip and
+preservation gates track the same set -- rather than left hidden. The
+stale-skip guards fail the gate if any starts passing. Conformance is
+382 pass / 15 skip / 0 fail.
+
 ## 0.19.2 — 2026-09-14
 
 No library code changed. This release is the result of an independent

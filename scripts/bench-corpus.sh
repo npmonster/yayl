@@ -21,13 +21,20 @@ done
 
 if [ -d vendor/yaml-test-suite/src ]; then
     n=0
-    for f in vendor/yaml-test-suite/src/*/in.yaml; do
+    # The corpus is a FLAT directory of <case>.yaml; the older
+    # <case>/in.yaml layout is accepted too, in case the fetch script
+    # changes. A glob that matches nothing must not report a clean zero.
+    for f in vendor/yaml-test-suite/src/*/in.yaml vendor/yaml-test-suite/src/*.yaml; do
         [ -f "$f" ] || continue
         n=$((n + 1))
         [ "$n" -le 40 ] || break
         "$BENCH" --machine "$f" "$ITERS" || echo "yayl_bench op=error file=$f"
     done
-    echo "yayl_bench op=summary corpus_files=$n"
+    if [ "$n" -eq 0 ]; then
+        echo "yayl_bench op=summary corpus_files=0 corpus_not_vendored=1"
+    else
+        echo "yayl_bench op=summary corpus_files=$n"
+    fi
 else
     echo "yayl_bench op=summary corpus_files=0 corpus_not_vendored=1"
 fi
