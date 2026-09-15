@@ -3,7 +3,7 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
-## Unreleased
+## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity
 defects. All five are fixed here, each with a regression test.
