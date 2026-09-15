@@ -36,24 +36,29 @@ const Skip = struct {
 /// silently hid the 15 failures below. They are now loaded and tracked
 /// here; the stale-skip guard fails the gate if any starts passing.
 const skips: []const Skip = &.{
-    // Unnamed sub-cases of 3RLN / DE56 / KH5V / DK95 (all "tabs in
-    // various contexts"). The suite's hard-tab marker interacts with a
-    // preceding backslash; yayl's escape handling diverges.
-    .{ .id = "3RLN-2", .reason = "yayl rejects a double-quoted escape the suite accepts", .target = "corpus unnamed sub-cases" },
-    .{ .id = "3RLN-5", .reason = "yayl rejects a double-quoted escape the suite accepts", .target = "corpus unnamed sub-cases" },
-    .{ .id = "DE56-3", .reason = "yayl rejects a double-quoted escape the suite accepts", .target = "corpus unnamed sub-cases" },
-    .{ .id = "DE56-4", .reason = "yayl rejects a double-quoted escape the suite accepts", .target = "corpus unnamed sub-cases" },
-    .{ .id = "KH5V-2", .reason = "yayl rejects a double-quoted escape the suite accepts", .target = "corpus unnamed sub-cases" },
-    .{ .id = "DK95-2", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
-    .{ .id = "DK95-5", .reason = "yayl rejects the indentation this case accepts", .target = "corpus unnamed sub-cases" },
-    .{ .id = "L24T-2", .reason = "event tree differs for this unnamed sub-case", .target = "corpus unnamed sub-cases" },
-    .{ .id = "Y79Y-4", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
-    .{ .id = "Y79Y-5", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
-    .{ .id = "Y79Y-6", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
-    .{ .id = "Y79Y-7", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
-    .{ .id = "Y79Y-8", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
-    .{ .id = "Y79Y-9", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
-    .{ .id = "Y79Y-10", .reason = "yayl accepts a tab form the suite marks invalid", .target = "corpus unnamed sub-cases" },
+    // Split by FAILURE KIND, so later triage can tell a permissiveness
+    // hole from a strictness gap. Both hid behind one generic target
+    // before, and "accepts invalid input" is a different bug class from
+    // "rejects valid input".
+    //
+    // Parser TOO STRICT: yayl rejects what the suite accepts.
+    .{ .id = "3RLN-2", .reason = "rejects a double-quoted escape the suite accepts (hard-tab marker)", .target = "corpus strictness: tab-marker escape" },
+    .{ .id = "3RLN-5", .reason = "rejects a double-quoted escape the suite accepts (hard-tab marker)", .target = "corpus strictness: tab-marker escape" },
+    .{ .id = "DE56-3", .reason = "rejects a double-quoted escape the suite accepts (hard-tab marker)", .target = "corpus strictness: tab-marker escape" },
+    .{ .id = "DE56-4", .reason = "rejects a double-quoted escape the suite accepts (hard-tab marker)", .target = "corpus strictness: tab-marker escape" },
+    .{ .id = "KH5V-2", .reason = "rejects a double-quoted escape the suite accepts (hard-tab marker)", .target = "corpus strictness: tab-marker escape" },
+    .{ .id = "DK95-5", .reason = "rejects the indentation this case accepts", .target = "corpus strictness: tab indentation" },
+    // Parser TOO PERMISSIVE: yayl accepts what the suite marks invalid.
+    .{ .id = "DK95-2", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
+    .{ .id = "Y79Y-4", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
+    .{ .id = "Y79Y-5", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
+    .{ .id = "Y79Y-6", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
+    .{ .id = "Y79Y-7", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
+    .{ .id = "Y79Y-8", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
+    .{ .id = "Y79Y-9", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
+    .{ .id = "Y79Y-10", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
+    // Event-tree divergence only: the bytes round-trip unchanged.
+    .{ .id = "L24T-2", .reason = "event tree differs; the document round-trips", .target = "corpus event-tree divergence" },
 };
 
 fn findSkip(id: []const u8) ?Skip {
