@@ -5,7 +5,6 @@ zig-out/
 vendor/
 
 # Local Git and agent metadata/worktrees
-.git/
 .plumb/
 .zcode/
 .claude/
