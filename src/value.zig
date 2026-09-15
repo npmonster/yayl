@@ -253,8 +253,7 @@ fn taggedScalarToValue(allocator: std.mem.Allocator, node: *const Node) Error!Va
             else => error.TypeMismatch,
         },
         .int => try taggedInt(allocator, s.value),
-        .float => .{ .float = std.fmt.parseFloat(f64, s.value) catch
-            document_mod.floatSpecial(s.value) orelse return error.TypeMismatch },
+        .float => .{ .float = document_mod.parseCoreFloat(s.value) orelse return error.TypeMismatch },
     };
 }
 
@@ -264,7 +263,10 @@ fn taggedScalarToValue(allocator: std.mem.Allocator, node: *const Node) Error!Va
 /// capable. Text that is not an integer at all is still `TypeMismatch`:
 /// `!!int abc` says one thing and means another.
 fn taggedInt(allocator: std.mem.Allocator, text: []const u8) Error!Value {
-    if (std.fmt.parseInt(i64, text, 0)) |i| return .{ .int = i } else |_| {}
+    if (document_mod.parseCoreInt(text)) |i| return .{ .int = i };
+    // Not representable as i64. It is still `!!int` only if the text is a
+    // core-schema integer (the shared rule, so `schema` and `value` agree
+    // on which scalars are bigints); otherwise the tag contradicts it.
     if (document_mod.resolveCoreTag(text, .plain) != .int) return error.TypeMismatch;
     return .{ .bigint = try allocator.dupe(u8, text) };
 }
@@ -278,15 +280,13 @@ pub fn scalarToValue(allocator: std.mem.Allocator, text: []const u8, style: Scal
         .null => return .null,
         .bool => return .{ .bool = text[0] == 't' or text[0] == 'T' },
         .int => {
-            if (std.fmt.parseInt(i64, text, 0)) |i| return .{ .int = i } else |_| {}
+            if (document_mod.parseCoreInt(text)) |i| return .{ .int = i };
             // Out-of-range integers keep their exact text.
             return .{ .bigint = try allocator.dupe(u8, text) };
         },
         .float => {
-            if (document_mod.floatSpecial(text)) |f| return .{ .float = f };
-            const f = std.fmt.parseFloat(f64, text) catch
-                return .{ .string = try allocator.dupe(u8, text) };
-            return .{ .float = f };
+            if (document_mod.parseCoreFloat(text)) |f| return .{ .float = f };
+            return .{ .string = try allocator.dupe(u8, text) };
         },
         .str => return .{ .string = try allocator.dupe(u8, text) },
     }

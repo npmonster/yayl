@@ -330,6 +330,7 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
             if (k != .float and k != .int) try typeErr(allocator, path, "a number", out);
         },
         .str_enum => |values| {
+            if (checkNodeCoreTag(cur) != .str) return typeErr(allocator, path, "a string", out);
             const s = cur.scalarValue() orelse return typeErr(allocator, path, "a string", out);
             for (values) |v| {
                 if (std.mem.eql(u8, v, s)) return;
@@ -340,8 +341,12 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
             const k = checkNodeCoreTag(cur);
             if (k != .int) return typeErr(allocator, path, "an integer", out);
             const text = cur.scalarValue().?;
-            const v = std.fmt.parseInt(i64, text, 0) catch {
-                try typeErr(allocator, path, "an integer", out);
+            // A core integer too wide for i64 is still an integer
+            // (`value` calls it .bigint), so it is a RANGE violation --
+            // not the "expected an integer" type error this used to
+            // report, which was false.
+            const v = document_mod.parseCoreInt(text) orelse {
+                try appendViolation(allocator, out, path, "range", "'{s}' is outside [{d}, {d}]", .{ text, r.min, r.max });
                 return;
             };
             if (v < r.min or v > r.max) {
@@ -352,8 +357,7 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
             const k = checkNodeCoreTag(cur);
             if (k != .float and k != .int) return typeErr(allocator, path, "a number", out);
             const text = cur.scalarValue().?;
-            const v = std.fmt.parseFloat(f64, text) catch
-                document_mod.floatSpecial(text) orelse {
+            const v = document_mod.parseCoreFloat(text) orelse {
                 try typeErr(allocator, path, "a number", out);
                 return;
             };
@@ -364,6 +368,7 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
             }
         },
         .str_len => |r| {
+            if (checkNodeCoreTag(cur) != .str) return typeErr(allocator, path, "a string", out);
             const s = cur.scalarValue() orelse return typeErr(allocator, path, "a string", out);
             const n = std.unicode.utf8CountCodepoints(s) catch s.len;
             if (n < r.min or n > r.max) {
@@ -911,4 +916,60 @@ test "a non-scalar key does not walk past deny_unknown" {
     try testing.expectEqualStrings("unknown", violations[0].rule);
     try testing.expectEqualStrings("$.?", violations[0].path);
     try testing.expectEqualStrings("unknown non-scalar key (a sequence)", violations[0].detail);
+}
+
+test "strEnum and strLen reject non-string core scalars" {
+    const allocator = testing.allocator;
+
+    // Regression: these two arms read `scalarValue()` directly, bypassing
+    // the `checkNodeCoreTag` gate every other scalar arm uses, so a bool
+    // passed `strEnum` and an int passed `strLen`.
+    var doc = try document_mod.Document.parse(allocator, "b: true\nn: 42\ns: hello\nq: \"true\"\n");
+    defer doc.deinit();
+
+    {
+        const vs = try Schema.strEnum(&.{"true"}).validate(allocator, doc.pathGet(&.{"b"}).?, "$");
+        defer freeViolations(allocator, vs);
+        try testing.expectEqual(@as(usize, 1), vs.len);
+        try testing.expectEqualStrings("type", vs[0].rule);
+    }
+    {
+        const vs = try Schema.strLen(1, 4).validate(allocator, doc.pathGet(&.{"n"}).?, "$");
+        defer freeViolations(allocator, vs);
+        try testing.expectEqual(@as(usize, 1), vs.len);
+        try testing.expectEqualStrings("type", vs[0].rule);
+    }
+    {
+        // A real string still validates, and a quoted string is a string
+        // even though its text spells a boolean.
+        const vs = try Schema.strLen(1, 8).validate(allocator, doc.pathGet(&.{"s"}).?, "$");
+        defer freeViolations(allocator, vs);
+        try testing.expectEqual(@as(usize, 0), vs.len);
+    }
+    {
+        const vs = try Schema.strEnum(&.{"true"}).validate(allocator, doc.pathGet(&.{"q"}).?, "$");
+        defer freeViolations(allocator, vs);
+        try testing.expectEqual(@as(usize, 0), vs.len);
+    }
+}
+
+test "an integer too wide for i64 is a range violation, not a type error" {
+    const allocator = testing.allocator;
+
+    // Regression: `checkNodeCoreTag` accepted the scalar as an integer,
+    // then parseInt's overflow was reported as "expected an integer" -- a
+    // false diagnostic. `value.zig` calls the same scalar `.bigint`.
+    var doc = try document_mod.Document.parse(allocator, "big: 99999999999999999999\nsmall: 5\n");
+    defer doc.deinit();
+    {
+        const vs = try Schema.intRange(0, 10).validate(allocator, doc.pathGet(&.{"big"}).?, "$");
+        defer freeViolations(allocator, vs);
+        try testing.expectEqual(@as(usize, 1), vs.len);
+        try testing.expectEqualStrings("range", vs[0].rule);
+    }
+    {
+        const vs = try Schema.intRange(0, 10).validate(allocator, doc.pathGet(&.{"small"}).?, "$");
+        defer freeViolations(allocator, vs);
+        try testing.expectEqual(@as(usize, 0), vs.len);
+    }
 }

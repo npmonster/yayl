@@ -50,12 +50,22 @@
 //! options (e.g. `max_bytes`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const diag = @import("diag.zig");
 const document_mod = @import("document.zig");
 
 const Document = document_mod.Document;
 
 pub const max_bytes_default: usize = 64 << 20; // 64 MiB
+
+/// The permission bits a create call should apply. POSIX `stat` reports
+/// the file-type bits (`S_IFREG` ...) in `mode` too; `open` ignores them,
+/// but carrying them in a permission value is wrong and makes an equality
+/// check compare 0o100600 against 0o600. Windows attributes pass through.
+fn permissionBits(p: std.Io.File.Permissions) std.Io.File.Permissions {
+    if (comptime builtin.os.tag == .windows) return p;
+    return @enumFromInt(@as(u32, @intFromEnum(p)) & 0o7777);
+}
 
 /// I/O failures plus the parse-error vocabulary the document layer
 /// can surface (kept in sync with `diag.YamlError` by construction).
@@ -103,6 +113,13 @@ pub fn writeBytesAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
     const tmp_suffix_max = ".yayl-tmp-".len + 10; // u32, widest decimal
     var buf: [std.fs.max_path_bytes + tmp_suffix_max]u8 = undefined;
     const cwd = std.Io.Dir.cwd();
+    // Preserve the target's permissions across the rename: a fresh temp
+    // file takes the umask default, so renaming it over a 0o600 secret
+    // would silently widen it. With no target, the default stands.
+    var create_flags: std.Io.Dir.CreateFileOptions = .{ .truncate = true, .exclusive = true };
+    if (cwd.statFile(io, path, .{})) |st| {
+        create_flags.permissions = permissionBits(st.permissions);
+    } else |_| {}
     var attempt: usize = 0;
     while (true) {
         attempt += 1;
@@ -110,7 +127,7 @@ pub fn writeBytesAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
         io.random(&rand_bytes);
         const tmp_path = std.fmt.bufPrint(&buf, "{s}.yayl-tmp-{d}", .{ path, std.mem.readInt(u32, &rand_bytes, .little) }) catch
             return error.NameTooLong;
-        var file = cwd.createFile(io, tmp_path, .{ .truncate = true, .exclusive = true }) catch |err| switch (err) {
+        var file = cwd.createFile(io, tmp_path, create_flags) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 if (attempt >= 4) return err;
                 continue;
@@ -296,4 +313,27 @@ test "a deep but valid path is not refused by the temp-name buffer" {
     const round = try readFile(allocator, io, path, max_bytes_default);
     defer allocator.free(round);
     try testing.expectEqualStrings("a: 1\n", round);
+}
+
+test "atomic write preserves the target's permissions" {
+    if (comptime builtin.os.tag != .windows) {
+        const allocator = testing.allocator;
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        const cwd = std.Io.Dir.cwd();
+        const path = "zig-out-test-perms.yaml";
+        defer cwd.deleteFile(io, path) catch {};
+
+        // A secret-bearing file, then an atomic rewrite of it: the temp
+        // file must inherit 0o600 rather than the umask default.
+        const secret: std.Io.File.Permissions = @enumFromInt(0o600);
+        {
+            var f = try cwd.createFile(io, path, .{ .truncate = true, .permissions = secret });
+            f.close(io);
+        }
+        try writeBytesAtomic(io, path, "a: 2\n");
+        const st = try cwd.statFile(io, path, .{});
+        try testing.expectEqual(secret, permissionBits(st.permissions));
+    }
 }

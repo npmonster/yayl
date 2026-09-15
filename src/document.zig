@@ -335,6 +335,23 @@ pub fn resolveCoreTag(value: []const u8, style: ScalarStyle) CoreTag {
     return .str;
 }
 
+/// Parse the text of a scalar already classified as a core-schema
+/// integer. Returns the value, or null when the text is a valid integer
+/// that does not fit `i64` (the "bigint" case). Callers must first
+/// confirm `resolveCoreTag(text, .plain) == .int`; this answers only
+/// "does it fit". `value` and `schema` previously each spelled this out,
+/// and disagreed: schema called the overflow a type error.
+pub fn parseCoreInt(text: []const u8) ?i64 {
+    return std.fmt.parseInt(i64, text, 0) catch null;
+}
+
+/// Parse the text of a scalar already classified as a core-schema float,
+/// resolving the `.inf`/`.nan` spellings. Null when the text is not a
+/// float. One home for the rule `value` and `schema` both apply.
+pub fn parseCoreFloat(text: []const u8) ?f64 {
+    return std.fmt.parseFloat(f64, text) catch floatSpecial(text);
+}
+
 /// Core schema int (spec 10.3.2): `[-+]? [0-9]+`, `0o [0-7]+` or
 /// `0x [0-9a-fA-F]+`. The radix forms take no sign and are lowercase
 /// only, so `+0x1F`, `-0x1F`, `0X1F` and `0O7` are all strings.
@@ -3482,4 +3499,15 @@ test "sequenceInsert refuses an ancestor instead of building a cycle" {
     var re = try Document.parse(allocator, out);
     defer re.deinit();
     try std.testing.expectEqual(@as(usize, 1), re.pathGet(&.{"list"}).?.items().?.len);
+}
+
+test "parseCoreInt and parseCoreFloat are the one shared scalar rule" {
+    // `value` and `schema` both call these, so they cannot disagree about
+    // which scalars are bigints or float specials.
+    try std.testing.expectEqual(@as(?i64, 42), parseCoreInt("42"));
+    try std.testing.expectEqual(@as(?i64, -7), parseCoreInt("-7"));
+    try std.testing.expectEqual(@as(?i64, null), parseCoreInt("99999999999999999999"));
+    try std.testing.expectEqual(@as(?f64, 1.5), parseCoreFloat("1.5"));
+    try std.testing.expectEqual(std.math.inf(f64), parseCoreFloat(".inf").?);
+    try std.testing.expectEqual(@as(?f64, null), parseCoreFloat("not a float"));
 }

@@ -89,8 +89,15 @@ pub const Options = struct {
 fn markOf(input: []const u8, offset: usize) Mark {
     var mark: Mark = .{ .offset = offset };
     var line_start: usize = 0;
-    for (input[0..offset], 0..) |b, i| {
-        if (b == '\n') {
+    // A lone CR is a line break too (b-break ::= CRLF | CR | LF), so a
+    // NUL after a CR-terminated line must not report the earlier line.
+    var i: usize = 0;
+    while (i < offset) : (i += 1) {
+        if (input[i] == '\r') {
+            mark.line += 1;
+            if (i + 1 < offset and input[i + 1] == '\n') i += 1;
+            line_start = i + 1;
+        } else if (input[i] == '\n') {
             mark.line += 1;
             line_start = i + 1;
         }
@@ -422,11 +429,19 @@ pub const Scanner = struct {
         sk.possible = false;
     }
 
+    /// Current syntactic nesting: block indent levels plus open flow
+    /// levels. `max_nesting` bounds this SUM (the `Options` doc and the
+    /// README both say so); checking each dimension against the full
+    /// budget separately let a document reach 2 * max_nesting.
+    fn nestingDepth(self: *const Scanner) usize {
+        return self.indents.items.len + self.flow_level;
+    }
+
     fn rollIndent(self: *Scanner, column: usize, number: ?usize, kind: Token.Data, mark: Mark) !void {
         if (self.flow_level > 0) return;
         const col: isize = @intCast(column);
         if (self.indent < col) {
-            if (self.indents.items.len >= self.max_nesting) {
+            if (self.nestingDepth() >= self.max_nesting) {
                 return self.failWith(error.NestingTooDeep, mark, "block nesting is too deep", .{});
             }
             try self.indents.append(self.allocator, self.indent);
@@ -676,7 +691,7 @@ pub const Scanner = struct {
         if (!self.flowIndentOk()) {
             return self.failWith(error.InvalidIndentation, self.mark, "wrongly indented flow collection start in flow mode", .{});
         }
-        if (self.flow_level >= self.max_nesting) {
+        if (self.nestingDepth() >= self.max_nesting) {
             return self.failWith(error.NestingTooDeep, self.mark, "flow nesting is too deep", .{});
         }
         try self.saveSimpleKey();
@@ -862,7 +877,15 @@ pub const Scanner = struct {
             const c = self.at(0);
             if (ctype.isBlankz(c)) break;
             if (c == ',' or c == '[' or c == ']' or c == '{' or c == '}') break;
-            if (c < 0x20 or c == 0x7F) break;
+            // An unprintable codepoint in an anchor/alias name is illegal
+            // (libfyaml: "illegal unicode control character in %s").
+            // BREAKING here silently truncated the name instead, so
+            // `&an\x01chor` became anchor "an" and `chor` leaked into
+            // the following scalar.
+            const r = (utf8.decode(self.input, self.pos) catch unreachable) orelse unreachable;
+            if (!utf8.isPrintableCodepoint(r.cp)) {
+                return self.fail(self.mark, "illegal control character in {s}", .{@tagName(tag)});
+            }
             self.skipCp();
         }
         const name = self.input[name_start..self.pos];
@@ -2048,4 +2071,50 @@ test "comment termination" {
         if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
     }
     try testing.expectEqualStrings("b", scalars.items[1]);
+}
+
+test "max_nesting counts block and flow levels together" {
+    const allocator = testing.allocator;
+    // Three block levels then three flow levels: each dimension alone is
+    // under the budget, but the documented cap is their SUM.
+    const input = "a:\n  b:\n    c:\n      d: [[[x]]]\n";
+    {
+        var s = try Scanner.initOpts(allocator, null, input, .{ .max_nesting = 4 });
+        defer s.deinit();
+        try testing.expectError(error.NestingTooDeep, drainScanner(&s));
+    }
+    {
+        var s = try Scanner.initOpts(allocator, null, input, .{ .max_nesting = 8 });
+        defer s.deinit();
+        try drainScanner(&s);
+    }
+}
+
+fn drainScanner(s: *Scanner) !void {
+    while ((try s.peekToken()) != null) s.skipToken();
+}
+
+test "a control byte cannot truncate an anchor or alias name" {
+    const allocator = testing.allocator;
+    // Regression: the name scan broke out on a control byte and returned
+    // a TRUNCATED anchor, so `&an\x01chor` became anchor "an" and `chor`
+    // leaked into the following scalar.
+    try testing.expectError(error.InvalidSyntax, drainInput(allocator, "k: &an\x01chor v\n"));
+    try testing.expectError(error.InvalidSyntax, drainInput(allocator, "k: *an\x01chor\n"));
+    // A C1 control is unprintable even though it is valid UTF-8.
+    try testing.expectError(error.InvalidSyntax, drainInput(allocator, "k: &a\u{0080}b v\n"));
+    // Ordinary punctuation and non-ASCII letters still scan.
+    try drainInput(allocator, "k: &a-b.c\u{4E2D} v\n");
+}
+
+fn drainInput(allocator: std.mem.Allocator, input: []const u8) !void {
+    var s = try Scanner.initOpts(allocator, null, input, .{});
+    defer s.deinit();
+    try drainScanner(&s);
+}
+
+test "markOf counts a lone CR as a line break" {
+    const input = "a\rb\x00c";
+    const m = markOf(input, 3);
+    try testing.expectEqual(@as(usize, 2), m.line);
 }

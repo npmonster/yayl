@@ -389,7 +389,7 @@ pub const Emitter = struct {
         // spaces; two is the YAML house default when unmeasurable.
         if (!self.forced_indent) {
             if (doc.root) |root| {
-                if (self.inferIndentStep(root)) |step| {
+                if (self.inferIndentStep(root, 0)) |step| {
                     self.indent_step = @min(@max(step, 1), 8);
                 }
             }
@@ -1078,7 +1078,14 @@ pub const Emitter = struct {
     /// insert into a four-space file does not arrive wearing two-space
     /// indentation. Null when the document nests nowhere and there is
     /// nothing to measure.
-    fn inferIndentStep(self: *const Emitter, node: *const Node) ?usize {
+    fn inferIndentStep(self: *const Emitter, node: *const Node, depth: usize) ?usize {
+        // Bounded like the emission walk: this measurement runs BEFORE
+        // the depth-checked walk, so unbounded recursion here segfaulted
+        // on a deep grafted subtree (a 60k-deep sequence reached the
+        // emitter through `Editor.set`) instead of letting the walk
+        // return `error.NestingTooDeep`. It is only a measurement, so
+        // giving up returns null and the walk reports the bound.
+        if (depth >= self.max_depth) return null;
         switch (node.data) {
             .mapping => |m| {
                 for (m.pairs.items) |pair| {
@@ -1090,12 +1097,12 @@ pub const Emitter = struct {
                         // compact `- name: a`) measures nothing.
                         if (child_col > key_col) return child_col - key_col;
                     }
-                    if (self.inferIndentStep(pair.value)) |d| return d;
+                    if (self.inferIndentStep(pair.value, depth + 1)) |d| return d;
                 }
             },
             .sequence => |sq| {
                 for (sq.items.items) |item| {
-                    if (self.inferIndentStep(item)) |d| return d;
+                    if (self.inferIndentStep(item, depth + 1)) |d| return d;
                 }
             },
             else => {},
@@ -1389,6 +1396,12 @@ pub const Emitter = struct {
     fn emitEntry(self: *Emitter, key: *Node, value: *Node, indent: usize) Error!void {
         switch (key.data) {
             .scalar => |s| {
+                // A scalar key can carry properties too (`&k name: v`,
+                // `!t 1: v`). They were dropped here while non-scalar
+                // keys (through `emitFlowNode`) kept theirs, so an alias
+                // to an anchored scalar key emitted `*k` with no `&k`.
+                if (key.anchor) |a| try self.seen.put(key, a);
+                if (try self.writeProperties(key)) try self.writeByte(' ');
                 try self.emitScalarValue(s.value, s.style, indent, false, false);
                 try self.writeByte(':');
             },
@@ -1643,7 +1656,13 @@ pub const Emitter = struct {
                 for (m.pairs.items, 0..) |pair, i| {
                     if (i > 0) try self.write(", ");
                     switch (pair.key.data) {
-                        .scalar => |s| try self.emitScalarValue(s.value, s.style, 0, false, true),
+                        .scalar => |s| {
+                            // Same rule as the block path: a scalar key's
+                            // own anchor/tag is written and registered.
+                            if (pair.key.anchor) |a| try self.seen.put(pair.key, a);
+                            if (try self.writeProperties(pair.key)) try self.writeByte(' ');
+                            try self.emitScalarValue(s.value, s.style, 0, false, true);
+                        },
                         else => try self.emitFlowNode(pair.key),
                     }
                     try self.write(": ");
@@ -2429,4 +2448,72 @@ test "an unmodified explicit key still re-emits from its source span" {
     const out = try roundTrip(testing.allocator, src);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings(src, out);
+}
+
+test "a normalized scalar key keeps its anchor and tag" {
+    const allocator = testing.allocator;
+
+    // Regression: `emitEntry`'s scalar arm wrote only the key text, so an
+    // anchored or tagged scalar KEY lost its properties (non-scalar keys
+    // went through `emitFlowNode`, which kept them). `&k key: v` with a
+    // `*k` elsewhere then emitted an undefined alias.
+    {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        const root = try doc.createMapping();
+        doc.root = root;
+        const key = try doc.createScalar("name", .plain);
+        try doc.setAnchor(key, "k");
+        key.tag = "tag:yaml.org,2002:str";
+        try doc.mappingAppend(root, key, try doc.createScalar("v", .plain));
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings("&k !!str name: v\n", out);
+    }
+    {
+        // The flow path follows the same rule.
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        const root = try doc.createMapping();
+        doc.root = root;
+        switch (root.data) {
+            .mapping => |*m| m.style = .flow,
+            else => unreachable,
+        }
+        const key = try doc.createScalar("name", .plain);
+        try doc.setAnchor(key, "k");
+        try doc.mappingAppend(root, key, try doc.createScalar("v", .plain));
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expect(std.mem.indexOf(u8, out, "&k name") != null);
+    }
+}
+
+test "indent inference is depth-bounded, so a deep graft cannot overflow the stack" {
+    const allocator = testing.allocator;
+
+    // The faithful emitter measures the document's indent convention
+    // BEFORE the depth-checked walk. That pre-walk recursion was
+    // unbounded, so a deep subtree grafted into a parsed document (a
+    // 60k-deep sequence reached through `Editor.set`) segfaulted instead
+    // of returning `error.NestingTooDeep`. Build the chain directly, so
+    // the test bypasses the O(depth) mark-modified walk and stays fast.
+    var doc = try Document.parse(allocator, "a: 1\n");
+    defer doc.deinit();
+    const root = try doc.createSequence();
+    var cur = root;
+    var i: usize = 0;
+    while (i < 100_000) : (i += 1) {
+        const next = try doc.createSequence();
+        switch (cur.data) {
+            .sequence => |*s| try s.items.append(doc.pool.allocator(), next),
+            else => unreachable,
+        }
+        next.parent = cur;
+        cur = next;
+    }
+    doc.root = root;
+
+    // A typed error, not a stack overflow in the pre-walk measurement.
+    try std.testing.expectError(error.NestingTooDeep, doc.write(allocator));
 }

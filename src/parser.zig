@@ -293,6 +293,19 @@ pub const Parser = struct {
         });
     }
 
+    /// YAML 1.2 spec 6.8.2 `c-tag-handle`: `!`, `!!`, or `!` word+ `!`
+    /// where word is [0-9A-Za-z-].
+    fn validTagHandle(handle: []const u8) bool {
+        if (std.mem.eql(u8, handle, "!") or std.mem.eql(u8, handle, "!!")) return true;
+        if (handle.len < 3 or handle[0] != '!' or handle[handle.len - 1] != '!') return false;
+        for (handle[1 .. handle.len - 1]) |c| {
+            const ok = (c >= '0' and c <= '9') or (c >= 'A' and c <= 'Z') or
+                (c >= 'a' and c <= 'z') or c == '-';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
     /// Consume directive tokens, validating them, then make sure the
     /// default tag handles are present.
     fn processDirectives(self: *Parser) !void {
@@ -336,6 +349,13 @@ pub const Parser = struct {
                 self.version_directive = .{ .major = 1, .minor = @intCast(minor) };
             } else if (std.mem.eql(u8, d.name, "TAG")) {
                 if (d.params.len != 2) {
+                    return self.fail(tok.start, "found malformed %TAG directive", .{});
+                }
+                // The handle must be a real tag handle and the prefix
+                // non-empty: `%TAG foo bar` and `%TAG !e tag:x` used to
+                // be accepted, so tags could resolve through a handle
+                // YAML does not define (libfyaml rejects both).
+                if (!validTagHandle(d.params[0]) or d.params[1].len == 0) {
                     return self.fail(tok.start, "found malformed %TAG directive", .{});
                 }
                 for (self.tag_directives.items) |td| {
@@ -952,4 +972,17 @@ test "comma after a tag is rejected in block context" {
         if (ev == null) break;
     }
     try testing.expectEqual(@as(?anyerror, error.InvalidSyntax), outcome);
+}
+
+test "%TAG handles and prefixes are validated" {
+    const allocator = testing.allocator;
+    // Regression: any two parameters were accepted, so `%TAG foo bar` and
+    // `%TAG !e tag:x` installed tag handles YAML does not define.
+    try testing.expectError(error.InvalidSyntax, drainEvents(allocator, "%TAG foo bar\n---\nx\n"));
+    try testing.expectError(error.InvalidSyntax, drainEvents(allocator, "%TAG !e tag:x\n---\nx\n"));
+    try testing.expectError(error.InvalidSyntax, drainEvents(allocator, "%TAG !e! \n---\nx\n"));
+    // Valid handles: primary, secondary and named.
+    try drainEvents(allocator, "%TAG ! tag:x\n---\nx\n");
+    try drainEvents(allocator, "%TAG !! tag:x\n---\nx\n");
+    try drainEvents(allocator, "%TAG !e! tag:example.com,2000:\n---\nx\n");
 }
