@@ -314,14 +314,26 @@ pub const Parser = struct {
                 if (p.len < 3 or p[0] != '1' or p[1] != '.') {
                     return self.failWith(error.UnsupportedVersion, tok.start, "found incompatible YAML document version '{s}'", .{p});
                 }
-                var minor: u8 = 0;
+                // libfyaml accepts 1.1 and 1.2, and 1.3 as
+                // experimental; everything else is unsupported. Parse
+                // into `usize` and reject the moment the value leaves
+                // that set, so a long digit run cannot overflow the
+                // accumulator -- `%YAML 1.300` overflowed a u8 and
+                // panicked here, and `1.250` was accepted unchecked.
+                var minor: usize = 0;
                 for (p[2..]) |ch| {
                     if (ch < '0' or ch > '9') {
                         return self.fail(tok.start, "found malformed %YAML directive", .{});
                     }
                     minor = minor * 10 + (ch - '0');
+                    if (minor > 3) {
+                        return self.failWith(error.UnsupportedVersion, tok.start, "found incompatible YAML document version '{s}'", .{p});
+                    }
                 }
-                self.version_directive = .{ .major = 1, .minor = minor };
+                if (minor == 0) {
+                    return self.failWith(error.UnsupportedVersion, tok.start, "found incompatible YAML document version '{s}'", .{p});
+                }
+                self.version_directive = .{ .major = 1, .minor = @intCast(minor) };
             } else if (std.mem.eql(u8, d.name, "TAG")) {
                 if (d.params.len != 2) {
                     return self.fail(tok.start, "found malformed %TAG directive", .{});
@@ -817,6 +829,38 @@ test "explicit document events" {
         .stream_start, .document_start, .scalar, .document_end, .stream_end,
     };
     try testing.expectEqualSlices(EventKind, want, evs.items);
+}
+
+test "%YAML minor version is bounded, never overflows" {
+    const allocator = testing.allocator;
+
+    // Regression: the minor accumulated into a u8, so `%YAML 1.300`
+    // overflowed and aborted the process on untrusted input, and `1.250`
+    // was accepted unchecked. libfyaml accepts 1.1 and 1.2, and 1.3 as
+    // experimental; the rest are `UnsupportedVersion`.
+    const rejected = [_][]const u8{
+        "%YAML 1.300\n---\nx\n",
+        "%YAML 1.250\n---\nx\n",
+        "%YAML 1.12345\n---\nx\n",
+        "%YAML 1.99999999999999999999\n---\nx\n",
+        "%YAML 1.4\n---\nx\n",
+        "%YAML 1.0\n---\nx\n",
+        "%YAML 2.0\n---\nx\n",
+    };
+    for (rejected) |input| {
+        try testing.expectError(error.UnsupportedVersion, drainEvents(allocator, input));
+    }
+
+    // The accepted set still parses, so the bound did not over-reject.
+    for ([_][]const u8{ "%YAML 1.1\n---\nx\n", "%YAML 1.2\n---\nx\n", "%YAML 1.3\n---\nx\n" }) |input| {
+        try drainEvents(allocator, input);
+    }
+}
+
+fn drainEvents(allocator: std.mem.Allocator, input: []const u8) !void {
+    var p = try Parser.init(allocator, null, input);
+    defer p.deinit();
+    while (try p.nextEvent()) |_| {}
 }
 
 test "tag resolution" {

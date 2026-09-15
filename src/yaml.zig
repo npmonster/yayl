@@ -413,10 +413,12 @@ test "fuzz smoke: mutated corpus never panics, leaks, or loses the round trip" {
 /// stays substantially richer than the string it replaced.
 const sweep_yaml =
     \\%YAML 1.2
+    \\%TAG !e! tag:example.com,2000:
     \\---
     \\# a leading comment, so comment gaps are scanned
     \\anchored: &anchor [1, 2, 3]
     \\alias: *anchor
+    \\tagged_local: !e!thing value
     \\flow_map: {alpha: 1, beta: [x, y]}
     \\tagged: !!str 42
     \\literal: |

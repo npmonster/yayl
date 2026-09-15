@@ -3,6 +3,50 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+An independent review of the 0.19.2 tree found five high-severity
+defects. All five are fixed here, each with a regression test.
+
+### Fixed
+
+**A `%YAML` directive could abort the process.** The minor version was
+accumulated into a `u8` with no bound, so `%YAML 1.300` overflowed and
+panicked (Debug/ReleaseSafe) or silently wrapped (ReleaseFast) on
+untrusted input; `%YAML 1.250` was accepted unchecked. Versions are now
+parsed into a wider accumulator and range-checked to the set libfyaml
+accepts — 1.1, 1.2, and experimental 1.3 — with anything else returning
+`error.UnsupportedVersion` before any allocation.
+
+**A float `Value` panicked on emission.** `value.toNode` formatted a
+float into a 64-byte buffer with `catch unreachable`, so a magnitude
+like `1e300` (~301 decimal digits) hit `error.NoSpaceLeft` and panicked.
+Floats now use a buffer that holds any finite `f64` in full decimal, and
+gain a fractional part when the form would otherwise reparse as an
+integer (`1.0` used to emit `1`, `-0.0` used to emit `-0`), so a float
+Value round-trips as a float.
+
+**Deleting or moving an anchored mapping KEY stranded its aliases.** The
+stranding guard inspected only a pair's value, but a pair is removed key
+and all, so `&k key: 1\nref: *k` with `$.key` deleted emitted `ref: *k`
+with no `&k` — a document that does not reparse. `Editor` now guards the
+key as well; `Document.mappingRemove`/`pathDelete` stay raw and are
+documented as not performing the check.
+
+**`sequenceInsert` could build a parent cycle and panic.** Unlike its
+append siblings it skipped the cycle guard, so inserting an ancestor
+under its own descendant tripped `markModified`'s assert. All three
+attach paths now share one guard, which reports a cycle as
+`error.WouldCycle` and a chain past the walk bound as
+`error.NestingTooDeep`.
+
+**An OOM while copying `%TAG` directives leaked the whole document
+arena.** `parseStream`'s `document_start` arm only published the new
+`Document` to the function-scope `errdefer` after the fallible
+directive copy. It is now published before the first allocation, and the
+allocation-failure sweep carries a custom `%TAG` case so the window is
+actually exercised.
+
 ## 0.19.2 — 2026-09-14
 
 No library code changed. This release is the result of an independent

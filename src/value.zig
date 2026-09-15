@@ -307,9 +307,28 @@ pub fn toNode(doc: *Document, value: Value) Error!*Node {
             if (std.math.isNan(f)) return doc.createScalar(".nan", .plain);
             if (std.math.isPositiveInf(f)) return doc.createScalar(".inf", .plain);
             if (std.math.isNegativeInf(f)) return doc.createScalar("-.inf", .plain);
-            var buf: [64]u8 = undefined;
-            const text = std.fmt.bufPrint(&buf, "{d}", .{f}) catch unreachable;
-            return doc.createScalar(text, .plain);
+            // A float must round-trip as a FLOAT. `{d}` is the historical
+            // form, but it renders `1.0` as "1" and `-0.0` as "-0", both
+            // of which are YAML *integers* -- so an integral float came
+            // back as an int and `toZig` into an `f64` failed. Full
+            // decimal is also unbounded (1e300 is 301 digits), which is
+            // what made the old [64]u8 + `catch unreachable` panic.
+            // Every finite f64 fits the 512-byte decimal buffer (the
+            // longest, 5e-324, is 326 bytes); the scientific fallback is a
+            // bounded guard against a future formatter change.
+            var decimal: [512]u8 = undefined;
+            var scientific: [32]u8 = undefined;
+            const text = std.fmt.bufPrint(&decimal, "{d}", .{f}) catch
+                std.fmt.bufPrint(&scientific, "{e}", .{f}) catch unreachable;
+            // Add a fractional part when the form would otherwise read
+            // back as an integer. `out` is separate: formatting into the
+            // buffer `text` already points at would alias.
+            var out: [514]u8 = undefined;
+            const value_text = if (std.mem.indexOfAny(u8, text, ".eE") == null)
+                std.fmt.bufPrint(&out, "{s}.0", .{text}) catch unreachable
+            else
+                text;
+            return doc.createScalar(value_text, .plain);
         },
         .string => |s| return doc.createScalar(s, .any),
         .sequence => |items| {
@@ -1051,6 +1070,40 @@ fn valueRoundTrip(allocator: std.mem.Allocator) !void {
     const Point = struct { x: i32, label: []const u8 };
     const vp = try fromZig(allocator, Point{ .x = 1, .label = label });
     defer freeValue(allocator, vp);
+}
+
+test "float Values emit a form that reparses to the same float" {
+    const allocator = testing.allocator;
+
+    // Regression: `toNode` formatted with `{d}` into a 64-byte buffer
+    // and called `unreachable` on NoSpaceLeft, so `Value{ .float = 1e300 }`
+    // panicked. The same form is what a float Value re-emits as, so this
+    // pins BOTH properties: no crash at any magnitude, and a round trip
+    // that comes back a float with the same bits (integral floats used to
+    // reparse as integers, e.g. 1.0 -> "1").
+    const cases = [_]f64{
+        0.0,    -0.0,
+        1.0,    3.0,
+        1.5,    -2.25,
+        1e30,   1e300,
+        -1e300, 1e-300,
+        5e-324, std.math.floatMax(f64),
+        0.1,    3.141592653589793,
+    };
+    for (cases) |f| {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        doc.root = try toNode(&doc, .{ .float = f });
+        const text = try doc.write(allocator);
+        defer allocator.free(text);
+
+        const back = try parseToValue(allocator, text);
+        defer freeValue(allocator, back);
+        try testing.expect(back == .float);
+        // Exact bits, not ==: -0.0 == 0.0 but they are different values,
+        // and losing that distinction is part of what this pins.
+        try testing.expectEqual(@as(u64, @bitCast(f)), @as(u64, @bitCast(back.float)));
+    }
 }
 
 // The amplification this bound exists for: each level aliases the one

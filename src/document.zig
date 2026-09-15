@@ -560,7 +560,13 @@ pub const Document = struct {
         while (try p.nextEvent()) |ev| {
             switch (ev.data) {
                 .document_start => {
-                    var d = Document.init(allocator);
+                    // Publish the new document to the function-scope
+                    // errdefer BEFORE any allocation: every allocation
+                    // below belongs to it, and a failure anywhere in the
+                    // %TAG copy loop would otherwise leak the whole arena
+                    // (the local was only assigned to `doc` at the end).
+                    doc = Document.init(allocator);
+                    const d = &doc.?;
                     d.version = ev.data.document_start.version;
                     d.explicit_start = !ev.data.document_start.implicit;
                     // Copy the stream input into this document's pool so
@@ -580,9 +586,8 @@ pub const Document = struct {
                             .prefix = try d.pool.dupe(td.prefix),
                         });
                     }
-                    doc = d;
                     // The builder works on the live document copy.
-                    builder = Builder.init(&doc.?);
+                    builder = Builder.init(d);
                 },
                 .document_end => {
                     if (builder) |*b| b.finish();
@@ -766,20 +771,27 @@ pub const Document = struct {
 
     /// Append a key/value pair to a mapping node, maintaining parent links.
     pub fn mappingAppend(self: *Document, map: *Node, key: *Node, value: *Node) !void {
-        if (wouldCycle(map, key) or wouldCycle(map, value)) return error.WouldCycle;
+        if (attachRefusal(map, key)) |reason| return reason;
+        if (attachRefusal(map, value)) |reason| return reason;
         try internal.attachPair(self, map, key, value);
         self.markModified(map);
     }
 
     /// Append an item to a sequence node, maintaining parent links.
     pub fn sequenceAppend(self: *Document, seq: *Node, item: *Node) !void {
-        if (wouldCycle(seq, item)) return error.WouldCycle;
+        if (attachRefusal(seq, item)) |reason| return reason;
         try internal.attachItem(self, seq, item);
         self.markModified(seq);
     }
 
     /// Insert an item into a sequence at `index`.
+    ///
+    /// Guarded like the append siblings. Without the guard an insert could
+    /// splice an ancestor under its own descendant, and `markModified`
+    /// then tripped its parent-cycle assert -- a panic reachable through
+    /// the public API (and through `Editor`'s insert/set).
     pub fn sequenceInsert(self: *Document, seq: *Node, index: usize, item: *Node) !void {
+        if (attachRefusal(seq, item)) |reason| return reason;
         switch (seq.data) {
             .sequence => |*s| {
                 try s.items.insert(self.pool.allocator(), index, item);
@@ -793,6 +805,12 @@ pub const Document = struct {
     /// Remove the mapping entry with scalar key `key`; returns the removed
     /// value node or null when no such key exists. The entry's source
     /// bytes are tombstoned so emission skips them.
+    ///
+    /// RAW: this detaches the key as well as the value and does NOT check
+    /// whether either carries an anchor an alias still needs, so removing
+    /// an anchored pair can emit a document that will not reparse.
+    /// `edit.Editor` is the guarded path; use it unless the tree is known
+    /// to contain no aliases.
     pub fn mappingRemove(self: *Document, map: *Node, key: []const u8) !?*Node {
         switch (map.data) {
             .mapping => |*m| {
@@ -1399,6 +1417,8 @@ pub const Document = struct {
 
     /// Delete the mapping entry at a mapping-key path. Returns true when
     /// something was removed.
+    ///
+    /// RAW: like `mappingRemove`, no alias-stranding check is performed.
     pub fn pathDelete(self: *Document, path: []const []const u8) !bool {
         if (path.len == 0) return false;
         var cur = self.root orelse return false;
@@ -1433,19 +1453,23 @@ pub const Document = struct {
         }
     }
 
-    /// Would attaching `child` under `parent` close a parent cycle?
-    /// True when `child` is `parent` itself or one of its ancestors.
-    /// The ancestor chain is acyclic by induction — this is the check
-    /// that keeps it so — hence the plain walk.
-    fn wouldCycle(parent: *Node, child: *Node) bool {
+    /// Why attaching `child` under `parent` must be refused, or null
+    /// when it is safe. `child` being `parent` itself or one of its
+    /// ancestors is a parent cycle. An ancestor chain longer than the
+    /// walk bound is reported as `NestingTooDeep` rather than a cycle:
+    /// `markModified` asserts past the same bound, so attaching there
+    /// would build a tree the rest of the module cannot maintain. The
+    /// chain is acyclic by induction — this is the check that keeps it so
+    /// — hence the plain walk.
+    fn attachRefusal(parent: *Node, child: *Node) ?error{ WouldCycle, NestingTooDeep } {
         var cur: ?*Node = parent;
         var guard: usize = 0;
         while (cur) |n| : (guard += 1) {
-            if (n == child) return true;
-            if (guard >= Node.max_parent_walk) return true;
+            if (n == child) return error.WouldCycle;
+            if (guard >= Node.max_parent_walk) return error.NestingTooDeep;
             cur = n.parent;
         }
-        return false;
+        return null;
     }
 
     /// The `dropped` tombstone list of a collection node (source ranges
@@ -3428,4 +3452,34 @@ test "merge keys: the GitLab CI fixture resolves its job templates" {
     // The template itself is untouched by being a merge source.
     const defaults = doc.pathGet(&.{".defaults"}) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("rust:1.79", defaults.lookup("image").?.scalarValue().?);
+}
+
+test "sequenceInsert refuses an ancestor instead of building a cycle" {
+    const allocator = std.testing.allocator;
+
+    // Regression: `sequenceInsert` skipped the `wouldCycle` guard the two
+    // append siblings enforce, so inserting an ancestor under its own
+    // descendant built a parent cycle and `markModified` then tripped its
+    // assert -- a panic reachable through `Document` (and through
+    // `Editor` when a caller passes a node of the same tree).
+    var doc = Document.init(allocator);
+    defer doc.deinit();
+    const root = try doc.createMapping();
+    doc.root = root;
+    const seq = try doc.createSequence();
+    try doc.mappingAppend(root, try doc.createScalar("list", .plain), seq);
+    try doc.sequenceAppend(seq, try doc.createScalar("x", .plain));
+
+    // The sequence, and any ancestor of it, cannot become one of its items.
+    try std.testing.expectError(error.WouldCycle, doc.sequenceInsert(seq, 0, seq));
+    try std.testing.expectError(error.WouldCycle, doc.sequenceInsert(seq, 0, root));
+    try std.testing.expectError(error.WouldCycle, doc.sequenceAppend(seq, seq));
+    try std.testing.expectError(error.WouldCycle, doc.sequenceAppend(seq, root));
+
+    // Refused means untouched: the tree still emits and reparses.
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    var re = try Document.parse(allocator, out);
+    defer re.deinit();
+    try std.testing.expectEqual(@as(usize, 1), re.pathGet(&.{"list"}).?.items().?.len);
 }

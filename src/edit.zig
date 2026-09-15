@@ -339,6 +339,30 @@ fn refuseIfAnchorReferenced(doc: *Document, doomed: *const Node) Error!void {
     if (aliasWouldDangle(root, doomed, 0)) return error.AnchorReferenced;
 }
 
+/// Refuse removing the mapping pair whose VALUE is `target` when an alias
+/// anywhere still needs an anchor carried by EITHER the value or the key.
+/// A pair is removed as a unit -- `mappingRemove` detaches both -- so an
+/// anchored key strands exactly like an anchored value, and the
+/// value-only guard missed it: `&k key: 1\nref: *k` with `$.key` deleted
+/// emitted `ref: *k` with no `&k`, which does not reparse.
+fn refuseIfPairStrandsAlias(doc: *Document, target: *const Node) Error!void {
+    try refuseIfAnchorReferenced(doc, target);
+    if (pairKeyOf(target)) |key| try refuseIfAnchorReferenced(doc, key);
+}
+
+/// The key node of the mapping pair whose value is `target`, or null when
+/// `target` is not a mapping value.
+fn pairKeyOf(target: *const Node) ?*Node {
+    const parent = target.parent orelse return null;
+    switch (parent.data) {
+        .mapping => |m| for (m.pairs.items) |p| {
+            if (p.value == target) return p.key;
+        },
+        else => {},
+    }
+    return null;
+}
+
 /// Does `node`, or anything under it, alias an anchor defined OUTSIDE
 /// `subtree`? Aliases are leaves; the walk never follows one.
 fn dependsOnOutsideAnchor(subtree: *const Node, node: *const Node, depth: usize) bool {
@@ -534,7 +558,7 @@ pub const Editor = struct {
                     try noopOrOOM(err);
                     return; // no match: no-op
                 };
-                try refuseIfAnchorReferenced(doc, target);
+                try refuseIfPairStrandsAlias(doc, target);
                 try applyDelete(doc, path);
             },
             .insert => |ins| try applyInsert(doc, ins),
@@ -676,7 +700,7 @@ pub const Editor = struct {
         try dedupeNodes(doc.allocator, &victims);
         if (victims.items.len == 0) return;
         for (victims.items) |victim| {
-            try refuseIfAnchorReferenced(doc, victim);
+            try refuseIfPairStrandsAlias(doc, victim);
         }
 
         // Remove the outermost match, then re-collect: an outer match's
@@ -760,6 +784,10 @@ pub const Editor = struct {
         const node = try ed.one(from);
         const target = try ed.one(to);
         try refuseIfMoveStrandsAlias(doc, node);
+        // Detaching a mapping value drops the whole pair, key included
+        // (see the detach loop below), so an anchor on that key leaves
+        // with it. `refuseIfMoveStrandsAlias` only sees the value tree.
+        if (pairKeyOf(node)) |pair_key| try refuseIfAnchorReferenced(doc, pair_key);
         // Reject moving a node into its own subtree.
         var anc: ?*Node = target;
         while (anc) |a| : (anc = a.parent) {
@@ -2900,4 +2928,51 @@ test "descent delete under a prefix removes matches only within it" {
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("out:\n  k: 1\nin:\n  {}\n", out);
+}
+
+test "deleting or moving an anchored KEY is refused, not silently corrupting" {
+    const allocator = testing.allocator;
+
+    // Regression: the stranding guard inspected only the pair's VALUE, but
+    // a mapping pair is removed key and all. `&k key: 1\nref: *k` with
+    // `$.key` deleted emitted `ref: *k` with no `&k`, which fails to
+    // reparse with `error.UnknownAlias`.
+    const src = "&k key: 1\nref: *k\n";
+    {
+        var doc = try Document.parse(allocator, src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try testing.expectError(error.AnchorReferenced, ed.delete("$.key"));
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings(src, out);
+    }
+    {
+        // A move detaches the whole pair too, so the key is guarded there.
+        var doc = try Document.parse(allocator, src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try testing.expectError(error.AnchorReferenced, ed.apply(&.{.{ .move = .{
+            .from = "$.key",
+            .to = "$.ref",
+        } }}));
+    }
+    {
+        // An UNREFERENCED key anchor still deletes: the guard must not
+        // over-refuse.
+        var doc = try Document.parse(allocator, "&k key: 1\nother: 2\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete("$.key");
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings("other: 2\n", out);
+    }
+    {
+        // The value-side guard still works (the original finding).
+        var doc = try Document.parse(allocator, "a: &v 1\nb: *v\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try testing.expectError(error.AnchorReferenced, ed.delete("$.a"));
+    }
 }
