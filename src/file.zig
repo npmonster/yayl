@@ -67,6 +67,15 @@ fn permissionBits(p: std.Io.File.Permissions) std.Io.File.Permissions {
     return @enumFromInt(@as(u32, @intFromEnum(p)) & 0o7777);
 }
 
+/// The mode to create a temp file with: restrictive, so there is never a
+/// window in which it is wider than the target. The target's exact mode is
+/// applied with `fchmod` afterwards (which ignores the umask). Windows
+/// attributes are not modes, so the default stands there.
+fn restrictivePermissions() std.Io.File.Permissions {
+    if (comptime builtin.os.tag == .windows) return .default_file;
+    return @enumFromInt(0o600);
+}
+
 /// I/O failures plus the parse-error vocabulary the document layer can
 /// surface. A convenience vocabulary for callers, NOT an annotation: the
 /// public functions use inferred error sets, so they can also return
@@ -115,12 +124,17 @@ pub fn writeBytesAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
     const tmp_suffix_max = ".yayl-tmp-".len + 10; // u32, widest decimal
     var buf: [std.fs.max_path_bytes + tmp_suffix_max]u8 = undefined;
     const cwd = std.Io.Dir.cwd();
-    // Preserve the target's permissions across the rename: a fresh temp
-    // file takes the umask default, so renaming it over a 0o600 secret
-    // would silently widen it. With no target, the default stands.
+    // Preserve the target's permissions across the rename. The temp is
+    // created RESTRICTIVELY so it is never wider than the target, then its
+    // exact mode is set with fchmod: a create mode is filtered by the
+    // umask (022 strips group/other write), so a 0o666 target would
+    // otherwise come back narrowed to 0o644. With no target the default
+    // mode stands.
     var create_flags: std.Io.Dir.CreateFileOptions = .{ .truncate = true, .exclusive = true };
+    var restore_mode: ?std.Io.File.Permissions = null;
     if (cwd.statFile(io, path, .{})) |st| {
-        create_flags.permissions = permissionBits(st.permissions);
+        restore_mode = permissionBits(st.permissions);
+        create_flags.permissions = restrictivePermissions();
     } else |_| {}
     var attempt: usize = 0;
     while (true) {
@@ -142,6 +156,7 @@ pub fn writeBytesAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
             if (file_open) file.close(io);
             if (!committed) cwd.deleteFile(io, tmp_path) catch {};
         }
+        if (restore_mode) |mode| try file.setPermissions(io, mode);
         try file.writeStreamingAll(io, bytes);
         // Flush to stable storage before the rename so the visible
         // file never contains torn content after a crash.
@@ -324,15 +339,25 @@ test "atomic write preserves the target's permissions" {
         const path = "zig-out-test-perms.yaml";
         defer cwd.deleteFile(io, path) catch {};
 
-        // A secret-bearing file, then an atomic rewrite of it: the temp
-        // file must inherit 0o600 rather than the umask default.
-        const secret: std.Io.File.Permissions = @enumFromInt(0o600);
-        {
-            var f = try cwd.createFile(io, path, .{ .truncate = true, .permissions = secret });
-            f.close(io);
+        // Every case must survive an atomic rewrite with its mode intact.
+        // 0o600 is umask-immune; 0o666 is the case that catches the bug --
+        // a create mode is filtered by the umask (022 strips group/other
+        // write), so relying on createFile's mode narrowed it to 0o644.
+        // fchmod ignores the umask, which is why the fix uses it.
+        const modes = [_]std.Io.File.Permissions{
+            @enumFromInt(0o600), @enumFromInt(0o666), @enumFromInt(0o640),
+        };
+        for (modes) |want| {
+            {
+                // Establish the target's mode explicitly: createFile's own
+                // mode is umask-filtered and cannot set 0o666.
+                var f = try cwd.createFile(io, path, .{ .truncate = true });
+                try f.setPermissions(io, want);
+                f.close(io);
+            }
+            try writeBytesAtomic(io, path, "a: 3\n");
+            const st = try cwd.statFile(io, path, .{});
+            try testing.expectEqual(want, permissionBits(st.permissions));
         }
-        try writeBytesAtomic(io, path, "a: 2\n");
-        const st = try cwd.statFile(io, path, .{});
-        try testing.expectEqual(secret, permissionBits(st.permissions));
     }
 }

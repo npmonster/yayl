@@ -66,8 +66,9 @@ regression test:
   rather than a range violation; and `value`/`schema` now share one scalar
   interpreter (`parseCoreInt` / `parseCoreFloat`).
 - **File M12.** Atomic writes took the umask default for the temp file, so
-  rewriting a 0o600 secret widened it; the target's permission bits are now
-  carried across the rename.
+  rewriting a 0o600 secret widened it. The temp is now created restrictively
+  and the target's exact mode is applied with `fchmod`; a create mode is
+  umask-filtered, which narrowed a 0o666 target to 0o644.
 - **Parser M14.** `%TAG` handles/prefixes are validated (`%TAG foo bar` and
   `%TAG !e tag:x` were accepted before).
 - **Harness.** Two report writers share one JSON escaper; the round-trip
