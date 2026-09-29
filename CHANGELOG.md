@@ -277,6 +277,21 @@ now says so. Its list of expected errors was kept by hand and lacked
 alias would have been reported as a harness failure; the list is now
 derived from the library's error sets.
 
+**`parseAll` copied the whole stream into every document.** Each
+document of a multi-document stream duplicated the *entire* input into
+its own arena (its spans are offsets into the stream), so memory was
+documents x stream: doubling the input quadrupled it, a 32 KiB stream of
+tiny documents held 180 MB, and 1 MiB of `---\na: 1\n` (116,509
+documents) wanted about 114 GiB, enough to exhaust a 64 GB machine,
+while `max_input_bytes` (64 MiB) bounded nothing. The stream is now
+copied once and shared by reference count: the last document to be
+deinitialized frees it, documents stay valid in any order of release,
+and the same 1 MiB stream holds about 190 MB (about 1.6 KB per document,
+linear). Emitted bytes, spans and the public API are unchanged; the
+conformance, round-trip, preservation and libfyaml gates produce
+identical output. `SECURITY.md` and the memory model in `docs/USAGE.md`
+now state what a stream costs. (#1)
+
 ### Changed
 
 - `edit.cloneTreeWhole` is removed. It existed for the clone the undo

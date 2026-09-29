@@ -719,6 +719,43 @@ fn looksLikeFloat(value: []const u8) bool {
     return i == value.len;
 }
 
+/// One immutable copy of a parsed stream, shared by every `Document`
+/// parsed from it.
+///
+/// Node spans are absolute byte offsets into the stream, so each document
+/// needs the stream's bytes (not only its own region) for as long as it
+/// lives. Giving every document its own copy costs documents x stream:
+/// doubling the input quadrupled the memory, and 1 MiB of 9-byte documents
+/// wanted ~114 GiB. One copy, released with the last document that
+/// references it, costs one stream and leaves every document valid however
+/// its siblings are freed.
+const SharedSource = struct {
+    allocator: std.mem.Allocator,
+    bytes: []u8,
+    refs: std.atomic.Value(usize),
+
+    /// Copy `input`. The caller holds the first reference.
+    fn create(allocator: std.mem.Allocator, input: []const u8) !*SharedSource {
+        const self = try allocator.create(SharedSource);
+        errdefer allocator.destroy(self);
+        const bytes = try allocator.dupe(u8, input);
+        self.* = .{ .allocator = allocator, .bytes = bytes, .refs = .init(1) };
+        return self;
+    }
+
+    fn retain(self: *SharedSource) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    /// Drop one reference; the last one frees the copy.
+    fn release(self: *SharedSource) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const allocator = self.allocator;
+        allocator.free(self.bytes);
+        allocator.destroy(self);
+    }
+};
+
 /// A parsed YAML document. All nodes live in `pool`; `deinit` releases
 /// everything in one go.
 pub const Document = struct {
@@ -729,17 +766,20 @@ pub const Document = struct {
     tag_directives: std.ArrayList(TagDirective) = .empty,
     explicit_start: bool = false,
     explicit_end: bool = false,
-    /// The original input this document was parsed from, duplicated
-    /// into the pool so the document owns its bytes. Null for
-    /// programmatically built documents. Every parsed document carries
-    /// its own copy (a multi-document stream duplicates once per
-    /// document); this is what makes byte-faithful round trips
-    /// possible.
+    /// The original input this document was parsed from, kept so the
+    /// document owns its bytes. Null for programmatically built
+    /// documents. This is what makes byte-faithful round trips possible.
+    /// The documents of one stream (`parseAll`) read it through a single
+    /// shared copy, reference-counted by `shared_source`, so a stream of
+    /// any number of documents holds the input once.
     ///
     /// PORT NOTE: libfyaml borrows the reader's buffer instead; here
     /// the copy keeps the documented ownership model (a Document is
     /// valid after the caller frees the input).
     source: ?[]const u8 = null,
+    /// Owner of `source` (null exactly when `source` is null). Internal:
+    /// `deinit` drops this document's reference.
+    shared_source: ?*SharedSource = null,
     /// Round-trip region of this document within `source`:
     /// [region_start, body_start) is the verbatim head (directives,
     /// `---`, leading comments), the root node's span is the body, and
@@ -763,7 +803,24 @@ pub const Document = struct {
     pub fn deinit(self: *Document) void {
         self.tag_directives.deinit(self.allocator);
         self.pool.deinit();
+        if (self.shared_source) |shared| shared.release();
         self.* = undefined;
+    }
+
+    /// Read the stream through `shared`, taking a reference that `deinit`
+    /// drops. Cannot fail, so a document can be published for cleanup
+    /// before anything that can.
+    fn shareSource(self: *Document, shared: *SharedSource) void {
+        shared.retain();
+        self.shared_source = shared;
+        self.source = shared.bytes;
+    }
+
+    /// Give this document a copy of `input` that no other document shares.
+    fn ownSource(self: *Document, input: []const u8) !void {
+        const shared = try SharedSource.create(self.allocator, input);
+        self.shared_source = shared;
+        self.source = shared.bytes;
     }
 
     /// Parse the first document of `input`. Extra documents in the same
@@ -848,7 +905,7 @@ pub const Document = struct {
     fn rootlessDocument(allocator: std.mem.Allocator, input: []const u8) !Document {
         var d = Document.init(allocator);
         errdefer d.deinit();
-        d.source = try d.pool.dupe(input);
+        try d.ownSource(input);
         d.region_start = 0;
         d.body_start = input.len;
         d.body_end = input.len;
@@ -861,6 +918,12 @@ pub const Document = struct {
         var doc: ?Document = null;
         var builder: ?Builder = null;
         var cursor: usize = 0;
+        // ONE copy of the stream for every document parsed from it (see
+        // `SharedSource`). This function holds the creating reference
+        // until it returns, so a failure before the first document, or
+        // after every document is already freed, cannot leak the copy.
+        var stream_source: ?*SharedSource = null;
+        defer if (stream_source) |shared| shared.release();
         errdefer {
             // Release every finished document plus the one in flight.
             for (docs.items) |*d| d.deinit();
@@ -881,10 +944,13 @@ pub const Document = struct {
                     const d = &doc.?;
                     d.version = ev.data.document_start.version;
                     d.explicit_start = !ev.data.document_start.implicit;
-                    // Copy the stream input into this document's pool so
-                    // presentation spans stay valid for the document's
-                    // whole lifetime.
-                    d.source = try d.pool.dupe(input);
+                    // Presentation spans are offsets into the stream, so
+                    // the document keeps the stream's bytes alive for its
+                    // whole lifetime. The copy is made once and shared:
+                    // copying it per document made memory documents x
+                    // stream.
+                    if (stream_source == null) stream_source = try SharedSource.create(allocator, input);
+                    d.shareSource(stream_source.?);
                     d.region_start = cursor;
                     // Copy directive strings into the pool so the document
                     // does not depend on the parser's lifetime. The two
@@ -2777,6 +2843,64 @@ test "writeAll reproduces a parsed stream byte for byte" {
         defer allocator.free(out);
         try testing.expectEqualStrings(input, out);
     }
+}
+
+test "parseAll holds one copy of the stream, however many documents it has" {
+    // Every document used to duplicate the WHOLE stream into its own
+    // arena, so memory was documents x stream: doubling the input
+    // quadrupled it, and 1 MiB of nine-byte documents wanted ~114 GiB
+    // (a 32 KiB stream measured 180 MB). Growth is linear in the input
+    // now. Measured as live bytes with a counting allocator, so the test
+    // needs no large allocation of its own and catches the regression at
+    // a size where the old code was already 16x apart.
+    const allocator = std.testing.allocator;
+    var live: [2]usize = undefined;
+    const doc_counts = [_]usize{ 400, 1600 };
+    for (doc_counts, 0..) |count, i| {
+        var stream: std.ArrayList(u8) = .empty;
+        defer stream.deinit(allocator);
+        for (0..count) |_| try stream.appendSlice(allocator, "---\na: 1\n");
+
+        var counting = std.testing.FailingAllocator.init(allocator, .{});
+        const counted = counting.allocator();
+        var docs = try Document.parseAll(counted, stream.items);
+        defer docs.deinit(counted);
+        try testing.expectEqual(count, docs.items.len);
+        live[i] = counting.allocated_bytes - counting.freed_bytes;
+        for (docs.items) |*d| d.deinit();
+    }
+    // 4x the documents: linear growth is ~4x, the per-document copy was
+    // ~16x. The slack absorbs allocator and arena rounding.
+    try testing.expect(live[1] < live[0] * 6);
+}
+
+test "documents of one stream stay valid in any order of release" {
+    // The shared copy of the stream is reference-counted, so a document
+    // must keep working after any of its siblings is gone, and the copy
+    // must be freed exactly once (the testing allocator reports both a
+    // leak and a double free).
+    const allocator = std.testing.allocator;
+    const input = "---\na: 1 # one\n---\nb: 2 # two\n---\nc: 3 # three\n";
+    var docs = try Document.parseAll(allocator, input);
+    defer docs.deinit(allocator);
+    try testing.expectEqual(@as(usize, 3), docs.items.len);
+
+    // Release the first and last; the middle one is the survivor.
+    docs.items[0].deinit();
+    docs.items[2].deinit();
+    const out = try docs.items[1].write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("---\nb: 2 # two\n", out);
+    try testing.expectEqualStrings("2", docs.items[1].pathGet(&.{"b"}).?.scalarValue().?);
+    docs.items[1].deinit();
+}
+
+test "a stream that fails after its first document releases the shared copy" {
+    // The failure path frees the finished documents and the one in
+    // flight; the copy they share must go with the last of them.
+    const allocator = std.testing.allocator;
+    try testing.expectError(error.InvalidSyntax, Document.parseAll(allocator, "a: 1\n---\nb: [\n"));
+    try testing.expectError(error.InvalidSyntax, Document.parseAll(allocator, "---\na: 1\n---\nb: 2\n---\nc: {\n"));
 }
 
 test "writeAll separates documents that would otherwise merge" {

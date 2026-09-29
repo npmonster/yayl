@@ -758,8 +758,12 @@ read time, before the bytes reach the parser.
 
 ## Memory and error model
 
-* Every `Document` owns an arena (`yaml.Pool`); nodes, strings,
-  copied source bytes, and edits live until `Document.deinit()`.
+* Every `Document` owns an arena (`yaml.Pool`); nodes, strings, and
+  edits live until `Document.deinit()`. The input a document was parsed
+  from is kept as well, and the documents of one stream (`parseAll`)
+  share a single copy of it, freed with the last of them: a stream costs
+  its input once plus each document's own tree, not the input once per
+  document. Documents can be released in any order.
 * `parseToValue`, `nodeToValue`, and `fromZig` return fully owned
   trees. Release them with `freeValue` and the same allocator.
 * `toZig` owns all slice storage in its result, including

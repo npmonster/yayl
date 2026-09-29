@@ -11,9 +11,10 @@
 //! the whole input in memory; there is no chunked reader.
 //!
 //! The load-bearing reason is round-trip fidelity, not scanning.
-//! `Document.parse` duplicates the entire input into the document's
-//! pool (`document.zig`, `d.source = try d.pool.dupe(input)`), and
-//! every `Node.src` is an absolute byte offset into that copy. Faithful
+//! `Document.parse` keeps a copy of the entire input for the document
+//! (`document.zig`, `SharedSource`: one copy per stream, shared by its
+//! documents), and every `Node.src` is an absolute byte offset into
+//! that copy. Faithful
 //! emission is then literally `src[a..b]` slicing: "untouched bytes are
 //! exact" is a promise that the original bytes are still there to
 //! copy. A reader that discards consumed chunks cannot keep that
