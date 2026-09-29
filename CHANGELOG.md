@@ -203,7 +203,7 @@ its old parent. (Found while checking the undo journal.)
 document or went to the wrong entry.** The comment sweep only wrote
 comments; a second sweep now follows every write with one of five edits
 next to it (delete the entry, its neighbours or the first entry; insert
-before it), 7,327 cases, and checks that the output re-parses to the
+before it), 7,334 cases, and checks that the output re-parses to the
 tree the same edit gives without the comment, writes it at most once,
 and puts it where the in-memory reads said it was. Run against the code
 before these fixes it reports 1,936 failures: 102 outputs that do not
