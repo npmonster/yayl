@@ -197,6 +197,63 @@ clears the attached node's own span and marks it, so it is written at
 its new position like a moved node, and a node set as the root leaves
 its old parent. (Found while checking the undo journal.)
 
+**A written leading comment next to a structural edit broke the
+document or went to the wrong entry.** The comment sweep only wrote
+comments; a second sweep now follows every write with one of five edits
+next to it (delete the entry, its neighbours or the first entry; insert
+before it), 7,327 cases, and checks that the output re-parses to the
+tree the same edit gives without the comment, writes it at most once,
+and puts it where the in-memory reads said it was. Run against the code
+before these fixes it reports 1,936 failures: 102 outputs that do not
+parse, 8 changed trees, and the rest comments that read back from a
+different node than the one holding them in memory.
+
+- A block written above a collection's first entry, with that entry then
+  deleted or moved, was followed by the entry's indentation on top of the
+  successor's own: `items:\n  # new\n    - name: y` (unparseable), or a
+  mapping silently re-nested one level down.
+- A block on a new first item left the original item after it at
+  column 0, which did not parse.
+- After an insert ahead of an item, a block written on that item went
+  above the new first item: which entry shares a collection's line is
+  now read from the tree as it is, not from the source lines. The reads
+  follow the same rule, and a block on an entry that has since become
+  first is still read.
+- A collection's trailing comment read its source end, stale once its
+  last entry changed; it now reads its last entry's. A `? key` with no
+  value reads the comment written on its value, which follows the key.
+- Comments written inside a new subtree (`$.c.x` after setting `$.c` to a
+  new mapping) were accepted, read back in memory and dropped on write;
+  they are refused with `error.InvalidSyntax`, as the emitter lays those
+  subtrees out afresh. A block on an emptied block value is kept above
+  its `{}`.
+
+A block written through any node on a line now replaces what is written
+above that line, and lives as long as the outermost node on it: a
+collection's first entry shares the collection's line, so its block
+stays above whichever entry is first, as a source comment does, while a
+later entry's block is deleted with it (`Document.setLeadingComments`,
+USAGE). A leading block on an empty first entry (`- ` over `- b`) is now
+written above the line it shares with its collection, where it reads
+back, instead of being refused.
+
+**Edits beside property lines and bare indicators.** Three edits wrote
+YAML that does not parse, all on main:
+
+- A new first entry of a collection whose anchor or tag sits on a line of
+  its own went above that line: `&sequence\n- a` with an item inserted
+  first became `- zz\n&sequence\n- a`, and setting its first entry
+  moved that entry above it too. The preservation sweep skipped every
+  such collection for this reason; it now sweeps them (488 deletes, 428
+  sets, 173 inserts and 1,997 moves over the fixtures, up from 474, 418,
+  166 and 1,955), where the code before this fix fails 16 of them.
+- Emptying a collection whose `-` stood alone on the line above it
+  (`-\n  - x`) wrote its `[]` at column 0, outside the item.
+- Deleting an explicit-key pair whose `:` stood on a line of its own
+  (`? a\n  :`) left the `:` behind (`{}\n  :`). A valueless pair now ends
+  at its value indicator wherever it is, which also makes the position
+  after that `:` a trailing comment position of the value.
+
 **The fuzz harness.** Its header claimed Zig 0.16.0 has no
 `std.testing.fuzz`; it has one, whose coverage-guided mode does not build
 on that toolchain (a type error in its own test runner), and the note
@@ -221,6 +278,9 @@ derived from the library's error sets.
   that matches nothing, so the two could not be told apart (asked for in
   #12). The single-target edits (`insert`, `append`, `move`) report the
   same, as `set` already did.
+- `Document.markModified` and `Document.retargetAliases` return an error
+  union (`!void`): a batch records their changes in its undo journal,
+  which can run out of memory. Callers add `try`.
 - `value.Limits` has a `max_bytes` field and `ParseOptions` a
   `max_merge_nodes` field (see Fixed); `diag.YamlError` gains
   `LimitExceeded`.

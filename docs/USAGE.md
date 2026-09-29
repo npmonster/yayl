@@ -447,9 +447,11 @@ entry, newline-joined (`"# one\n# two"`). A blank line breaks the
 attachment, which is what makes "belongs to this entry" decidable. For a
 pair, the value stands in for the entry: an inline value (`host:
 localhost`) reads the pair's comments, and a block value (a mapping or
-sequence on its own line) reads the comments above it. A container's
-trailing comment is the one on its last entry's line, so the collection
-and that entry read the same bytes.
+sequence on its own line) reads the comments above it. Every node that
+starts on a line reads that line's block — a collection and its first
+entry, an item and its mapping's first key. A container's trailing
+comment is the one on its last entry's line, so the collection and that
+entry read the same bytes.
 
 Writes take the same raw form and canonicalize only the spacing:
 
@@ -468,12 +470,25 @@ unchanged scalars, asserted per position by `make preservation`.
 Comments work on brand-new values too: set a value with `pathSet`,
 then annotate it.
 
+A leading block belongs to its line: a write through any node on it
+replaces what is written there, and the block lives as long as the
+outermost node on the line. A collection's first entry shares the
+collection's line, so its block stays above whichever entry is first —
+after that entry is deleted, or another is inserted ahead of it — as a
+comment in the source would; a later entry owns its own line, and its
+block is deleted with it. After an edit, the reads follow the tree as it
+is now; source comments stay where the source put them, so one left
+above a deleted neighbour reads as that neighbour's until the document
+is written and parsed again.
+
 Rejected with `error.InvalidSyntax`, rather than silently dropped at
 emission time: comment text that is not one raw comment (no `#`, or a
 line break in a trailing comment), trailing comments on block
 collections (address the last entry), on the pair's key (the comment
 follows the value), on literal/folded or multi-line scalars (the value
-owns its lines), and anything inside a flow collection. Bytes the
+owns its lines), anything inside a flow collection, and anything inside
+a new or moved subtree, which is laid out afresh without comments (a new
+entry itself takes them). Bytes the
 scanner would refuse on re-parse are refused on the way in, so a write
 never produces a document `parse` cannot read back: malformed UTF-8 is
 `error.InvalidUtf8`, a NUL is `error.InvalidSyntax`. Everything the

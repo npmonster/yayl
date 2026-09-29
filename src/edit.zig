@@ -1517,6 +1517,51 @@ fn deleteBatch(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("a: 1\n", out);
 }
 
+test "a new first entry goes below the container's own property line" {
+    // Properties on a line of their own are the container's header; the
+    // new item was written above them (`- zz\n&sequence\n- a`), which
+    // does not parse. The preservation sweep skipped every such
+    // container for this; it now sweeps them.
+    const cases = [_]struct { in: []const u8, seq: []const u8, out: []const u8 }{
+        .{ .in = "&sequence\n- a\n", .seq = "$", .out = "&sequence\n- zz\n- a\n" },
+        .{ .in = "sequence: !!seq\n- entry\n- !!seq\n - nested\n", .seq = "$.sequence[1]", .out = "sequence: !!seq\n- entry\n- !!seq\n - zz\n - nested\n" },
+        .{ .in = "k: &a\n  - x\n", .seq = "$.k", .out = "k: &a\n  - zz\n  - x\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const pos = try std.fmt.allocPrint(testing.allocator, "{s}[0]", .{c.seq});
+        defer testing.allocator.free(pos);
+        try ed.apply(&.{.{ .insert = .{ .sequence = c.seq, .position = pos, .value = try doc.createScalar("zz", .plain), .before = true } }});
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+}
+
+test "emptying a collection under an indicator alone on its line" {
+    // `-` over `  - x`: the deleted entry's tombstone took the next
+    // line's indentation, and `[]` landed at column 0, out of the item.
+    // And an explicit key's `:` on a line of its own belongs to its
+    // pair: it stayed behind when the pair was deleted (`{}\n  :`).
+    const cases = [_]struct { in: []const u8, del: []const u8, out: []const u8 }{
+        .{ .in = "- a\n-\n  - x\n", .del = "$[1][0]", .out = "- a\n-\n  []\n" },
+        .{ .in = "-\n foo: bar\n-\n - x\n", .del = "$[1][0]", .out = "-\n foo: bar\n-\n []\n" },
+        .{ .in = "k:\n  ? a\n  :\nx: 1\n", .del = "$.k.a", .out = "k:\n  {}\nx: 1\n" },
+        .{ .in = "k:\n  ? a\n  :\n  ? b\n  : c\nx: 1\n", .del = "$.k.a", .out = "k:\n  ? b\n  : c\nx: 1\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete(c.del);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+}
+
 test "emptying a collection keeps the value's placement under its key" {
     // Removing a container's LAST entry leaves `{}` / `[]` behind. The
     // bytes between the key's colon and the (now departed) first entry

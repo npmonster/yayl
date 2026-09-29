@@ -244,6 +244,19 @@ pub const Node = struct {
     /// programmatically has no source bytes and reads null until
     /// something is written.
     pub fn trailingComment(self: *const Node, doc: *const Document) ?[]const u8 {
+        if (!trailingPlaced(self)) return null;
+        // A block collection's trailing comment is its LAST entry's, as
+        // the entries are now: after an edit its source end is another
+        // entry's line, or a deleted one's.
+        const last: ?*const Node = switch (self.data) {
+            .mapping => |m| if (m.style == .block and m.pairs.items.len > 0) m.pairs.items[m.pairs.items.len - 1].value else null,
+            .sequence => |sq| if (sq.style == .block and sq.items.items.len > 0) sq.items.items[sq.items.items.len - 1] else null,
+            else => null,
+        };
+        if (last) |l| return l.trailingComment(doc);
+        // `? key # c` with no value: the comment after the key is its
+        // empty value's (where it is written), and both read it.
+        if (emptyValueAfterKey(self, doc.source orelse "")) |v| return v.trailingComment(doc);
         if (self.pending_trailing) |t| return if (t.len == 0) null else t;
         const doc_src = doc.source orelse return null;
         const at = trailingAnchor(self, doc_src) orelse return null;
@@ -260,14 +273,33 @@ pub const Node = struct {
     /// line; for an inline value (`host: localhost`) the value stands in
     /// for the pair and reads the pair's block, so key and value read
     /// the same bytes; for a block value (a mapping or sequence on its
-    /// own line) the comments above it are its own. Free-floating
+    /// own line) the comments above it are its own. Every node starting
+    /// on a line reads that line's block: a collection and its first
+    /// entry, an item and its mapping's first key. Free-floating
     /// comments -- separated by a blank line, or in the document head
     /// before `---` -- attach to nothing.
+    ///
+    /// After an edit the reads follow the tree as it is now: which entry
+    /// is first, and a block written on an entry wherever that entry now
+    /// is. Nothing inside a new or moved subtree reads a comment -- the
+    /// emitter lays it out afresh, without any. Source comments are read
+    /// where the source put them, so a comment left above a deleted
+    /// neighbour reads as that neighbour's until the document is written
+    /// and parsed again.
     pub fn leadingComments(self: *const Node, doc: *const Document) ?[]const u8 {
-        const owner = if (doc.source) |src| leadingOwner(self, src) else self;
-        if (owner.pending_leading) |t| return if (t.len == 0) null else t;
+        const src = doc.source orelse return null;
+        const owner = leadingOwner(self, src);
+        if (!leadingPlaced(owner)) return null;
+        // A block written on any node that starts on the line is written
+        // above it -- including one written on an entry that has since
+        // become its container's first (an earlier sibling deleted).
+        var c: ?*const Node = owner;
+        while (c) |n| : (c = nextOnLine(n, src)) {
+            if (ownerPending(n, src)) |t| if (t.len > 0) return t;
+        }
+        if (owner.pending_leading) |t| if (t.len == 0) return null; // deleted
         const span = doc.leadingSourceSpan(owner) orelse return null;
-        return doc.source.?[span[0]..span[1]];
+        return src[span[0]..span[1]];
     }
 };
 
@@ -284,7 +316,9 @@ fn trailingAnchor(node: *const Node, source: []const u8) ?usize {
         .mapping => |m| for (m.pairs.items) |pair| {
             if (pair.value != node) continue;
             const ks = realSpan(pair.key) orelse return null;
-            const after = markup.colonEnd(source, ks.end);
+            // Past the value indicator, which for an explicit key can sit
+            // on a line of its own (`? a` over `: # c`).
+            const after = pair.src_end orelse markup.colonEnd(source, ks.end);
             // `? >` with no `:` on its line: after the key is inside the
             // block scalar's content, not a comment position.
             if (after == ks.end) switch (pair.key.data) {
@@ -298,46 +332,167 @@ fn trailingAnchor(node: *const Node, source: []const u8) ?usize {
     return null;
 }
 
+/// The empty value of the pair keyed by `key` when nothing -- no `:` --
+/// stands between them, so the value's trailing comment follows the key.
+fn emptyValueAfterKey(key: *const Node, source: []const u8) ?*const Node {
+    const p = key.parent orelse return null;
+    const ps = p.pairs() orelse return null;
+    for (ps) |pair| {
+        if (pair.key != key) continue;
+        const vs = pair.value.src orelse return null;
+        const ks = realSpan(key) orelse return null;
+        if (!vs.synthetic) return null;
+        const at = trailingAnchor(pair.value, source) orelse return null;
+        return if (at == ks.end) pair.value else null;
+    }
+    return null;
+}
+
 /// The node that holds the leading comment block of `node`'s entry
 /// line. Several nodes start on one line: a sequence item's mapping and
-/// its first key share the item's `- `, a block value and the root share
-/// their line with their first entry, and an inline value (`k: v`) sits
-/// on its key's line. All of them read the block above that line, so a
+/// its first key share the item's `- `, a block collection shares its
+/// line with its first entry, and an inline value (`k: v`) sits on its
+/// key's line. All of them read the block above that line, so a
 /// written block belongs to the outermost of them: every node on the
 /// line then reads the same block, its old lines are tombstoned in the
 /// gap that holds them, and the emitter writes the new ones once, where
 /// that node is emitted. Without this the first key of an item recorded
 /// its tombstone in the item's list while the lines sat in the
 /// sequence's gap, and the old block survived beside the new one.
+///
+/// The climb follows the tree as it is NOW, not the source lines: a
+/// node shares its container's line only while it is the container's
+/// first entry. After an insert ahead of it, the old first item has a
+/// line of its own again, and a block written on it goes above it --
+/// reading source lines, it went above the new first item instead. A
+/// new first entry takes the container's line, and a new inline value
+/// its key's, as the emitter lays them out.
 fn leadingOwner(node: anytype, source: []const u8) @TypeOf(node) {
     var n = node;
     var guard: usize = 0;
     climb: while (n.parent) |p| : (guard += 1) {
         if (guard >= Node.max_parent_walk) break;
-        const s = realSpan(n) orelse break;
-        // The line whose block `n` reads: the one its entry starts on
-        // (for the first key of `-\n  k: v`, the `-` line above).
-        const line = markup.lineStart(source, s.entry_start);
         // A flow collection's entries share its line but have no line of
         // their own; they stay themselves (and unwritable).
         if (Document.insideFlow(n)) break;
-        // An inline value hands over to its key: the value sits on the
-        // key's own line, and reads that entry's block.
         switch (p.data) {
-            .mapping => |m| for (m.pairs.items) |pair| {
-                if (pair.value != n) continue;
-                const ks = realSpan(pair.key) orelse break;
-                if (markup.lineStart(source, ks.start) != line) break;
-                n = pair.key;
+            .mapping => |m| for (m.pairs.items, 0..) |pair, i| {
+                if (pair.key == n) {
+                    if (i != 0 or !startsOnFirstEntryLine(p, source)) break :climb;
+                    n = p;
+                    continue :climb;
+                }
+                if (pair.value == n) {
+                    // After a synthetic key (`: v`) the value is the
+                    // entry's first byte and owns its line, climbing as
+                    // a key would: the key has no bytes to hold a block.
+                    if (pair.key.src) |ks| if (ks.synthetic) {
+                        if (i != 0 or !startsOnFirstEntryLine(p, source)) break :climb;
+                        n = p;
+                        continue :climb;
+                    };
+                    // An inline value hands over to its key.
+                    if (!valueOnKeyLine(pair, source)) break :climb;
+                    n = pair.key;
+                    continue :climb;
+                }
+            },
+            .sequence => |sq| {
+                if (sq.items.items.len == 0 or sq.items.items[0] != n) break;
+                if (!startsOnFirstEntryLine(p, source)) break;
+                n = p;
                 continue :climb;
             },
             else => {},
         }
-        const ps = realSpan(p) orelse break;
-        if (markup.lineStart(source, ps.entry_start) != line) break;
-        n = p;
+        break;
     }
     return n;
+}
+
+/// True when a block collection begins on its first entry's line -- the
+/// line whatever entry is first now takes. Not when its properties end
+/// a line of their own (`k: &a !!map` over `  x: 1`): the first entry
+/// then has a line, and a block, of its own.
+fn startsOnFirstEntryLine(container: *const Node, source: []const u8) bool {
+    const cs = realSpan(container) orelse return true;
+    return markup.propertiesLineEnd(source, cs.start) == null;
+}
+
+/// True when a mapping value sits on its key's line: by the source when
+/// both have bytes of their own, and by the emitter's layout otherwise
+/// (`internal.inlineValue`). An empty value's point span is on the key's
+/// line.
+fn valueOnKeyLine(pair: Pair, source: []const u8) bool {
+    // A new key: the value is laid out after it.
+    const ks = realSpan(pair.key) orelse return internal.inlineValue(pair.value);
+    const vs = pair.value.src orelse return internal.inlineValue(pair.value);
+    if (vs.synthetic) return true;
+    return markup.lineStart(source, vs.entry_start) == markup.lineStart(source, ks.start);
+}
+
+/// True when the faithful emitter reaches `node` by walking entries --
+/// the root, or an entry of a container that itself has source bytes,
+/// all the way up. Below a node with none (a new or moved subtree, a
+/// replaced root) everything is laid out afresh: comments written there
+/// are never emitted, and source comments no longer describe it.
+fn walkedFaithfully(node: *const Node) bool {
+    var cur = node.parent;
+    var guard: usize = 0;
+    while (cur) |c| : (guard += 1) {
+        if (guard >= Node.max_parent_walk) return false;
+        if (realSpan(c) == null) return false;
+        cur = c.parent;
+    }
+    return true;
+}
+
+/// The written block the emitter puts above `owner`'s line, if any. For a
+/// key that is the pair's (`internal.pairLeadingOverride`), which a value
+/// carried into the pair can hold.
+fn ownerPending(owner: *const Node, source: []const u8) ?[]const u8 {
+    if (owner.parent) |p| if (p.pairs()) |ps| for (ps) |pair| {
+        if (pair.key == owner) return internal.pairLeadingOverride(source, pair.key, pair.value);
+    };
+    return owner.pending_leading;
+}
+
+/// The next node that starts on `node`'s line, going in: a block
+/// collection's first entry (for a mapping its key, or the value after a
+/// synthetic key), or null. A key's inline value is covered by the key
+/// (`ownerPending`).
+fn nextOnLine(node: anytype, source: []const u8) ?@TypeOf(node) {
+    switch (node.data) {
+        .mapping => |m| {
+            if (m.style == .flow or m.pairs.items.len == 0 or !startsOnFirstEntryLine(node, source)) return null;
+            const first = m.pairs.items[0];
+            if (first.key.src) |ks| if (ks.synthetic) return first.value;
+            return first.key;
+        },
+        .sequence => |sq| {
+            if (sq.style == .flow or sq.items.items.len == 0 or !startsOnFirstEntryLine(node, source)) return null;
+            return sq.items.items[0];
+        },
+        else => return null,
+    }
+}
+
+/// True when a trailing comment on `node` is written where it reads
+/// back: an entry the faithful emitter walks to, or a root with source
+/// bytes (a replaced root is laid out afresh, without one).
+fn trailingPlaced(node: *const Node) bool {
+    if (!walkedFaithfully(node)) return false;
+    return node.parent != null or node.src != null;
+}
+
+/// True when a leading block on `owner` (see `leadingOwner`) is written
+/// where it reads back: `owner` is walked faithfully, and a block value
+/// -- the one owner that is not an entry -- has the source line the
+/// emitter writes its block above.
+fn leadingPlaced(owner: *const Node) bool {
+    if (!walkedFaithfully(owner)) return false;
+    if (Document.isMappingValue(owner)) return realSpan(owner) != null;
+    return true;
 }
 
 /// Where the bytes that can hold `owner`'s leading block begin: past
@@ -1305,9 +1460,10 @@ pub const Document = struct {
     /// line, so address it through that entry. A comment is not
     /// addressable inside a flow collection, and a block scalar's value
     /// owns every line after its header, so `setTrailingComment`
-    /// rejects containers, flow-positioned nodes, and literal/folded
-    /// scalars with `error.InvalidSyntax` rather than silently dropping
-    /// the write at emission time.
+    /// rejects containers, flow-positioned nodes, literal/folded scalars
+    /// and nodes inside a new or moved subtree (laid out afresh, without
+    /// comments) with `error.InvalidSyntax` rather than silently
+    /// dropping the write at emission time.
     pub fn setTrailingComment(self: *Document, node: *Node, text: ?[]const u8) !void {
         // Validate the position first: a write that emission would
         // silently drop must fail here instead.
@@ -1336,12 +1492,22 @@ pub const Document = struct {
     /// document's line-terminator convention; a deleted block's lines
     /// disappear whole.
     ///
+    /// The block belongs to the line, not to one node: a write through
+    /// any node starting on it replaces what is written above that line,
+    /// and the block lives as long as the outermost of those nodes. A
+    /// collection's first entry shares the collection's line, so a block
+    /// written there stays above whichever entry is first -- after that
+    /// entry is deleted, or another inserted ahead of it -- as a comment
+    /// in the source would; a later entry owns its own line, and its
+    /// block is deleted with it.
+    ///
     /// Like `setTrailingComment`, set-to-same is a no-op. Rejects nodes
     /// whose comment block cannot be rewritten honestly — a root scalar
     /// (its head is free-floating), a scalar sitting as a block value
     /// (no gap of its own to rewrite), anything inside a flow
-    /// collection, and a block separated from this document's region —
-    /// with `error.InvalidSyntax`.
+    /// collection or inside a new or moved subtree (laid out afresh,
+    /// without comments), and a block separated from this document's
+    /// region — with `error.InvalidSyntax`.
     pub fn setLeadingComments(self: *Document, node_in: *Node, text: ?[]const u8) !void {
         const t: ?[]const u8 = if (text) |raw| try normalizeLeadingText(raw) else null;
         // The block belongs to the outermost node starting on this line.
@@ -1365,13 +1531,50 @@ pub const Document = struct {
         // publish last — a failure before the publish leaves the node
         // untouched (the duplicate is pool garbage, freed with the pool).
         const stored: ?[]const u8 = if (t) |body| try self.pool.dupe(body) else "";
+        const src = self.source.?;
+        // The block replaces everything written above the line. An entry
+        // that became first after a sibling was deleted still carries its
+        // own written block, or its source block in its own gap; both
+        // would be written below the new one.
+        var c: ?*Node = nextOnLine(node, src);
+        while (c) |inner| : (c = nextOnLine(inner, src)) {
+            if (inner.pending_leading == null and !sameLeadingSource(self, inner, node)) {
+                if (self.leadingSourceSpan(inner) != null) try self.tombstoneLeadingBlock(inner);
+            }
+        }
         if (current != null and node.pending_leading == null) try self.tombstoneLeadingBlock(node);
+        c = nextOnLine(node, src);
+        while (c) |inner| : (c = nextOnLine(inner, src)) {
+            clearPendingLeading(inner);
+        }
         node.pending_leading = stored;
         try self.markModified(node);
     }
 
+    /// Drop a written block from `node` (and from a key's inline value,
+    /// which `internal.pairLeadingOverride` also reads). Its source block
+    /// was tombstoned when it was written.
+    fn clearPendingLeading(node: *Node) void {
+        node.pending_leading = null;
+        if (node.parent) |p| if (p.pairs()) |ps| for (ps) |pair| {
+            if (pair.key == node) pair.value.pending_leading = null;
+        };
+    }
+
+    /// True when `inner` reads its source block from the same bytes as
+    /// `outer`: they shared the line in the source.
+    fn sameLeadingSource(self: *const Document, inner: *const Node, outer: *const Node) bool {
+        const a = self.leadingSourceSpan(inner) orelse return true;
+        const b = self.leadingSourceSpan(outer) orelse return false;
+        return a[0] == b[0] and a[1] == b[1];
+    }
+
     /// True when `setTrailingComment` can act on this node.
     fn trailingWritablePosition(self: *const Document, node: *Node) bool {
+        // Below a node with no source bytes the emitter lays everything
+        // out afresh and writes no comments: the write was accepted and
+        // dropped.
+        if (!trailingPlaced(node)) return false;
         // An empty node that reads no trailing comment (an empty item or
         // document) must not take one: it was accepted and never written.
         if (node.src) |s| if (s.synthetic) {
@@ -1401,6 +1604,9 @@ pub const Document = struct {
     /// has a gap of its own, and that gap is rewritable verbatim bytes.
     fn leadingPositionWritable(self: *const Document, node: *Node) bool {
         if (insideFlow(node)) return false;
+        // Inside a new or moved subtree, or under a replaced root: laid
+        // out afresh, and a written block was accepted and dropped.
+        if (!leadingPlaced(node)) return false;
         // An empty node's span is a point borrowed from the next token:
         // it has no line of its own to write a block above, and reads
         // none. The write used to be accepted and then dropped.
@@ -1494,6 +1700,15 @@ pub const Document = struct {
             if (i >= line.len or line[i] != '#') return error.InvalidSyntax;
         }
         return t;
+    }
+
+    fn isMappingValue(node: *const Node) bool {
+        const parent = node.parent orelse return false;
+        const ps = parent.pairs() orelse return false;
+        for (ps) |p| {
+            if (p.value == node) return true;
+        }
+        return false;
     }
 
     fn isMappingKey(node: *const Node) bool {
@@ -2104,7 +2319,7 @@ const Builder = struct {
                     // and must not be trusted.
                     const key_end: usize = if (key.src) |ks| ks.end else key.mark.offset;
                     const pair_end: usize = if (n.src) |vs|
-                        (if (vs.synthetic) markup.colonEnd(self.source, key_end) else vs.end)
+                        (if (vs.synthetic) markup.valueIndicatorEnd(self.source, key_end, vs.start) else vs.end)
                     else
                         key_end;
                     if (frame.node.data == .mapping) {
@@ -3086,9 +3301,21 @@ test "comment reads: block scalar content and property-only nodes" {
 test "comment write: an empty node has no line of its own and is refused" {
     // Its span is a point borrowed from the next token; the write was
     // accepted and then silently dropped.
-    var doc = try Document.parse(testing.allocator, "- \n- b\n");
+    var doc = try Document.parse(testing.allocator, "- a\n- \n- b\n");
     defer doc.deinit();
-    try testing.expectError(error.InvalidSyntax, doc.setLeadingComments(doc.root.?.items().?[0], "# c"));
+    try testing.expectError(error.InvalidSyntax, doc.setLeadingComments(doc.root.?.items().?[1], "# c"));
+
+    // Unless it is first: then it shares the line of the collection it
+    // opens, and the block is the collection's, above that line.
+    var first = try Document.parse(testing.allocator, "- \n- b\n");
+    defer first.deinit();
+    try first.setLeadingComments(first.root.?.items().?[0], "# c");
+    const out = try first.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# c\n- \n- b\n", out);
+    var again = try Document.parse(testing.allocator, out);
+    defer again.deinit();
+    try testing.expectEqualStrings("# c", again.root.?.items().?[0].leadingComments(&again).?);
 }
 
 test "comment write: a multi-line key stays a key" {
@@ -3133,10 +3360,22 @@ test "comment reads and writes: a trailing comment on an empty value" {
         try testing.expectError(error.InvalidSyntax, doc.setTrailingComment(doc.root.?.items().?[0], "# c"));
     }
     {
-        // After a block scalar key is inside its content.
-        var doc = try Document.parse(testing.allocator, "? >\n  a\n:\n");
+        // After a block scalar key with no `:` is inside its content.
+        var doc = try Document.parse(testing.allocator, "? >\n  a\n? b\n");
         defer doc.deinit();
         try testing.expectError(error.InvalidSyntax, doc.setTrailingComment(doc.root.?.pairs().?[0].value, "# c"));
+    }
+    {
+        // Its `:` on a line of its own is the value's position.
+        var doc = try Document.parse(testing.allocator, "? >\n  a\n:\n");
+        defer doc.deinit();
+        try doc.setTrailingComment(doc.root.?.pairs().?[0].value, "# c");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("? >\n  a\n: # c\n", out);
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        try testing.expectEqualStrings("# c", again.root.?.pairs().?[0].value.trailingComment(&again).?);
     }
 }
 
@@ -3220,6 +3459,188 @@ test "comment round trip: every written comment survives write and re-parse" {
     try testing.expectEqualStrings("# doc head", again.pathGet(&.{"a"}).?.leadingComments(&again).?);
     const items = again.pathGet(&.{"b"}).?.items().?;
     try testing.expectEqualStrings("# tail of y", items[1].trailingComment(&again).?);
+}
+
+test "comment write then edit: the block stays where it reads back" {
+    // A written leading block followed by a structural edit near it: the
+    // comment sweep only ever wrote, so none of these was seen. Each
+    // result must parse, keep the tree, and put the block where the
+    // in-memory reads said it was.
+    const edit_mod = @import("edit.zig");
+    const Case = struct { in: []const u8, lead: []const u8, edit: edit_mod.Edit, out: []const u8 };
+    const cases = [_]Case{
+        // The first entry deleted: its block belongs to the container's
+        // line and stays above the new first entry. The block writer
+        // put that entry's indentation back on top of the successor's
+        // own, two levels deep: a different tree, or none.
+        .{ .in = "items:\n  - name: x\n  - name: y\n    port: 1\n", .lead = "$.items[0]", .edit = .{ .delete = "$.items[0]" }, .out = "items:\n  # new\n  - name: y\n    port: 1\n" },
+        .{ .in = "a:\n  b: 1\n  c:\n    d: 2\n", .lead = "$.a.b", .edit = .{ .delete = "$.a.b" }, .out = "a:\n  # new\n  c:\n    d: 2\n" },
+        .{ .in = "k:\n  - a\n  - b\n", .lead = "$.k[0]", .edit = .{ .delete = "$.k[0]" }, .out = "k:\n  # new\n  - b\n" },
+        .{ .in = "  a: 1\n  b: 2\n", .lead = "$", .edit = .{ .delete = "$.a" }, .out = "  # new\n  b: 2\n" },
+        .{ .in = "a:\n  b: 1\n  c: 2\n", .lead = "$.a.b", .edit = .{ .move = .{ .from = "$.a.b", .to = "$", .key = "z" } }, .out = "a:\n  # new\n  c: 2\nz: 1\n" },
+        // A later entry owns its line: deleted with it.
+        .{ .in = "a:\n  x: 1\n  y: 2\n  z: 3\n", .lead = "$.a.y", .edit = .{ .delete = "$.a.y" }, .out = "a:\n  x: 1\n  z: 3\n" },
+        // Emptied by the delete, the block value keeps its own line and
+        // its block above `{}`.
+        .{ .in = "a: 1\nv:\n  k: x\nb: 2\n", .lead = "$.v", .edit = .{ .delete = "$.v.k" }, .out = "a: 1\nv:\n  # new\n  {}\nb: 2\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = edit_mod.Editor.init(&doc);
+        try doc.setLeadingComments(try ed.one(c.lead), "# new");
+        try ed.apply(&.{c.edit});
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+}
+
+test "comment write after an edit: a block goes where the tree is now" {
+    const edit_mod = @import("edit.zig");
+    {
+        // An insert ahead of `x` gives it a line of its own again: its
+        // block goes above it, not above the new first item (which the
+        // source lines still said shared the sequence's line).
+        var doc = try Document.parse(testing.allocator, "a: 1\nb:\n  - x\n");
+        defer doc.deinit();
+        var ed = edit_mod.Editor.init(&doc);
+        try ed.apply(&.{.{ .insert = .{ .sequence = "$.b", .position = "$.b[0]", .value = try doc.createScalar("z", .plain), .before = true } }});
+        try doc.setLeadingComments(try ed.one("$.b[1]"), "# other");
+        try testing.expectEqualStrings("# other", (try ed.one("$.b[1]")).leadingComments(&doc).?);
+        try testing.expect((try ed.one("$.b[0]")).leadingComments(&doc) == null);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("a: 1\nb:\n  - z\n  # other\n  - x\n", out);
+    }
+    {
+        // A block on a new first item: the original item after it kept
+        // its indentation (it was written at column 0, and did not parse).
+        var doc = try Document.parse(testing.allocator, "a: 1\nb:\n  - x\n");
+        defer doc.deinit();
+        var ed = edit_mod.Editor.init(&doc);
+        try ed.apply(&.{.{ .insert = .{ .sequence = "$.b", .position = "$.b[0]", .value = try doc.createScalar("z", .plain), .before = true } }});
+        try doc.setLeadingComments(try ed.one("$.b[0]"), "# new");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("a: 1\nb:\n  # new\n  - z\n  - x\n", out);
+    }
+    {
+        // A block on a new item between two original ones, nested: the
+        // original after it keeps its indentation.
+        var doc = try Document.parse(testing.allocator, "k:\n  - a\n  - b\n");
+        defer doc.deinit();
+        var ed = edit_mod.Editor.init(&doc);
+        try ed.apply(&.{.{ .insert = .{ .sequence = "$.k", .position = "$.k[1]", .value = try doc.createScalar("z", .plain), .before = true } }});
+        try doc.setLeadingComments(try ed.one("$.k[1]"), "# new");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("k:\n  - a\n  # new\n  - z\n  - b\n", out);
+    }
+    {
+        // The in-memory reads follow the tree too: after the insert the
+        // block on the sequence's first line is the new item's to read.
+        var doc = try Document.parse(testing.allocator, "- a\n- b\n");
+        defer doc.deinit();
+        var ed = edit_mod.Editor.init(&doc);
+        try doc.setLeadingComments(try ed.one("$[0]"), "# new");
+        try ed.apply(&.{.{ .insert = .{ .sequence = "$", .position = "$[0]", .value = try doc.createScalar("z", .plain), .before = true } }});
+        try testing.expectEqualStrings("# new", (try ed.one("$[0]")).leadingComments(&doc).?);
+        try testing.expect((try ed.one("$[1]")).leadingComments(&doc) == null);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("# new\n- z\n- a\n- b\n", out);
+    }
+    {
+        // A block written on an entry that later becomes first is still
+        // its own, and still read.
+        var doc = try Document.parse(testing.allocator, "a:\n  x: 1\n  y: 2\n");
+        defer doc.deinit();
+        var ed = edit_mod.Editor.init(&doc);
+        try doc.setLeadingComments(try ed.one("$.a.y"), "# new");
+        try ed.delete("$.a.x");
+        try testing.expectEqualStrings("# new", (try ed.one("$.a.y")).leadingComments(&doc).?);
+        try testing.expectEqualStrings("# new", (try ed.one("$.a")).leadingComments(&doc).?);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("a:\n  # new\n  y: 2\n", out);
+    }
+}
+
+test "comment write: nothing inside a new subtree is accepted and dropped" {
+    // The emitter lays a new subtree out afresh and writes no comments
+    // inside it; the write used to be accepted, read back in memory and
+    // silently lost.
+    const edit_mod = @import("edit.zig");
+    var doc = try Document.parse(testing.allocator, "a: 1\nb: 2\n");
+    defer doc.deinit();
+    var ed = edit_mod.Editor.init(&doc);
+    const m = try doc.createMapping();
+    try doc.mappingAppend(m, try doc.createScalar("x", .plain), try doc.createScalar("1", .plain));
+    try ed.set("$.c", m);
+    const x = try ed.one("$.c.x");
+    try testing.expectError(error.InvalidSyntax, doc.setLeadingComments(x, "# new"));
+    try testing.expectError(error.InvalidSyntax, doc.setTrailingComment(x, "# t"));
+    // So is one on the new block value itself: nothing writes a block
+    // between `c:` and its first line. The entry's line is its key's.
+    try testing.expectError(error.InvalidSyntax, doc.setLeadingComments(try ed.one("$.c"), "# new"));
+    const pairs = doc.root.?.pairs().?;
+    try doc.setLeadingComments(pairs[pairs.len - 1].key, "# new");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a: 1\nb: 2\n# new\nc:\n  x: 1\n", out);
+}
+
+test "comment reads: a collection's trailing comment is its last entry's now" {
+    const edit_mod = @import("edit.zig");
+    var doc = try Document.parse(testing.allocator, "a:\n  x: 1\n  y: 2 # c\nb: 3\n");
+    defer doc.deinit();
+    var ed = edit_mod.Editor.init(&doc);
+    try testing.expectEqualStrings("# c", (try ed.one("$.a")).trailingComment(&doc).?);
+    try doc.setTrailingComment(try ed.one("$.a.x"), "# x");
+    try ed.delete("$.a.y");
+    try testing.expectEqualStrings("# x", (try ed.one("$.a")).trailingComment(&doc).?);
+    // `? key` with no value: the key reads what is written on its value.
+    var set = try Document.parse(testing.allocator, "? a\n? b\n");
+    defer set.deinit();
+    try set.setTrailingComment(set.root.?.pairs().?[0].value, "# t");
+    try testing.expectEqualStrings("# t", set.root.?.pairs().?[0].key.trailingComment(&set).?);
+}
+
+test "comment write: a value after a synthetic key reads its entry's line" {
+    // `: a` has no key bytes: the value is the entry's first byte, and
+    // for the first pair it shares the mapping's line. Written there, the
+    // block read back from nobody.
+    // Not first, the value holds its own line's block.
+    {
+        var doc = try Document.parse(testing.allocator, ": a\n: b\n");
+        defer doc.deinit();
+        try doc.setLeadingComments(doc.root.?.pairs().?[1].value, "# probe");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(": a\n# probe\n: b\n", out);
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        try testing.expectEqualStrings("# probe", again.root.?.pairs().?[1].value.leadingComments(&again).?);
+    }
+    for ([_][]const u8{ ": a\n: b\n", "- ? : x\n" }) |in| {
+        var doc = try Document.parse(testing.allocator, in);
+        defer doc.deinit();
+        var node = doc.root.?;
+        while (true) {
+            if (node.items()) |its| node = its[0] else if (node.pairs()) |ps| node = if (ps[0].key.pairs() != null) ps[0].key else ps[0].value else break;
+        }
+        try doc.setLeadingComments(node, "# probe");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        var back = again.root.?;
+        while (true) {
+            if (back.items()) |its| back = its[0] else if (back.pairs()) |ps| back = if (ps[0].key.pairs() != null) ps[0].key else ps[0].value else break;
+        }
+        try testing.expectEqualStrings("# probe", back.leadingComments(&again).?);
+    }
 }
 
 test "comment write in a CRLF document keeps the convention" {

@@ -241,6 +241,17 @@ pub fn adopt(doc: *Document, node: *Node) !void {
     try doc.markModified(node);
 }
 
+/// INTERNAL. True when the emitter lays a value out on its key's line:
+/// scalars, aliases, flow and empty collections. A block collection
+/// starts on the next, deeper line.
+pub fn inlineValue(value: *const Node) bool {
+    return switch (value.data) {
+        .scalar, .alias => true,
+        .mapping => |m| m.pairs.items.len == 0 or m.style == .flow,
+        .sequence => |s| s.items.items.len == 0 or s.style == .flow,
+    };
+}
+
 /// INTERNAL. Structural append that deliberately skips the `modified`
 /// mark, for the builder composing a parsed tree. Calling this from
 /// outside leaves the subtree looking clean, so it re-emits verbatim

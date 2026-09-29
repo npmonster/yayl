@@ -124,6 +124,19 @@ pub fn propertiesEnd(source: []const u8, start: usize) usize {
     return end;
 }
 
+/// When the properties at `start` end their line (`&seq` over `- a`,
+/// `- !!map` over `  k: v`, a comment allowed after them), the offset
+/// just past that line: the node's content begins on a later line.
+/// Null when content follows them on the same line, or there are none.
+pub fn propertiesLineEnd(source: []const u8, start: usize) ?usize {
+    const end = propertiesEnd(source, start);
+    if (end == start) return null;
+    var i = end;
+    while (i < source.len and (source[i] == ' ' or source[i] == '\t')) i += 1;
+    if (i < source.len and source[i] != '\n' and source[i] != '\r' and source[i] != '#') return null;
+    return lineEnd(source, i);
+}
+
 /// Walk backwards from a node's content start to find the block entry
 /// indicator (`-` or `?`) that introduces it, if any. Returns
 /// `content_start` when the node starts its own entry (no indicator).
@@ -187,6 +200,25 @@ pub fn colonEnd(source: []const u8, after: usize) usize {
     var i = after;
     while (i < source.len and (source[i] == ' ' or source[i] == '\t')) i += 1;
     if (i < source.len and source[i] == ':') return i + 1;
+    return after;
+}
+
+/// The end of the value indicator of a pair whose value is empty: the
+/// `:` after `after` (the key's end) and before `limit` (the next
+/// token), past blanks, line breaks and comment lines -- an explicit
+/// key's indicator can sit on a later line (`? a` over `:`). `after`
+/// when there is none (`? a` alone).
+pub fn valueIndicatorEnd(source: []const u8, after: usize, limit: usize) usize {
+    var i = after;
+    const end = @min(limit, source.len);
+    while (i < end) : (i += 1) {
+        switch (source[i]) {
+            ' ', '\t', '\n', '\r' => {},
+            ':' => return i + 1,
+            '#' => i = newlineAt(source, i),
+            else => return after,
+        }
+    }
     return after;
 }
 

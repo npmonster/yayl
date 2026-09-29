@@ -168,14 +168,19 @@ pub const Emitter = struct {
 
     /// Write the framing bytes a container carries ahead of its first
     /// entry — an outer `- ` indicator when the container is itself a
-    /// sequence item. They are normally re-emitted with the first
-    /// original entry, so a BRAND-NEW first entry has to claim them.
-    /// Returns the gap offset to continue from.
+    /// sequence item, and properties on a line of their own (`&seq` over
+    /// `- a`). They are normally re-emitted with the first original
+    /// entry, so a BRAND-NEW first entry has to claim them: written
+    /// above the properties, it left them dangling after it
+    /// (`- zz\n&seq\n- a`), which does not parse. Returns the gap offset
+    /// to continue from.
     fn writeContainerFraming(self: *Emitter, container: *const Node, gap_start: usize) Error!usize {
         const cs = container.src orelse return gap_start;
-        if (cs.synthetic or gap_start >= cs.start) return gap_start;
+        if (cs.synthetic or gap_start > cs.start) return gap_start;
         try self.writeGap(container, gap_start, cs.start);
-        return cs.start;
+        const header_end = markup.propertiesLineEnd(self.src, cs.start) orelse return cs.start;
+        try self.writeGap(container, cs.start, header_end);
+        return header_end;
     }
 
     /// An emptied container re-emits as `{}` / `[]` straight from the
@@ -189,7 +194,12 @@ pub const Emitter = struct {
         if (cs.synthetic) return;
         const parent = node.parent orelse return;
         if (parent.kind() != .sequence) return;
-        _ = try self.writeContainerFraming(node, cs.entry_start);
+        // Only the framing: the `{}` / `[]` writes its own properties.
+        if (cs.entry_start < cs.start) try self.writeGap(node, cs.entry_start, cs.start);
+        // An indicator alone on its line (`-` over `  - x`): the deleted
+        // first entry took the next line's indentation with it, and the
+        // `[]` at column 0 was no longer the item.
+        if (self.pendingLine().len == 0) try self.writeIndent(markup.columnOf(self.src, cs.start));
     }
 
     /// An emptied BLOCK collection's source still holds the comment and
@@ -265,15 +275,24 @@ pub const Emitter = struct {
     }
 
     /// Open a line at `col` for a BRAND-NEW block entry, whose layout
-    /// the emitter owns. The gap before it may have supplied the
-    /// indentation already, none of it (the original indentation went
-    /// with a deleted sibling's tombstone), or a whole previous entry.
-    /// Returns true when the entry lands on a line the previous entry
-    /// had already terminated — nothing downstream will close this one,
-    /// so the entry owes its own line terminator. Without it the entry
-    /// borrows the NEXT line's newline and swallows a blank separator.
-    fn openEntryLine(self: *Emitter, col: usize) Error!bool {
+    /// the emitter owns, with its written leading block (if any) above
+    /// it. The gap before it may have supplied the indentation already,
+    /// none of it (the original indentation went with a deleted
+    /// sibling's tombstone), or a whole previous entry. Returns true
+    /// when the entry lands on a line the previous entry had already
+    /// terminated — nothing downstream will close this one, so the entry
+    /// owes its own line terminator. Without it the entry borrows the
+    /// NEXT line's newline and swallows a blank separator. A written
+    /// block changes none of that: when it goes above indentation the
+    /// gap had begun, the next original sibling still breaks the line
+    /// (claiming the terminator left the sibling at column 0).
+    fn openEntryLine(self: *Emitter, col: usize, leading: ?[]const u8, term: []const u8) Error!bool {
         const pending = self.pendingLine();
+        if (leading) |t| if (t.len > 0) {
+            const fresh = pending.len == 0;
+            try self.writePendingLeadingText(t, col, term, true);
+            return fresh;
+        };
         // Fresh line with nothing on it: the indentation is ours to write.
         if (pending.len == 0) {
             try self.writeIndent(col);
@@ -420,7 +439,7 @@ pub const Emitter = struct {
             // tombstoned out of the head above, and nothing else writes
             // the new ones -- the root has no entry slot of its own.
             const col = markup.columnOf(src, doc.body_start);
-            if (root.pending_leading) |pt| try self.writePendingLeadingText(pt, col, self.terminatorAt(doc.body_start));
+            if (root.pending_leading) |pt| try self.writePendingLeadingText(pt, col, self.terminatorAt(doc.body_start), false);
             stop = try self.emitRoot(root, col, doc.body_end);
         }
         if (stop < doc.region_end) {
@@ -587,7 +606,7 @@ pub const Emitter = struct {
                 const pending = internal.pairLeadingOverride(src, key, value);
                 if (pending != null) {
                     const col = markup.columnOf(src, s.entry_start);
-                    try self.writePendingLeadingText(pending, col, self.terminatorAt(s.entry_start));
+                    try self.writePendingLeadingText(pending, col, self.terminatorAt(s.entry_start), false);
                 }
                 try self.breakBeforeEntry(entry_col);
             } else {
@@ -610,7 +629,7 @@ pub const Emitter = struct {
                 // written block (`: a`); it was accepted and never
                 // written.
                 if (internal.pairLeadingOverride(src, key, value)) |pt| {
-                    try self.writePendingLeadingText(pt, markup.columnOf(src, s.entry_start), self.terminatorAt(s.entry_start));
+                    try self.writePendingLeadingText(pt, markup.columnOf(src, s.entry_start), self.terminatorAt(s.entry_start), false);
                 }
                 try self.breakBeforeEntry(entry_col);
             }
@@ -648,12 +667,7 @@ pub const Emitter = struct {
             gap = try self.writeContainerFraming(container, gap);
             gap = try self.consumeBlockTrailingBlanks(container, gap);
             const pending = internal.pairLeadingOverride(src, key, value);
-            if (pending != null) {
-                // Written lines terminate themselves and end with the
-                // indentation the entry continues on.
-                try self.writePendingLeadingText(pending, entry_col, self.terminatorAt(gap));
-                owed_terminator = true;
-            } else if (try self.openEntryLine(entry_col)) {
+            if (try self.openEntryLine(entry_col, pending, self.terminatorAt(gap))) {
                 owed_terminator = true;
             }
             try self.emitEntry(key, value, entry_col);
@@ -721,7 +735,21 @@ pub const Emitter = struct {
                 // entry.
                 if (ks) |s| {
                     if (emptiedCollection(value)) {
-                        try self.write(src[key_end..vs.entry_start]);
+                        if (value.pending_leading) |pt| {
+                            // A written (or deleted) block replaced the
+                            // comment lines here: through the tombstones,
+                            // then the block, then the indentation the
+                            // deleted first entry took, at its column.
+                            try self.writeGap(value, key_end, vs.entry_start);
+                            const vcol = markup.columnOf(src, vs.entry_start);
+                            if (pt.len > 0 and markup.lineStart(src, vs.entry_start) != markup.lineStart(src, s.start)) {
+                                try self.writePendingLeadingText(pt, vcol, self.terminatorAt(vs.entry_start), true);
+                            } else if (self.pendingLine().len == 0) {
+                                try self.writeIndent(vcol);
+                            }
+                        } else {
+                            try self.write(src[key_end..vs.entry_start]);
+                        }
                         try self.indentEmptied(markup.columnOf(src, s.entry_start));
                     } else if (value.pending_leading != null and
                         markup.lineStart(src, vs.entry_start) != markup.lineStart(src, s.start))
@@ -738,7 +766,7 @@ pub const Emitter = struct {
                         // key's gap.)
                         try self.writeGap(value, key_end, vs.entry_start);
                         const vcol = markup.columnOf(src, vs.entry_start);
-                        try self.writePendingLeadingText(value.pending_leading, vcol, self.terminatorAt(vs.entry_start));
+                        try self.writePendingLeadingText(value.pending_leading, vcol, self.terminatorAt(vs.entry_start), false);
                     } else {
                         try self.writeGap(value, key_end, vs.entry_start);
                     }
@@ -787,7 +815,7 @@ pub const Emitter = struct {
             try self.writeNewlineIndent(icol);
             try self.write(": ");
             _ = try self.emitContent(value, icol + self.indent_step);
-        } else if (inlineValue(value)) {
+        } else if (internal.inlineValue(value)) {
             try self.write(": ");
             _ = try self.emitContent(value, entry_col + self.indent_step);
         } else {
@@ -837,12 +865,7 @@ pub const Emitter = struct {
             }
             gap = try self.writeContainerFraming(container, gap);
             gap = try self.consumeBlockTrailingBlanks(container, gap);
-            if (item.pending_leading) |pt| {
-                // Written lines terminate themselves and end with the
-                // indentation the entry continues on.
-                try self.writePendingLeadingText(pt, entry_col, self.terminatorAt(gap));
-                owed_terminator = true;
-            } else if (try self.openEntryLine(entry_col)) {
+            if (try self.openEntryLine(entry_col, item.pending_leading, self.terminatorAt(gap))) {
                 owed_terminator = true;
             }
             try self.write("- ");
@@ -876,7 +899,7 @@ pub const Emitter = struct {
         try self.writeGap(container, gap_start, s.entry_start);
         if (item.pending_leading != null) {
             const col = markup.columnOf(src, s.entry_start);
-            try self.writePendingLeadingText(item.pending_leading, col, self.terminatorAt(s.entry_start));
+            try self.writePendingLeadingText(item.pending_leading, col, self.terminatorAt(s.entry_start), false);
         }
         try self.breakBeforeEntry(entry_col);
         if (!s.synthetic) {
@@ -1096,15 +1119,6 @@ pub const Emitter = struct {
         return switch (node.data) {
             .scalar => |s| s.value.len == 0 and s.style == .plain,
             else => false,
-        };
-    }
-
-    /// True when a value can sit on the same line as its key.
-    fn inlineValue(value: *const Node) bool {
-        return switch (value.data) {
-            .scalar, .alias => true,
-            .mapping => |m| m.pairs.items.len == 0 or m.style == .flow,
-            .sequence => |s| s.items.items.len == 0 or s.style == .flow,
         };
     }
 
@@ -1378,10 +1392,17 @@ pub const Emitter = struct {
     /// everything before the entry (the original gap up to its entry
     /// start, or a new entry's separator); indentation and `- `/`? `/`: `
     /// framing already written on the entry's line is lifted off and put
-    /// back after the block. The empty override (a
-    /// deletion) writes nothing — the tombstoned block is already
-    /// skipped in the gap.
-    fn writePendingLeadingText(self: *Emitter, pending: ?[]const u8, col: usize, term: []const u8) Error!void {
+    /// back after the block. The empty override (a deletion) writes
+    /// nothing — the tombstoned block is already skipped in the gap.
+    ///
+    /// `opens_line` is true when the caller opens a BRAND-NEW entry,
+    /// whose indentation is the emitter's to write. Otherwise a line the
+    /// gap left empty is either at column 0 or the line of a deleted
+    /// first entry, whose tombstone took the indentation -- and the next
+    /// surviving entry's gap brings its own. Writing it here as well put
+    /// that entry two levels deep (`  # c\n    - y`), a different tree or
+    /// none.
+    fn writePendingLeadingText(self: *Emitter, pending: ?[]const u8, col: usize, term: []const u8, opens_line: bool) Error!void {
         const t = pending orelse return;
         if (t.len == 0) return;
         // The block opens a line of its own, above the entry's line. A
@@ -1396,19 +1417,22 @@ pub const Emitter = struct {
         if (isEntryFraming(open)) {
             var indent: usize = 0;
             while (indent < open.len and open[indent] == ' ') indent += 1;
+            const begun = open.len > 0;
             const framing = try self.allocator.dupe(u8, open[indent..]);
             defer self.allocator.free(framing);
             self.out.shrinkRetainingCapacity(self.out.items.len - open.len);
-            try self.writeLeadingLines(t, if (framing.len > 0) indent else col, term);
+            const at = if (framing.len > 0) indent else col;
+            try self.writeLeadingLines(t, at, term);
+            if (begun or opens_line) try self.writeIndent(at);
             try self.write(framing);
             return;
         }
         if (!self.endsWithNewline()) try self.write(self.defaultTerminator());
         try self.writeLeadingLines(t, col, term);
+        try self.writeIndent(col);
     }
 
-    /// The lines of a written leading block at `col`, each terminated,
-    /// then the indentation of the line they sit above.
+    /// The lines of a written leading block at `col`, each terminated.
     fn writeLeadingLines(self: *Emitter, text: []const u8, col: usize, term: []const u8) Error!void {
         var it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |line| {
@@ -1416,7 +1440,6 @@ pub const Emitter = struct {
             try self.write(line);
             try self.write(term);
         }
-        try self.writeIndent(col);
     }
 
     fn writeNewlineIndent(self: *Emitter, indent: usize) Error!void {
@@ -1520,7 +1543,7 @@ pub const Emitter = struct {
 
         // Value placement: scalars and flow collections stay inline,
         // block collections start on the next, deeper line.
-        if (inlineValue(value)) {
+        if (internal.inlineValue(value)) {
             try self.writeByte(' ');
             try self.emitNode(value, indent + self.indent_step);
         } else {
