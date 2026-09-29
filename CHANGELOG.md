@@ -48,6 +48,14 @@ empty plain scalar stays unwritten where YAML allows it (`key:`, `- `,
 `{k: }`), but as a flow sequence item with no anchor or tag it is now
 written `null`, so the item keeps its place and its value. (#10)
 
+**An anchor set on a parsed mapping key was silently dropped.**
+`setAnchor` on the key of `k: v` succeeded, but the document was written
+back as `k: v`: the emitter copied a key's source bytes whenever it had
+any, without asking whether the key had been modified since. Keys now
+follow the same rule as values, so `&x k: v` is written, clearing the
+anchor writes `k: v`, and a key's `- ` or `? ` framing and untouched
+sibling keys keep their bytes. (#11)
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity

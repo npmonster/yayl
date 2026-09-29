@@ -547,7 +547,10 @@ pub const Emitter = struct {
         const key = pair.key;
         const value = pair.value;
         const ks = key.src;
-        const key_clean = ks != null and !ks.?.synthetic;
+        // A key with bytes of its own. Whether they can be copied is
+        // `nodeClean`'s call, as for any value: a key given an anchor or
+        // tag after parsing is modified, and its old bytes would drop it.
+        const key_spanned = ks != null and !ks.?.synthetic;
         const pair_end = pair.src_end;
         const value_empty = pairEndsAtColon(pair);
 
@@ -644,12 +647,15 @@ pub const Emitter = struct {
         }
 
         // Key.
-        const expl = key_clean and explicitKeySpan(src, ks.?.entry_start, ks.?.start);
-        if (key_clean) {
+        const expl = key_spanned and explicitKeySpan(src, ks.?.entry_start, ks.?.start);
+        if (key_spanned and self.nodeClean(key)) {
             try self.emitted.put(key, {});
             try self.write(src[ks.?.entry_start..ks.?.end]);
         } else {
             try self.emitted.put(key, {});
+            // A modified key keeps its framing -- the `- ` or `? ` in
+            // [entry_start, start) -- and re-emits only its content.
+            if (key_spanned) try self.write(src[ks.?.entry_start..ks.?.start]);
             _ = try self.emitContent(key, if (ks) |s| markup.columnOf(src, s.start) else entry_col);
         }
 
@@ -2735,6 +2741,43 @@ test "an unmodified explicit key still re-emits from its source span" {
     const out = try roundTrip(testing.allocator, src);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings(src, out);
+}
+
+test "an anchor set on or cleared from a parsed key is written" {
+    // `key_clean` only asked whether the key had a source span, never
+    // whether it was modified, so a parsed key was always copied from
+    // its old bytes: `setAnchor(key, "x")` on `k: v` wrote `k: v`, and
+    // the new anchor was silently lost. Values already went through
+    // `nodeClean`, which is why `k: &x v` worked.
+    const cases = [_]struct { in: []const u8, key: []const u8 = "k", item: bool = false, anchor: ?[]const u8, out: []const u8 }{
+        .{ .in = "k: v\n", .anchor = "x", .out = "&x k: v\n" },
+        .{ .in = "&x k: v\n", .anchor = null, .out = "k: v\n" },
+        .{ .in = "&x k: v\n", .anchor = "y", .out = "&y k: v\n" },
+        .{ .in = "!!str k: v\n", .anchor = "x", .out = "&x !!str k: v\n" },
+        .{ .in = "\"q k\": v\n", .key = "q k", .anchor = "x", .out = "&x \"q k\": v\n" },
+        // Next to an untouched sibling key, whose bytes stay as written.
+        .{ .in = "a:   1 # one\nk: v # two\n", .anchor = "x", .out = "a:   1 # one\n&x k: v # two\n" },
+        .{ .in = "k:\n  z: 1\nj: 2\n", .anchor = "x", .out = "&x k:\n  z: 1\nj: 2\n" },
+        .{ .in = "k:\nj: 2\n", .anchor = "x", .out = "&x k:\nj: 2\n" },
+        // The key's `- ` and `? ` framing is the author's and stays.
+        .{ .in = "- k: v\n  j: w\n", .item = true, .anchor = "x", .out = "- &x k: v\n  j: w\n" },
+        .{ .in = "? k\n: v\n", .anchor = "x", .out = "? &x k\n: v\n" },
+        .{ .in = "- ? k\n  : v\n", .item = true, .anchor = "x", .out = "- ? &x k\n  : v\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        const map = if (c.item) doc.root.?.items().?[0] else doc.root.?;
+        const pairs = map.pairs().?;
+        // Any key but `c.key` is an untouched sibling.
+        const key = for (pairs) |p| {
+            if (std.mem.eql(u8, p.key.scalarValue().?, c.key)) break p.key;
+        } else unreachable;
+        try doc.setAnchor(key, c.anchor);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
 }
 
 test "a normalized scalar key keeps its anchor and tag" {
