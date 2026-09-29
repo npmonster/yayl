@@ -120,6 +120,15 @@ whatever the edit, as it already did for a sequence item's `- `, and a
 modified collection key no longer writes its `? ` twice or leaves a blank
 line before `: value`.
 
+**A trailing comment on an empty value could be written but not read.**
+`push: # c` read no comment (an empty value's span is a point borrowed
+from the next token), so a comment written there did not read back; an
+empty item or document took the write and never emitted it. An empty
+mapping value now reads the comment after its key and colon (`push:`,
+`? key`), and a trailing comment on an empty item or document, or after a
+block scalar key with no `:`, is refused with `error.InvalidSyntax`. The
+comment sweep now writes a trailing comment on every writable node too.
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity

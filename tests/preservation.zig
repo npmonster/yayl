@@ -2704,12 +2704,14 @@ test "preservation sweep: comment positions — set-to-same is byte-identical" {
     if (checked_trailing < 5 or checked_leading < 5) return error.TestUnexpectedResult;
 }
 
-/// Write `# probe` as the leading comment of the `index`-th node (in
+const CommentKind = enum { leading, trailing };
+
+/// Write `# probe` as the `kind` comment of the `index`-th node (in
 /// `collectNodes` order) of the first document of `text`. Returns
 /// false when the position is not writable; otherwise records a failure
 /// unless the output re-parses to the same tree and the same node reads
 /// the probe back.
-fn probeLeadingComment(allocator: std.mem.Allocator, label: []const u8, text: []const u8, index: usize, failures: *Failures) !bool {
+fn probeComment(allocator: std.mem.Allocator, label: []const u8, text: []const u8, index: usize, kind: CommentKind, failures: *Failures) !bool {
     var orig = try yaml.parse(allocator, text);
     defer orig.deinit();
     var doc = try yaml.parse(allocator, text);
@@ -2717,7 +2719,11 @@ fn probeLeadingComment(allocator: std.mem.Allocator, label: []const u8, text: []
     var nodes: std.ArrayList(*yaml.Node) = .empty;
     defer nodes.deinit(allocator);
     try collectNodes(allocator, doc.root.?, &nodes);
-    doc.setLeadingComments(nodes.items[index], "# probe") catch |err| switch (err) {
+    const set = switch (kind) {
+        .leading => doc.setLeadingComments(nodes.items[index], "# probe"),
+        .trailing => doc.setTrailingComment(nodes.items[index], "# probe"),
+    };
+    set catch |err| switch (err) {
         error.InvalidSyntax => return false,
         else => return err,
     };
@@ -2733,34 +2739,37 @@ fn probeLeadingComment(allocator: std.mem.Allocator, label: []const u8, text: []
         else => "?",
     } else "root";
     var re = yaml.parse(allocator, out) catch {
-        failures.add("{s}: node {d} ({s} {t}): a written leading comment does not re-parse:\n{s}", .{ label, index, role, n.kind(), out });
+        failures.add("{s}: node {d} ({s} {t}): a written {t} comment does not re-parse:\n{s}", .{ label, index, role, n.kind(), kind, out });
         return true;
     };
     defer re.deinit();
     if (re.root == null or !structuralEql(orig.root.?, re.root.?, 0)) {
-        failures.add("{s}: node {d} ({s} {t}): a written leading comment changed the tree:\n{s}", .{ label, index, role, n.kind(), out });
+        failures.add("{s}: node {d} ({s} {t}): a written {t} comment changed the tree:\n{s}", .{ label, index, role, n.kind(), kind, out });
         return true;
     }
     var back: std.ArrayList(*yaml.Node) = .empty;
     defer back.deinit(allocator);
     try collectNodes(allocator, re.root.?, &back);
-    const got = back.items[index].leadingComments(&re) orelse "";
+    const got = switch (kind) {
+        .leading => back.items[index].leadingComments(&re),
+        .trailing => back.items[index].trailingComment(&re),
+    } orelse "";
     if (!std.mem.eql(u8, got, "# probe")) {
-        failures.add("{s}: node {d} ({s} {t}): a written leading comment reads back as \"{s}\"{s}:\n{s}", .{
-            label, index, role, n.kind(), got, if (std.mem.indexOf(u8, out, "# probe") == null) " (never written)" else "", out,
+        failures.add("{s}: node {d} ({s} {t}): a written {t} comment reads back as \"{s}\"{s}:\n{s}", .{
+            label, index, role, n.kind(), kind, got, if (std.mem.indexOf(u8, out, "# probe") == null) " (never written)" else "", out,
         });
     }
     return true;
 }
 
-test "preservation sweep: a new leading comment on any node reads back from it" {
+test "preservation sweep: a new comment on any node reads back from it" {
     // The set-to-same sweep above cannot see a comment written where
     // there was none: that path re-assembles the entry's line, and it
     // doubled a key's `- `/`? ` framing (`- - k: v`) or cut an item's
     // `- ` off an explicit key. Every writable position of every
-    // fixture and corpus document now takes a new comment, and the
-    // result must re-parse to the same tree with the comment on the
-    // same node.
+    // fixture and corpus document now takes a new leading and a new
+    // trailing comment, one at a time, and the result must re-parse to
+    // the same tree with the comment on the same node.
     var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer std.debug.assert(da.deinit() == .ok);
     const allocator = da.allocator();
@@ -2773,8 +2782,8 @@ test "preservation sweep: a new leading comment on any node reads back from it" 
         for (failures.list.items) |f| allocator.free(f);
         failures.list.deinit(allocator);
     }
-    var written: usize = 0;
-    var skipped: usize = 0;
+    var written = [_]usize{ 0, 0 };
+    var skipped = [_]usize{ 0, 0 };
 
     // Inputs: the first document of every fixture and valid corpus case.
     var texts: std.ArrayList(struct { label: []const u8, text: []const u8 }) = .empty;
@@ -2820,15 +2829,18 @@ test "preservation sweep: a new leading comment on any node reads back from it" 
         defer nodes.deinit(allocator);
         try collectNodes(allocator, root, &nodes);
         for (0..nodes.items.len) |i| {
-            if (try probeLeadingComment(allocator, t.label, t.text, i, &failures)) written += 1 else skipped += 1;
+            for (std.enums.values(CommentKind)) |kind| {
+                const k = @intFromEnum(kind);
+                if (try probeComment(allocator, t.label, t.text, i, kind, &failures)) written[k] += 1 else skipped[k] += 1;
+            }
         }
     }
-    std.debug.print("preservation[new leading comments]: {d} written, {d} positions not writable, over {d} documents\n", .{ written, skipped, texts.items.len });
+    std.debug.print("preservation[new comments]: leading {d} written, {d} positions not writable; trailing {d} written, {d} not writable; over {d} documents\n", .{ written[0], skipped[0], written[1], skipped[1], texts.items.len });
     if (failures.list.items.len > 0) {
         for (failures.list.items) |f| std.debug.print("  PRESERVATION-FAIL {s}\n", .{f});
         return error.TestUnexpectedResult;
     }
-    if (written < 100) return error.TestUnexpectedResult;
+    if (written[0] < 100 or written[1] < 100) return error.TestUnexpectedResult;
 }
 
 /// The bytes of the first document of `input`, owned, or null when it

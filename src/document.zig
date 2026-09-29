@@ -246,9 +246,8 @@ pub const Node = struct {
     pub fn trailingComment(self: *const Node, doc: *const Document) ?[]const u8 {
         if (self.pending_trailing) |t| return if (t.len == 0) null else t;
         const doc_src = doc.source orelse return null;
-        const s = self.src orelse return null;
-        if (s.synthetic) return null;
-        const span = markup.trailingCommentSpan(doc_src, s.end) orelse return null;
+        const at = trailingAnchor(self, doc_src) orelse return null;
+        const span = markup.trailingCommentSpan(doc_src, at) orelse return null;
         return doc_src[span[0]..span[1]];
     }
 
@@ -271,6 +270,33 @@ pub const Node = struct {
         return doc.source.?[span[0]..span[1]];
     }
 };
+
+/// Where a node's trailing comment is looked for: after its content, or
+/// for an empty mapping value (`push:`, `? key`) -- whose span is a point
+/// borrowed from the next token -- after its key and colon, on the
+/// key's line. Null for other empty nodes: an empty item or document has
+/// no bytes to hang a comment on.
+fn trailingAnchor(node: *const Node, source: []const u8) ?usize {
+    const s = node.src orelse return null;
+    if (!s.synthetic) return s.end;
+    const parent = node.parent orelse return null;
+    switch (parent.data) {
+        .mapping => |m| for (m.pairs.items) |pair| {
+            if (pair.value != node) continue;
+            const ks = realSpan(pair.key) orelse return null;
+            const after = markup.colonEnd(source, ks.end);
+            // `? >` with no `:` on its line: after the key is inside the
+            // block scalar's content, not a comment position.
+            if (after == ks.end) switch (pair.key.data) {
+                .scalar => |k| if (k.style == .literal or k.style == .folded) return null,
+                else => {},
+            };
+            return after;
+        },
+        else => {},
+    }
+    return null;
+}
 
 /// The node that holds the leading comment block of `node`'s entry
 /// line. Several nodes start on one line: a sequence item's mapping and
@@ -1298,7 +1324,12 @@ pub const Document = struct {
 
     /// True when `setTrailingComment` can act on this node.
     fn trailingWritablePosition(self: *const Document, node: *Node) bool {
-        _ = self;
+        // An empty node that reads no trailing comment (an empty item or
+        // document) must not take one: it was accepted and never written.
+        if (node.src) |s| if (s.synthetic) {
+            const src = self.source orelse return false;
+            if (trailingAnchor(node, src) == null) return false;
+        };
         switch (node.data) {
             .scalar => |s| switch (s.style) {
                 .literal, .folded => return false, // the value owns its lines
@@ -3020,6 +3051,43 @@ test "comment write: a multi-line key stays a key" {
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("# k\n\"a\\nb\": 1\nc: 2\n", out);
+}
+
+test "comment reads and writes: a trailing comment on an empty value" {
+    // An empty value's span is a point borrowed from the next token, so
+    // `push: # c` read no comment although the write put it there; an
+    // empty item or document took the write and never emitted it.
+    {
+        var doc = try Document.parse(testing.allocator, "on:\n  push: # c\n  pull_request:\n");
+        defer doc.deinit();
+        try testing.expectEqualStrings("# c", doc.pathGet(&.{ "on", "push" }).?.trailingComment(&doc).?);
+        const pr = doc.pathGet(&.{ "on", "pull_request" }).?;
+        try doc.setTrailingComment(pr, "# new");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("on:\n  push: # c\n  pull_request: # new\n", out);
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        try testing.expectEqualStrings("# new", again.pathGet(&.{ "on", "pull_request" }).?.trailingComment(&again).?);
+    }
+    {
+        // An explicit key with no value: the comment follows the key.
+        var doc = try Document.parse(testing.allocator, "? a # c\n? b\n");
+        defer doc.deinit();
+        try testing.expectEqualStrings("# c", doc.root.?.pairs().?[0].value.trailingComment(&doc).?);
+    }
+    // No bytes to hang it on: refused.
+    {
+        var doc = try Document.parse(testing.allocator, "- \n- b\n");
+        defer doc.deinit();
+        try testing.expectError(error.InvalidSyntax, doc.setTrailingComment(doc.root.?.items().?[0], "# c"));
+    }
+    {
+        // After a block scalar key is inside its content.
+        var doc = try Document.parse(testing.allocator, "? >\n  a\n:\n");
+        defer doc.deinit();
+        try testing.expectError(error.InvalidSyntax, doc.setTrailingComment(doc.root.?.pairs().?[0].value, "# c"));
+    }
 }
 
 test "comment write: a comment on a brand-new entry, the motivating case" {
