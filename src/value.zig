@@ -77,6 +77,17 @@ pub const Limits = struct {
     /// `error.LimitExceeded` on the value that would exceed it.
     max_values: usize = 1 << 20,
 
+    /// Maximum bytes of text one conversion may copy: every string,
+    /// big integer and mapping key. `Value` holds its strings, so an
+    /// expanded alias copies them each time -- and the value budget
+    /// cannot see that: one 64 KiB anchored string behind four levels of
+    /// ten aliases is only 10^4 Values, but 640 MiB of copies from a
+    /// 65 KiB input. Conversion stops with `error.LimitExceeded` on the
+    /// text that would exceed it. The default matches the input limit
+    /// (`max_input_bytes`): a document without aliases never copies more
+    /// text than it holds.
+    max_bytes: usize = 64 << 20,
+
     /// Deepest nesting one conversion will descend before returning
     /// `error.NestingTooDeep`.
     ///
@@ -104,6 +115,7 @@ pub const Limits = struct {
     /// budget, set `max_values` and leave `max_depth` alone.
     pub const unlimited: Limits = .{
         .max_values = std.math.maxInt(usize),
+        .max_bytes = std.math.maxInt(usize),
         .max_depth = std.math.maxInt(usize),
     };
 };
@@ -154,7 +166,7 @@ pub fn nodeToValue(allocator: std.mem.Allocator, node: *const Node) Error!Value 
 /// `nodeToValue` with an explicit expansion bound. Pass
 /// `Limits.unlimited` only for input you produced yourself.
 pub fn nodeToValueLimited(allocator: std.mem.Allocator, node: *const Node, limits: Limits) Error!Value {
-    var budget: Budget = .{ .remaining = limits.max_values, .max_depth = limits.max_depth };
+    var budget: Budget = .{ .remaining = limits.max_values, .bytes = limits.max_bytes, .max_depth = limits.max_depth };
     return convert(allocator, node, &budget);
 }
 
@@ -164,6 +176,8 @@ pub fn nodeToValueLimited(allocator: std.mem.Allocator, node: *const Node, limit
 /// exceeded it rather than firing after the work is done.
 const Budget = struct {
     remaining: usize,
+    /// Bytes of text it may still copy.
+    bytes: usize,
     depth: usize = 0,
     max_depth: usize,
 
@@ -171,6 +185,12 @@ const Budget = struct {
     fn charge(self: *Budget) Error!void {
         if (self.remaining == 0) return error.LimitExceeded;
         self.remaining -= 1;
+    }
+
+    /// The length of text about to be copied (a scalar's, a key's).
+    fn chargeBytes(self: *Budget, n: usize) Error!void {
+        if (n > self.bytes) return error.LimitExceeded;
+        self.bytes -= n;
     }
 
     /// Open one nesting level, or fail. Paired with `leave`.
@@ -193,7 +213,11 @@ fn convert(allocator: std.mem.Allocator, node: *const Node, b: *Budget) Error!Va
     defer b.leave();
     const cur = node.resolveAlias();
     switch (cur.data) {
-        .scalar => return taggedScalarToValue(allocator, cur),
+        .scalar => |sc| {
+            // At most the text is copied (a string or a bigint's digits).
+            try b.chargeBytes(sc.value.len);
+            return taggedScalarToValue(allocator, cur);
+        },
         .alias => unreachable, // resolveAlias never returns alias
         .sequence => |sq| {
             var out = try allocator.alloc(Value, sq.items.items.len);
@@ -220,10 +244,12 @@ fn convert(allocator: std.mem.Allocator, node: *const Node, b: *Budget) Error!Va
             }
             for (m.pairs.items, 0..) |p, i| {
                 const k = p.key.resolveAlias();
-                const key_copy = try allocator.dupe(u8, switch (k.data) {
-                    .scalar => |s| s.value,
+                const key_text = switch (k.data) {
+                    .scalar => |ks| ks.value,
                     else => return error.TypeMismatch,
-                });
+                };
+                try b.chargeBytes(key_text.len);
+                const key_copy = try allocator.dupe(u8, key_text);
                 errdefer allocator.free(key_copy);
                 out[i] = .{
                     .key = key_copy,
@@ -1154,6 +1180,32 @@ test "alias expansion is bounded, and the bound is configurable" {
     // And an explicit opt-out still works, for input you produced.
     const v2 = try parseToValueLimited(allocator, small, Limits.unlimited);
     defer freeValue(allocator, v2);
+}
+
+test "alias expansion is bounded in bytes as well as in values" {
+    // The value budget counts Values, but every expanded alias copies its
+    // strings: one 64 KiB anchored string reached through four levels of
+    // ten aliases is 10^4 Values -- well inside the value budget -- and
+    // 640 MiB of copies from a 65 KiB input.
+    const allocator = testing.allocator;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "l0: &l0 \"");
+    try input.appendNTimes(allocator, 'x', 64 << 10);
+    try input.appendSlice(allocator, "\"\n");
+    for (1..5) |l| {
+        try input.print(allocator, "l{d}: &l{d} [", .{ l, l });
+        for (0..10) |i| try input.print(allocator, "{s}*l{d}", .{ if (i > 0) ", " else "", l - 1 });
+        try input.appendSlice(allocator, "]\n");
+    }
+    try testing.expectError(error.LimitExceeded, parseToValueLimited(allocator, input.items, .{ .max_bytes = 1 << 20 }));
+    // The default is a bound too (asserted directly, so the test does not
+    // copy 64 MiB every run), above the input limit's 64 MiB of text.
+    try testing.expectEqual(@as(usize, 64 << 20), (Limits{}).max_bytes);
+    // The bound is configurable, and ordinary documents are far below it.
+    try testing.expectError(error.LimitExceeded, parseToValueLimited(allocator, "a: bcdef\n", .{ .max_bytes = 4 }));
+    const v = try parseToValueLimited(allocator, "a: bcdef\n", .{ .max_bytes = 6 });
+    freeValue(allocator, v);
 }
 
 /// A linear chain of `depth` nested sequences, built through the public

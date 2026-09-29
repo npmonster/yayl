@@ -32,6 +32,8 @@ and every one is adjustable through the public API.
 | Nesting (scanner/parser) | `ParseOptions.max_nesting` | 200 | `yaml.parseOpts` |
 | Simple key length | fixed cap | 1024 characters | not adjustable (spec 7.4.2) |
 | Alias expansion (values) | `value.Limits.max_values` | 1,048,576 | `parseToValueLimited`, `nodeToValueLimited`, `Limits.unlimited` to opt out |
+| Alias expansion (copied text) | `value.Limits.max_bytes` | 64 MiB | `parseToValueLimited`, `nodeToValueLimited` |
+| Query walks through aliases | each node walked once | linear in the document | not adjustable |
 | Alias expansion (validation) | `schema.Limits.max_nodes` | 1,048,576 | `Schema.validateLimited` |
 | Conversion depth | `value.Limits.max_depth` | 1000 | `parseToValueLimited`, `nodeToValueLimited` |
 | Validation depth | `schema.Limits.max_depth` | 1000 | `Schema.validateLimited` |
@@ -41,7 +43,8 @@ and every one is adjustable through the public API.
 
 Two shapes motivate the expansion bounds: N levels each aliasing the
 level above M times is M^N values — a 194-byte document reached ~19.5k
-values — and a deep tree built programmatically (through
+values, and with a large string at the bottom the copies are bytes the
+value count cannot see (a 65 KiB input asked for 640 MiB) — and a deep tree built programmatically (through
 `createSequence`/`sequenceAppend` or `value.toNode`), which the scanner
 never sees and `max_nesting` therefore never bounds. Every one of these
 bounds returns a typed error (`error.LimitExceeded`,

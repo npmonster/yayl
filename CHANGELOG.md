@@ -152,6 +152,14 @@ and filter results list each node once, as descent already did, and a
 trailing-descent delete no longer re-walks the document after every
 removal.
 
+**Converting aliases to Values was bounded in count but not in bytes.**
+`value.Limits.max_values` counts Values, but every expanded alias copies
+its strings: one 64 KiB anchored string behind four levels of ten aliases
+is only 10^4 Values, and asked for about 700 MB from a 65 KiB input. The
+new `value.Limits.max_bytes` (64 MiB by default, like the input limit)
+bounds the text one conversion copies, with `error.LimitExceeded`; a
+document without aliases never copies more text than it holds.
+
 **The fuzz harness.** Its header claimed Zig 0.16.0 has no
 `std.testing.fuzz`; it has one, whose coverage-guided mode does not build
 on that toolchain (a type error in its own test runner), and the note
