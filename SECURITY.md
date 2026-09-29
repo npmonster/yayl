@@ -48,6 +48,18 @@ bounds returns a typed error (`error.LimitExceeded`,
 `error.NestingTooDeep`) rather than growing without limit; on the
 failure path the caller gets an error, not a half-built result.
 
+**Documents per stream.** `parseAll` builds one `Document` per document
+and the count has no bound of its own: `max_input_bytes` is what limits
+it. A stream costs its input once (every document reads one shared
+copy) plus each document's tree and a fixed per-document record, about
+1.6 KB for a document as small as `a: 1`. A stream of nothing but tiny
+documents therefore costs on the order of 180x its size in memory
+(1 MiB of `---\na: 1\n` holds about 190 MB). Choose `max_input_bytes`
+with that in mind for untrusted multi-document streams, or walk the
+stream with the event API (`Parser.nextEvent`), which builds no document
+trees. Earlier releases also copied the whole stream once per document,
+which made the cost quadratic; see the changelog.
+
 Depth is bounded separately from size, on every recursive walk over the
 node graph, and for a reason: a count of values or nodes cannot stand in
 for a depth, because a linear chain of N nested collections is N values

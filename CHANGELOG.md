@@ -3,6 +3,25 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Fixed
+
+**`parseAll` copied the whole stream into every document.** Each
+document of a multi-document stream duplicated the *entire* input into
+its own arena (its spans are offsets into the stream), so memory was
+documents x stream: doubling the input quadrupled it, a 32 KiB stream of
+tiny documents held 180 MB, and 1 MiB of `---\na: 1\n` (116,509
+documents) wanted about 114 GiB, enough to exhaust a 64 GB machine,
+while `max_input_bytes` (64 MiB) bounded nothing. The stream is now
+copied once and shared by reference count: the last document to be
+deinitialized frees it, documents stay valid in any order of release,
+and the same 1 MiB stream holds about 190 MB (about 1.6 KB per document,
+linear). Emitted bytes, spans and the public API are unchanged; the
+conformance, round-trip, preservation and libfyaml gates produce
+identical output. `SECURITY.md` and the memory model in `docs/USAGE.md`
+now state what a stream costs. (#1)
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity
