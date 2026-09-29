@@ -1626,6 +1626,10 @@ pub fn writeAllOpts(allocator: std.mem.Allocator, docs: []const Document, option
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
+    // What the output so far ends with, kept as it is written. Asking the
+    // accumulated text instead cost O(output) per document (see `StreamEnd`).
+    var tail: StreamEnd = .{};
+
     for (docs, 0..) |*doc, i| {
         const body_start = out.items.len;
         var em = emitter_mod.Emitter.init(allocator, &out);
@@ -1633,19 +1637,20 @@ pub fn writeAllOpts(allocator: std.mem.Allocator, docs: []const Document, option
         em.configure(options);
         try em.emitDocument(doc);
 
-        if (i == 0) continue;
-        if (endsStream(out.items[0..body_start])) continue;
-        if (startsDocument(out.items[body_start..])) continue;
-
-        // No boundary either side: supply one. Nothing is inserted on
-        // the path above, which is what keeps a parsed stream byte-exact
-        // -- including the case that motivated this shape, where a
-        // document's region ends mid-line (`--- foo`) and its own
-        // trailing comment belongs to the *next* document's leading
-        // bytes. Inserting a newline there unconditionally would cut
-        // that line in half.
-        const sep = if (body_start > 0 and out.items[body_start - 1] != '\n') "\n---\n" else "---\n";
-        try out.insertSlice(allocator, body_start, sep);
+        // A separator goes in only when nothing already marks the
+        // boundary: the output so far does not end a stream with `...`,
+        // and this document does not itself open one. Nothing is inserted
+        // otherwise, which is what keeps a parsed stream byte-exact --
+        // including the case that motivated this shape, where a
+        // document's region ends mid-line (`--- foo`) and its own trailing
+        // comment belongs to the *next* document's leading bytes.
+        // Inserting a newline there unconditionally would cut that line in
+        // half.
+        if (i > 0 and !tail.endsStream() and !startsDocument(out.items[body_start..])) {
+            const sep = if (body_start > 0 and out.items[body_start - 1] != '\n') "\n---\n" else "---\n";
+            try out.insertSlice(allocator, body_start, sep);
+        }
+        tail.feed(out.items[body_start..]);
     }
 
     return try out.toOwnedSlice(allocator);
@@ -1711,24 +1716,56 @@ fn isTrailer(text: []const u8) bool {
     return true;
 }
 
-/// True when `text` ends with an explicit `...` end-of-document marker,
-/// which is itself a boundary: the next document needs no `---`.
+/// What `writeAll` needs to know about the output written so far: whether
+/// its last non-blank line is an explicit `...` end-of-document marker
+/// (`...` followed by the end of the line or a blank), which is itself a
+/// boundary, so the next document needs no `---`.
 ///
-/// Only the last line that has anything on it can be that marker, so it
-/// is found from the end. `writeAll` asks this of ALL the output so far,
-/// once per document; walking every line to reach the last one made a
-/// stream of N documents cost N x its output, which is quadratic.
-fn endsStream(text: []const u8) bool {
-    // Drop the blank lines after the last line with content, and that
-    // line's own trailing blanks: the marker is `...` followed by the end
-    // of the line or a blank, so they cannot change the answer.
-    var end = text.len;
-    while (end > 0 and (ctype.isBlank(text[end - 1]) or ctype.isBreak(text[end - 1]))) end -= 1;
-    if (end == 0) return false;
-    const last = text[markup.lineStart(text, end)..end];
-    return std.mem.startsWith(u8, last, "...") and
-        (last.len == 3 or last[3] == ' ' or last[3] == '\t');
-}
+/// It is fed every byte exactly once, in output order, and remembers only
+/// the line in progress and the last finished non-blank line, so a whole
+/// stream costs O(output). Asking the accumulated text instead was
+/// quadratic in the number of documents however the answer was found:
+/// walking every line to reach the last one, or scanning back to where the
+/// last one starts, which for output with no line break at all (separately
+/// parsed strings that end without a newline and each open a document) is
+/// the start of the buffer.
+const StreamEnd = struct {
+    /// The first bytes of the line in progress and how many it has so far,
+    /// counted up to four: `...` alone, and `...` plus one more byte, are
+    /// all the marker test can tell apart.
+    head: [4]u8 = undefined,
+    head_len: usize = 0,
+    /// The line in progress has something on it besides blanks.
+    has_content: bool = false,
+    /// Whether the last non-blank line that already ended is a marker.
+    finished_is_marker: bool = false,
+
+    fn feed(self: *StreamEnd, bytes: []const u8) void {
+        for (bytes) |byte| {
+            if (ctype.isBreak(byte)) {
+                if (self.has_content) self.finished_is_marker = self.lineIsMarker();
+                self.head_len = 0;
+                self.has_content = false;
+                continue;
+            }
+            if (self.head_len < self.head.len) {
+                self.head[self.head_len] = byte;
+                self.head_len += 1;
+            }
+            if (!ctype.isBlank(byte)) self.has_content = true;
+        }
+    }
+
+    /// True when the last line that has anything on it is a `...` marker.
+    fn endsStream(self: *const StreamEnd) bool {
+        return if (self.has_content) self.lineIsMarker() else self.finished_is_marker;
+    }
+
+    fn lineIsMarker(self: *const StreamEnd) bool {
+        return self.head_len >= 3 and std.mem.eql(u8, self.head[0..3], "...") and
+            (self.head_len == 3 or self.head[3] == ' ' or self.head[3] == '\t');
+    }
+};
 
 /// Builds a node tree out of parser events (fy_docbuilder). While
 /// building, every node records its source span (see `markup.Src`) so
@@ -2521,12 +2558,21 @@ fn endsStreamByLines(text: []const u8) bool {
         (last.len == 3 or last[3] == ' ' or last[3] == '\t');
 }
 
-test "endsStream agrees with the line-by-line definition on every short input" {
+fn streamEndAfter(chunks: []const []const u8) bool {
+    var tail: StreamEnd = .{};
+    for (chunks) |chunk| tail.feed(chunk);
+    return tail.endsStream();
+}
+
+test "the stream-end tracker agrees with the line-by-line definition on every short input" {
     // Every string up to length 7 over the bytes that decide the answer:
     // the marker's dot, both blanks, all three line breaks (`\n`, `\r`, and
     // `\r\n` by adjacency) and one byte of ordinary content. 335,923
     // inputs, so a boundary case (CR/LF pairs, blanks around the marker, a
     // marker not on the last line) cannot slip past a hand-picked list.
+    // Each is fed whole, one byte at a time, and (up to length 6) split in
+    // two at every position, because the tracker's whole point is that the
+    // answer must not depend on how the output arrived.
     const alphabet = [_]u8{ '.', ' ', '\t', '\n', '\r', 'x' };
     var buf: [7]u8 = undefined;
     var checked: usize = 0;
@@ -2542,7 +2588,17 @@ test "endsStream agrees with the line-by-line definition on every short input" {
             }
             const text = buf[0..len];
             const expected = endsStreamByLines(text);
-            try testing.expectEqual(expected, endsStream(text));
+            try testing.expectEqual(expected, streamEndAfter(&.{text}));
+
+            var bytewise: StreamEnd = .{};
+            for (text) |byte| bytewise.feed(&.{byte});
+            try testing.expectEqual(expected, bytewise.endsStream());
+
+            if (len <= 6) {
+                for (0..len + 1) |cut| {
+                    try testing.expectEqual(expected, streamEndAfter(&.{ text[0..cut], text[cut..] }));
+                }
+            }
             checked += 1;
             if (expected) yes += 1;
         }
@@ -2552,32 +2608,47 @@ test "endsStream agrees with the line-by-line definition on every short input" {
     try testing.expect(yes > 1000 and yes < checked / 2);
 }
 
-test "endsStream does not read the whole output to answer" {
-    // `writeAll` asks it of everything written so far, once per document.
-    // Reading all of it each time made N documents cost N x output
-    // (32 KB of tiny documents took 47 ms and each doubling quadrupled
-    // it). Here the answer sits in the last four bytes of 32 MiB of short
-    // lines: the old walk needs ~0.2 s in ReleaseSafe and seconds in
-    // Debug, the backwards scan a few nanoseconds. The 20 ms bound is
-    // far from both, so it cannot flake and the regression cannot hide;
-    // the fastest of three calls is judged, to ignore a scheduling stall.
-    const allocator = testing.allocator;
-    const size: usize = 32 * 1024 * 1024;
-    const text = try allocator.alloc(u8, size);
-    defer allocator.free(text);
-    for (text, 0..) |*c, i| c.* = if (i % 2 == 0) 'a' else '\n';
-    @memcpy(text[size - 4 ..], "...\n");
-
+test "writeAll stays linear when the output has no line break at all" {
+    // Separately parsed strings that end without a newline and each open a
+    // document: nothing is inserted between them, so the output is ONE
+    // line and "the last line" is all of it. Finding it by walking the
+    // lines, or by scanning back to where it starts, cost O(output) per
+    // document: 8,000 documents (1.6 MB) took ~3.5 s in ReleaseSafe and
+    // far longer in Debug, against milliseconds now. The bound is far
+    // from both, so a slow CI machine cannot flake it and the regression
+    // cannot hide inside it; the fastest of three runs is judged.
+    //
+    // Leak-checked, but without `testing.allocator`'s per-allocation stack
+    // traces, which make thousands of parses slow.
+    var leak_check: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer testing.expect(leak_check.deinit() == .ok) catch @panic("leaked memory");
+    const allocator = leak_check.allocator();
     const io = testing.io;
+
+    var source: [200]u8 = undefined;
+    @memcpy(source[0..4], "--- ");
+    @memset(source[4..], 'x');
+
+    var docs: std.ArrayList(Document) = .empty;
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(allocator);
+    }
+    for (0..8000) |_| try docs.append(allocator, try Document.parse(allocator, &source));
+
     var fastest_ns: i96 = std.math.maxInt(i96);
     for (0..3) |_| {
         const start = std.Io.Timestamp.now(io, .awake);
-        const ends = endsStream(text);
+        const out = try writeAll(allocator, docs.items);
         const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
-        try testing.expect(ends);
+        defer allocator.free(out);
+        // The scenario is what it claims to be: every document written
+        // back as it was parsed, and no line break anywhere.
+        try testing.expectEqual(docs.items.len * source.len, out.len);
+        try testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
         fastest_ns = @min(fastest_ns, elapsed);
     }
-    try testing.expect(fastest_ns < 20_000_000);
+    try testing.expect(fastest_ns < 1_000_000_000);
 }
 
 test "emit options carry the depth bound" {
