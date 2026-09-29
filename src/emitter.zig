@@ -1612,7 +1612,7 @@ pub const Emitter = struct {
                         try self.write(src[is.entry_start..is.end]);
                     } else {
                         try self.write(src[is.entry_start..is.start]);
-                        try self.emitFlowBody(item);
+                        if (!try self.writeNullFlowItem(item)) try self.emitFlowBody(item);
                     }
                     gap = is.end;
                 }
@@ -1675,11 +1675,27 @@ pub const Emitter = struct {
                 try self.writeByte('[');
                 for (s.items.items, 0..) |item, i| {
                     if (i > 0) try self.write(", ");
-                    try self.emitFlowNode(item);
+                    if (!try self.writeNullFlowItem(item)) try self.emitFlowNode(item);
                 }
                 try self.writeByte(']');
             },
         }
+    }
+
+    /// An empty plain scalar is YAML's null and is written as nothing
+    /// (`key:`, `- `, `{k: }`), but a flow sequence item cannot be
+    /// nothing: `[, b]` does not parse and `[a, ]` has one item. Such an
+    /// item, with no anchor or tag to stand in for it, is written `null`,
+    /// the core schema's spelling of the same value (`""` would be the
+    /// empty string). Returns whether it wrote the item.
+    fn writeNullFlowItem(self: *Emitter, item: *const Node) Error!bool {
+        if (item.anchor != null or item.tag != null) return false;
+        switch (item.data) {
+            .scalar => |s| if (s.value.len != 0 or s.style != .plain) return false,
+            else => return false,
+        }
+        try self.write("null");
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -2339,6 +2355,69 @@ test "a plain scalar in a flow collection is quoted when it holds a flow indicat
         const items = rt.pathGet(&.{"a"}).?.items().?;
         try testing.expectEqual(@as(usize, 2), items.len);
         try testing.expectEqualStrings(c.value, items[0].scalarValue().?);
+    }
+}
+
+test "an empty plain scalar in a flow sequence is written as null" {
+    // An empty plain scalar is YAML's null, written as nothing. A flow
+    // sequence item cannot be nothing: `s: [a, b]` with `$.s[0]` set to
+    // it was written `s: [, b]`, which does not parse, and `$.s[1]`
+    // gave `s: [a, ]`, which has one item.
+    // `index` set: replace that item of `s`; otherwise set `m.k`.
+    const cases = [_]struct { in: []const u8, index: ?usize, out: []const u8 }{
+        .{ .in = "s: [a, b]\n", .index = 0, .out = "s: [null, b]\n" },
+        .{ .in = "s: [a, b]\n", .index = 1, .out = "s: [a, null]\n" },
+        .{ .in = "s: [a]\n", .index = 0, .out = "s: [null]\n" },
+        // Controls: a block item and a flow mapping value can be empty.
+        .{ .in = "s:\n  - a\n  - b\n", .index = 0, .out = "s:\n  - \n  - b\n" },
+        .{ .in = "m: {k: v, j: w}\n", .index = null, .out = "m: {k: , j: w}\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        const empty = try doc.createScalar("", .plain);
+        if (c.index) |i| {
+            const seq = doc.pathGet(&.{"s"}).?;
+            if (seq.data.sequence.style == .flow) {
+                try testing.expect(internal.sequenceReplace(&doc, seq, i, empty));
+            } else {
+                // Block items have no in-place replace: empty the item.
+                const item = seq.items().?[i];
+                item.data.scalar.value = "";
+                doc.markModified(item);
+            }
+        } else try doc.pathSet(&.{ "m", "k" }, empty);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+
+    // Every position of flow sequences of one to four items, parsed and
+    // built: the item stays a null and the length stays the same.
+    for (1..5) |n| {
+        for (0..n) |pos| {
+            for ([_]bool{ true, false }) |parsed| {
+                var doc = Document.init(testing.allocator);
+                defer doc.deinit();
+                if (parsed) {
+                    doc.deinit();
+                    doc = try Document.parse(testing.allocator, ([_][]const u8{ "[a]\n", "[a, b]\n", "[a, b, c]\n", "[a, b, c, d]\n" })[n - 1]);
+                    try testing.expect(internal.sequenceReplace(&doc, doc.root.?, pos, try doc.createScalar("", .plain)));
+                } else {
+                    const seq = try doc.createSequence();
+                    seq.data.sequence.style = .flow;
+                    for (0..n) |i| try doc.sequenceAppend(seq, try doc.createScalar(if (i == pos) "" else "x", .plain));
+                    doc.root = seq;
+                }
+                const out = try doc.write(testing.allocator);
+                defer testing.allocator.free(out);
+                var rt = try Document.parse(testing.allocator, out);
+                defer rt.deinit();
+                const items = rt.root.?.items().?;
+                try testing.expectEqual(n, items.len);
+                try testing.expectEqual(document_mod.CoreTag.null, document_mod.resolveCoreTag(items[pos].scalarValue().?, items[pos].data.scalar.style));
+            }
+        }
     }
 }
 

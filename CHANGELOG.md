@@ -41,6 +41,13 @@ streams (flow and scalar roots, tags, anchors, comments, CRLF, BOM,
 directives, several documents) and checks that exactly that scalar's
 bytes change. (#9)
 
+**An empty item in a flow sequence was written as nothing.** Setting an
+item of `s: [a, b]` to the empty plain scalar (YAML's null) wrote
+`s: [, b]`, which does not parse, or `s: [a, ]`, which has one item. An
+empty plain scalar stays unwritten where YAML allows it (`key:`, `- `,
+`{k: }`), but as a flow sequence item with no anchor or tag it is now
+written `null`, so the item keeps its place and its value. (#10)
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity
