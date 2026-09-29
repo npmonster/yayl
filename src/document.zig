@@ -3643,6 +3643,35 @@ test "comment write: a value after a synthetic key reads its entry's line" {
     }
 }
 
+test "comment write: a root on the `---` line moves below its block" {
+    // It was written `--- \n    # new\n    {a: 1}`: a trailing blank
+    // after the marker and the root four columns in.
+    const parseAll = @import("yaml.zig").parseAll;
+    for ([_][2][]const u8{
+        .{ "--- {a: 1}\n", "---\n# new\n{a: 1}\n" },
+        .{ "--- !!map {a: 1}\n", "---\n# new\n!!map {a: 1}\n" },
+        .{ "x: 1\n--- [1, 2]\n", "x: 1\n---\n# new\n[1, 2]\n" },
+    }) |c| {
+        var docs = try parseAll(testing.allocator, c[0]);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(testing.allocator);
+        }
+        const doc = &docs.items[docs.items.len - 1];
+        try doc.setLeadingComments(doc.root.?, "# new");
+        const out = try writeAll(testing.allocator, docs.items);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c[1], out);
+        var again = try parseAll(testing.allocator, out);
+        defer {
+            for (again.items) |*d| d.deinit();
+            again.deinit(testing.allocator);
+        }
+        const last = &again.items[again.items.len - 1];
+        try testing.expectEqualStrings("# new", last.root.?.leadingComments(last).?);
+    }
+}
+
 test "comment write in a CRLF document keeps the convention" {
     const src = "# head\r\na: 1 # one\r\nb: 2\r\n";
     var doc = try Document.parse(testing.allocator, src);

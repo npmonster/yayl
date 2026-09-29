@@ -179,7 +179,9 @@ single-key sets on an 8,000-key mapping took 20 s and grew the arena by
 journal, which a failed batch rolls back, so the document is left as it
 was (spans, tombstones, parent links and `modified` flags included; a
 new test fails a nine-edit batch at each of its allocations and compares
-the whole tree with a fresh parse). The same 800 sets take 74 ms and
+the whole tree with a fresh parse; a second batch covers root, descent,
+wildcard and block-item changes, and merge resolution is failed at each
+of its allocations the same way). The same 800 sets take 74 ms and
 leave the arena as it was. Merge-key resolution uses the same journal
 instead of its own whole-tree clone. The alias checks that guard a delete
 or replacement now walk the tree only when the doomed subtree defines an
@@ -227,6 +229,9 @@ different node than the one holding them in memory.
   they are refused with `error.InvalidSyntax`, as the emitter lays those
   subtrees out afresh. A block on an emptied block value is kept above
   its `{}`.
+- A block written on a root sharing the `---` line came out as
+  `--- \n    # new\n    {a: 1}`; the root now moves below it, at column 0
+  (`---\n# new\n{a: 1}`).
 
 A block written through any node on a line now replaces what is written
 above that line, and lives as long as the outermost node on it: a

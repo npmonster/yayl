@@ -439,7 +439,10 @@ pub const Emitter = struct {
             // tombstoned out of the head above, and nothing else writes
             // the new ones -- the root has no entry slot of its own.
             const col = markup.columnOf(src, doc.body_start);
-            if (root.pending_leading) |pt| try self.writePendingLeadingText(pt, col, self.terminatorAt(doc.body_start), false);
+            // A root sharing the `---` line leaves it for a line of its
+            // own below the block, at column 0 (`--- {a: 1}`).
+            const block_col = if (isEntryFraming(self.pendingLine())) col else 0;
+            if (root.pending_leading) |pt| try self.writePendingLeadingText(pt, block_col, self.terminatorAt(doc.body_start), false);
             stop = try self.emitRoot(root, col, doc.body_end);
         }
         if (stop < doc.region_end) {
@@ -1427,7 +1430,11 @@ pub const Emitter = struct {
             try self.write(framing);
             return;
         }
-        if (!self.endsWithNewline()) try self.write(self.defaultTerminator());
+        if (!self.endsWithNewline()) {
+            // Break the line without the blanks that led up to the entry.
+            while (self.out.items.len > 0 and self.out.items[self.out.items.len - 1] == ' ') self.out.items.len -= 1;
+            try self.write(self.defaultTerminator());
+        }
         try self.writeLeadingLines(t, col, term);
         try self.writeIndent(col);
     }

@@ -904,13 +904,12 @@ pub const Editor = struct {
         switch (target.data) {
             .mapping => {
                 const k = key orelse return error.AmbiguousOperation;
+                // The attach drops the span of the node's old place
+                // (`internal.adopt`).
                 try doc.mappingAppend(target, try doc.createScalar(k, .plain), node);
-                // The node's source spans describe its old location.
-                try clearSpans(doc, node);
             },
             .sequence => {
                 try doc.sequenceAppend(target, node);
-                try clearSpans(doc, node);
             },
             else => return error.NotACollection,
         }
@@ -943,12 +942,6 @@ fn detachChild(doc: *Document, container: *Node, child: *Node) Error!bool {
     try internal.setParent(doc, child, null);
     try doc.markModified(container);
     return true;
-}
-
-fn clearSpans(doc: *Document, node: *Node) !void {
-    try internal.setSrc(doc, node, null);
-    // Children keep their spans: they still describe their own bytes,
-    // which the emitter only uses when the slot itself is original.
 }
 
 /// Deep-clone a subtree into `doc`'s pool, keeping presentation spans
@@ -2824,53 +2817,34 @@ test "a batch that fails at any allocation leaves the document byte-identical" {
         \\flow: [1, 2, 3]
         \\
     ;
-    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
-    const allocator = failing.allocator();
-    var fail_at: usize = 0;
-    while (true) : (fail_at += 1) {
-        failing.fail_index = std.math.maxInt(usize);
-        var doc = try Document.parse(allocator, src);
-        defer doc.deinit();
-        const v1 = try doc.createScalar("X", .plain);
-        const v2 = try doc.createScalar("Y", .plain);
-        const v3 = try doc.createScalar("Z", .plain);
-        const v4 = try doc.createScalar("W", .plain);
-        const v5 = try doc.createScalar("V", .plain);
-        // A replacement carrying the anchor `ref` names: the alias is
-        // re-pointed at it, and that has to be undone too.
-        const m2 = try doc.createMapping();
-        try doc.mappingAppend(m2, try doc.createScalar("r", .plain), try doc.createScalar("1", .plain));
-        try doc.setAnchor(m2, "m");
-        var ed = Editor.init(&doc);
-        failing.fail_index = failing.alloc_index + fail_at;
-        const result = ed.apply(&.{
-            .{ .set = .{ .path = "$.a", .value = v1 } },
-            .{ .set = .{ .path = "$.flow[1]", .value = v2 } },
-            .{ .set = .{ .path = "$.new", .value = v3 } },
-            .{ .delete = "$.items[?k=1]" },
-            .{ .insert = .{ .sequence = "$.items", .position = "$.items[0]", .value = v4, .before = true } },
-            .{ .delete = "$.m.q" },
-            .{ .set = .{ .path = "$.m", .value = m2 } },
-            .{ .move = .{ .from = "$.items[1]", .to = "$.flow" } },
-            .{ .append = .{ .sequence = "$.items", .value = v5 } },
-        });
-        failing.fail_index = std.math.maxInt(usize);
-        const out = try doc.write(allocator);
-        defer allocator.free(out);
-        if (result) |_| {
-            // Every allocation point has been failed once; this run
-            // allocated nothing that could fail, and succeeded.
-            try testing.expect(!std.mem.eql(u8, src, out));
-            break;
-        } else |err| {
-            try testing.expectEqual(error.OutOfMemory, err);
-            try testing.expectEqualStrings(src, out);
-            var fresh = try Document.parse(allocator, src);
-            defer fresh.deinit();
-            try expectSameState(doc.root.?, fresh.root.?, doc.root.?, fresh.root.?);
+    const Batch = struct {
+        fn make(doc: *Document, buf: []Edit) anyerror![]const Edit {
+            const v1 = try doc.createScalar("X", .plain);
+            const v2 = try doc.createScalar("Y", .plain);
+            const v3 = try doc.createScalar("Z", .plain);
+            const v4 = try doc.createScalar("W", .plain);
+            const v5 = try doc.createScalar("V", .plain);
+            // A replacement carrying the anchor `ref` names: the alias is
+            // re-pointed at it, and that has to be undone too.
+            const m2 = try doc.createMapping();
+            try doc.mappingAppend(m2, try doc.createScalar("r", .plain), try doc.createScalar("1", .plain));
+            try doc.setAnchor(m2, "m");
+            const edits = [_]Edit{
+                .{ .set = .{ .path = "$.a", .value = v1 } },
+                .{ .set = .{ .path = "$.flow[1]", .value = v2 } },
+                .{ .set = .{ .path = "$.new", .value = v3 } },
+                .{ .delete = "$.items[?k=1]" },
+                .{ .insert = .{ .sequence = "$.items", .position = "$.items[0]", .value = v4, .before = true } },
+                .{ .delete = "$.m.q" },
+                .{ .set = .{ .path = "$.m", .value = m2 } },
+                .{ .move = .{ .from = "$.items[1]", .to = "$.flow" } },
+                .{ .append = .{ .sequence = "$.items", .value = v5 } },
+            };
+            @memcpy(buf[0..edits.len], &edits);
+            return buf[0..edits.len];
         }
-    }
-    try testing.expect(fail_at > 20);
+    };
+    try testing.expect(try rollbackAtEveryAllocation(src, Batch.make) > 20);
 
     // A batch that fails on an edit's own terms, after replacing the
     // whole root, is rolled back the same way.
@@ -2924,6 +2898,113 @@ test "a batch inside another atomic section is undone with it" {
         if (result) |_| break else |err| try testing.expectEqual(error.OutOfMemory, err);
     }
     try testing.expect(fail_at > 5);
+}
+
+test "the journal undoes every other kind of change too" {
+    // The paths the first batch does not take: a block item replaced
+    // (remove then insert) by a same-document clone, intermediate
+    // mappings created, a descent and a wildcard delete, a move into a
+    // mapping, and the root replaced.
+    const src =
+        \\a: 1
+        \\items:
+        \\  - x
+        \\  - {k: 1}
+        \\m: &m
+        \\  p: 1
+        \\ref: *m
+        \\flow: [1, 2]
+        \\
+    ;
+    const Batch = struct {
+        fn make(doc: *Document, buf: []Edit) anyerror![]const Edit {
+            var ed = Editor.init(doc);
+            const clone = try cloneTree(doc, try ed.one("$.m"));
+            const root = try doc.createMapping();
+            try doc.mappingAppend(root, try doc.createScalar("only", .plain), try doc.createScalar("1", .plain));
+            const edits = [_]Edit{
+                .{ .set = .{ .path = "$.items[0]", .value = clone } },
+                .{ .set = .{ .path = "$.n1.n2.leaf", .value = try doc.createScalar("L", .plain) } },
+                .{ .delete = "$..k" },
+                .{ .delete = "$.flow[*]" },
+                .{ .move = .{ .from = "$.a", .to = "$.m", .key = "moved" } },
+                .{ .set = .{ .path = "$", .value = root } },
+            };
+            @memcpy(buf[0..edits.len], &edits);
+            return buf[0..edits.len];
+        }
+    };
+    try testing.expect(try rollbackAtEveryAllocation(src, Batch.make) > 20);
+}
+
+test "merge resolution that fails at any allocation leaves the tree as parsed" {
+    const src =
+        \\base: &b {a: 1, b: 2}
+        \\more: &c {d: 4}
+        \\use:
+        \\  <<: [*b, *c]
+        \\  e: 5
+        \\
+    ;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing.allocator();
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        failing.fail_index = std.math.maxInt(usize);
+        var doc = try Document.parse(allocator, src);
+        defer doc.deinit();
+        failing.fail_index = failing.alloc_index + fail_at;
+        const result = doc.resolveMergeKeys();
+        failing.fail_index = std.math.maxInt(usize);
+        if (result) |_| break else |err| try testing.expectEqual(error.OutOfMemory, err);
+        var fresh = try Document.parse(allocator, src);
+        defer fresh.deinit();
+        try expectSameState(doc.root.?, fresh.root.?, doc.root.?, fresh.root.?);
+    }
+    try testing.expect(fail_at > 3);
+    // A budget refusal rolls back the same way.
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try testing.expectError(error.LimitExceeded, doc.resolveMergeKeysLimited(2));
+    var fresh = try Document.parse(testing.allocator, src);
+    defer fresh.deinit();
+    try expectSameState(doc.root.?, fresh.root.?, doc.root.?, fresh.root.?);
+}
+
+/// Parse `src`, build a batch with `make` (its values are made before
+/// anything fails), and apply it failing at each of its allocations in
+/// turn: each time, the tree must be in exactly the state a fresh parse
+/// gives. Returns how many allocation points were failed before the
+/// batch ran through.
+fn rollbackAtEveryAllocation(src: []const u8, make: *const fn (*Document, []Edit) anyerror![]const Edit) !usize {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing.allocator();
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        failing.fail_index = std.math.maxInt(usize);
+        var doc = try Document.parse(allocator, src);
+        defer doc.deinit();
+        var buf: [16]Edit = undefined;
+        const edits = try make(&doc, &buf);
+        var ed = Editor.init(&doc);
+        failing.fail_index = failing.alloc_index + fail_at;
+        const result = ed.apply(edits);
+        failing.fail_index = std.math.maxInt(usize);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        if (result) |_| {
+            // Every allocation point has been failed once; this run
+            // allocated nothing that could fail, and succeeded.
+            try testing.expect(!std.mem.eql(u8, src, out));
+            return fail_at;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqualStrings(src, out);
+            var fresh = try Document.parse(allocator, src);
+            defer fresh.deinit();
+            try expectSameState(doc.root.?, fresh.root.?, doc.root.?, fresh.root.?);
+        }
+    }
 }
 
 /// `a` (a rolled-back tree) is in the state `b` (a fresh parse of the
