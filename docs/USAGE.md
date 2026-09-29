@@ -386,13 +386,18 @@ Recursive descent resolves aliases as it walks, and reports each node
 once: a `k` reachable both directly and through a `*ref` is one match,
 not two, so a per-match edit over `ed.all("$..k")` is applied once.
 
-A delete whose final segment is a recursive descent removes EVERY node
-it matches, in document order (`delete("$..k")` deletes every `k`
-anywhere beneath the root), atomically: if any removal would strand an
-alias the whole delete is refused with `error.AnchorReferenced` and
-nothing changes. The prefix resolves through the full grammar, so
-`$..in..k` reaches every `k` beneath every `in`. Descent deletes that
-match nothing are a no-op, like every delete.
+A delete removes EVERY node its path matches, in document order. A
+path of keys and indices names at most one node; a wildcard, filter or
+recursive descent can name many: `delete("$.items[*]")` empties the
+list, `delete("$.items[?k=1]")` removes every item whose `k` is `1`,
+`delete("$.items[*].tmp")` removes `tmp` from every item, and
+`delete("$..k")` deletes every `k` anywhere beneath the root. The
+prefix resolves through the full grammar, so `$..in..k` reaches every
+`k` beneath every `in`. It is atomic: if any removal would strand an
+alias the whole delete is refused with `error.AnchorReferenced`, and a
+match reached through an alias container is refused with
+`error.AliasPath`; either way nothing changes. A delete that matches
+nothing is a no-op.
 
 To copy a subtree into a *different* document, use
 `yaml.edit.cloneTreeInto(&target_doc, node)`: it deep-clones the node

@@ -56,6 +56,21 @@ follow the same rule as values, so `&x k: v` is written, clearing the
 anchor writes `k: v`, and a key's `- ` or `? ` framing and untouched
 sibling keys keep their bytes. (#11)
 
+**A delete matching several nodes reported success and deleted
+nothing.** `Editor.delete("$.items[*]")` and `delete("$.items[?k=1]")`
+left the document unchanged when they matched several nodes, and failed
+with `error.AmbiguousOperation` when they matched exactly one: the target
+was looked up with `one`, whose "not exactly one" error was taken for
+"no match". A delete now removes every node its path matches, as a
+trailing `..` descent already did: `[*]` empties a list or mapping,
+`[?k=v]` removes every matching item, and a wildcard or filter earlier
+in the path (`$.items[*].tmp`) applies to every item. A path of keys and
+indices still names at most one node, and matching nothing is still a
+no-op. It is all or nothing: a match whose removal would strand an alias
+(`error.AnchorReferenced`) or that is reached through an alias container
+(`error.AliasPath`) refuses the whole delete. Behaviour change: deletes
+that match several nodes used to be silent no-ops. (#12)
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity

@@ -456,7 +456,12 @@ pub const Edit = union(enum) {
     /// keeps its place and source span, and emitted output stays
     /// byte-identical. A different style or tag is a real edit.
     set: struct { path: []const u8, value: *Node },
-    /// Delete the (single) node at `path`. No match is not an error.
+    /// Delete every node `path` matches: a path of keys and indices
+    /// names at most one, a wildcard (`[*]`), filter (`[?k=v]`) or
+    /// descent (`..k`) can name many, and each is removed. No match is
+    /// not an error. All or nothing: if removing any match would strand
+    /// an alias (`error.AnchorReferenced`) or a match is reached through
+    /// an alias container (`error.AliasPath`), nothing is removed.
     delete: []const u8,
     /// Insert `value` into the sequence at `path`, before or after the
     /// (single) node at `position`.
@@ -550,21 +555,17 @@ pub const Editor = struct {
                 try applySet(doc, s.path, s.value);
             },
             .delete => |path| {
-                // A trailing descent deletes EVERY match: unlike `set`
-                // there is no single deterministic target to require,
-                // and the old behaviour — an error on one match, a
-                // silent no-op on several — was exactly backwards.
+                // A delete removes EVERY match: unlike `set` there is no
+                // single deterministic target to require, and the old
+                // behaviour — an error on one match, a silent no-op on
+                // several — was exactly backwards. A trailing descent
+                // re-collects as it goes (its matches can nest).
                 var p = try Path.parse(doc.allocator, path);
                 defer p.deinit(doc.allocator);
                 if (p.segments.len > 0 and p.segments[p.segments.len - 1] == .descend) {
                     return applyDescendDelete(doc, p.segments);
                 }
-                const target = ed.one(path) catch |err| {
-                    try noopOrOOM(err);
-                    return; // no match: no-op
-                };
-                try refuseIfPairStrandsAlias(doc, target);
-                try applyDelete(doc, path);
+                try applyDelete(doc, p.segments);
             },
             .insert => |ins| try applyInsert(doc, ins),
             .append => |app| {
@@ -725,35 +726,52 @@ pub const Editor = struct {
         }
     }
 
-    fn applyDelete(doc: *Document, path: []const u8) Error!void {
-        var p = try Path.parse(doc.allocator, path);
-        defer p.deinit(doc.allocator);
-        if (p.segments.len == 0) return error.AmbiguousOperation;
+    /// Delete every node `segments` matches, atomically. A path of keys
+    /// and indices names at most one node; a wildcard or filter, at the
+    /// end or in the middle, can name many, and each is removed. No
+    /// match is a no-op. Every guard runs before anything is removed, so
+    /// a refusal leaves the document as it was.
+    fn applyDelete(doc: *Document, segments: []const Segment) Error!void {
         const root = doc.root orelse return;
-        var cur = root;
-        // Keys and indices both step to exactly one node, so either can
-        // address the parent. Wildcards, filters and recursive descent
-        // can match many: not a single deterministic target.
-        for (p.segments[0 .. p.segments.len - 1]) |seg| {
-            switch (seg) {
-                .key => |k| cur = cur.lookup(k) orelse return,
-                .index => |ix| {
-                    const items = cur.items() orelse return;
-                    if (ix >= items.len) return;
-                    cur = items[ix];
-                },
-                else => return error.AmbiguousOperation,
+        if (segments.len == 0) {
+            try refuseIfPairStrandsAlias(doc, root);
+            return error.AmbiguousOperation;
+        }
+        const containers = try resolve(doc.allocator, root, .{ .segments = segments[0 .. segments.len - 1] });
+        defer doc.allocator.free(containers);
+
+        // Each victim with the container it is removed from, found one
+        // container at a time so a container that is an alias is seen:
+        // reads forward through it, writes do not.
+        const Victim = struct { container: *Node, node: *Node };
+        var victims: std.ArrayList(Victim) = .empty;
+        defer victims.deinit(doc.allocator);
+        var seen: std.AutoHashMapUnmanaged(*Node, void) = .empty;
+        defer seen.deinit(doc.allocator);
+        var through_alias = false;
+        for (containers) |container| {
+            const hits = try resolve(doc.allocator, container, .{ .segments = segments[segments.len - 1 ..] });
+            defer doc.allocator.free(hits);
+            if (hits.len > 0 and container.data == .alias) through_alias = true;
+            for (hits) |hit| {
+                // One node reached twice (a descent in the prefix, or an
+                // alias) is one deletion.
+                if ((try seen.getOrPut(doc.allocator, hit)).found_existing) continue;
+                try victims.append(doc.allocator, .{ .container = container, .node = hit });
             }
         }
-        // Before the removal, not after: `mappingRemove` rejects a
-        // non-mapping and `noopOrOOM` swallowed that as "matched
+        if (victims.items.len == 0) return;
+        for (victims.items) |v| try refuseIfPairStrandsAlias(doc, v.node);
+        // Before the removal, not after: `mappingRemove` rejected a
+        // non-mapping and the old no-op path swallowed that as "matched
         // nothing", so `delete("$.b.k")` through an alias reported
         // SUCCESS and deleted nothing.
-        try refuseAliasContainer(cur);
-        switch (p.segments[p.segments.len - 1]) {
-            .key => |k| _ = doc.mappingRemove(cur, k) catch |err| try noopOrOOM(err),
-            .index => |ix| _ = doc.sequenceRemove(cur, ix) catch |err| try noopOrOOM(err),
-            else => return error.AmbiguousOperation,
+        if (through_alias) return error.AliasPath;
+        // By identity, in document order: positions shift as items go,
+        // and a mapping may repeat a key.
+        for (victims.items) |v| {
+            const removed = try detachChild(doc, v.container, v.node);
+            std.debug.assert(removed);
         }
     }
 
@@ -798,37 +816,10 @@ pub const Editor = struct {
         while (anc) |a| : (anc = a.parent) {
             if (a == node) return error.MoveIntoSubtree;
         }
-        // Detach from the current parent. Marking the parent is not
-        // enough: the flag has to reach the root, or an ANCESTOR still
-        // counts as clean and re-emits this whole subtree verbatim from
-        // the source -- reinstating the node we just detached while it
-        // also appears at its destination, so a move silently becomes a
-        // copy. `markModified` is what walks the chain.
-        if (node.parent) |parent| {
-            switch (parent.data) {
-                .mapping => |*m| {
-                    for (m.pairs.items, 0..) |p, i| {
-                        if (p.value == node) {
-                            try internal.dropPairSpan(doc, parent, p);
-                            _ = m.pairs.orderedRemove(i);
-                            doc.markModified(parent);
-                            break;
-                        }
-                    }
-                },
-                .sequence => |*sq| {
-                    for (sq.items.items, 0..) |item, i| {
-                        if (item == node) {
-                            try internal.dropItemSpan(doc, parent, node);
-                            _ = sq.items.orderedRemove(i);
-                            doc.markModified(parent);
-                            break;
-                        }
-                    }
-                },
-                else => {},
-            }
-        }
+        // Detach from the current parent. An ancestor left clean would
+        // re-emit the node at its old place too, and the move would
+        // silently become a copy (see `detachChild`).
+        if (node.parent) |parent| _ = try detachChild(doc, parent, node);
         node.parent = null;
         switch (target.data) {
             .mapping => {
@@ -845,6 +836,34 @@ pub const Editor = struct {
         }
     }
 };
+
+/// Remove `child` from `container` by identity -- the pair whose value
+/// it is, or the item it is -- tombstoning its bytes, and mark the
+/// container modified. The flag has to reach the root, or an ANCESTOR
+/// still counts as clean and re-emits the subtree verbatim from the
+/// source, reinstating what was removed; `markModified` walks the
+/// chain. Returns false when `child` is not there.
+fn detachChild(doc: *Document, container: *Node, child: *Node) Error!bool {
+    switch (container.data) {
+        .mapping => |*m| for (m.pairs.items, 0..) |p, i| {
+            if (p.value != child) continue;
+            try internal.dropPairSpan(doc, container, p);
+            _ = m.pairs.orderedRemove(i);
+            p.key.parent = null;
+            break;
+        } else return false,
+        .sequence => |*sq| for (sq.items.items, 0..) |item, i| {
+            if (item != child) continue;
+            try internal.dropItemSpan(doc, container, child);
+            _ = sq.items.orderedRemove(i);
+            break;
+        } else return false,
+        else => return false,
+    }
+    child.parent = null;
+    doc.markModified(container);
+    return true;
+}
 
 fn clearSpans(node: *Node) void {
     node.src = null;
@@ -2522,6 +2541,35 @@ fn insertMoveBatch(allocator: std.mem.Allocator) !void {
     defer allocator.free(out);
 }
 
+test "allocation failures in a wildcard and filter delete leak nothing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, wildcardDeleteBatch, .{});
+}
+
+/// A delete with several matches resolves per container, collects and
+/// de-duplicates its victims, then detaches each: every step allocates.
+fn wildcardDeleteBatch(allocator: std.mem.Allocator) !void {
+    var doc = try Document.parse(allocator,
+        \\items:
+        \\  - {k: 1, j: 1}
+        \\  - {k: 2, j: 2}
+        \\  - {k: 1, j: 3}
+        \\m:
+        \\  a: 1
+        \\  b: 2
+        \\
+    );
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{
+        .{ .delete = "$.items[?k=1]" },
+        .{ .delete = "$.items[*].j" },
+        .{ .delete = "$.m[*]" },
+    });
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("items:\n  - {k: 2}\nm:\n  {}\n", out);
+}
+
 test "allocation failures in a cross-document clone leak nothing" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, crossDocumentClone, .{});
 }
@@ -2885,6 +2933,91 @@ test "a trailing descent delete removes every match" {
     try testing.expect(re.pathGet(&.{"k"}) == null);
     try testing.expect(re.pathGet(&.{ "inner", "k" }) == null);
     try testing.expectEqualStrings("4", re.pathGet(&.{"other"}).?.scalarValue().?);
+}
+
+test "a wildcard or filter delete removes every match" {
+    // `one` answers UnknownPath for several matches as well as none, and
+    // delete took any error for "no match": a delete matching several
+    // nodes reported success and removed nothing, while one matching a
+    // single node reached a final-segment switch that knew only keys and
+    // indices, and failed with AmbiguousOperation.
+    const cases = [_]struct { in: []const u8, path: []const u8, out: []const u8 }{
+        // [*] over 3, 1 and 0 items.
+        .{ .in = "items:\n  - a\n  - b\n  - c\nk: v\n", .path = "$.items[*]", .out = "items:\n  []\nk: v\n" },
+        .{ .in = "items:\n  - a\nk: v\n", .path = "$.items[*]", .out = "items:\n  []\nk: v\n" },
+        .{ .in = "items: []\nk: v\n", .path = "$.items[*]", .out = "items: []\nk: v\n" },
+        // [?k=v] with 2, 1 and 0 matches.
+        .{ .in = "items:\n  - {k: 1}\n  - {k: 1}\n  - {k: 2}\n", .path = "$.items[?k=1]", .out = "items:\n  - {k: 2}\n" },
+        .{ .in = "items:\n  - {k: 1}\n  - {k: 2}\n", .path = "$.items[?k=1]", .out = "items:\n  - {k: 2}\n" },
+        .{ .in = "items:\n  - {k: 1}\n  - {k: 2}\n", .path = "$.items[?k=9]", .out = "items:\n  - {k: 1}\n  - {k: 2}\n" },
+        // Mappings: [*] takes every entry, [?k=v] every matching value
+        // -- by identity, so of two entries with the same key only the
+        // matching one goes.
+        .{ .in = "m:\n  a: 1\n  b: 2\nk: v\n", .path = "$.m[*]", .out = "m:\n  {}\nk: v\n" },
+        .{ .in = "a: {k: 1}\na: {k: 2}\nb: {k: 1}\n", .path = "$[?k=1]", .out = "a: {k: 2}\n" },
+        // In the middle of a path: each item's `k`.
+        .{ .in = "items:\n  - k: 1\n    j: 1\n  - k: 2\n    j: 2\n", .path = "$.items[*].k", .out = "items:\n  - j: 1\n  - j: 2\n" },
+        .{ .in = "items:\n  - k: 1\n    j: 1\n", .path = "$.items[*].k", .out = "items:\n  - j: 1\n" },
+        // An alias item goes like any other; its anchor stays.
+        .{ .in = "a: &x 1\nitems: [*x, 2]\n", .path = "$.items[*]", .out = "a: &x 1\nitems: []\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete(c.path);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+        // And nothing the path matches is left.
+        var re = try Document.parse(testing.allocator, out);
+        defer re.deinit();
+        var red = Editor.init(&re);
+        const left = try red.all(c.path);
+        defer testing.allocator.free(left);
+        try testing.expectEqual(@as(usize, 0), left.len);
+    }
+}
+
+test "a wildcard delete refuses atomically, and not through an alias" {
+    const cases = [_]struct { in: []const u8, path: []const u8, err: Error }{
+        // An anchored item an alias still names: nothing is removed,
+        // not even the items before it.
+        .{ .in = "items:\n  - a\n  - &x b\n  - c\nref: *x\n", .path = "$.items[*]", .err = error.AnchorReferenced },
+        .{ .in = "items:\n  - {k: 1}\n  - &x {k: 1}\nref: *x\n", .path = "$.items[?k=1]", .err = error.AnchorReferenced },
+        // Writes do not forward through an alias, whatever the count.
+        .{ .in = "a: &s [1, 2]\nb: *s\n", .path = "$.b[*]", .err = error.AliasPath },
+        .{ .in = "a: &s [{k: 1}]\nb: *s\n", .path = "$.b[?k=1]", .err = error.AliasPath },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try testing.expectError(c.err, ed.delete(c.path));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.in, out);
+    }
+    // In a batch: a later failing edit rolls the deletes back too.
+    const src = "items:\n  - a\n  - b\nk: v\n";
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try testing.expectError(error.AmbiguousOperation, ed.apply(&.{
+        .{ .delete = "$.items[*]" },
+        .{ .set = .{ .path = "$[*]", .value = try doc.createScalar("x", .plain) } },
+    }));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(src, out);
+    // An anchored item nobody references is simply deleted.
+    var doc2 = try Document.parse(testing.allocator, "items:\n  - &x a\n  - b\n");
+    defer doc2.deinit();
+    var ed2 = Editor.init(&doc2);
+    try ed2.delete("$.items[*]");
+    const out2 = try doc2.write(testing.allocator);
+    defer testing.allocator.free(out2);
+    try testing.expectEqualStrings("items:\n  []\n", out2);
 }
 
 test "descent reports a node reached through an alias once" {

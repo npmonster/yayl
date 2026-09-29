@@ -194,7 +194,7 @@ try ed.apply(&.{
 });
 ```
 
-If a batch fails, the original document is left byte-identical.
+A delete removes every node its path matches (`$.items[*]`, `$.items[?k=1]`, `$..tmp`), and a delete that matches nothing is a no-op. If a batch fails, the original document is left byte-identical.
 
 ## Values, schemas, files
 
