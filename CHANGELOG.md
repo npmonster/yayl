@@ -254,6 +254,16 @@ YAML that does not parse, all on main:
   at its value indicator wherever it is, which also makes the position
   after that `:` a trailing comment position of the value.
 
+**A write one level below an alias went through it.** `error.AliasPath`
+fired only when the container being edited was itself the alias: with
+`a: &x {k: 1, inner: {j: 2}}` and `b: *x`, `delete("$.b.k")` was refused
+but `delete("$.b.inner.j")`, `set` of the same path, `$.b..j`, and an
+insert, append or move through `$.b` edited the anchored mapping that
+every alias shares. Queries now report when a match was reached by
+stepping out of an alias, at any step or inside a descent, and every
+write refuses that. A descent over the whole document reaches an
+anchored node directly first, so `delete("$..j")` still deletes it.
+
 **The fuzz harness.** Its header claimed Zig 0.16.0 has no
 `std.testing.fuzz`; it has one, whose coverage-guided mode does not build
 on that toolchain (a type error in its own test runner), and the note

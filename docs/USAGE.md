@@ -377,10 +377,11 @@ convention; its structure and values survive, its internal comments
 and blank lines do not. Untouched siblings stay verbatim. Moving a
 node into its own subtree is rejected (`error.MoveIntoSubtree`).
 
-Reads forward through aliases; writes do not. A mutation whose
-container is an alias (`$.b.k` where `b` is a `*ref`) is refused with
-`error.AliasPath` rather than misreported — edit the anchor's side
-instead, and the alias reflects the change. A move that would reorder
+Reads forward through aliases; writes do not. A mutation whose path
+steps through an alias anywhere (`$.b.k` or `$.b.inner.j` where `b` is a
+`*ref`) is refused with `error.AliasPath`, since it would change the
+anchored node every alias shares — edit the anchor's side instead, and
+the alias reflects the change. A move that would reorder
 an alias ahead of its anchor is refused with `error.AnchorReferenced`;
 a move where the anchor and its aliases travel together is allowed.
 
@@ -403,8 +404,8 @@ list, `delete("$.items[?k=1]")` removes every item whose `k` is `1`,
 prefix resolves through the full grammar, so `$..in..k` reaches every
 `k` beneath every `in`. It is atomic: if any removal would strand an
 alias the whole delete is refused with `error.AnchorReferenced`, and a
-match reached through an alias container is refused with
-`error.AliasPath`; either way nothing changes. A delete that matches
+match reached through an alias is refused with `error.AliasPath`;
+either way nothing changes. A delete that matches
 nothing is a no-op.
 
 To copy a subtree into a *different* document, use

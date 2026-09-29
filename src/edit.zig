@@ -69,7 +69,8 @@ pub const CloneError = error{
 /// disagreeing. Editing the shared target through the anchor side works
 /// and is the supported route; whether writes should forward through an
 /// alias the way reads do is a semantic decision, not something to
-/// settle by accident.
+/// settle by accident. An alias EARLIER in the path is refused by
+/// `resolveForWrite`: this checks the container the write lands in.
 fn refuseAliasContainer(container: *const Node) Error!void {
     if (container.data == .alias) return error.AliasPath;
 }
@@ -205,6 +206,16 @@ pub const Path = struct {
 /// Evaluate `path` against `root`. Results are in document order;
 /// aliases are followed (bounded). Caller owns the returned slice.
 pub fn resolve(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*Node {
+    var via_alias = false;
+    return resolveTracked(allocator, root, path, &via_alias);
+}
+
+/// `resolve`, also reporting in `via_alias` whether a match was reached
+/// by stepping out of an alias into its target's entries, at any step.
+/// Reads forward through aliases; a write must not, at any depth: an
+/// edit at `$.b.inner.j` with `b` an alias changes the anchored node
+/// every alias shares (see `resolveForWrite`).
+fn resolveTracked(allocator: std.mem.Allocator, root: *Node, path: Path, via_alias: *bool) Error![]*Node {
     var results: std.ArrayList(*Node) = .empty;
     errdefer results.deinit(allocator);
     var current: std.ArrayList(*Node) = .empty;
@@ -226,6 +237,10 @@ pub fn resolve(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*N
         defer descent.deinit();
         for (current.items) |node| {
             if ((try expanded.getOrPut(allocator, node.resolveAlias())).found_existing) continue;
+            const before = next.items.len;
+            defer if (node.data == .alias and next.items.len > before) {
+                via_alias.* = true;
+            };
             switch (seg) {
                 .key => |k| if (node.lookup(k)) |child| try next.append(allocator, child),
                 .index => |ix| {
@@ -255,11 +270,34 @@ pub fn resolve(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*N
                 },
             }
         }
+        if (descent.via_alias) via_alias.* = true;
         current.deinit(allocator);
         current = next;
     }
     try results.appendSlice(allocator, current.items);
     return results.toOwnedSlice(allocator);
+}
+
+/// `resolve` for a write: a match reached through an alias is refused
+/// with `error.AliasPath`.
+fn resolveForWrite(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*Node {
+    var via_alias = false;
+    const found = try resolveTracked(allocator, root, path, &via_alias);
+    if (via_alias and found.len > 0) {
+        allocator.free(found);
+        return error.AliasPath;
+    }
+    return found;
+}
+
+/// The single node of `found`: `error.UnknownPath` for none,
+/// `error.AmbiguousOperation` for several.
+fn exactlyOne(found: []const *Node) Error!*Node {
+    return switch (found.len) {
+        0 => error.UnknownPath,
+        1 => found[0],
+        else => error.AmbiguousOperation,
+    };
 }
 
 fn filterMatches(candidate: *Node, key: []const u8, value: []const u8) bool {
@@ -441,6 +479,9 @@ const Descent = struct {
     allocator: std.mem.Allocator,
     out: *std.ArrayList(*Node),
     done: std.AutoHashMapUnmanaged(*const Node, void) = .empty,
+    /// Aliases the walk is inside, and whether it matched anything there.
+    alias_depth: usize = 0,
+    via_alias: bool = false,
 
     fn deinit(self: *Descent) void {
         self.done.deinit(self.allocator);
@@ -450,10 +491,18 @@ const Descent = struct {
         if (depth >= max_walk_depth) return error.NestingTooDeep;
         const cur = node.resolveAlias();
         if (self.done.contains(cur)) return;
+        const through = node.data == .alias;
+        if (through) self.alias_depth += 1;
+        defer if (through) {
+            self.alias_depth -= 1;
+        };
         if (cur.pairs()) |pairs| {
             for (pairs) |p| {
                 const kv = p.key.scalarValue() orelse continue;
-                if (std.mem.eql(u8, kv, key)) try self.out.append(self.allocator, p.value);
+                if (std.mem.eql(u8, kv, key)) {
+                    try self.out.append(self.allocator, p.value);
+                    if (self.alias_depth > 0) self.via_alias = true;
+                }
             }
             for (pairs) |p| try self.walk(p.value, key, depth + 1);
         } else if (cur.items()) |items| {
@@ -487,7 +536,7 @@ pub const Edit = union(enum) {
     /// descent (`..k`) can name many, and each is removed. No match is
     /// not an error. All or nothing: if removing any match would strand
     /// an alias (`error.AnchorReferenced`) or a match is reached through
-    /// an alias container (`error.AliasPath`), nothing is removed.
+    /// an alias at any step (`error.AliasPath`), nothing is removed.
     delete: []const u8,
     /// Insert `value` into the sequence at `path`, before or after the
     /// (single) node at `position`.
@@ -517,11 +566,18 @@ pub const Editor = struct {
         const root = self.doc.root orelse return error.UnknownPath;
         const found = try resolve(self.doc.allocator, root, p);
         defer self.doc.allocator.free(found);
-        return switch (found.len) {
-            0 => error.UnknownPath,
-            1 => found[0],
-            else => error.AmbiguousOperation,
-        };
+        return exactlyOne(found);
+    }
+
+    /// `one` for the target of a write: a node reached through an alias
+    /// is refused (`error.AliasPath`).
+    fn oneForWrite(self: *Editor, path: []const u8) Error!*Node {
+        var p = try Path.parse(self.doc.allocator, path);
+        defer p.deinit(self.doc.allocator);
+        const root = self.doc.root orelse return error.UnknownPath;
+        const found = try resolveForWrite(self.doc.allocator, root, p);
+        defer self.doc.allocator.free(found);
+        return exactlyOne(found);
     }
 
     /// Query convenience: every match for `path`, each node once, in
@@ -596,7 +652,7 @@ pub const Editor = struct {
             },
             .insert => |ins| try applyInsert(doc, ins),
             .append => |app| {
-                const seq = try ed.one(app.sequence);
+                const seq = try ed.oneForWrite(app.sequence);
                 try refuseAliasContainer(seq);
                 if (!seq.isSequence()) return error.NotASequence;
                 try doc.sequenceAppend(seq, app.value);
@@ -621,13 +677,21 @@ pub const Editor = struct {
     /// through the general resolver and must match exactly once.
     fn setContainer(doc: *Document, parent: []const Segment, may_create: bool) Error!*Node {
         if (may_create and allPlainKeys(parent)) {
+            // The part of the walk that exists must not step through an
+            // alias (the rest is created).
+            var cur = doc.root;
+            for (parent) |seg| {
+                const c = cur orelse break;
+                if (c.data == .alias) return error.AliasPath;
+                cur = c.lookup(seg.key);
+            }
             const keys = try doc.allocator.alloc([]const u8, parent.len);
             defer doc.allocator.free(keys);
             for (parent, 0..) |seg, i| keys[i] = seg.key;
             return doc.mappingWalkOrCreate(keys);
         }
         const root = doc.root orelse return error.UnknownPath;
-        const found = try resolve(doc.allocator, root, .{ .segments = parent });
+        const found = try resolveForWrite(doc.allocator, root, .{ .segments = parent });
         defer doc.allocator.free(found);
         if (found.len != 1) return error.UnknownPath;
         return found[0];
@@ -723,7 +787,8 @@ pub const Editor = struct {
     fn applyDescendDelete(doc: *Document, segments: []const Segment) Error!void {
         const k = segments[segments.len - 1].descend;
         const root = doc.root orelse return;
-        const containers = try resolve(doc.allocator, root, .{ .segments = segments[0 .. segments.len - 1] });
+        var through_alias = false;
+        const containers = try resolveTracked(doc.allocator, root, .{ .segments = segments[0 .. segments.len - 1] }, &through_alias);
         defer doc.allocator.free(containers);
 
         var victims: std.ArrayList(*Node) = .empty;
@@ -737,6 +802,9 @@ pub const Editor = struct {
         for (victims.items) |victim| {
             try refuseIfPairStrandsAlias(doc, victim);
         }
+        // A match found only through an alias sits in the anchored node
+        // every alias shares, as for `applyDelete`.
+        if (through_alias or descent.via_alias) return error.AliasPath;
         // Outermost first (the walk is pre-order), each by identity. A
         // match inside an earlier one's subtree leaves with it; detaching
         // it from that detached subtree afterwards changes nothing that
@@ -759,7 +827,8 @@ pub const Editor = struct {
             try refuseIfPairStrandsAlias(doc, root);
             return error.AmbiguousOperation;
         }
-        const containers = try resolve(doc.allocator, root, .{ .segments = segments[0 .. segments.len - 1] });
+        var through_alias = false;
+        const containers = try resolveTracked(doc.allocator, root, .{ .segments = segments[0 .. segments.len - 1] }, &through_alias);
         defer doc.allocator.free(containers);
 
         // Each victim with the container it is removed from, found one
@@ -770,11 +839,9 @@ pub const Editor = struct {
         defer victims.deinit(doc.allocator);
         var seen: std.AutoHashMapUnmanaged(*Node, void) = .empty;
         defer seen.deinit(doc.allocator);
-        var through_alias = false;
         for (containers) |container| {
-            const hits = try resolve(doc.allocator, container, .{ .segments = segments[segments.len - 1 ..] });
+            const hits = try resolveTracked(doc.allocator, container, .{ .segments = segments[segments.len - 1 ..] }, &through_alias);
             defer doc.allocator.free(hits);
-            if (hits.len > 0 and container.data == .alias) through_alias = true;
             for (hits) |hit| {
                 // One node reached twice (a descent in the prefix, or an
                 // alias) is one deletion.
@@ -787,7 +854,8 @@ pub const Editor = struct {
         // Before the removal, not after: `mappingRemove` rejected a
         // non-mapping and the old no-op path swallowed that as "matched
         // nothing", so `delete("$.b.k")` through an alias reported
-        // SUCCESS and deleted nothing.
+        // SUCCESS and deleted nothing. Through an alias at ANY step, not
+        // only the last: `$.b.inner.j` deleted from the anchored node.
         if (through_alias) return error.AliasPath;
         // By identity, in document order: positions shift as items go,
         // and a mapping may repeat a key.
@@ -799,7 +867,7 @@ pub const Editor = struct {
 
     fn applyInsert(doc: *Document, ins: Insert) Error!void {
         var ed = Editor{ .doc = doc };
-        const seq = try ed.one(ins.sequence);
+        const seq = try ed.oneForWrite(ins.sequence);
         try refuseAliasContainer(seq);
         const items = seq.items() orelse return error.NotASequence;
         const anchor = try ed.one(ins.position);
@@ -816,13 +884,14 @@ pub const Editor = struct {
 
     fn applyMove(doc: *Document, from: []const u8, to: []const u8, key: ?[]const u8) Error!void {
         var ed = Editor{ .doc = doc };
-        const node = try ed.one(from);
-        const target = try ed.one(to);
+        const node = try ed.oneForWrite(from);
+        const target = try ed.oneForWrite(to);
         try refuseIfMoveStrandsAlias(doc, node);
         // Detaching a mapping value drops the whole pair, key included
         // (see the detach loop below), so an anchor on that key leaves
         // with it. `refuseIfMoveStrandsAlias` only sees the value tree.
         if (pairKeyOf(node)) |pair_key| try refuseIfAnchorReferenced(doc, pair_key);
+        try refuseAliasContainer(target);
         // Reject moving a node into its own subtree.
         var anc: ?*Node = target;
         while (anc) |a| : (anc = a.parent) {
@@ -3493,6 +3562,48 @@ test "descent delete under a prefix removes matches only within it" {
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("out:\n  k: 1\nin:\n  {}\n", out);
+}
+
+test "a write through an alias is refused at any depth, not only the last" {
+    // `error.AliasPath` fired only when the IMMEDIATE container was the
+    // alias: one level deeper the write went through it and edited the
+    // anchored node every alias shares.
+    for ([_][]const u8{
+        "a: &x {k: 1, inner: {j: 2}, list: [1]}\nb: *x\n",
+        "a: &x\n  k: 1\n  inner:\n    j: 2\n  list:\n    - 1\nb: *x\n",
+    }) |src| {
+        var doc = try Document.parse(testing.allocator, src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const v = try doc.createScalar("9", .plain);
+        const edits = [_]Edit{
+            .{ .delete = "$.b.k" },
+            .{ .delete = "$.b.inner.j" },
+            .{ .delete = "$.b.inner[*]" },
+            .{ .delete = "$.b..j" },
+            .{ .set = .{ .path = "$.b.inner.j", .value = v } },
+            .{ .set = .{ .path = "$.b.inner.new", .value = v } },
+            .{ .set = .{ .path = "$.b.list[0]", .value = v } },
+            .{ .append = .{ .sequence = "$.b.list", .value = v } },
+            .{ .insert = .{ .sequence = "$.b.list", .position = "$.b.list[0]", .value = v, .before = true } },
+            .{ .move = .{ .from = "$.b.inner.j", .to = "$", .key = "z" } },
+            .{ .move = .{ .from = "$.a.k", .to = "$.b.inner", .key = "z" } },
+        };
+        for (edits) |e| {
+            try testing.expectError(error.AliasPath, ed.apply(&.{e}));
+            const out = try doc.write(testing.allocator);
+            defer testing.allocator.free(out);
+            try testing.expectEqualStrings(src, out);
+        }
+        // Reads still go through, and the anchor side is writable.
+        try testing.expectEqualStrings("2", (try ed.one("$.b.inner.j")).scalarValue().?);
+        try ed.set("$.a.inner.j", try doc.createScalar("3", .plain));
+        try testing.expectEqualStrings("3", (try ed.one("$.b.inner.j")).scalarValue().?);
+        // A descent over the whole document reaches the anchored node
+        // directly first, so it deletes there.
+        try ed.delete("$..j");
+        try testing.expectError(error.UnknownPath, ed.one("$.a.inner.j"));
+    }
 }
 
 test "deleting or moving an anchored KEY is refused, not silently corrupting" {
