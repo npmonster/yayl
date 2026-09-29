@@ -93,39 +93,24 @@ pub fn dropRange(self: *Document, drops: *std.ArrayList([2]usize), from: usize, 
 /// after detaching, it tombstones the wrong bytes silently. Returns
 /// early for flow containers — an emitter gap-walk invariant, not a
 /// document-model one.
-/// The framing an entry's leading bytes [from, to) carry: the offset of
-/// the last `-` sequence-item indicator, and of the `?` explicit-key
-/// indicator after it, when present. Only indentation, indicators, line
-/// breaks and node properties sit there; an indicator is followed by a
-/// blank or a line break (`-\n  name: x` is an item whose dash sits on
-/// its own line), while a `-` inside an anchor or tag name is not.
-const Framing = struct { dash: ?usize = null, question: ?usize = null };
-
-/// DROP-time counterpart of `markup.entryStart`. `entryStart` is
-/// AUTHORITATIVE: at build time it decides which `-`/`?` frames an entry
-/// (it also requires the content to be indented under the indicator) and
-/// records that in `Node.src.entry_start`. This helper only re-reads the
-/// leading bytes of that already-accepted span to decide which indicator a
-/// tombstone must keep; it must not be read as an independent rule.
-fn entryFraming(src: []const u8, from: usize, to: usize) Framing {
-    var f = Framing{};
-    var i = from;
-    while (i < to) : (i += 1) {
-        const c = src[i];
-        if (c != '-' and c != '?') continue;
-        const followed = i + 1 >= to or switch (src[i + 1]) {
-            ' ', '\t', '\n', '\r' => true,
-            else => false,
-        };
-        if (!followed) continue;
-        if (c == '-') {
-            f.dash = i;
-            f.question = null; // a `?` before this dash belongs to an outer key
-        } else if (f.question == null) {
-            f.question = i;
-        }
+/// The framing an entry's line carries for the nodes around it. When
+/// `container` starts on that line -- the entry is its first -- the
+/// bytes from the line start to the container's own start are the
+/// indicators of enclosing nodes (an item's `- `, a key collection's
+/// `? `, an explicit value's `: `, nested: `- - `, `- ? `) and
+/// indentation. They belong to those nodes and outlive the entry; the
+/// entry's own bytes begin at the container's start (which is where an
+/// explicit key's own `? ` sits: `? a\n: 1`). Returns that start and the
+/// end of the last indicator, or null when the line has no such framing.
+fn outerFraming(src: []const u8, container: *const Node, line: usize) ?struct { own: usize, after: usize } {
+    const cs = container.src orelse return null;
+    if (cs.synthetic or cs.start < line) return null;
+    var after = line;
+    for (src[line..cs.start], line..) |c, i| {
+        if (!ctype.isBlank(c) and !ctype.isBreak(c)) after = i + 1;
     }
-    return f;
+    if (after == line) return null; // indentation only
+    return .{ .own = cs.start, .after = after };
 }
 
 pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
@@ -141,57 +126,40 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
             if (m.style == .flow) return;
             var from = markup.lineStart(src, ks.entry_start);
             var to = markup.lineEnd(src, p.src_end orelse ks.end);
-            // A mapping that is a sequence item carries the `- `
-            // indicator in its FIRST entry's leading bytes, but the
-            // indicator belongs to the item and outlives the entry.
-            // Leave it in place and consume the successor's own
-            // indentation instead, so it moves up onto that line
-            // (`- name: x` + `  port: 1` -> `- port: 1`). Only when
-            // nothing but blanks separates them: a comment in
-            // between has to stay where the author put it.
-            //
-            // Only a `-` in those leading bytes is such an indicator.
-            // An explicit key's `? ` sits there too (`? a\n: 1`), but
-            // it is the entry's own: keeping it left a bare `? ` behind,
-            // which reads back as a null key nobody wrote. The LAST dash
-            // is the one that frames this mapping (`- - a: 1` nests two
-            // items).
-            // Scan from the line start, not from `entry_start`: an
-            // explicit key's span begins at its own `?`, and the item's
-            // `- ` ahead of it on the same line is the mapping's.
-            const fr = entryFraming(src, markup.lineStart(src, ks.entry_start), ks.start);
-            if (fr.dash) |dash| {
-                // Everything from the indicator up to the key -- its
-                // blanks, or a line break and the indentation after it
-                // (`-\n  name: x`) -- stays, except an explicit key's
-                // own `?` and what follows it (`- ? a` keeps `- `).
-                const after_dash = dash + 1;
-                const keep = fr.question orelse ks.start;
+            // The first entry's line can carry enclosing nodes' framing
+            // (`- name: x`, `? x: 1` for a key mapping, `: x: 1` for an
+            // explicit key's value). It outlives the entry: leave it and
+            // consume the successor's own indentation instead, so the
+            // successor moves up onto that line (`- name: x` +
+            // `  port: 1` -> `- port: 1`). Only when nothing but blanks
+            // separates them: a comment in between has to stay where the
+            // author put it. Taking the whole line lost a `: ` (a
+            // different tree) and left a bare `- ` or `? ` behind.
+            if (outerFraming(src, map, markup.lineStart(src, ks.entry_start))) |fr| {
                 if (nextEntryStart(m, p)) |nx| {
                     if (nx >= to and ctype.isBlankRun(src[to..nx])) {
-                        from = keep;
+                        from = fr.own;
                         to = nx;
                     } else {
                         // Something the author wrote — a comment —
                         // sits between the two entries and has to
                         // stay where it is, so the successor cannot
-                        // move up. Keep the indicator on its own
-                        // line (dropping the space after it) and
-                        // remove only this entry's own text.
-                        from = keep;
-                        while (from > after_dash and src[from - 1] == ' ') from -= 1;
+                        // move up. Keep the framing on its own line
+                        // (dropping the space after it) and remove
+                        // only this entry's own text.
+                        from = fr.own;
+                        while (from > fr.after and src[from - 1] == ' ') from -= 1;
                         to = markup.newlineAt(src, p.src_end orelse ks.end);
                     }
                 } else {
-                    // No successor at all: this entry was the item's
-                    // only one, so the mapping empties and re-emits
-                    // as `{}`. The item itself survives -- it just
-                    // becomes `- {}` -- so the indicator has to stay
-                    // put. Taking the whole line, indicator and all,
-                    // deletes a sequence entry nobody asked to
-                    // delete and leaves the `{}` dangling at the
-                    // parent's column, which does not parse.
-                    from = keep;
+                    // No successor at all: this entry was the mapping's
+                    // only one, so it empties and re-emits as `{}`. The
+                    // enclosing node survives -- `- {}`, `: {}` -- so the
+                    // framing has to stay put. Taking the whole line
+                    // deletes an entry nobody asked to delete and leaves
+                    // the `{}` dangling at the parent's column, which
+                    // does not parse.
+                    from = fr.own;
                     to = markup.newlineAt(src, p.src_end orelse ks.end);
                 }
             }
@@ -234,34 +202,33 @@ pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
             }
             var from = markup.lineStart(src, is.entry_start);
             var to = markup.lineEnd(src, is.end);
-            // A nested sequence (`- - a`) puts an OUTER item's
-            // indicator on this item's line. That indicator belongs
-            // to the outer item and outlives this one, so leave it
-            // and consume the successor's indentation instead
-            // (see dropPairSpan for the mapping equivalent).
-            if (std.mem.lastIndexOfScalar(u8, src[from..is.entry_start], '-')) |od| {
-                const after_outer = from + od + 1;
+            // The first item's line can carry enclosing nodes' framing
+            // (an outer item's `- ` in `- - a`, an explicit key's `? `
+            // or value's `: `). It outlives this item, so leave it and
+            // consume the successor's indentation instead (see
+            // dropPairSpan for the mapping equivalent).
+            if (outerFraming(src, seq, from)) |fr| {
                 if (nextItemStart(s, item)) |nx| {
                     if (nx >= to and ctype.isBlankRun(src[to..nx])) {
-                        from = is.entry_start;
+                        from = fr.own;
                         to = nx;
                     } else {
                         // A comment between the two items keeps the
-                        // successor from moving up: the outer indicator
-                        // stays on its own line (dropping the blanks
-                        // after it) and only this item's text goes.
-                        from = is.entry_start;
-                        while (from > after_outer and src[from - 1] == ' ') from -= 1;
+                        // successor from moving up: the framing stays on
+                        // its own line (dropping the blanks after it)
+                        // and only this item's text goes.
+                        from = fr.own;
+                        while (from > fr.after and src[from - 1] == ' ') from -= 1;
                         to = markup.newlineAt(src, is.end);
                     }
                 } else {
                     // No successor: this sequence empties and re-emits
-                    // as `[]`, but the OUTER item survives as `- []`.
-                    // Taking the whole line deleted an item nobody asked
-                    // to delete and left `[]` dangling at the parent's
-                    // column, which does not parse (`- - x` minus
-                    // `$[0][0]` emitted a bare `[]`).
-                    from = is.entry_start;
+                    // as `[]`, but the enclosing node survives as
+                    // `- []`. Taking the whole line deleted an item
+                    // nobody asked to delete and left `[]` dangling at
+                    // the parent's column, which does not parse (`- - x`
+                    // minus `$[0][0]` emitted a bare `[]`).
+                    from = fr.own;
                     to = markup.newlineAt(src, is.end);
                 }
             }

@@ -2812,14 +2812,6 @@ test "preservation sweep: a new leading comment on any node reads back from it" 
         }
     }
 
-    // Cases whose failure is a separate emitter defect, not a comment
-    // one, fixed in its own commit: a compact collection after an
-    // explicit `? `/`: ` indicator. Each must still fail (stale guard),
-    // and nothing else may.
-    const pending = [_][]const u8{ "5WE3", "A2M4", "KK5P", "M5DY", "V9D5" };
-    var pending_hit = [_]bool{false} ** pending.len;
-    var tracked: usize = 0;
-
     for (texts.items) |t| {
         var doc = try yaml.parse(allocator, t.text);
         defer doc.deinit();
@@ -2828,28 +2820,13 @@ test "preservation sweep: a new leading comment on any node reads back from it" 
         defer nodes.deinit(allocator);
         try collectNodes(allocator, root, &nodes);
         for (0..nodes.items.len) |i| {
-            const before = failures.list.items.len;
             if (try probeLeadingComment(allocator, t.label, t.text, i, &failures)) written += 1 else skipped += 1;
-            if (failures.list.items.len == before) continue;
-            for (pending, 0..) |id, k| {
-                if (!std.mem.eql(u8, id, t.label)) continue;
-                pending_hit[k] = true;
-                tracked += 1;
-                allocator.free(failures.list.pop().?);
-                break;
-            }
         }
     }
-    std.debug.print("preservation[new leading comments]: {d} written, {d} positions not writable, {d} tracked failures, over {d} documents\n", .{ written, skipped, tracked, texts.items.len });
+    std.debug.print("preservation[new leading comments]: {d} written, {d} positions not writable, over {d} documents\n", .{ written, skipped, texts.items.len });
     if (failures.list.items.len > 0) {
         for (failures.list.items) |f| std.debug.print("  PRESERVATION-FAIL {s}\n", .{f});
         return error.TestUnexpectedResult;
-    }
-    for (pending, pending_hit) |id, hit| {
-        if (!hit) {
-            std.debug.print("  stale tracked failure: {s} passes now; remove it from the list\n", .{id});
-            return error.TestUnexpectedResult;
-        }
     }
     if (written < 100) return error.TestUnexpectedResult;
 }

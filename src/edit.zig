@@ -2703,6 +2703,56 @@ test "an edit under a root that shares its line with `---` keeps the marker" {
     }
 }
 
+test "edits inside a compact collection after an explicit `: ` keep the indicator" {
+    // `? a` / `: - b` puts the value's first entry on the `: ` line. The
+    // indicator belongs to the value, not to that entry, but a delete or
+    // replace tombstoned the whole line with it (`? a\n  - X`, a
+    // different tree), and a re-emitted value broke its line after the
+    // `: `, leaving mis-indented entries that did not parse.
+    const Case = struct { in: []const u8, edit: Edit, out: []const u8 };
+    const x: *Node = undefined; // replaced per case below
+    const cases = [_]Case{
+        .{ .in = "? a\n: - b\n  - c\n", .edit = .{ .set = .{ .path = "$.a[0]", .value = x } }, .out = "? a\n: - X\n  - c\n" },
+        .{ .in = "? a\n: - b\n  - c\n", .edit = .{ .set = .{ .path = "$.a[1]", .value = x } }, .out = "? a\n: - b\n  - X\n" },
+        .{ .in = "? a\n: - b\n  - c\n", .edit = .{ .delete = "$.a[0]" }, .out = "? a\n: - c\n" },
+        .{ .in = "? a\n: - b\n  - c\n", .edit = .{ .delete = "$.a[1]" }, .out = "? a\n: - b\n" },
+        .{ .in = "? a\n: - b\n  - c\n", .edit = .{ .append = .{ .sequence = "$.a", .value = x } }, .out = "? a\n: - b\n  - c\n  - X\n" },
+        .{ .in = "? a\n: x: 1\n  y: 2\n", .edit = .{ .set = .{ .path = "$.a.x", .value = x } }, .out = "? a\n: x: X\n  y: 2\n" },
+        .{ .in = "? a\n: x: 1\n  y: 2\n", .edit = .{ .set = .{ .path = "$.a.y", .value = x } }, .out = "? a\n: x: 1\n  y: X\n" },
+        .{ .in = "? a\n: x: 1\n  y: 2\n", .edit = .{ .delete = "$.a.x" }, .out = "? a\n: y: 2\n" },
+        .{ .in = "? a\n: x: 1\n  y: 2\n", .edit = .{ .delete = "$.a.y" }, .out = "? a\n: x: 1\n" },
+        .{ .in = "? a\n: x: 1\n  y: 2\n", .edit = .{ .set = .{ .path = "$.a.z", .value = x } }, .out = "? a\n: x: 1\n  y: 2\n  z: X\n" },
+        .{ .in = "- ? a\n  : x: 1\n    y: 2\n", .edit = .{ .set = .{ .path = "$[0].a.y", .value = x } }, .out = "- ? a\n  : x: 1\n    y: X\n" },
+        .{ .in = "- ? a\n  : x: 1\n    y: 2\n", .edit = .{ .delete = "$[0].a.x" }, .out = "- ? a\n  : y: 2\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        const v = try doc.createScalar("X", .plain);
+        var e = c.edit;
+        switch (e) {
+            .set => |*st| st.value = v,
+            .append => |*ap| ap.value = v,
+            else => {},
+        }
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{e});
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+        var again = try Document.parse(testing.allocator, out);
+        again.deinit();
+    }
+    // A key that is a compact collection after `? `: modifying it wrote
+    // the `? ` for the key and again with its first entry (`? ? - x`).
+    var doc = try Document.parse(testing.allocator, "? - x\n  - y\n: v\n");
+    defer doc.deinit();
+    try doc.setAnchor(doc.root.?.pairs().?[0].key.items().?[1], "z");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("? - x\n  - &z y\n: v\n", out);
+}
+
 test "emptying a container keeps the comments between its entries" {
     // `{}` / `[]` alone ate every comment line the deleted entries had
     // between them, although deleting the entries one at a time kept

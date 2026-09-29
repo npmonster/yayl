@@ -246,26 +246,17 @@ pub const Emitter = struct {
     }
 
     /// True when the pending line holds nothing but block-entry framing:
-    /// indentation and `- ` indicators. The cursor then already sits
-    /// where an entry belongs (`- ` left behind by a deleted first
-    /// entry, or a nested `- - `), so no line break is owed.
+    /// indentation and `- `, `? ` or `: ` indicators. The cursor then
+    /// already sits where an entry belongs (`- ` left behind by a deleted
+    /// first entry, a nested `- - `, the `: ` of an explicit key's
+    /// compact value), so no line break is owed -- breaking there cut
+    /// `: - b` into `:` and a mis-indented ` - b` -- and a leading block
+    /// written for the entry goes above the whole line.
     fn isEntryFraming(pending: []const u8) bool {
-        return isFraming(pending, "-");
-    }
-
-    /// True when the pending line is the beginning of an entry's line:
-    /// indentation, then any `- `, `? ` or `: ` indicators. A leading
-    /// block written for that entry goes above the whole line.
-    fn isLineFraming(pending: []const u8) bool {
-        return isFraming(pending, "-?:");
-    }
-
-    /// Indentation, then only `indicators`, each followed by a blank.
-    fn isFraming(pending: []const u8, indicators: []const u8) bool {
         var i: usize = 0;
         while (i < pending.len and pending[i] == ' ') i += 1;
         while (i < pending.len) {
-            if (std.mem.indexOfScalar(u8, indicators, pending[i]) == null) return false;
+            if (pending[i] != '-' and pending[i] != '?' and pending[i] != ':') return false;
             i += 1;
             if (i >= pending.len or pending[i] != ' ') return false;
             while (i < pending.len and pending[i] == ' ') i += 1;
@@ -676,24 +667,31 @@ pub const Emitter = struct {
             return gap;
         }
 
-        // Key.
+        // Key. `key_end` is where the source bytes after it begin: a
+        // re-emitted block collection key's walk consumes through its
+        // last entry's line break, which the gap to the value must not
+        // write again (a blank line before `: v`).
         const expl = key_spanned and explicitKeySpan(src, ks.?.entry_start, ks.?.start);
+        var key_end: usize = if (ks) |s| s.end else 0;
         if (key_spanned and self.nodeClean(key)) {
             try self.emitted.put(key, {});
             try self.write(src[ks.?.entry_start..ks.?.end]);
         } else {
             try self.emitted.put(key, {});
             // A modified key keeps its framing -- the `- ` or `? ` in
-            // [entry_start, start) -- and re-emits only its content.
-            if (key_spanned) try self.write(src[ks.?.entry_start..ks.?.start]);
-            try self.emitKeyContent(key, if (ks) |s| markup.columnOf(src, s.start) else entry_col, expl);
+            // [entry_start, start) -- and re-emits only its content. A
+            // block collection key's own walk writes that framing with
+            // its first entry, as for items (`? ? - a` otherwise).
+            if (key_spanned and !framingOwnedByContent(key)) try self.write(src[ks.?.entry_start..ks.?.start]);
+            const stop = try self.emitKeyContent(key, if (ks) |s| markup.columnOf(src, s.start) else entry_col, expl);
+            if (key_spanned and stop > key_end) key_end = stop;
         }
 
         // Valueless entry (`key:` / `? key`): emit the original colon
         // bytes and stop.
         if (value_empty) {
             if (ks != null and pair_end != null) {
-                try self.write(src[ks.?.end..pair_end.?]);
+                try self.write(src[@min(key_end, pair_end.?)..pair_end.?]);
                 return self.writeEntryTail(value, pair_end.?);
             }
             try self.writeByte(':');
@@ -723,7 +721,7 @@ pub const Emitter = struct {
                 // entry.
                 if (ks) |s| {
                     if (emptiedCollection(value)) {
-                        try self.write(src[s.end..vs.entry_start]);
+                        try self.write(src[key_end..vs.entry_start]);
                         try self.indentEmptied(markup.columnOf(src, s.entry_start));
                     } else if (value.pending_leading != null and
                         markup.lineStart(src, vs.entry_start) != markup.lineStart(src, s.start))
@@ -738,11 +736,11 @@ pub const Emitter = struct {
                         // start dropped. (An inline value's block belongs
                         // to the pair and was already written at the
                         // key's gap.)
-                        try self.writeGap(value, s.end, vs.entry_start);
+                        try self.writeGap(value, key_end, vs.entry_start);
                         const vcol = markup.columnOf(src, vs.entry_start);
                         try self.writePendingLeadingText(value.pending_leading, vcol, self.terminatorAt(vs.entry_start));
                     } else {
-                        try self.writeGap(value, s.end, vs.entry_start);
+                        try self.writeGap(value, key_end, vs.entry_start);
                     }
                 }
                 if (try self.writeCleanSlice(value, vs.entry_start)) |vend| {
@@ -934,13 +932,16 @@ pub const Emitter = struct {
     /// scalar there; `emitContent` would write a multi-line key as `|-`
     /// and its lines, which reads back as a different mapping. An
     /// explicit key (`? `) takes any form.
-    fn emitKeyContent(self: *Emitter, key: *Node, col: usize, explicit: bool) Error!void {
+    /// Returns what `emitContent` does: the source offset its bytes
+    /// reach (a scalar's end, a container walk's stop).
+    fn emitKeyContent(self: *Emitter, key: *Node, col: usize, explicit: bool) Error!usize {
         switch (key.data) {
             .scalar => |s| {
                 if (try self.writeProperties(key)) try self.writeByte(' ');
                 try self.emitScalarValue(s.value, s.style, col, explicit, false);
+                return if (key.src) |ks| ks.end else 0;
             },
-            else => _ = try self.emitContent(key, col),
+            else => return self.emitContent(key, col),
         }
     }
 
@@ -1389,7 +1390,7 @@ pub const Emitter = struct {
         // (`items:\n  \n  # c`), or cut an item's `- ` off its entry
         // (`- \n  # c\n  ? k`).
         const open = self.pendingLine();
-        if (isLineFraming(open)) {
+        if (isEntryFraming(open)) {
             var indent: usize = 0;
             while (indent < open.len and open[indent] == ' ') indent += 1;
             const framing = try self.allocator.dupe(u8, open[indent..]);
@@ -1489,7 +1490,7 @@ pub const Emitter = struct {
                 // keys (through `emitFlowNode`) kept theirs, so an alias
                 // to an anchored scalar key emitted `*k` with no `&k`.
                 if (key.anchor) |a| try self.seen.put(key, a);
-                try self.emitKeyContent(key, indent, false);
+                _ = try self.emitKeyContent(key, indent, false);
                 try self.writeByte(':');
             },
             else => {

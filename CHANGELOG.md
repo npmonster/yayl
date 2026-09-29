@@ -109,6 +109,17 @@ again, which the keep chomping took in: `keep\n\n` read back as
 `keep\n\n\n`. The blank lines are now skipped after a re-written keep
 block.
 
+**Edits inside a compact collection after an explicit `: ` or `? `
+changed or broke the document.** With `? a` / `: - b` (the value's first
+entry on the `: ` line), replacing or deleting that entry tombstoned the
+whole line, `: ` included: `$.a[0]` set gave `? a\n  - X`, a different
+tree, and a compact mapping value (`: x: 1`) no longer parsed after any
+edit. A re-emitted value also broke its line after the `: `. The first
+entry's line keeps the framing of the nodes around it (`- `, `? `, `: `)
+whatever the edit, as it already did for a sequence item's `- `, and a
+modified collection key no longer writes its `? ` twice or leaves a blank
+line before `: value`.
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity
