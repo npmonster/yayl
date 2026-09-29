@@ -313,14 +313,32 @@ non-blank one. That is the whole stream written so far, once per
 document, so N documents cost N x output: 32 KB of tiny documents took
 47 ms, every doubling quadrupled it, and a 1 MiB stream would take
 close to a minute to write back. Scanning back to the start of the
-last line is no better for output with no line break at all (separately
-parsed strings that lack a trailing newline and each open a document):
-the last line is the whole buffer. The answer is now kept as the output
-is written, so each byte is looked at once. Output is byte-identical:
+last line is no better when a document ends mid-line (see the next
+entry): the last line can be the whole buffer. The answer is now kept as
+the output is written, so each byte is looked at once, and each document
+is emitted on its own before it is joined on, so its emitter no longer
+measures the line the previous document ended on (16,000 such documents
+took 11 s to write, and take 9 ms). Parsed streams are written back
+byte-identical:
 the tracker is checked against the old definition on all 335,923
 strings up to length 7 over the marker's dot, both blanks, every line
 break and one byte of ordinary content, fed whole, one byte at a time
 and split in two at every position. (#5)
+
+**`writeAll` merged documents when one ended mid-line.** A document
+parsed from text with no final line break is written back without one,
+and the next document's bytes were appended to its last line, where a
+`---` is not a marker: `--- x` and `--- y` were written `--- x--- y`,
+one document holding `x--- y`. The same went for `x` then `--- y`, and
+for `y` after a `...` with no line break (`x\n...y`, one document; with a
+blank after the marker, a parse error). A directive after a document that
+did not end with `...` became part of it (`x` then `%YAML 1.2\n--- y`
+read back `x %YAML 1.2`), and a comment starting the next document was
+glued to the value (`x# c`). `writeAll` now ends the line first unless the
+next document's bytes only finish it with blanks or a comment (how a
+parsed stream splits `--- x # c`), and closes the previous document with
+`...` before a directive. Parsed streams are still written back
+byte-identical.
 
 ### Changed
 

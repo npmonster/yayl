@@ -2089,35 +2089,80 @@ pub fn writeAllOpts(allocator: std.mem.Allocator, docs: []const Document, option
     // accumulated text instead cost O(output) per document (see `StreamEnd`).
     var tail: StreamEnd = .{};
 
+    // Each document is emitted on its own, as if it started a line, and
+    // then joined on. Emitting straight onto the output let a document's
+    // emitter see the previous document's last line as its own, and
+    // measuring that line cost O(output) per document when the output had
+    // no line break.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+
     for (docs, 0..) |*doc, i| {
-        const body_start = out.items.len;
-        var em = emitter_mod.Emitter.init(allocator, &out);
+        body.clearRetainingCapacity();
+        var em = emitter_mod.Emitter.init(allocator, &body);
         defer em.deinit();
         em.configure(options);
         try em.emitDocument(doc);
 
-        // A separator goes in only when nothing already marks the
-        // boundary: the output so far does not end a stream with `...`,
-        // and this document does not itself open one. Nothing is inserted
-        // otherwise, which is what keeps a parsed stream byte-exact --
-        // including the case that motivated this shape, where a
-        // document's region ends mid-line (`--- foo`) and its own trailing
-        // comment belongs to the *next* document's leading bytes.
-        // Inserting a newline there unconditionally would cut that line in
-        // half.
-        if (i > 0 and !tail.endsStream() and !startsDocument(out.items[body_start..])) {
-            const sep = if (body_start > 0 and out.items[body_start - 1] != '\n') "\n---\n" else "---\n";
-            try out.insertSlice(allocator, body_start, sep);
-        }
-        tail.feed(out.items[body_start..]);
+        const join = if (i > 0) boundary(&tail, out.items, body.items) else "";
+        try out.ensureUnusedCapacity(allocator, join.len + body.items.len);
+        out.appendSliceAssumeCapacity(join);
+        out.appendSliceAssumeCapacity(body.items);
+        tail.feed(join);
+        tail.feed(body.items);
     }
 
     return try out.toOwnedSlice(allocator);
 }
 
-/// True when `text` opens a new document — its first line that is not
-/// blank, a comment or a directive is a `---` marker. Directives imply
-/// one, since a directive can only precede a document start.
+/// What `writeAllOpts` puts between the output so far (`before`, whose end
+/// `tail` describes) and the next document's bytes (`next`) so that the
+/// stream reads back as the same documents. Nothing is added where the
+/// boundary is already marked, which is what keeps a parsed stream
+/// byte-exact -- including a document whose region ends mid-line
+/// (`--- foo`) while its trailing comment is the *next* document's first
+/// bytes (` # c`): breaking that line would move the comment.
+///
+/// A marker counts only at the start of a line. After a document that
+/// ends mid-line, `--- y` or `%YAML` would be read as content of that
+/// line, so the line is ended first unless `next` merely finishes it with
+/// blanks or a comment. A directive also needs the previous document
+/// closed with `...`: after a bare or open document it is read as part of
+/// its last scalar.
+fn boundary(tail: *const StreamEnd, before: []const u8, next: []const u8) []const u8 {
+    const mid_line = before.len > 0 and before[before.len - 1] != '\n' and before[before.len - 1] != '\r';
+    const cut = mid_line and !finishesLine(next);
+    if (tail.endsStream()) return if (cut) "\n" else "";
+    const first = firstContentLine(next) orelse return if (mid_line) "\n---\n" else "---\n";
+    if (first[0] == '%') return if (mid_line) "\n...\n" else "...\n";
+    if (first[0] == '-' and Document.isMarkerLine(first, 0)) return if (cut) "\n" else "";
+    return if (mid_line) "\n---\n" else "---\n";
+}
+
+/// True when `text` can follow a line that already has content on it
+/// without changing that line: its first line is empty, blank, or blanks
+/// then a comment (a `#` needs a blank before it to open one).
+fn finishesLine(text: []const u8) bool {
+    var it: LineIter = .{ .src = text };
+    const line = it.next() orelse return true;
+    if (line.len == 0) return true;
+    if (line[0] != ' ' and line[0] != '\t') return false;
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    return trimmed.len == 0 or trimmed[0] == '#';
+}
+
+/// The first line of `text` that is neither blank nor a comment, as
+/// written (leading blanks kept), or null when there is none.
+fn firstContentLine(text: []const u8) ?[]const u8 {
+    var it: LineIter = .{ .src = text };
+    while (it.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        return line;
+    }
+    return null;
+}
+
 /// Iterate lines on any YAML line break — `\n`, `\r\n`, or a lone `\r`
 /// (§5.4 `b-break ::= CRLF | CR | LF`) — yielding each line without its
 /// terminator. Splitting on `\n` alone left a wholly CR-terminated
@@ -2148,19 +2193,6 @@ const LineIter = struct {
         return self.src[start..];
     }
 };
-
-fn startsDocument(text: []const u8) bool {
-    var it: LineIter = .{ .src = text };
-    while (it.next()) |line| {
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-        if (trimmed.len == 0) continue;
-        if (trimmed[0] == '#') continue;
-        if (trimmed[0] == '%') return true;
-        return std.mem.startsWith(u8, line, "---") and
-            (line.len == 3 or line[3] == ' ' or line[3] == '\t');
-    }
-    return false;
-}
 
 /// True when `text` is nothing but blank and comment lines: the tail a
 /// document may own after its content. A directive line is not one; it
@@ -2990,6 +3022,63 @@ test "writeAll separates documents that would otherwise merge" {
     try testing.expectEqualStrings("2", back.items[1].pathGet(&.{"b"}).?.scalarValue().?);
 }
 
+test "writeAll keeps documents apart when one ends mid-line" {
+    const allocator = std.testing.allocator;
+
+    // A document parsed from text with no final line break is written
+    // back without one, so the next document's bytes land on its last
+    // line. A `---` or `%` there is not at the start of a line, so it is
+    // content, not a marker: `--- x` then `--- y` was written
+    // `--- x--- y`, ONE document holding `x--- y`. A directive after a
+    // document that did not end with `...` was read as part of it
+    // (`x\n%YAML 1.2` is the scalar `x %YAML 1.2`), and `y` after a `...`
+    // with no line break was glued to the marker.
+    const Case = struct { docs: []const []const u8, roots: []const []const u8 };
+    const cases = [_]Case{
+        .{ .docs = &.{ "--- x", "--- y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x", "--- y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x # c", "--- y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "--- x", "# c\n--- y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x\n...", "y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x\n... ", "y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x", "%YAML 1.2\n--- y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x\n", "%YAML 1.2\n--- y\n" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x\n", "%TAG !e! tag:e,2000:\n--- !e!t y\n" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x\r", "--- y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x", "y", "--- z" }, .roots = &.{ "x", "y", "z" } },
+    };
+    for (cases) |case| {
+        var docs: std.ArrayList(Document) = .empty;
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        for (case.docs) |text| try docs.append(allocator, try Document.parse(allocator, text));
+
+        const out = try writeAll(allocator, docs.items);
+        defer allocator.free(out);
+        var back = try Document.parseAll(allocator, out);
+        defer {
+            for (back.items) |*d| d.deinit();
+            back.deinit(allocator);
+        }
+        errdefer std.debug.print("writeAll gave {f}\n", .{std.zig.fmtString(out)});
+        try testing.expectEqual(case.roots.len, back.items.len);
+        for (case.roots, back.items) |want, *d| try testing.expectEqualStrings(want, d.root.?.scalarValue().?);
+    }
+
+    // A comment that belongs to the line the previous document ended on
+    // (how a parsed stream splits `--- x # c`) stays on that line.
+    var parsed = try Document.parseAll(allocator, "--- x # c\n--- y\n");
+    defer {
+        for (parsed.items) |*d| d.deinit();
+        parsed.deinit(allocator);
+    }
+    const same = try writeAll(allocator, parsed.items);
+    defer allocator.free(same);
+    try testing.expectEqualStrings("--- x # c\n--- y\n", same);
+}
+
 test "writeAll separates hand-built documents" {
     const allocator = std.testing.allocator;
     var one = Document.init(allocator);
@@ -3133,15 +3222,18 @@ test "the stream-end tracker agrees with the line-by-line definition on every sh
     try testing.expect(yes > 1000 and yes < checked / 2);
 }
 
-test "writeAll stays linear when the output has no line break at all" {
+test "writeAll stays linear over documents that end mid-line" {
     // Separately parsed strings that end without a newline and each open a
-    // document: nothing is inserted between them, so the output is ONE
-    // line and "the last line" is all of it. Finding it by walking the
-    // lines, or by scanning back to where it starts, cost O(output) per
-    // document: 8,000 documents (1.6 MB) took ~3.5 s in ReleaseSafe and
-    // far longer in Debug, against milliseconds now. The bound is far
-    // from both, so a slow CI machine cannot flake it and the regression
-    // cannot hide inside it; the fastest of three runs is judged.
+    // document. Nothing was once inserted between them, so the output was
+    // ONE line (and one document: see "writeAll keeps documents apart when
+    // one ends mid-line"), and anything that measured the last line --
+    // walking the lines, scanning back to where the last one starts, or
+    // the next document's emitter measuring the line it starts on --
+    // cost O(output) per document: 8,000 documents (1.6 MB) took ~3.5 s
+    // in ReleaseSafe and far longer in Debug, against milliseconds now.
+    // The bound is far from both, so a slow CI machine cannot flake it
+    // and the regression cannot hide inside it; the fastest of three runs
+    // is judged.
     //
     // Leak-checked, but without `testing.allocator`'s per-allocation stack
     // traces, which make thousands of parses slow.
@@ -3168,9 +3260,10 @@ test "writeAll stays linear when the output has no line break at all" {
         const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
         defer allocator.free(out);
         // The scenario is what it claims to be: every document written
-        // back as it was parsed, and no line break anywhere.
-        try testing.expectEqual(docs.items.len * source.len, out.len);
-        try testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
+        // back as it was parsed, with only the line break each needs to
+        // start a line of its own.
+        try testing.expectEqual(docs.items.len * (source.len + 1) - 1, out.len);
+        try testing.expectEqual(docs.items.len - 1, std.mem.count(u8, out, "\n"));
         fastest_ns = @min(fastest_ns, elapsed);
     }
     try testing.expect(fastest_ns < 1_000_000_000);
