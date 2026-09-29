@@ -95,6 +95,35 @@ pub fn columnOf(source: []const u8, offset: usize) usize {
     return offset - lineStart(source, offset);
 }
 
+/// The end of the node properties (`&anchor`, `!tag`, `!<verbatim>`)
+/// that begin at `start`, or `start` when none do. A node that is
+/// properties and nothing else (`a: &anchor`) ends there -- not at the
+/// next token the scanner read, which would pull the comment lines in
+/// between into its span (and out of the next entry's reach).
+pub fn propertiesEnd(source: []const u8, start: usize) usize {
+    var i = start;
+    var end = start;
+    while (i < source.len and (source[i] == '&' or source[i] == '!')) {
+        if (source[i] == '!' and i + 1 < source.len and source[i + 1] == '<') {
+            // Verbatim tag: through its closing `>`.
+            i = if (std.mem.indexOfScalarPos(u8, source, i, '>')) |close| close + 1 else source.len;
+        } else {
+            // Anchor and tag characters exclude blanks, breaks and the
+            // flow indicators (spec 6.8.1, 6.9.2).
+            i += 1;
+            while (i < source.len) : (i += 1) {
+                switch (source[i]) {
+                    ' ', '\t', '\r', '\n', ',', '[', ']', '{', '}' => break,
+                    else => {},
+                }
+            }
+        }
+        end = i;
+        while (i < source.len and (source[i] == ' ' or source[i] == '\t')) i += 1;
+    }
+    return end;
+}
+
 /// Walk backwards from a node's content start to find the block entry
 /// indicator (`-` or `?`) that introduces it, if any. Returns
 /// `content_start` when the node starts its own entry (no indicator).
@@ -203,14 +232,17 @@ pub fn trailingCommentSpan(source: []const u8, end: usize) ?[2]usize {
 /// comment. The scan stops at a blank line -- that is the rule that
 /// makes "belongs to this entry" decidable -- and at any non-comment
 /// line, so a block separated from its entry, or a free-floating one,
-/// attaches to nothing.
-pub fn leadingCommentSpan(source: []const u8, entry_start: usize) ?[2]usize {
+/// attaches to nothing. Lines starting before `floor` are never part
+/// of the block: the caller passes the end of whatever precedes the
+/// entry, so the content lines of a block scalar above (`  # text`)
+/// are not taken for comments.
+pub fn leadingCommentSpan(source: []const u8, entry_start: usize, floor: usize) ?[2]usize {
     const own = lineStart(source, entry_start);
     if (own == 0) return null; // first line: nothing above to attach
     var line = lineStart(source, own - 1); // the line directly above
     var top_hash: ?usize = null;
     var bottom_end: usize = 0;
-    while (true) {
+    while (line >= floor) {
         const nl = newlineAt(source, line);
         var i = line;
         while (i < nl and (source[i] == ' ' or source[i] == '\t')) i += 1;
@@ -309,6 +341,14 @@ test "entryStart finds dash indicators" {
     try std.testing.expectEqual(@as(usize, 1), entryStart("\n", 1));
 }
 
+test "propertiesEnd stops after the last property" {
+    try std.testing.expectEqual(@as(usize, 10), propertiesEnd("a: &anchor\n# c\nb: 1\n", 3));
+    try std.testing.expectEqual(@as(usize, 11), propertiesEnd("a: &x !!str # t\n", 3));
+    try std.testing.expectEqual(@as(usize, 11), propertiesEnd("a: !<tag:x> \n", 3));
+    try std.testing.expectEqual(@as(usize, 3), propertiesEnd("[&a , b]", 1));
+    try std.testing.expectEqual(@as(usize, 3), propertiesEnd("a: v\n", 3));
+}
+
 test "entryStart does not take the last dash of a --- marker for an entry" {
     // `--- {a: 1}`: the root sits after the directives-end marker, and
     // the dash before its blank is the marker's third, not a `- `
@@ -375,34 +415,34 @@ test "leadingCommentSpan stacks upward and stops at blanks and content" {
     // One comment directly above the entry ('h' of host is at 16).
     const one = "# the main host\nhost: localhost\n";
     {
-        const span = leadingCommentSpan(one, 16).?;
+        const span = leadingCommentSpan(one, 16, 0).?;
         try std.testing.expectEqualStrings("# the main host", one[span[0]..span[1]]);
     }
     // Stacked: topmost '#' through the bottom line's end.
     const stacked = "# one\n# two\nkey: v\n";
     {
-        const span = leadingCommentSpan(stacked, 12).?;
+        const span = leadingCommentSpan(stacked, 12, 0).?;
         try std.testing.expectEqualStrings("# one\n# two", stacked[span[0]..span[1]]);
     }
     // A blank line breaks the attachment.
     const blanked = "# far away\n\nkey: v\n";
-    try std.testing.expect(leadingCommentSpan(blanked, 12) == null);
+    try std.testing.expect(leadingCommentSpan(blanked, 12, 0) == null);
     // A non-comment line does too.
     const content = "prev: 1\nkey: v\n";
-    try std.testing.expect(leadingCommentSpan(content, 8) == null);
+    try std.testing.expect(leadingCommentSpan(content, 8, 0) == null);
     // First line of the document: nothing above to attach.
-    try std.testing.expect(leadingCommentSpan("key: v\n", 0) == null);
+    try std.testing.expect(leadingCommentSpan("key: v\n", 0, 0) == null);
     // Indented comments keep their indentation inside the span
     // (the '-' of the item is at 25).
     const indented = "top:\n  # about the value\n  - a\n";
     {
-        const span = leadingCommentSpan(indented, 25).?;
+        const span = leadingCommentSpan(indented, 25, 0).?;
         try std.testing.expectEqualStrings("# about the value", indented[span[0]..span[1]]);
     }
     // CRLF: the terminator bytes stay outside the span ('k' is at 7).
     const crlf = "# win\r\nk: v\r\n";
     {
-        const span = leadingCommentSpan(crlf, 7).?;
+        const span = leadingCommentSpan(crlf, 7, 0).?;
         try std.testing.expectEqualStrings("# win", crlf[span[0]..span[1]]);
     }
 }

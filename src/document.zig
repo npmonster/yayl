@@ -265,14 +265,98 @@ pub const Node = struct {
     /// comments -- separated by a blank line, or in the document head
     /// before `---` -- attach to nothing.
     pub fn leadingComments(self: *const Node, doc: *const Document) ?[]const u8 {
-        if (self.pending_leading) |t| return if (t.len == 0) null else t;
-        const doc_src = doc.source orelse return null;
-        const s = self.src orelse return null;
-        if (s.synthetic) return null;
-        const span = markup.leadingCommentSpan(doc_src, s.entry_start) orelse return null;
-        return doc_src[span[0]..span[1]];
+        const owner = if (doc.source) |src| leadingOwner(self, src) else self;
+        if (owner.pending_leading) |t| return if (t.len == 0) null else t;
+        const span = doc.leadingSourceSpan(owner) orelse return null;
+        return doc.source.?[span[0]..span[1]];
     }
 };
+
+/// The node that holds the leading comment block of `node`'s entry
+/// line. Several nodes start on one line: a sequence item's mapping and
+/// its first key share the item's `- `, a block value and the root share
+/// their line with their first entry, and an inline value (`k: v`) sits
+/// on its key's line. All of them read the block above that line, so a
+/// written block belongs to the outermost of them: every node on the
+/// line then reads the same block, its old lines are tombstoned in the
+/// gap that holds them, and the emitter writes the new ones once, where
+/// that node is emitted. Without this the first key of an item recorded
+/// its tombstone in the item's list while the lines sat in the
+/// sequence's gap, and the old block survived beside the new one.
+fn leadingOwner(node: anytype, source: []const u8) @TypeOf(node) {
+    var n = node;
+    var guard: usize = 0;
+    climb: while (n.parent) |p| : (guard += 1) {
+        if (guard >= Node.max_parent_walk) break;
+        const s = realSpan(n) orelse break;
+        // The line whose block `n` reads: the one its entry starts on
+        // (for the first key of `-\n  k: v`, the `-` line above).
+        const line = markup.lineStart(source, s.entry_start);
+        // A flow collection's entries share its line but have no line of
+        // their own; they stay themselves (and unwritable).
+        if (Document.insideFlow(n)) break;
+        // An inline value hands over to its key: the value sits on the
+        // key's own line, and reads that entry's block.
+        switch (p.data) {
+            .mapping => |m| for (m.pairs.items) |pair| {
+                if (pair.value != n) continue;
+                const ks = realSpan(pair.key) orelse break;
+                if (markup.lineStart(source, ks.start) != line) break;
+                n = pair.key;
+                continue :climb;
+            },
+            else => {},
+        }
+        const ps = realSpan(p) orelse break;
+        if (markup.lineStart(source, ps.entry_start) != line) break;
+        n = p;
+    }
+    return n;
+}
+
+/// Where the bytes that can hold `owner`'s leading block begin: past
+/// whatever precedes its entry -- the previous entry of its container,
+/// the key of a value, the container's own start for a first entry --
+/// so the content lines of a block scalar above (`  # text`) are never
+/// read as a comment. The root's is its document's region, except that
+/// a root sharing its line with `---` has none: the head before the
+/// marker is free-floating.
+fn leadingFloor(owner: *const Node, doc: *const Document) usize {
+    const s = owner.src.?;
+    const parent = owner.parent orelse {
+        const src = doc.source.?;
+        const ls = markup.lineStart(src, s.entry_start);
+        if (s.entry_start > ls + 3 and std.mem.startsWith(u8, src[ls..], "---")) return ls;
+        return doc.region_start;
+    };
+    // Only real spans count: an empty node's span is a point borrowed
+    // from the NEXT token (`a: &anchor` then `b:`), which would put the
+    // floor past the lines above this entry.
+    var floor: usize = if (realSpan(parent)) |cs| cs.entry_start else 0;
+    switch (parent.data) {
+        .mapping => |m| for (m.pairs.items) |pair| {
+            if (pair.key == owner) break;
+            if (pair.value == owner) {
+                if (realSpan(pair.key)) |ks| floor = @max(floor, ks.end);
+                break;
+            }
+            if (realSpan(pair.key)) |ks| floor = @max(floor, ks.end);
+            if (realSpan(pair.value)) |vs| floor = @max(floor, vs.end);
+        },
+        .sequence => |sq| for (sq.items.items) |item| {
+            if (item == owner) break;
+            if (realSpan(item)) |is| floor = @max(floor, is.end);
+        },
+        else => {},
+    }
+    return floor;
+}
+
+/// A node's span when it covers bytes of its own, not a synthetic point.
+fn realSpan(node: *const Node) ?markup.Src {
+    const s = node.src orelse return null;
+    return if (s.synthetic) null else s;
+}
 
 /// One `byPath` segment: a decimal number indexes a sequence, anything
 /// else is a mapping key. The accessors forward through aliases, so an
@@ -1184,8 +1268,10 @@ pub const Document = struct {
     /// (no gap of its own to rewrite), anything inside a flow
     /// collection, and a block separated from this document's region —
     /// with `error.InvalidSyntax`.
-    pub fn setLeadingComments(self: *Document, node: *Node, text: ?[]const u8) !void {
+    pub fn setLeadingComments(self: *Document, node_in: *Node, text: ?[]const u8) !void {
         const t: ?[]const u8 = if (text) |raw| try normalizeLeadingText(raw) else null;
+        // The block belongs to the outermost node starting on this line.
+        const node = if (self.source) |src| leadingOwner(node_in, src) else node_in;
         // Position and current block, for the no-op check and the
         // tombstone below.
         const current: ?[]const u8 = blk: {
@@ -1236,6 +1322,10 @@ pub const Document = struct {
     /// has a gap of its own, and that gap is rewritable verbatim bytes.
     fn leadingPositionWritable(self: *const Document, node: *Node) bool {
         if (insideFlow(node)) return false;
+        // An empty node's span is a point borrowed from the next token:
+        // it has no line of its own to write a block above, and reads
+        // none. The write used to be accepted and then dropped.
+        if (node.src) |s| if (s.synthetic) return false;
         const src = self.source orelse return false;
         const owner = gapOwnerForLeading(node, src) orelse return false;
         return dropsOf(owner) != null;
@@ -1246,11 +1336,18 @@ pub const Document = struct {
     /// lines: the structural separator before the block (the previous
     /// line's terminator) survives, and so does the entry's own
     /// indentation after it.
+    /// The source span of the block above `owner`'s entry line (see
+    /// `leadingOwner`), or null.
+    fn leadingSourceSpan(self: *const Document, owner: *const Node) ?[2]usize {
+        const src = self.source orelse return null;
+        const s = owner.src orelse return null; // brand-new: no block in the source
+        if (s.synthetic) return null;
+        return markup.leadingCommentSpan(src, s.entry_start, leadingFloor(owner, self));
+    }
+
     fn tombstoneLeadingBlock(self: *Document, node: *Node) !void {
         const src = self.source orelse return;
-        const s = node.src orelse return; // brand-new: no block in the source
-        if (s.synthetic) return;
-        const span = markup.leadingCommentSpan(src, s.entry_start) orelse return;
+        const span = self.leadingSourceSpan(node) orelse return;
         // A root entry sharing its line with `---` reads backwards into
         // the previous document's region; those bytes are not ours.
         if (span[0] < self.region_start or span[1] > self.region_end) return error.InvalidSyntax;
@@ -1774,6 +1871,14 @@ const Builder = struct {
             while (end > ev.start.offset and end <= src.len and
                 (src[end - 1] == ' ' or src[end - 1] == '\t' or
                     src[end - 1] == '\r' or src[end - 1] == '\n')) end -= 1;
+            // A scalar that is only properties (`a: &anchor`, `- !!str`)
+            // ends at the next token, so trimming blanks stops inside
+            // any comment in between: `&anchor\n# c` took the next
+            // entry's comment, and a trailing `# t` was not read as one.
+            const sc = ev.data.scalar;
+            if (sc.value.len == 0 and sc.style == .plain) {
+                end = @min(end, markup.propertiesEnd(src, ev.start.offset));
+            }
         }
         return .{
             .entry_start = if (synthetic)
@@ -2803,6 +2908,118 @@ test "comment write: leading blocks set, change and delete whole lines" {
             out,
         );
     }
+}
+
+test "comment write: a leading comment on a framed key keeps one `- ` or `? `" {
+    // The first key of a sequence item and an explicit key start their
+    // entry with framing -- a `- ` or `? ` in [entry_start, start). The
+    // written block re-assembled the entry's line with that framing, and
+    // the key then re-emitted it from entry_start: `- k: v` came out as
+    // `# lead\n- - k: v`, a nested sequence, and `? k` as `? ? k`.
+    const cases = [_]struct { in: []const u8, at: []const []const u8, anchor: bool = false, out: []const u8 }{
+        .{ .in = "- k: v\n  j: w\n", .at = &.{"0"}, .out = "# lead\n- k: v\n  j: w\n" },
+        .{ .in = "items:\n  - k: v\n    j: w\n", .at = &.{ "items", "0" }, .out = "items:\n  # lead\n  - k: v\n    j: w\n" },
+        .{ .in = "? k\n: v\n", .at = &.{}, .out = "# lead\n? k\n: v\n" },
+        .{ .in = "- ? k\n  : v\n", .at = &.{"0"}, .out = "# lead\n- ? k\n  : v\n" },
+        // A modified key takes the same path.
+        .{ .in = "- k: v\n  j: w\n", .at = &.{"0"}, .anchor = true, .out = "# lead\n- &x k: v\n  j: w\n" },
+        // Control: an unframed key.
+        .{ .in = "a: 1\nk: v\n", .at = &.{}, .out = "a: 1\n# lead\nk: v\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        const key = for (doc.root.?.byPath(c.at).?.pairs().?) |p| {
+            if (std.mem.eql(u8, p.key.scalarValue().?, "k")) break p.key;
+        } else unreachable;
+        if (c.anchor) try doc.setAnchor(key, "x");
+        try doc.setLeadingComments(key, "# lead");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+
+        // Read back: the same comment above the same key, value intact.
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        const pair = for (again.root.?.byPath(c.at).?.pairs().?) |p| {
+            if (std.mem.eql(u8, p.key.scalarValue().?, "k")) break p;
+        } else unreachable;
+        try testing.expectEqualStrings("# lead", pair.key.leadingComments(&again).?);
+        try testing.expectEqualStrings("v", pair.value.scalarValue().?);
+    }
+}
+
+test "comment write: every node on an entry line shares one block" {
+    // Written blocks used to go wrong wherever several nodes start on one
+    // line. Each case writes `# new` through one node and checks the
+    // output and that every node on the line reads it back.
+    const cases = [_]struct { in: []const u8, at: []const []const u8, out: []const u8 }{
+        // The root: the block was tombstoned out of the head and never
+        // written, so the old comment was lost and the new one too.
+        .{ .in = "# old\na: 1\nb: 2\n", .at = &.{}, .out = "# new\na: 1\nb: 2\n" },
+        .{ .in = "- a\n- b\n", .at = &.{}, .out = "# new\n- a\n- b\n" },
+        // A sequence item holding a mapping: the item's `- ` was written
+        // twice (`- - name: x`), a nested sequence.
+        .{ .in = "items:\n  - name: x\n  - name: y\n", .at = &.{ "items", "1" }, .out = "items:\n  - name: x\n  # new\n  - name: y\n" },
+        // The first key of an item: its old block sat in the sequence's
+        // gap but was tombstoned in the item's list, and survived.
+        .{ .in = "- a: 1\n# old\n- b: 2\n", .at = &.{ "1", "b" }, .out = "- a: 1\n# new\n- b: 2\n" },
+        // An inline value writes the block above its pair.
+        .{ .in = "a: 1\nb: 2\n", .at = &.{"b"}, .out = "a: 1\n# new\nb: 2\n" },
+        // An item whose content starts on the line after its `-`.
+        .{ .in = "- x\n-\n  name: y\n", .at = &.{ "1", "name" }, .out = "- x\n# new\n-\n  name: y\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        try doc.setLeadingComments(doc.root.?.byPath(c.at).?, "# new");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        try testing.expectEqualStrings("# new", again.root.?.byPath(c.at).?.leadingComments(&again).?);
+    }
+}
+
+test "comment reads: block scalar content and property-only nodes" {
+    // A `# ...` line inside a block scalar is content, not the next
+    // item's comment; reading it as one also tombstoned it on a write.
+    {
+        var doc = try Document.parse(testing.allocator, "- >\n  text\n  # not a comment\n- b\n");
+        defer doc.deinit();
+        try testing.expect(doc.root.?.items().?[1].leadingComments(&doc) == null);
+    }
+    // A node that is only properties ended at the next token, so its
+    // span took the comment lines in between: the next key read no
+    // block, and a trailing comment was not read at all.
+    {
+        var doc = try Document.parse(testing.allocator, "a: &anchor\n# about b\nb: *anchor\nc: &x !!str # t\n");
+        defer doc.deinit();
+        try testing.expectEqualStrings("# about b", doc.pathGet(&.{"b"}).?.leadingComments(&doc).?);
+        try testing.expectEqualStrings("# t", doc.pathGet(&.{"c"}).?.trailingComment(&doc).?);
+    }
+}
+
+test "comment write: an empty node has no line of its own and is refused" {
+    // Its span is a point borrowed from the next token; the write was
+    // accepted and then silently dropped.
+    var doc = try Document.parse(testing.allocator, "- \n- b\n");
+    defer doc.deinit();
+    try testing.expectError(error.InvalidSyntax, doc.setLeadingComments(doc.root.?.items().?[0], "# c"));
+}
+
+test "comment write: a multi-line key stays a key" {
+    // A modified key re-emitted through `emitContent` came out as a
+    // literal block (`|-` then its lines), which reads back as another
+    // mapping.
+    var doc = try Document.parse(testing.allocator, "\"a\\nb\": 1\nc: 2\n");
+    defer doc.deinit();
+    try doc.setLeadingComments(doc.root.?.pairs().?[0].key, "# k");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# k\n\"a\\nb\": 1\nc: 2\n", out);
 }
 
 test "comment write: a comment on a brand-new entry, the motivating case" {

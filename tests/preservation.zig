@@ -2704,6 +2704,174 @@ test "preservation sweep: comment positions — set-to-same is byte-identical" {
     if (checked_trailing < 5 or checked_leading < 5) return error.TestUnexpectedResult;
 }
 
+/// Write `# probe` as the leading comment of the `index`-th node (in
+/// `collectNodes` order) of the first document of `text`. Returns
+/// false when the position is not writable; otherwise records a failure
+/// unless the output re-parses to the same tree and the same node reads
+/// the probe back.
+fn probeLeadingComment(allocator: std.mem.Allocator, label: []const u8, text: []const u8, index: usize, failures: *Failures) !bool {
+    var orig = try yaml.parse(allocator, text);
+    defer orig.deinit();
+    var doc = try yaml.parse(allocator, text);
+    defer doc.deinit();
+    var nodes: std.ArrayList(*yaml.Node) = .empty;
+    defer nodes.deinit(allocator);
+    try collectNodes(allocator, doc.root.?, &nodes);
+    doc.setLeadingComments(nodes.items[index], "# probe") catch |err| switch (err) {
+        error.InvalidSyntax => return false,
+        else => return err,
+    };
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    // Which node, for the report: its role in its parent and its kind.
+    const n = nodes.items[index];
+    const role: []const u8 = if (n.parent) |p| switch (p.data) {
+        .sequence => "item",
+        .mapping => |m| for (m.pairs.items) |pair| {
+            if (pair.key == n) break "key";
+        } else "value",
+        else => "?",
+    } else "root";
+    var re = yaml.parse(allocator, out) catch {
+        failures.add("{s}: node {d} ({s} {t}): a written leading comment does not re-parse:\n{s}", .{ label, index, role, n.kind(), out });
+        return true;
+    };
+    defer re.deinit();
+    if (re.root == null or !structuralEql(orig.root.?, re.root.?, 0)) {
+        failures.add("{s}: node {d} ({s} {t}): a written leading comment changed the tree:\n{s}", .{ label, index, role, n.kind(), out });
+        return true;
+    }
+    var back: std.ArrayList(*yaml.Node) = .empty;
+    defer back.deinit(allocator);
+    try collectNodes(allocator, re.root.?, &back);
+    const got = back.items[index].leadingComments(&re) orelse "";
+    if (!std.mem.eql(u8, got, "# probe")) {
+        failures.add("{s}: node {d} ({s} {t}): a written leading comment reads back as \"{s}\"{s}:\n{s}", .{
+            label, index, role, n.kind(), got, if (std.mem.indexOf(u8, out, "# probe") == null) " (never written)" else "", out,
+        });
+    }
+    return true;
+}
+
+test "preservation sweep: a new leading comment on any node reads back from it" {
+    // The set-to-same sweep above cannot see a comment written where
+    // there was none: that path re-assembles the entry's line, and it
+    // doubled a key's `- `/`? ` framing (`- - k: v`) or cut an item's
+    // `- ` off an explicit key. Every writable position of every
+    // fixture and corpus document now takes a new comment, and the
+    // result must re-parse to the same tree with the comment on the
+    // same node.
+    var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer std.debug.assert(da.deinit() == .ok);
+    const allocator = da.allocator();
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var failures: Failures = .{ .allocator = allocator };
+    defer {
+        for (failures.list.items) |f| allocator.free(f);
+        failures.list.deinit(allocator);
+    }
+    var written: usize = 0;
+    var skipped: usize = 0;
+
+    // Inputs: the first document of every fixture and valid corpus case.
+    var texts: std.ArrayList(struct { label: []const u8, text: []const u8 }) = .empty;
+    defer {
+        for (texts.items) |t| {
+            allocator.free(t.label);
+            allocator.free(t.text);
+        }
+        texts.deinit(allocator);
+    }
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, fixtures_dir, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".yaml") and !std.mem.endsWith(u8, entry.name, ".yml")) continue;
+            const input = try dir.readFileAlloc(io, entry.name, allocator, .limited(4 << 20));
+            defer allocator.free(input);
+            const text = try firstDocument(allocator, input) orelse continue;
+            errdefer allocator.free(text);
+            try texts.append(allocator, .{ .label = try allocator.dupe(u8, entry.name), .text = text });
+        }
+        var cases: std.ArrayList(corpus.Case) = .empty;
+        defer {
+            for (cases.items) |*c| corpus.freeCase(allocator, c);
+            cases.deinit(allocator);
+        }
+        try corpus.loadCases(allocator, io, &cases);
+        for (cases.items) |*c| {
+            if (c.fail or corpus.skipPreservation(c.id)) continue;
+            const text = try firstDocument(allocator, c.input) orelse continue;
+            errdefer allocator.free(text);
+            try texts.append(allocator, .{ .label = try allocator.dupe(u8, c.id), .text = text });
+        }
+    }
+
+    // Cases whose failure is a separate emitter defect, not a comment
+    // one, fixed in their own commits: a compact collection after an
+    // explicit `? `/`: ` indicator, and a keep-chomped block scalar
+    // re-emitted. Each must still fail (stale guard), and nothing else
+    // may.
+    const pending = [_][]const u8{ "5WE3", "A2M4", "KK5P", "M5DY", "P2AD", "V9D5" };
+    var pending_hit = [_]bool{false} ** pending.len;
+    var tracked: usize = 0;
+
+    for (texts.items) |t| {
+        var doc = try yaml.parse(allocator, t.text);
+        defer doc.deinit();
+        const root = doc.root orelse continue;
+        var nodes: std.ArrayList(*yaml.Node) = .empty;
+        defer nodes.deinit(allocator);
+        try collectNodes(allocator, root, &nodes);
+        for (0..nodes.items.len) |i| {
+            const before = failures.list.items.len;
+            if (try probeLeadingComment(allocator, t.label, t.text, i, &failures)) written += 1 else skipped += 1;
+            if (failures.list.items.len == before) continue;
+            for (pending, 0..) |id, k| {
+                if (!std.mem.eql(u8, id, t.label)) continue;
+                pending_hit[k] = true;
+                tracked += 1;
+                allocator.free(failures.list.pop().?);
+                break;
+            }
+        }
+    }
+    std.debug.print("preservation[new leading comments]: {d} written, {d} positions not writable, {d} tracked failures, over {d} documents\n", .{ written, skipped, tracked, texts.items.len });
+    if (failures.list.items.len > 0) {
+        for (failures.list.items) |f| std.debug.print("  PRESERVATION-FAIL {s}\n", .{f});
+        return error.TestUnexpectedResult;
+    }
+    for (pending, pending_hit) |id, hit| {
+        if (!hit) {
+            std.debug.print("  stale tracked failure: {s} passes now; remove it from the list\n", .{id});
+            return error.TestUnexpectedResult;
+        }
+    }
+    if (written < 100) return error.TestUnexpectedResult;
+}
+
+/// The bytes of the first document of `input`, owned, or null when it
+/// has none (or does not parse).
+fn firstDocument(allocator: std.mem.Allocator, input: []const u8) !?[]const u8 {
+    var docs = yaml.parseAll(allocator, input) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(allocator);
+    }
+    if (docs.items.len == 0 or docs.items[0].root == null) return null;
+    const d = docs.items[0];
+    const text = if (docs.items.len > 1) input[d.region_start..d.region_end] else input;
+    return try allocator.dupe(u8, text);
+}
+
 test "preservation sweep: every comment in every fixture is reachable" {
     var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer std.debug.assert(da.deinit() == .ok);

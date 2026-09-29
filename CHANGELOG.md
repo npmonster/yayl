@@ -71,6 +71,35 @@ no-op. It is all or nothing: a match whose removal would strand an alias
 (`error.AliasPath`) refuses the whole delete. Behaviour change: deletes
 that match several nodes used to be silent no-ops. (#12)
 
+**Writing a leading comment corrupted or lost the document in many
+positions.** A new preservation sweep writes a comment on every writable
+node of every fixture and corpus document and reads it back: 733 of 2,334
+writes failed. The causes:
+
+- On the first key of a sequence item or an explicit key, the `- ` or
+  `? ` was written twice (`- - k: v`, a nested sequence), and on an item
+  holding a mapping the same happened to the item's `- `.
+- On the root, the old comment block was removed and the new one never
+  written.
+- Several nodes start on one entry line (an item and its first key, a
+  block value and its first entry, a key and its inline value), and a
+  written block went to whichever node was named. The first key of an
+  item then recorded its tombstone in the wrong container, so the old
+  block survived next to the new one. A block now belongs to the
+  outermost node starting on the line; every node there reads and
+  writes that one block.
+- A `# ...` content line of a block scalar was read as the next entry's
+  comment, and a node made only of properties (`a: &anchor`, `- !!str`)
+  had a span running to the next token, taking the comment lines in
+  between (and a trailing `# comment` on it was not read at all).
+- A comment written for an empty node was accepted and dropped; it is now
+  refused with `error.InvalidSyntax`, as the read side has nothing there.
+- A written block for an explicit key's value dropped the `: ` indicator.
+
+A modified mapping key is also re-emitted under the rules for keys: since
+the #11 fix, a multi-line key given a comment or an anchor came out as a
+literal block, a different mapping.
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity

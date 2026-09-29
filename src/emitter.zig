@@ -246,10 +246,22 @@ pub const Emitter = struct {
     /// where an entry belongs (`- ` left behind by a deleted first
     /// entry, or a nested `- - `), so no line break is owed.
     fn isEntryFraming(pending: []const u8) bool {
+        return isFraming(pending, "-");
+    }
+
+    /// True when the pending line is the beginning of an entry's line:
+    /// indentation, then any `- `, `? ` or `: ` indicators. A leading
+    /// block written for that entry goes above the whole line.
+    fn isLineFraming(pending: []const u8) bool {
+        return isFraming(pending, "-?:");
+    }
+
+    /// Indentation, then only `indicators`, each followed by a blank.
+    fn isFraming(pending: []const u8, indicators: []const u8) bool {
         var i: usize = 0;
         while (i < pending.len and pending[i] == ' ') i += 1;
         while (i < pending.len) {
-            if (pending[i] != '-') return false;
+            if (std.mem.indexOfScalar(u8, indicators, pending[i]) == null) return false;
             i += 1;
             if (i >= pending.len or pending[i] != ' ') return false;
             while (i < pending.len and pending[i] == ' ') i += 1;
@@ -409,7 +421,12 @@ pub const Emitter = struct {
         }
         var stop = doc.body_start;
         if (doc.root) |root| {
-            stop = try self.emitRoot(root, markup.columnOf(src, doc.body_start), doc.body_end);
+            // A leading block written on the root: its old lines were
+            // tombstoned out of the head above, and nothing else writes
+            // the new ones -- the root has no entry slot of its own.
+            const col = markup.columnOf(src, doc.body_start);
+            if (root.pending_leading) |pt| try self.writePendingLeadingText(pt, col, self.terminatorAt(doc.body_start));
+            stop = try self.emitRoot(root, col, doc.body_end);
         }
         if (stop < doc.region_end) {
             // Deleted-entry tombstones of the root container can reach
@@ -560,19 +577,19 @@ pub const Emitter = struct {
         if (ks) |s| {
             if (!s.synthetic) {
                 // A written leading block replaces the entry's own
-                // lines: stop the verbatim gap at the entry's line
-                // start (the tombstoned old block is already skipped in
-                // there), write the new lines, then re-assemble the
-                // entry's line -- indentation, framing indicator, key.
+                // lines (the tombstoned old block is skipped in the
+                // gap). The gap runs up to the key as usual, leaving the
+                // entry's line begun -- indentation and any outer `- `
+                // -- and the block writer lifts that above the new
+                // lines. The key's own framing is written below from
+                // entry_start; re-assembling the line here as well
+                // doubled it (`- - k: v`, `? ? k`), and stopping the gap
+                // at the line start lost an item's `- ` before `? k`.
+                try self.writeGap(container, gap_start, s.entry_start);
                 const pending = internal.pairLeadingOverride(src, key, value);
                 if (pending != null) {
-                    const ls = markup.lineStart(src, s.entry_start);
-                    try self.writeGap(container, gap_start, ls);
                     const col = markup.columnOf(src, s.entry_start);
                     try self.writePendingLeadingText(pending, col, self.terminatorAt(s.entry_start));
-                    try self.write(src[s.entry_start..s.start]);
-                } else {
-                    try self.writeGap(container, gap_start, s.entry_start);
                 }
                 try self.breakBeforeEntry(entry_col);
             } else {
@@ -591,6 +608,12 @@ pub const Emitter = struct {
                 // path reaches here; an untouched region is emitted
                 // verbatim in one slice.
                 try self.writeGap(container, gap_start, s.entry_start);
+                // With no key bytes, the value holds the entry line's
+                // written block (`: a`); it was accepted and never
+                // written.
+                if (internal.pairLeadingOverride(src, key, value)) |pt| {
+                    try self.writePendingLeadingText(pt, markup.columnOf(src, s.entry_start), self.terminatorAt(s.entry_start));
+                }
                 try self.breakBeforeEntry(entry_col);
             }
         } else if (pair_end == null) {
@@ -656,7 +679,7 @@ pub const Emitter = struct {
             // A modified key keeps its framing -- the `- ` or `? ` in
             // [entry_start, start) -- and re-emits only its content.
             if (key_spanned) try self.write(src[ks.?.entry_start..ks.?.start]);
-            _ = try self.emitContent(key, if (ks) |s| markup.columnOf(src, s.start) else entry_col);
+            try self.emitKeyContent(key, if (ks) |s| markup.columnOf(src, s.start) else entry_col, expl);
         }
 
         // Valueless entry (`key:` / `? key`): emit the original colon
@@ -700,17 +723,15 @@ pub const Emitter = struct {
                     {
                         // A written leading block for a BLOCK value
                         // replaces the comment lines between the key's
-                        // colon and the value's first line. The verbatim
-                        // gap stops after its last newline -- the lines'
-                        // indentation is re-written below with the new
-                        // block. (An inline value's block belongs to the
-                        // pair and was already written at the key's gap.)
-                        const vls = markup.lineStart(src, vs.entry_start);
-                        const split = s.end + if (std.mem.lastIndexOfScalar(u8, src[s.end..vls], '\n')) |idx|
-                            idx + 1
-                        else
-                            0;
-                        try self.writeGap(value, s.end, split);
+                        // colon and the value's first line (tombstoned
+                        // out of the gap), and goes above the value's
+                        // line, which the gap has begun: its indentation,
+                        // and for an explicit key's value the `: `
+                        // indicator, which stopping the gap at the line
+                        // start dropped. (An inline value's block belongs
+                        // to the pair and was already written at the
+                        // key's gap.)
+                        try self.writeGap(value, s.end, vs.entry_start);
                         const vcol = markup.columnOf(src, vs.entry_start);
                         try self.writePendingLeadingText(value.pending_leading, vcol, self.terminatorAt(vs.entry_start));
                     } else {
@@ -840,19 +861,17 @@ pub const Emitter = struct {
             }
             return error.AliasCycle;
         }
+        // A written leading block replaces the item's own comment lines
+        // (tombstoned out of the gap) and goes above the item's line,
+        // which the gap has begun; the block writer lifts that above the
+        // new lines (see the pair case). The item's `- ` is then written
+        // by the rule below and nowhere else: re-assembling it here as
+        // well doubled it for a block collection item, whose first entry
+        // carries it (`- - name: x`).
+        try self.writeGap(container, gap_start, s.entry_start);
         if (item.pending_leading != null) {
-            // A written leading block replaces the item's own comment
-            // lines; the verbatim gap stops at the item's line start
-            // (tombstoned old lines are already skipped in there). The
-            // entry's line is re-assembled here: indentation, then the
-            // `- ` framing the walk's content emission assumes copied.
-            const ls = markup.lineStart(src, s.entry_start);
-            try self.writeGap(container, gap_start, ls);
             const col = markup.columnOf(src, s.entry_start);
             try self.writePendingLeadingText(item.pending_leading, col, self.terminatorAt(s.entry_start));
-            try self.write(src[s.entry_start..s.start]);
-        } else {
-            try self.writeGap(container, gap_start, s.entry_start);
         }
         try self.breakBeforeEntry(entry_col);
         if (!s.synthetic) {
@@ -866,9 +885,8 @@ pub const Emitter = struct {
             // with entries -- is emitted from `start`, so the indicator
             // went missing and the item stopped being one: `- {a: 1}`
             // with `$[0].a` set wrote `{a: Z}` at the parent's column,
-            // and a refilled `- {}` did not parse at all. A written
-            // leading block re-assembled the line above already.
-            if (item.pending_leading == null and !framingOwnedByContent(item)) {
+            // and a refilled `- {}` did not parse at all.
+            if (!framingOwnedByContent(item)) {
                 try self.write(src[s.entry_start..s.start]);
             }
             const stop = try self.emitContent(item, markup.columnOf(src, s.start));
@@ -884,6 +902,21 @@ pub const Emitter = struct {
         try self.emitted.put(item, {});
         try self.write(src[s.entry_start..s.start]);
         return s.end;
+    }
+
+    /// A mapping key's own content, under the rules for keys. An
+    /// implicit key is one line, so a scalar key is never a block
+    /// scalar there; `emitContent` would write a multi-line key as `|-`
+    /// and its lines, which reads back as a different mapping. An
+    /// explicit key (`? `) takes any form.
+    fn emitKeyContent(self: *Emitter, key: *Node, col: usize, explicit: bool) Error!void {
+        switch (key.data) {
+            .scalar => |s| {
+                if (try self.writeProperties(key)) try self.writeByte(' ');
+                try self.emitScalarValue(s.value, s.style, col, explicit, false);
+            },
+            else => _ = try self.emitContent(key, col),
+        }
     }
 
     /// Emit a node's own content (properties + body) at the cursor.
@@ -1322,10 +1355,33 @@ pub const Emitter = struct {
     fn writePendingLeadingText(self: *Emitter, pending: ?[]const u8, col: usize, term: []const u8) Error!void {
         const t = pending orelse return;
         if (t.len == 0) return;
-        // An empty output is at a line start already: breaking here put
-        // a blank line ahead of a comment written on the first item.
-        if (self.out.items.len > 0 and !self.endsWithNewline()) try self.write(self.defaultTerminator());
-        var it = std.mem.splitScalar(u8, t, '\n');
+        // The block opens a line of its own, above the entry's line. A
+        // pending line holding only indentation and `- `/`? `/`: `
+        // framing IS the entry's line, already begun: lift it off, write
+        // the block at its indentation, and put the framing back after
+        // it.
+        // Breaking the line instead left a whitespace-only line behind
+        // (`items:\n  \n  # c`), or cut an item's `- ` off its entry
+        // (`- \n  # c\n  ? k`).
+        const open = self.pendingLine();
+        if (isLineFraming(open)) {
+            var indent: usize = 0;
+            while (indent < open.len and open[indent] == ' ') indent += 1;
+            const framing = try self.allocator.dupe(u8, open[indent..]);
+            defer self.allocator.free(framing);
+            self.out.shrinkRetainingCapacity(self.out.items.len - open.len);
+            try self.writeLeadingLines(t, if (framing.len > 0) indent else col, term);
+            try self.write(framing);
+            return;
+        }
+        if (!self.endsWithNewline()) try self.write(self.defaultTerminator());
+        try self.writeLeadingLines(t, col, term);
+    }
+
+    /// The lines of a written leading block at `col`, each terminated,
+    /// then the indentation of the line they sit above.
+    fn writeLeadingLines(self: *Emitter, text: []const u8, col: usize, term: []const u8) Error!void {
+        var it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |line| {
             try self.writeIndent(col);
             try self.write(line);
@@ -1402,14 +1458,13 @@ pub const Emitter = struct {
     /// Emit one mapping entry. The cursor is at the key column.
     fn emitEntry(self: *Emitter, key: *Node, value: *Node, indent: usize) Error!void {
         switch (key.data) {
-            .scalar => |s| {
+            .scalar => {
                 // A scalar key can carry properties too (`&k name: v`,
                 // `!t 1: v`). They were dropped here while non-scalar
                 // keys (through `emitFlowNode`) kept theirs, so an alias
                 // to an anchored scalar key emitted `*k` with no `&k`.
                 if (key.anchor) |a| try self.seen.put(key, a);
-                if (try self.writeProperties(key)) try self.writeByte(' ');
-                try self.emitScalarValue(s.value, s.style, indent, false, false);
+                try self.emitKeyContent(key, indent, false);
                 try self.writeByte(':');
             },
             else => {

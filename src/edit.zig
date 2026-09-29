@@ -1967,7 +1967,11 @@ test "cloneTreeInto keeps no pointers into the source document" {
         try testing.expect(clone.tag.?.ptr != node.tag.?.ptr);
         const cloned_value = clone.data.mapping.pairs.items[0].value;
         try testing.expect(cloned_value.pending_trailing.?.ptr != inner.pending_trailing.?.ptr);
-        try testing.expect(cloned_value.pending_leading.?.ptr != inner.pending_leading.?.ptr);
+        // A leading block is held by the node that starts its line: for
+        // an inline value, the key (`Document.setLeadingComments`).
+        const inner_key = a.pathGet(&.{"subtree"}).?.pairs().?[0].key;
+        const cloned_key = clone.data.mapping.pairs.items[0].key;
+        try testing.expect(cloned_key.pending_leading.?.ptr != inner_key.pending_leading.?.ptr);
         break :blk clone;
     };
     // `a` and its pool are gone. Nothing below may read through it.
@@ -1975,7 +1979,7 @@ test "cloneTreeInto keeps no pointers into the source document" {
     try testing.expectEqualStrings("tag:yaml.org,2002:map", copy.tag.?);
     const value = copy.data.mapping.pairs.items[0].value;
     try testing.expectEqualStrings("# trailing", value.pending_trailing.?);
-    try testing.expectEqualStrings("# leading", value.pending_leading.?);
+    try testing.expectEqualStrings("# leading", copy.data.mapping.pairs.items[0].key.pending_leading.?);
     // Spans are cleared, and `src_end` is a span like any other.
     try testing.expect(copy.src == null);
     try testing.expect(copy.data.mapping.pairs.items[0].src_end == null);
