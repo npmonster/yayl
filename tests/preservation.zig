@@ -2813,11 +2813,10 @@ test "preservation sweep: a new leading comment on any node reads back from it" 
     }
 
     // Cases whose failure is a separate emitter defect, not a comment
-    // one, fixed in their own commits: a compact collection after an
-    // explicit `? `/`: ` indicator, and a keep-chomped block scalar
-    // re-emitted. Each must still fail (stale guard), and nothing else
-    // may.
-    const pending = [_][]const u8{ "5WE3", "A2M4", "KK5P", "M5DY", "P2AD", "V9D5" };
+    // one, fixed in its own commit: a compact collection after an
+    // explicit `? `/`: ` indicator. Each must still fail (stale guard),
+    // and nothing else may.
+    const pending = [_][]const u8{ "5WE3", "A2M4", "KK5P", "M5DY", "V9D5" };
     var pending_hit = [_]bool{false} ** pending.len;
     var tracked: usize = 0;
 

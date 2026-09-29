@@ -59,6 +59,10 @@ pub const Emitter = struct {
     /// True when the caller set `indent_step` explicitly, so faithful
     /// emission must not overwrite it with the source's own convention.
     forced_indent: bool = false,
+    /// The scalar last written by `emitScalarValue` was a block with keep
+    /// chomping (`|+`, `>+`), which absorbs any blank lines after it into
+    /// its value; see `pastKeptBlanks`.
+    kept_breaks: bool = false,
     /// Nesting levels currently open. Emission is recursive, so this
     /// bounds native stack use; see `max_depth`.
     depth: usize = 0,
@@ -478,6 +482,9 @@ pub const Emitter = struct {
             // from there.
             .scalar, .alias => {
                 _ = try self.emitContent(node, indent);
+                if (self.kept_breaks and self.endsWithNewline()) {
+                    return self.pastKeptBlanks(node, markup.lineEnd(self.src, s.end));
+                }
                 return self.writeEntryTail(node, s.end);
             },
             // Modified container: its slot walk consumes through the
@@ -749,7 +756,7 @@ pub const Emitter = struct {
                 const base = pair_end orelse vs.end;
                 const le = markup.lineEnd(src, base);
                 if (stop >= le) return stop;
-                if (self.endsWithNewline()) return le;
+                if (self.endsWithNewline()) return self.pastKeptBlanks(value, le);
                 // Write the remainder of the line the walk actually
                 // stopped on — when the value's LAST entry was deleted,
                 // `base` sits on a tombstoned line whose remainder is
@@ -794,7 +801,7 @@ pub const Emitter = struct {
         // chomping break; only advance the gap anchor.
         if (pair_end) |pe| {
             const le = markup.lineEnd(src, pe);
-            if (self.endsWithNewline()) return le;
+            if (self.endsWithNewline()) return self.pastKeptBlanks(value, le);
             return self.writeEntryTail(value, pe);
         }
         return gap_start;
@@ -895,13 +902,31 @@ pub const Emitter = struct {
             // of that would append a blank line after the item.
             const le = markup.lineEnd(src, s.end);
             if (stop >= le) return stop;
-            if (self.endsWithNewline()) return le;
+            if (self.endsWithNewline()) return self.pastKeptBlanks(item, le);
             return self.writeEntryTail(item, s.end);
         }
         // Synthesized empty item: the entry shell only.
         try self.emitted.put(item, {});
         try self.write(src[s.entry_start..s.start]);
         return s.end;
+    }
+
+    /// Where the next gap starts after `node` was re-emitted, given the
+    /// offset `le` its original line ended at. A block written with keep
+    /// chomping already holds all its trailing line breaks, and would
+    /// absorb any blank line after it into its value -- the source's own
+    /// blank lines there, which were the old block's kept breaks, then
+    /// doubled them on every edit (`keep\n\n` read back `keep\n\n\n`).
+    /// So those are skipped.
+    fn pastKeptBlanks(self: *const Emitter, node: *const Node, le: usize) usize {
+        if (node.data != .scalar or !self.kept_breaks) return le;
+        var i = le;
+        while (i < self.src.len) {
+            const next = markup.lineEnd(self.src, i);
+            if (next == i or !ctype.isBlankRun(self.src[i..next])) break;
+            i = next;
+        }
+        return i;
     }
 
     /// A mapping key's own content, under the rules for keys. An
@@ -1799,6 +1824,7 @@ pub const Emitter = struct {
 
     fn emitScalarValue(self: *Emitter, value: []const u8, prefer: ScalarStyle, indent: usize, block_ok: bool, flow: bool) Error!void {
         const style = chooseScalarStyle(value, prefer, indent, block_ok, flow);
+        self.kept_breaks = (style == .literal or style == .folded) and stripTrailingNewlines(value).trailing > 1;
         switch (style) {
             .plain => try self.write(value),
             .single_quoted => {
@@ -2479,6 +2505,35 @@ test "an empty plain scalar in a flow sequence is written as null" {
                 try testing.expectEqual(document_mod.CoreTag.null, document_mod.resolveCoreTag(items[pos].scalarValue().?, items[pos].data.scalar.style));
             }
         }
+    }
+}
+
+test "a re-emitted keep-chomped block scalar keeps its value" {
+    // A `|+`/`>+` block keeps its trailing line breaks as value, and they
+    // sit in the source after its slot, at the start of the next gap. A
+    // modified one is re-written with its whole value -- and the gap then
+    // replayed the same blank lines, which the keep chomping absorbed:
+    // `keep\n\n` came back `keep\n\n\n` on every edit of that node.
+    const cases = [_]struct { in: []const u8, path: []const []const u8, out: []const u8 }{
+        .{ .in = "- |+\n keep\n\n- x\n", .path = &.{"0"}, .out = "- &z |+\n  keep\n\n- x\n" },
+        .{ .in = "a: |+\n  keep\n\nb: x\n", .path = &.{"a"}, .out = "a: &z |+\n   keep\n\nb: x\n" },
+        .{ .in = "a: >+\n  keep\n\n\nb: x\n", .path = &.{"a"}, .out = "a: &z >+\n   keep\n\n\nb: x\n" },
+        .{ .in = "a: |+\n  keep\n\n", .path = &.{"a"}, .out = "a: &z |+\n   keep\n\n" },
+        .{ .in = "a: |+\n  keep\n\n# c\nb: x\n", .path = &.{"a"}, .out = "a: &z |+\n   keep\n\n# c\nb: x\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        const node = doc.root.?.byPath(c.path).?;
+        const want = try testing.allocator.dupe(u8, node.scalarValue().?);
+        defer testing.allocator.free(want);
+        try doc.setAnchor(node, "z");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        try testing.expectEqualStrings(want, again.root.?.byPath(c.path).?.scalarValue().?);
     }
 }
 

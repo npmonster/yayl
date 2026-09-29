@@ -100,6 +100,15 @@ A modified mapping key is also re-emitted under the rules for keys: since
 the #11 fix, a multi-line key given a comment or an anchor came out as a
 literal block, a different mapping.
 
+**A modified keep-chomped block scalar grew on every write.** A `|+` or
+`>+` block keeps its trailing line breaks as value, and in the source
+they sit after its slot. When the node was modified (a new anchor, tag
+or comment, or a new value with trailing breaks) the block was re-written
+with its whole value and then those source blank lines were written
+again, which the keep chomping took in: `keep\n\n` read back as
+`keep\n\n\n`. The blank lines are now skipped after a re-written keep
+block.
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity
