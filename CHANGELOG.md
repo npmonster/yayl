@@ -141,6 +141,14 @@ type violation from `yaml.schema`. `toZig` holds a hand-built `.bigint`
 to the same rule, and a read path (`pathGet`, `byPath`) indexes a
 sequence only with plain digits (`1_0` and `+1` were items 10 and 1).
 
+**The fuzz harness.** Its header claimed Zig 0.16.0 has no
+`std.testing.fuzz`; it has one, whose coverage-guided mode does not build
+on that toolchain (a type error in its own test runner), and the note
+now says so. Its list of expected errors was kept by hand and lacked
+`AliasPath`, so the edit API's correct refusal of a write through an
+alias would have been reported as a harness failure; the list is now
+derived from the library's error sets.
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity
