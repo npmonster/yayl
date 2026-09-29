@@ -2622,6 +2622,35 @@ test "a modified scalar or flow sequence item keeps its `- `" {
     try testing.expectEqualStrings("- a # c\n- b\n", out);
 }
 
+test "an edit under a root that shares its line with `---` keeps the marker" {
+    // `markup.entryStart` took the marker's third dash for a `- `
+    // indicator, so the root's entry_start (and the document's
+    // body_start) pointed inside `---`. An untouched root re-emitted
+    // from there, dash and all; a modified one from its content, and
+    // `--- {a: 1}` with `$.a` set to 2 was written `--{a: 2}`: valid
+    // YAML meaning a mapping keyed `--{a`.
+    const cases = [_]struct { in: []const u8, path: []const u8, out: []const u8 }{
+        .{ .in = "--- {a: 1}\n", .path = "$.a", .out = "--- {a: 2}\n" },
+        .{ .in = "--- [1, 2]\n", .path = "$[0]", .out = "--- [2, 2]\n" },
+        .{ .in = "--- !!map {a: 1}\n", .path = "$.a", .out = "--- !!map {a: 2}\n" },
+        .{ .in = "--- &r {a: 1}\n", .path = "$.a", .out = "--- &r {a: 2}\n" },
+        .{ .in = "--- foo\n", .path = "$", .out = "--- 2\n" },
+        .{ .in = "--- {a: 1} # c\n", .path = "$.a", .out = "--- {a: 2} # c\n" },
+        // Controls: the marker on its own line, and no marker.
+        .{ .in = "---\n{a: 1}\n", .path = "$.a", .out = "---\n{a: 2}\n" },
+        .{ .in = "{a: 1}\n", .path = "$.a", .out = "{a: 2}\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.set(c.path, try doc.createScalar("2", .plain));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+}
+
 test "emptying a container keeps the comments between its entries" {
     // `{}` / `[]` alone ate every comment line the deleted entries had
     // between them, although deleting the entries one at a time kept

@@ -2266,6 +2266,91 @@ test "flow-sequence replacements preserve exact slots and surrounding bytes" {
     }
 }
 
+test "preservation sweep: a root on its `---` line keeps the marker through every scalar edit" {
+    // A root that starts on its own `---` line (`--- {a: 1}`, the usual
+    // shape of a flow root or minified JSON) lost the marker's last dash
+    // and the blank on ANY edit under it: `markup.entryStart` took that
+    // dash for a `- ` indicator, and the document was written back as
+    // `--{a: 2}`, a mapping keyed `--{a`. The fixture sweep skips every
+    // target inside a flow collection (flow collections reflow by
+    // design), which is where this class lives, so it is swept here with
+    // the strongest assertion there is: setting any scalar changes
+    // exactly that scalar's bytes, in every document of the stream.
+    const allocator = std.testing.allocator;
+    const streams = [_][]const u8{
+        "--- {a: 1, b: [x, 'y'], c: {d: \"e\"}}\n",
+        "--- [1, {k: v}, [2, 3]]\n",
+        "--- !!map {a: 1, b: 2}\n",
+        "--- &r {a: 1, b: 2}\n",
+        "--- !!seq [x, y]\n",
+        "--- {a: 1} # trailing\n",
+        "# head\n--- {a: 1, b: 2}\n...\n",
+        "%YAML 1.2\n--- {a: 1}\n",
+        "--- {a: 1,\n  b: 2}\n",
+        "--- {a: 1}\r\n",
+        "\xEF\xBB\xBF--- {a: 1}\n",
+        "---\t{a: 1}\n",
+        "--- foo\n",
+        "--- 'quoted' # c\n",
+        "--- |\n  text\n",
+        "--- {a: 1}\n--- [x, y]\n--- z\n",
+        "a: 1\n--- {b: 2}\n",
+    };
+    var swept: usize = 0;
+    for (streams) |input| {
+        // Every scalar of every document, with its path and its bytes.
+        var docs = try yaml.parseAll(allocator, input);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        for (docs.items, 0..) |*doc, di| {
+            const root = doc.root orelse continue;
+            var ed = yaml.edit.Editor.init(doc);
+            var referenced = std.StringHashMap(void).init(allocator);
+            defer referenced.deinit();
+            var comps: std.ArrayList(Comp) = .empty;
+            defer comps.deinit(allocator);
+            var found: Found = .{};
+            defer found.deinit(allocator);
+            try walkTargets(allocator, &ed, input, &referenced, root, &comps, &found, 0, false, false);
+
+            var paths: std.ArrayList([]const u8) = .empty;
+            defer paths.deinit(allocator);
+            try paths.append(allocator, "$");
+            for (found.targets.items) |t| try paths.append(allocator, t.path);
+            for (paths.items) |path| {
+                const node = try ed.one(path);
+                if (node.kind() != .scalar) continue;
+                const span = node.src.?;
+
+                var edited = try yaml.parseAll(allocator, input);
+                defer {
+                    for (edited.items) |*d| d.deinit();
+                    edited.deinit(allocator);
+                }
+                var eed = yaml.edit.Editor.init(&edited.items[di]);
+                try eed.set(path, try edited.items[di].createScalar("SENTINEL", .plain));
+                const out = try yaml.writeAll(allocator, edited.items);
+                defer allocator.free(out);
+
+                const want = try std.mem.concat(allocator, u8, &.{ input[0..span.start], "SENTINEL", input[span.end..] });
+                defer allocator.free(want);
+                if (!std.mem.eql(u8, want, out)) {
+                    std.debug.print("  PRESERVATION-FAIL \"{f}\" doc {d} set {s}:\n    want \"{f}\"\n    got  \"{f}\"\n", .{
+                        std.zig.fmtString(input), di, path, std.zig.fmtString(want), std.zig.fmtString(out),
+                    });
+                    return error.TestUnexpectedResult;
+                }
+                swept += 1;
+            }
+        }
+    }
+    // Every scalar value above: 4 + 4 + 2 + 2 + 2 + 1 + 2 + 1 + 2 + 1 +
+    // 1 + 1 + 1 + 1 + 1 + (1 + 2 + 1) + (1 + 1).
+    try std.testing.expectEqual(@as(usize, 32), swept);
+}
+
 test "preservation sweep: bounded edits over every valid corpus document" {
     // Leak-checking allocator WITHOUT per-allocation stack traces (see
     // the fixture sweep above for the cost arithmetic).

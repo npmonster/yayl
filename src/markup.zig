@@ -106,6 +106,10 @@ pub fn entryStart(source: []const u8, content_start: usize) usize {
     while (i > 0 and (source[i - 1] == ' ' or source[i - 1] == '\t')) i -= 1;
     if (i == 0) return content_start;
     const prev = source[i - 1];
+    // A dash right after another dash is not an indicator (one is
+    // followed by a blank): it is the last dash of a `---` marker, as
+    // in `--- {a: 1}`, and the root after it starts its own entry.
+    if (prev == '-' and i >= 2 and source[i - 2] == '-') return content_start;
     if (prev == '-' or prev == '?') return i - 1;
     if (prev == '\n' or prev == '\r') {
         // The indicator may sit alone at the end of the previous line.
@@ -303,6 +307,24 @@ test "entryStart finds dash indicators" {
     try std.testing.expectEqual(@as(usize, 0), entryStart("-", 0));
     try std.testing.expectEqual(@as(usize, 1), entryStart("\r", 1));
     try std.testing.expectEqual(@as(usize, 1), entryStart("\n", 1));
+}
+
+test "entryStart does not take the last dash of a --- marker for an entry" {
+    // `--- {a: 1}`: the root sits after the directives-end marker, and
+    // the dash before its blank is the marker's third, not a `- `
+    // indicator. Taking it for one put the root's entry_start inside
+    // `---`, and a modified root re-emitted as `--{a: 2}`.
+    try std.testing.expectEqual(@as(usize, 4), entryStart("--- {a: 1}\n", 4));
+    try std.testing.expectEqual(@as(usize, 4), entryStart("--- foo\n", 4));
+    try std.testing.expectEqual(@as(usize, 5), entryStart("---\t[1]\n", 5));
+    try std.testing.expectEqual(@as(usize, 7), entryStart("\xEF\xBB\xBF--- {a: 1}\n", 7));
+    try std.testing.expectEqual(@as(usize, 9), entryStart("a\n--- {b}\n", 6 + 3));
+    // Real indicators are still found: after the marker line, after
+    // `? `, and nested; `-1` is a scalar, not an entry.
+    try std.testing.expectEqual(@as(usize, 4), entryStart("---\n- a\n", 6));
+    try std.testing.expectEqual(@as(usize, 2), entryStart("? - a\n", 4));
+    try std.testing.expectEqual(@as(usize, 2), entryStart("- - a\n", 4));
+    try std.testing.expectEqual(@as(usize, 0), entryStart("- -1\n", 2));
 }
 
 test "entryStart rejects bogus previous-line indicators" {

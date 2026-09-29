@@ -29,6 +29,18 @@ indicators (two bytes in each explicitly requested style; five over
 dashes, dots, blanks and line breaks) as a root, a block and flow mapping key and value, a sequence item and
 a nested value, and each comes back unchanged. (#8)
 
+**An edit under a root that shares its line with `---` dropped a dash.**
+`--- {a: 1}` with `$.a` set to 2 was written `--{a: 2}`, valid YAML that
+reads back as a mapping keyed `--{a`; flow, tagged, anchored and
+replaced scalar roots were all affected. `markup.entryStart` took the
+marker's last dash for a `- ` block-entry indicator, so the root's entry
+started inside `---` and a modified root was re-emitted without it. A
+dash directly after another dash is no longer taken for an indicator. A
+new preservation sweep sets every scalar of seventeen marker-line
+streams (flow and scalar roots, tags, anchors, comments, CRLF, BOM,
+directives, several documents) and checks that exactly that scalar's
+bytes change. (#9)
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity
