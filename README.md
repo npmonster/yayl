@@ -184,7 +184,7 @@ defer alloc.free(out);
 
 ## Edit with paths, batch atomically
 
-`yaml.edit.Editor` queries with a path grammar (`$.a.b[0]`, `[*]`, `..name`, `[?key=value]`) and applies edits (set, delete, insert, append, move) as an atomic batch over a deep clone of the tree:
+`yaml.edit.Editor` queries with a path grammar (`$.a.b[0]`, `[*]`, `..name`, `[?key=value]`) and applies edits (set, delete, insert, append, move) as an atomic batch: a batch that fails is rolled back, leaving the document as it was:
 
 ```zig
 var ed = yaml.edit.Editor.init(&doc);

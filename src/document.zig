@@ -596,6 +596,10 @@ pub const Document = struct {
     body_start: usize = 0,
     body_end: usize = 0,
     region_end: usize = 0,
+    /// INTERNAL. The undo log of the atomic batch in progress
+    /// (`edit.Editor.apply`, merge resolution), or null. Transient: only
+    /// `internal.Transaction` sets it.
+    journal: ?*internal.Journal = null,
 
     pub fn init(allocator: std.mem.Allocator) Document {
         return .{ .allocator = allocator, .pool = Pool.init(allocator) };
@@ -863,28 +867,28 @@ pub const Document = struct {
             }
         }
         node.anchor = if (name) |n| try self.pool.dupe(n) else null;
-        self.markModified(node);
+        try self.markModified(node);
     }
 
     /// Point every alias in this document named `name` at `target`.
     /// Used when the node carrying an anchor is replaced by one that
     /// carries the same name: the aliases follow the anchor.
-    pub fn retargetAliases(self: *Document, name: []const u8, target: *Node) void {
+    pub fn retargetAliases(self: *Document, name: []const u8, target: *Node) !void {
         const root = self.root orelse return;
-        retarget(root, name, target, 0);
+        try self.retarget(root, name, target, 0);
     }
 
-    fn retarget(node: *Node, name: []const u8, target: *Node, depth: usize) void {
+    fn retarget(self: *Document, node: *Node, name: []const u8, target: *Node, depth: usize) !void {
         if (depth >= max_alias_walk) return;
         switch (node.data) {
-            .alias => |*a| if (std.mem.eql(u8, a.name, name)) {
-                a.target = target;
+            .alias => |a| if (std.mem.eql(u8, a.name, name)) {
+                try internal.setAliasTarget(self, node, target);
             },
             .mapping => |m| for (m.pairs.items) |p| {
-                retarget(p.key, name, target, depth + 1);
-                retarget(p.value, name, target, depth + 1);
+                try self.retarget(p.key, name, target, depth + 1);
+                try self.retarget(p.value, name, target, depth + 1);
             },
-            .sequence => |s| for (s.items.items) |item| retarget(item, name, target, depth + 1),
+            .sequence => |sq| for (sq.items.items) |item| try self.retarget(item, name, target, depth + 1),
             .scalar => {},
         }
     }
@@ -922,14 +926,14 @@ pub const Document = struct {
         if (attachRefusal(map, key)) |reason| return reason;
         if (attachRefusal(map, value)) |reason| return reason;
         try internal.attachPair(self, map, key, value);
-        self.markModified(map);
+        try self.markModified(map);
     }
 
     /// Append an item to a sequence node, maintaining parent links.
     pub fn sequenceAppend(self: *Document, seq: *Node, item: *Node) !void {
         if (attachRefusal(seq, item)) |reason| return reason;
         try internal.attachItem(self, seq, item);
-        self.markModified(seq);
+        try self.markModified(seq);
     }
 
     /// Insert an item into a sequence at `index`.
@@ -941,10 +945,10 @@ pub const Document = struct {
     pub fn sequenceInsert(self: *Document, seq: *Node, index: usize, item: *Node) !void {
         if (attachRefusal(seq, item)) |reason| return reason;
         switch (seq.data) {
-            .sequence => |*s| {
-                try s.items.insert(self.pool.allocator(), index, item);
-                item.parent = seq;
-                self.markModified(seq);
+            .sequence => {
+                try internal.insertItem(self, seq, index, item);
+                try internal.setParent(self, item, seq);
+                try self.markModified(seq);
             },
             else => return error.InvalidSyntax,
         }
@@ -961,14 +965,14 @@ pub const Document = struct {
     /// to contain no aliases.
     pub fn mappingRemove(self: *Document, map: *Node, key: []const u8) !?*Node {
         switch (map.data) {
-            .mapping => |*m| {
+            .mapping => |m| {
                 for (m.pairs.items, 0..) |p, i| {
                     if (std.mem.eql(u8, p.key.scalarValue() orelse continue, key)) {
                         try internal.dropPairSpan(self, map, p);
-                        const removed = m.pairs.orderedRemove(i);
-                        removed.value.parent = null;
-                        removed.key.parent = null;
-                        self.markModified(map);
+                        const removed = try internal.removePair(self, map, i);
+                        try internal.setParent(self, removed.value, null);
+                        try internal.setParent(self, removed.key, null);
+                        try self.markModified(map);
                         return removed.value;
                     }
                 }
@@ -981,15 +985,15 @@ pub const Document = struct {
     /// Remove the sequence item at `index`.
     pub fn sequenceRemove(self: *Document, seq: *Node, index: usize) !?*Node {
         switch (seq.data) {
-            .sequence => |*s| {
+            .sequence => |s| {
                 if (index >= s.items.items.len) return null;
                 // Tombstone BEFORE detaching: the span depends on where
                 // the following item starts (as in `mappingRemove`).
                 const removed = s.items.items[index];
                 try internal.dropItemSpan(self, seq, removed);
-                _ = s.items.orderedRemove(index);
-                removed.parent = null;
-                self.markModified(seq);
+                _ = try internal.removeItem(self, seq, index);
+                try internal.setParent(self, removed, null);
+                try self.markModified(seq);
                 return removed;
             },
             else => return error.InvalidSyntax,
@@ -1046,11 +1050,11 @@ pub const Document = struct {
     /// those. A key the mapping already has wins; among sequence sources
     /// the earliest wins. The `<<` pair is removed afterwards.
     ///
-    /// The work runs on a deep clone that is swapped in only on success
-    /// (the `edit.apply` contract), so a document that fails to resolve —
-    /// an invalid value, a merge that reaches itself, a depth or
-    /// allocation failure — is left byte-identical, spans included. A
-    /// document with no `<<` is returned untouched, without a clone.
+    /// It is atomic (the `edit.apply` contract, through the same undo
+    /// journal): a document that fails to resolve — an invalid value, a
+    /// merge that reaches itself, a size, depth or allocation failure —
+    /// is left byte-identical, spans included. A document with no `<<` is
+    /// returned untouched.
     ///
     /// `ParseOptions.resolve_merge_keys` calls this after each document
     /// is built. Resolution re-emits the mappings it touches normalized,
@@ -1066,18 +1070,17 @@ pub const Document = struct {
 
     /// `resolveMergeKeys` creating at most `max_nodes` nodes.
     pub fn resolveMergeKeysLimited(self: *Document, max_nodes: usize) !void {
-        const old_root = self.root orelse return;
-        if (!treeHasMergeKey(old_root, 0)) return;
-        const new_root = try edit.cloneTreeWhole(self, old_root);
-        self.root = new_root;
-        var ok = false;
-        defer if (!ok) {
-            self.root = old_root;
-        };
+        const root = self.root orelse return;
+        if (!treeHasMergeKey(root, 0)) return;
+        // Atomic through the undo journal (`internal.Journal`), as for
+        // `edit.Editor.apply`: a failure rolls every change back.
+        var txn: internal.Transaction = undefined;
+        txn.begin(self);
+        errdefer txn.abort();
         var run: MergeRun = .{ .seen = std.AutoHashMap(*Node, MergeVisit).init(self.allocator), .remaining = max_nodes };
         defer run.seen.deinit();
-        try self.resolveMergeNode(new_root, &run, 0);
-        ok = true;
+        try self.resolveMergeNode(root, &run, 0);
+        try txn.commit();
     }
 
     /// True when any mapping pair in `node` is a merge key. Structural
@@ -1169,9 +1172,9 @@ pub const Document = struct {
             const p = m.pairs.items[i];
             if (!isMergeKeyPair(p)) continue;
             try internal.dropPairSpan(self, map, p);
-            _ = m.pairs.orderedRemove(i);
-            p.key.parent = null;
-            p.value.parent = null;
+            _ = try internal.removePair(self, map, i);
+            try internal.setParent(self, p.key, null);
+            try internal.setParent(self, p.value, null);
         }
         // The key texts the mapping holds, so each copied pair's check is
         // one lookup: scanning the pairs made every merge quadratic.
@@ -1181,7 +1184,7 @@ pub const Document = struct {
             if (p.key.scalarValue()) |t| try present.put(self.allocator, t, {});
         }
         for (values.items) |value| try self.mergeValueInto(map, value, run, &present, depth);
-        self.markModified(map);
+        try self.markModified(map);
     }
 
     /// Add the pairs a merge value contributes to `map`, in source order,
@@ -1311,7 +1314,7 @@ pub const Document = struct {
         const t = text orelse {
             if (node.trailingComment(self) == null) return; // nothing to delete
             node.pending_trailing = "";
-            self.markModified(node);
+            try self.markModified(node);
             return;
         };
         try validateTrailingText(t);
@@ -1321,7 +1324,7 @@ pub const Document = struct {
             if (std.mem.eql(u8, cur, t)) return;
         }
         node.pending_trailing = try self.pool.dupe(t);
-        self.markModified(node);
+        try self.markModified(node);
     }
 
     /// Set the node's leading comment block: the own-line comments
@@ -1363,7 +1366,7 @@ pub const Document = struct {
         const stored: ?[]const u8 = if (t) |body| try self.pool.dupe(body) else "";
         if (current != null and node.pending_leading == null) try self.tombstoneLeadingBlock(node);
         node.pending_leading = stored;
-        self.markModified(node);
+        try self.markModified(node);
     }
 
     /// True when `setTrailingComment` can act on this node.
@@ -1427,11 +1430,11 @@ pub const Document = struct {
         // the previous document's region; those bytes are not ours.
         if (span[0] < self.region_start or span[1] > self.region_end) return error.InvalidSyntax;
         const owner = gapOwnerForLeading(node, src) orelse return error.InvalidSyntax;
-        const drops = dropsOf(owner) orelse return error.InvalidSyntax;
+        if (dropsOf(owner) == null) return error.InvalidSyntax;
         const from = markup.lineStart(src, span[0]);
         const to = markup.lineEnd(src, span[1]);
         if (to <= from) return;
-        try internal.dropRange(self, drops, from, to);
+        try internal.dropRange(self, owner, from, to);
     }
 
     /// Refuse comment bytes the scanner refuses on input: a write that
@@ -1568,7 +1571,7 @@ pub const Document = struct {
     /// mappings as needed; returns the container holding the final key.
     pub fn mappingWalkOrCreate(self: *Document, keys: []const []const u8) !*Node {
         if (self.root == null) {
-            self.root = try self.createMapping();
+            try internal.setRoot(self, try self.createMapping());
         }
         var cur = self.root.?;
         for (keys) |seg| {
@@ -1594,7 +1597,7 @@ pub const Document = struct {
             // `lookup` only matches values of the mapping `cur`, so the
             // in-place replace must succeed; falling through would
             // append a duplicate key.
-            if (!internal.mappingReplace(self, cur, existing, value)) return error.InvalidSyntax;
+            if (!try internal.mappingReplace(self, cur, existing, value)) return error.InvalidSyntax;
             return;
         }
         try self.mappingAppend(cur, try self.createScalar(last, .plain), value);
@@ -1618,8 +1621,7 @@ pub const Document = struct {
     /// re-emitted verbatim from its parent slot, and the parent's parent
     /// must not re-emit *it* verbatim, and so on. Unmodified siblings
     /// stay verbatim regardless (the emitter walks per slot).
-    pub fn markModified(self: *Document, node: *Node) void {
-        _ = self;
+    pub fn markModified(self: *Document, node: *Node) !void {
         var cur: ?*Node = node;
         // Bounded. `mappingAppend`/`sequenceAppend` refuse to build a
         // parent cycle, so the chain is acyclic and this never trips —
@@ -1633,7 +1635,10 @@ pub const Document = struct {
                 std.debug.assert(false); // parent cycle: attach guards were bypassed
                 return;
             }
-            n.modified = true;
+            if (!n.modified) {
+                try internal.recordModified(self, n);
+                n.modified = true;
+            }
             cur = n.parent;
         }
     }

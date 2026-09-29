@@ -18,6 +18,214 @@ const Document = document_mod.Document;
 const Node = document_mod.Node;
 const Pair = document_mod.Pair;
 
+// ----------------------------------------------------------------------
+// Journal: the undo log behind atomic edits
+// ----------------------------------------------------------------------
+
+/// INTERNAL. The undo log of one atomic batch -- `edit.Editor.apply`, or
+/// merge-key resolution (see `Transaction`). While `Document.journal`
+/// points at one, every
+/// structural mutation goes through the primitives below, which record
+/// what they overwrite; a failed batch replays the records newest first.
+///
+/// A record is reserved before its mutation and pushed only after the
+/// mutation succeeded, so the log never names a change that did not
+/// happen. And every undo writes back into room the forward change left
+/// -- a list never gives capacity back, so re-inserting a removed entry
+/// fits -- so rolling back cannot fail.
+///
+/// It replaces a deep clone of the whole tree per batch, which made every
+/// single `set` cost the document's size and left a dead copy of the tree
+/// in the arena each time: 800 sets on an 8,000-key mapping took 20 s and
+/// 4.3 GB.
+pub const Journal = struct {
+    allocator: std.mem.Allocator,
+    entries: std.ArrayList(Entry) = .empty,
+
+    pub const Entry = union(enum) {
+        root: ?*Node,
+        parent: struct { node: *Node, old: ?*Node },
+        src: struct { node: *Node, old: ?markup.Src },
+        /// The node's `modified` flag was false.
+        modified: *Node,
+        alias_target: struct { node: *Node, old: *Node },
+        pair_inserted: struct { map: *Node, index: usize },
+        pair_removed: struct { map: *Node, index: usize, pair: Pair },
+        pair_value: struct { map: *Node, index: usize, old: *Node },
+        item_inserted: struct { seq: *Node, index: usize },
+        item_removed: struct { seq: *Node, index: usize, item: *Node },
+        item_replaced: struct { seq: *Node, index: usize, old: *Node },
+        dropped_inserted: struct { node: *Node, index: usize },
+    };
+
+    pub fn deinit(self: *Journal) void {
+        self.entries.deinit(self.allocator);
+    }
+
+    /// Undo every recorded change, newest first.
+    pub fn rollback(self: *Journal, doc: *Document) void {
+        var i = self.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            undo(doc, self.entries.items[i]);
+        }
+        self.entries.clearRetainingCapacity();
+    }
+
+    fn undo(doc: *Document, e: Entry) void {
+        switch (e) {
+            .root => |r| doc.root = r,
+            .parent => |x| x.node.parent = x.old,
+            .src => |x| x.node.src = x.old,
+            .modified => |n| n.modified = false,
+            .alias_target => |x| x.node.data.alias.target = x.old,
+            .pair_inserted => |x| _ = x.map.data.mapping.pairs.orderedRemove(x.index),
+            .pair_removed => |x| x.map.data.mapping.pairs.insertAssumeCapacity(x.index, x.pair),
+            .pair_value => |x| x.map.data.mapping.pairs.items[x.index].value = x.old,
+            .item_inserted => |x| _ = x.seq.data.sequence.items.orderedRemove(x.index),
+            .item_removed => |x| x.seq.data.sequence.items.insertAssumeCapacity(x.index, x.item),
+            .item_replaced => |x| x.seq.data.sequence.items.items[x.index] = x.old,
+            .dropped_inserted => |x| _ = droppedList(x.node).orderedRemove(x.index),
+        }
+    }
+};
+
+/// INTERNAL. One atomic section over a document: `begin` points
+/// `Document.journal` at a fresh log, `abort` rolls it back, `commit`
+/// keeps the changes. Lives on the caller's stack (the document points
+/// into it) and is used as
+///
+///     var txn: internal.Transaction = undefined;
+///     txn.begin(doc);
+///     errdefer txn.abort();
+///     ... journalled mutations ...
+///     try txn.commit();
+///
+/// A section begun inside another hands its records to the outer one on
+/// commit, so the outer one's rollback still undoes them.
+pub const Transaction = struct {
+    doc: *Document,
+    journal: Journal,
+    outer: ?*Journal,
+
+    pub fn begin(self: *Transaction, doc: *Document) void {
+        self.* = .{ .doc = doc, .journal = .{ .allocator = doc.allocator }, .outer = doc.journal };
+        doc.journal = &self.journal;
+    }
+
+    /// Keep the changes. Fails only while nested (the outer log could
+    /// not take the records); the caller's `abort` then undoes them.
+    pub fn commit(self: *Transaction) !void {
+        if (self.outer) |o| try o.entries.appendSlice(o.allocator, self.journal.entries.items);
+        self.end();
+    }
+
+    /// Undo every change made since `begin`.
+    pub fn abort(self: *Transaction) void {
+        self.doc.journal = null; // the rollback itself records nothing
+        self.journal.rollback(self.doc);
+        self.end();
+    }
+
+    fn end(self: *Transaction) void {
+        self.doc.journal = self.outer;
+        self.journal.deinit();
+    }
+};
+
+/// Room for one record, before the mutation it describes.
+fn reserve(doc: *Document) !void {
+    if (doc.journal) |j| try j.entries.ensureUnusedCapacity(j.allocator, 1);
+}
+
+/// The record of a mutation that has just succeeded (room reserved).
+fn record(doc: *Document, e: Journal.Entry) void {
+    if (doc.journal) |j| j.entries.appendAssumeCapacity(e);
+}
+
+fn droppedList(node: *Node) *std.ArrayList([2]usize) {
+    return switch (node.data) {
+        .mapping => |*m| &m.dropped,
+        .sequence => |*s| &s.dropped,
+        else => unreachable,
+    };
+}
+
+/// INTERNAL mutation primitives: each records itself when a journal is
+/// active. Every change `edit` or merge resolution makes to an existing
+/// tree goes through one of these (or `Document.markModified`).
+pub fn setRoot(doc: *Document, root: ?*Node) !void {
+    try reserve(doc);
+    record(doc, .{ .root = doc.root });
+    doc.root = root;
+}
+
+pub fn setParent(doc: *Document, node: *Node, parent: ?*Node) !void {
+    if (node.parent == parent) return;
+    try reserve(doc);
+    record(doc, .{ .parent = .{ .node = node, .old = node.parent } });
+    node.parent = parent;
+}
+
+pub fn setSrc(doc: *Document, node: *Node, src: ?markup.Src) !void {
+    try reserve(doc);
+    record(doc, .{ .src = .{ .node = node, .old = node.src } });
+    node.src = src;
+}
+
+pub fn setAliasTarget(doc: *Document, node: *Node, target: *Node) !void {
+    try reserve(doc);
+    record(doc, .{ .alias_target = .{ .node = node, .old = node.data.alias.target } });
+    node.data.alias.target = target;
+}
+
+/// Record that `node.modified` is about to flip from false. Called by
+/// `Document.markModified` for each node it flips.
+pub fn recordModified(doc: *Document, node: *Node) !void {
+    try reserve(doc);
+    record(doc, .{ .modified = node });
+}
+
+pub fn insertPair(doc: *Document, map: *Node, index: usize, pair: Pair) !void {
+    try reserve(doc);
+    try map.data.mapping.pairs.insert(doc.pool.allocator(), index, pair);
+    record(doc, .{ .pair_inserted = .{ .map = map, .index = index } });
+}
+
+pub fn removePair(doc: *Document, map: *Node, index: usize) !Pair {
+    try reserve(doc);
+    const pair = map.data.mapping.pairs.orderedRemove(index);
+    record(doc, .{ .pair_removed = .{ .map = map, .index = index, .pair = pair } });
+    return pair;
+}
+
+pub fn setPairValue(doc: *Document, map: *Node, index: usize, value: *Node) !void {
+    try reserve(doc);
+    const slot = &map.data.mapping.pairs.items[index];
+    record(doc, .{ .pair_value = .{ .map = map, .index = index, .old = slot.value } });
+    slot.value = value;
+}
+
+pub fn insertItem(doc: *Document, seq: *Node, index: usize, item: *Node) !void {
+    try reserve(doc);
+    try seq.data.sequence.items.insert(doc.pool.allocator(), index, item);
+    record(doc, .{ .item_inserted = .{ .seq = seq, .index = index } });
+}
+
+pub fn removeItem(doc: *Document, seq: *Node, index: usize) !*Node {
+    try reserve(doc);
+    const item = seq.data.sequence.items.orderedRemove(index);
+    record(doc, .{ .item_removed = .{ .seq = seq, .index = index, .item = item } });
+    return item;
+}
+
+pub fn setItem(doc: *Document, seq: *Node, index: usize, item: *Node) !void {
+    try reserve(doc);
+    const slot = &seq.data.sequence.items.items[index];
+    record(doc, .{ .item_replaced = .{ .seq = seq, .index = index, .old = slot.* } });
+    slot.* = item;
+}
+
 /// INTERNAL. Structural append that deliberately skips the `modified`
 /// mark, for the builder composing a parsed tree. Calling this from
 /// outside leaves the subtree looking clean, so it re-emits verbatim
@@ -26,10 +234,10 @@ const Pair = document_mod.Pair;
 /// `Document.mappingAppend`.
 pub fn attachPair(self: *Document, map: *Node, key: *Node, value: *Node) !void {
     switch (map.data) {
-        .mapping => |*m| {
-            try m.pairs.append(self.pool.allocator(), .{ .key = key, .value = value });
-            key.parent = map;
-            value.parent = map;
+        .mapping => |m| {
+            try insertPair(self, map, m.pairs.items.len, .{ .key = key, .value = value });
+            try setParent(self, key, map);
+            try setParent(self, value, map);
         },
         else => return error.InvalidSyntax,
     }
@@ -39,9 +247,9 @@ pub fn attachPair(self: *Document, map: *Node, key: *Node, value: *Node) !void {
 /// hazard as `attachPair`; use `Document.sequenceAppend`.
 pub fn attachItem(self: *Document, seq: *Node, item: *Node) !void {
     switch (seq.data) {
-        .sequence => |*s| {
-            try s.items.append(self.pool.allocator(), item);
-            item.parent = seq;
+        .sequence => |s| {
+            try insertItem(self, seq, s.items.items.len, item);
+            try setParent(self, item, seq);
         },
         else => return error.InvalidSyntax,
     }
@@ -79,10 +287,13 @@ fn nextItemStart(s: anytype, item: *const Node) ?usize {
 /// range appended out of order would resurrect the deleted bytes
 /// it covers — and edits applied after an earlier one can easily
 /// detach entries in reverse document order.
-pub fn dropRange(self: *Document, drops: *std.ArrayList([2]usize), from: usize, to: usize) !void {
+pub fn dropRange(self: *Document, node: *Node, from: usize, to: usize) !void {
+    const drops = droppedList(node);
     var i: usize = 0;
     while (i < drops.items.len and drops.items[i][0] < from) i += 1;
+    try reserve(self);
     try drops.insert(self.pool.allocator(), i, .{ from, to });
+    record(self, .{ .dropped_inserted = .{ .node = node, .index = i } });
 }
 
 /// INTERNAL. Tombstone the source bytes a mapping entry occupied.
@@ -166,7 +377,7 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
             if (to <= from) return;
             // Losing a tombstone to OOM would resurrect the deleted
             // entry verbatim on the next write: propagate the error.
-            try dropRange(self, &m.dropped, from, to);
+            try dropRange(self, map, from, to);
         },
         else => {},
     }
@@ -197,7 +408,7 @@ pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
                 // covered the document tail.
                 const from = if (is.end > 0) markup.lineStart(src, is.end - 1) else 0;
                 const to = is.end;
-                if (to > from) try dropRange(self, &s.dropped, from, to);
+                if (to > from) try dropRange(self, seq, from, to);
                 return;
             }
             var from = markup.lineStart(src, is.entry_start);
@@ -233,7 +444,7 @@ pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
                 }
             }
             if (to <= from) return;
-            try dropRange(self, &s.dropped, from, to);
+            try dropRange(self, seq, from, to);
         },
         else => {},
     }
@@ -243,22 +454,22 @@ pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
 /// its position or separator layout. The replacement inherits the old
 /// item's exact byte bounds; false means the caller must fall back to
 /// ordinary remove/insert semantics.
-pub fn sequenceReplace(self: *Document, seq: *Node, index: usize, value: *Node) bool {
+pub fn sequenceReplace(self: *Document, seq: *Node, index: usize, value: *Node) !bool {
     switch (seq.data) {
-        .sequence => |*s| {
+        .sequence => |s| {
             if (s.style != .flow or index >= s.items.items.len) return false;
             const old = s.items.items[index];
             const old_src = old.src orelse return false;
             if (old_src.synthetic) return false;
 
-            value.parent = seq;
-            value.src = .{
+            try setParent(self, value, seq);
+            try setSrc(self, value, .{
                 .entry_start = old_src.entry_start,
                 .start = old_src.entry_start,
                 .end = old_src.end,
-            };
-            s.items.items[index] = value;
-            self.markModified(value);
+            });
+            try setItem(self, seq, index, value);
+            try self.markModified(value);
             return true;
         },
         else => return false,
@@ -268,23 +479,23 @@ pub fn sequenceReplace(self: *Document, seq: *Node, index: usize, value: *Node) 
 /// INTERNAL. Replace the existing value node `existing` (a value of
 /// `map`) with `value`, preserving pair order and the key node. Returns
 /// false when `existing` is not a value of `map`.
-pub fn mappingReplace(self: *Document, map: *Node, existing: *Node, value: *Node) bool {
+pub fn mappingReplace(self: *Document, map: *Node, existing: *Node, value: *Node) !bool {
     const pairs = switch (map.data) {
-        .mapping => |*m| m.pairs.items,
+        .mapping => |m| m.pairs.items,
         else => return false,
     };
-    for (pairs) |*p| {
+    for (pairs, 0..) |p, i| {
         if (p.value == existing) {
-            value.parent = map;
-            p.value = value;
+            try setParent(self, value, map);
+            try setPairValue(self, map, i, value);
             // A replacement must never carry a span into a slot it does
             // not describe. A spanned replacement (a clone) either
             // looks clean — the pair's fast path re-emits the ORIGINAL
             // bytes and the replacement silently vanishes — or re-emits
             // whatever region its span happens to name. Clear it and
             // mark it: the value re-emits normalized, like a moved one.
-            value.src = null;
-            self.markModified(value);
+            try setSrc(self, value, null);
+            try self.markModified(value);
             return true;
         }
     }

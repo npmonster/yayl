@@ -157,12 +157,11 @@ fn fuzzOnce(allocator: std.mem.Allocator, input: []const u8) !void {
     // document MUST resolve back, so a failure is a real addressing
     // defect and not a miss.
     //
-    // Bounded to small inputs. Each re-parses and deep-clones the tree
-    // several times (an edit clones the whole root), and the corpus
-    // seeds run to 64 KiB, which put one iteration into the hundreds of
-    // milliseconds. Every defect these have found lived in a document
-    // under a hundred bytes; the large seeds still get the parse, emit,
-    // value and schema coverage above.
+    // Bounded to small inputs. Each re-parses and re-writes the
+    // document several times, and the corpus seeds run to 64 KiB. Every
+    // defect these have found lived in a document under a hundred bytes;
+    // the large seeds still get the parse, emit, value and schema
+    // coverage above.
     if (docs.items.len > 0 and input.len <= 2048) try fuzzPaths(allocator, input);
 }
 
@@ -530,14 +529,12 @@ fn fuzzEdit(allocator: std.mem.Allocator, doc: *yaml.Document) !void {
     }
 
     // A mutating batch, then prove the document still round-trips.
-    // `apply` clones the root, so a deep or cyclic tree drives the
-    // clone walk too.
     const scalar = doc.createScalar("fuzz", .plain) catch |err| {
         try expectTypedError(err);
         return;
     };
-    // `set` routes through `apply`, which deep-clones the root, so a
-    // deep or cyclic tree drives the clone walk as well as the edit.
+    // `set` routes through `apply`, so a failure here also drives the
+    // undo journal's rollback.
     ed.set("$.fuzzed", scalar) catch |err| {
         try expectTypedError(err);
         return;
@@ -584,12 +581,16 @@ fn writeAllDocs(allocator: std.mem.Allocator, docs: []const yaml.Document) ![]u8
 /// as a harness failure.
 const Declared = yaml.YamlError || yaml.value.Error || yaml.schema.Error || yaml.edit.Error;
 
-fn expectTypedError(err: anyerror) !void {
-    const name = @errorName(err);
+fn isDeclared(err: anyerror) bool {
     inline for (@typeInfo(Declared).error_set.?) |e| {
-        if (std.mem.eql(u8, e.name, name)) return;
+        if (std.mem.eql(u8, e.name, @errorName(err))) return true;
     }
-    std.debug.print("fuzz: untyped error escaped: {s}\n", .{name});
+    return false;
+}
+
+fn expectTypedError(err: anyerror) !void {
+    if (isDeclared(err)) return;
+    std.debug.print("fuzz: untyped error escaped: {s}\n", .{@errorName(err)});
     return error.FuzzUntypedError;
 }
 
@@ -714,10 +715,11 @@ fn appendDirSeeds(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8
 }
 
 test "the harness accepts the library's declared errors and nothing else" {
-    try expectTypedError(error.AliasPath);
-    try expectTypedError(error.TypeMismatch);
-    try expectTypedError(error.InvalidSyntax);
-    try std.testing.expectError(error.FuzzUntypedError, expectTypedError(error.EndOfStream));
+    try std.testing.expect(isDeclared(error.AliasPath));
+    try std.testing.expect(isDeclared(error.TypeMismatch));
+    try std.testing.expect(isDeclared(error.InvalidSyntax));
+    try std.testing.expect(isDeclared(error.LimitExceeded));
+    try std.testing.expect(!isDeclared(error.EndOfStream));
 }
 
 test {

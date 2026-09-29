@@ -149,10 +149,12 @@ aliases only — see `docs/design/merge-keys.md`). An explicit key in the
 mapping wins over a merged one, and among sequence sources the earliest
 wins. A quoted `"<<"` is an ordinary key. The `<<` entry is removed.
 
-Resolution runs on a deep clone that is swapped in only on success, so a
-document that fails — an invalid value (`error.InvalidMergeKey`), a merge
-that reaches itself (`error.MergeKeyRecursive`), a depth or allocation
-failure — keeps its original bytes. It is merge-only: aliases outside the
+Resolution records every change in an undo journal and rolls it back on
+failure, so a document that fails — an invalid value
+(`error.InvalidMergeKey`), a merge that reaches itself
+(`error.MergeKeyRecursive`), more copied nodes than
+`ParseOptions.max_merge_nodes` allows (`error.LimitExceeded`), a depth or
+allocation failure — keeps its original bytes. It is merge-only: aliases outside the
 merged mapping are not inlined and anchors are not purged. For a read-only
 path, `yaml.value.parseToValueResolved` parses with the option on before
 converting.
@@ -350,8 +352,9 @@ var ed = yaml.edit.Editor.init(&doc);
 const first = try ed.one("$.store.book[0].title");
 const titles = try ed.all("$.store.book[*].title");
 
-// Edits. `apply` is atomic: edits run on a deep clone of the tree
-// (presentation spans included) and swap in only if ALL succeeded.
+// Edits. `apply` is atomic: edits run in place and every change is
+// journalled, so a failed batch is rolled back (presentation spans
+// included) and the document is left as it was.
 try ed.apply(&.{
     .{ .set    = .{ .path = "$.port", .value = try doc.createScalar("9090", .plain) } },
     .{ .append = .{ .sequence = "$.items", .value = try doc.createScalar("new", .plain) } },
@@ -692,6 +695,18 @@ const violations = try schema.validateLimited(alloc, node, "$", .{ .max_nodes = 
 
 `nodeToValueLimited` takes the same bound, and `Limits.unlimited` opts
 out — only for input you produced yourself.
+
+A count of values does not bound their size: every expanded alias copies
+its strings too, so one large anchored string behind a few levels of
+aliases is few values and a great deal of text. `value.Limits.max_bytes`
+(64 MiB, like the file limit) bounds the scalar and key text one
+conversion copies, with the same `error.LimitExceeded`.
+
+**Resolving merge keys** — `ParseOptions.max_merge_nodes`. Each `<<`
+copies its source's pairs into its mapping, so merges of merges grow the
+same way. Resolution stops at 262,144 copied nodes by default with
+`error.LimitExceeded`, leaving the document as it was;
+`Document.resolveMergeKeysLimited` takes the bound directly.
 
 Both also carry `max_depth` (1000), because a count of values cannot
 stand in for a depth: a linear chain of N nested collections is N values

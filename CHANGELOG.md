@@ -171,6 +171,20 @@ it was; `Document.resolveMergeKeysLimited` takes the bound directly. The
 key check is a hash lookup, so a merge costs what it copies: 100 merges
 of that mapping take a sixth of the time they did.
 
+**Every edit cost the size of the whole document.** `Editor.apply` (and
+so every `set`, `delete`, `insert`, `append` and `move`) deep-cloned the
+tree to stay atomic, and the clone was left in the document's arena: 800
+single-key sets on an 8,000-key mapping took 20 s and grew the arena by
+4.3 GB. A batch now edits in place and records each change in an undo
+journal, which a failed batch rolls back, so the document is left as it
+was (spans, tombstones, parent links and `modified` flags included; a
+new test fails a nine-edit batch at each of its allocations and compares
+the whole tree with a fresh parse). The same 800 sets take 74 ms and
+leave the arena as it was. Merge-key resolution uses the same journal
+instead of its own whole-tree clone. The alias checks that guard a delete
+or replacement now walk the tree only when the doomed subtree defines an
+anchor.
+
 **The fuzz harness.** Its header claimed Zig 0.16.0 has no
 `std.testing.fuzz`; it has one, whose coverage-guided mode does not build
 on that toolchain (a type error in its own test runner), and the note
@@ -178,6 +192,21 @@ now says so. Its list of expected errors was kept by hand and lacked
 `AliasPath`, so the edit API's correct refusal of a write through an
 alias would have been reported as a harness failure; the list is now
 derived from the library's error sets.
+
+### Changed
+
+- `edit.cloneTreeWhole` is removed. It existed for the clone the undo
+  journal replaced, and nothing else called it; `cloneTree` (same
+  document) and `cloneTreeInto` (another document) are unchanged.
+- `edit.Error` and `edit.CloneError` no longer list `UnknownAlias`, which
+  only `cloneTreeWhole` returned. With it went the other effect of that
+  clone: any batch on a hand-built tree holding a forward alias (one
+  whose anchor comes later) failed with `error.UnknownAlias`. Such a
+  batch now runs, and one that would delete or replace the anchor is
+  refused with `error.AnchorReferenced`, like any stranding edit.
+- `value.Limits` has a `max_bytes` field and `ParseOptions` a
+  `max_merge_nodes` field (see Fixed); `diag.YamlError` gains
+  `LimitExceeded`.
 
 ## 0.19.3 — 2026-09-15
 

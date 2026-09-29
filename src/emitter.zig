@@ -2432,7 +2432,7 @@ test "a plain scalar in a flow collection is quoted when it holds a flow indicat
         var doc = try Document.parse(testing.allocator, "a: [x, y]\n");
         defer doc.deinit();
         const seq = doc.pathGet(&.{"a"}).?;
-        try testing.expect(internal.sequenceReplace(&doc, seq, 0, try doc.createScalar(c.value, .plain)));
+        try testing.expect(try internal.sequenceReplace(&doc, seq, 0, try doc.createScalar(c.value, .plain)));
         const out = try doc.write(testing.allocator);
         defer testing.allocator.free(out);
         try testing.expectEqualStrings(c.want, out);
@@ -2467,12 +2467,12 @@ test "an empty plain scalar in a flow sequence is written as null" {
         if (c.index) |i| {
             const seq = doc.pathGet(&.{"s"}).?;
             if (seq.data.sequence.style == .flow) {
-                try testing.expect(internal.sequenceReplace(&doc, seq, i, empty));
+                try testing.expect(try internal.sequenceReplace(&doc, seq, i, empty));
             } else {
                 // Block items have no in-place replace: empty the item.
                 const item = seq.items().?[i];
                 item.data.scalar.value = "";
-                doc.markModified(item);
+                try doc.markModified(item);
             }
         } else try doc.pathSet(&.{ "m", "k" }, empty);
         const out = try doc.write(testing.allocator);
@@ -2490,7 +2490,7 @@ test "an empty plain scalar in a flow sequence is written as null" {
                 if (parsed) {
                     doc.deinit();
                     doc = try Document.parse(testing.allocator, ([_][]const u8{ "[a]\n", "[a, b]\n", "[a, b, c]\n", "[a, b, c, d]\n" })[n - 1]);
-                    try testing.expect(internal.sequenceReplace(&doc, doc.root.?, pos, try doc.createScalar("", .plain)));
+                    try testing.expect(try internal.sequenceReplace(&doc, doc.root.?, pos, try doc.createScalar("", .plain)));
                 } else {
                     const seq = try doc.createSequence();
                     seq.data.sequence.style = .flow;

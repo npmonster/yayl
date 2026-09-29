@@ -11,10 +11,10 @@
 //! Query results are deterministic: document order, wildcards and
 //! recursion yield in encounter order.
 //!
-//! All edits run through `Editor`. A `batch` applies every edit to a
-//! deep clone of the document tree and swaps it in only when the whole
-//! batch succeeded — a failure (unknown path, OOM, cycle) leaves the
-//! original document byte-identical, including its round-trip spans.
+//! All edits run through `Editor`. A batch (`apply`) edits the tree in
+//! place and records every change in an undo journal; a failure
+//! (unknown path, OOM, cycle) rolls the journal back, leaving the
+//! document byte-identical, including its round-trip spans.
 
 const std = @import("std");
 const document_mod = @import("document.zig");
@@ -41,10 +41,6 @@ pub const Error = error{
     WouldCycle,
     AnchorReferenced,
     AliasPath,
-    /// A whole-tree clone met a forward alias (an alias whose anchor is
-    /// defined later). `cloneTreeWhole` refuses it rather than pointing
-    /// the clone back at the pre-clone tree.
-    UnknownAlias,
     OutOfMemory,
 };
 
@@ -56,7 +52,6 @@ pub const CloneError = error{
     NestingTooDeep,
     InvalidSyntax,
     OutOfMemory,
-    UnknownAlias,
 };
 
 /// Refuse a MUTATION whose container is an alias node.
@@ -344,7 +339,29 @@ fn anchorMovesWith(existing: *const Node, replacement: *const Node) ?[]const u8 
 /// Refuse an edit that removes a node an alias still needs.
 fn refuseIfAnchorReferenced(doc: *Document, doomed: *const Node) Error!void {
     const root = doc.root orelse return;
+    // Nothing to strand without an anchor in the doomed subtree -- the
+    // common case, answered from the subtree alone. The alias scan below
+    // walks the whole document, and ran for every replace and delete.
+    if (!anchorIn(doomed, 0)) return;
     if (aliasWouldDangle(root, doomed, 0)) return error.AnchorReferenced;
+}
+
+/// Does `node`, or anything under it, carry an anchor? Aliases are
+/// leaves; the walk never follows one. Past the depth bound it answers
+/// yes, which only costs the full check.
+fn anchorIn(node: *const Node, depth: usize) bool {
+    if (depth >= max_walk_depth) return true;
+    if (node.anchor != null) return true;
+    switch (node.data) {
+        .mapping => |m| for (m.pairs.items) |pair| {
+            if (anchorIn(pair.key, depth + 1) or anchorIn(pair.value, depth + 1)) return true;
+        },
+        .sequence => |sq| for (sq.items.items) |item| {
+            if (anchorIn(item, depth + 1)) return true;
+        },
+        else => {},
+    }
+    return false;
 }
 
 /// Refuse removing the mapping pair whose VALUE is `target` when an alias
@@ -405,7 +422,7 @@ fn dependsOnOutsideAnchor(subtree: *const Node, node: *const Node, depth: usize)
 /// self-contained move stays allowed.
 fn refuseIfMoveStrandsAlias(doc: *Document, subtree: *const Node) Error!void {
     const root = doc.root orelse return;
-    if (aliasWouldDangle(root, subtree, 0)) return error.AnchorReferenced;
+    if (anchorIn(subtree, 0) and aliasWouldDangle(root, subtree, 0)) return error.AnchorReferenced;
     if (dependsOnOutsideAnchor(subtree, subtree, 0)) return error.AnchorReferenced;
 }
 
@@ -482,8 +499,8 @@ pub const Edit = union(enum) {
     move: struct { from: []const u8, to: []const u8, key: ?[]const u8 = null },
 };
 
-/// High-level editor over one document. Single operations apply
-/// directly; `batch` is atomic (copy-apply-swap).
+/// High-level editor over one document. Every edit goes through
+/// `apply`, which is atomic: a failed batch is rolled back.
 pub const Editor = struct {
     doc: *Document,
 
@@ -521,24 +538,17 @@ pub const Editor = struct {
         return self.apply(&.{.{ .delete = path }});
     }
 
-    /// Apply every edit atomically: work happens on a deep clone; the
-    /// clone is swapped in only if all edits succeeded.
+    /// Apply every edit atomically: all of them, or none. Each change is
+    /// recorded in an undo journal as it is made (`internal.Journal`),
+    /// and a failed batch rolls the recorded changes back, leaving the
+    /// document byte-identical. The cost is that of the edits, not of the
+    /// document: this used to deep-clone the whole tree on every call.
     pub fn apply(self: *Editor, edits: []const Edit) Error!void {
-        const doc = self.doc;
-        const old_root = doc.root;
-        // The WHOLE tree is swapped in, so a forward alias (an alias
-        // whose anchor is defined later -- valid only in a hand-built
-        // tree) must be refused rather than left pointing at the
-        // pre-clone tree, which the rollback contract assumes is gone.
-        // `cloneTree` tolerates one; `cloneTreeWhole` does not.
-        const new_root = if (old_root) |r| try cloneTreeWhole(doc, r) else null;
-        doc.root = new_root;
-        var ok = false;
-        defer if (!ok) {
-            doc.root = old_root; // roll back: discard the clone
-        };
-        for (edits) |edit| try applyOne(doc, edit);
-        ok = true;
+        var txn: internal.Transaction = undefined;
+        txn.begin(self.doc);
+        errdefer txn.abort();
+        for (edits) |edit| try applyOne(self.doc, edit);
+        try txn.commit();
     }
 
     fn applyOne(doc: *Document, edit: Edit) Error!void {
@@ -558,7 +568,7 @@ pub const Editor = struct {
                 if (ed.one(s.path)) |existing| {
                     if (!sameScalarPresentation(existing, s.value)) {
                         if (anchorMovesWith(existing, s.value)) |name| {
-                            doc.retargetAliases(name, s.value);
+                            try doc.retargetAliases(name, s.value);
                         } else {
                             try refuseIfAnchorReferenced(doc, existing);
                         }
@@ -625,7 +635,7 @@ pub const Editor = struct {
             if (doc.root) |root| {
                 if (sameScalarPresentation(root, value)) return;
             }
-            doc.root = value;
+            try internal.setRoot(doc, value);
             return;
         }
         const parent = p.segments[0 .. p.segments.len - 1];
@@ -645,7 +655,7 @@ pub const Editor = struct {
                     // `lookup` only matches values of the mapping `cur`,
                     // so the in-place replace must succeed; falling
                     // through would append a duplicate key.
-                    if (!internal.mappingReplace(doc, cur, existing, value)) return error.InvalidSyntax;
+                    if (!try internal.mappingReplace(doc, cur, existing, value)) return error.InvalidSyntax;
                     return;
                 }
                 try doc.mappingAppend(cur, try doc.createScalar(last, .plain), value);
@@ -660,7 +670,7 @@ pub const Editor = struct {
                     if (ix < items.len) {
                         if (sameScalarPresentation(items[ix], value)) return;
                         if (emitter_mod.Emitter.rewritableInFlow(value) and
-                            internal.sequenceReplace(doc, cur, ix, value))
+                            try internal.sequenceReplace(doc, cur, ix, value))
                         {
                             return;
                         }
@@ -814,17 +824,16 @@ pub const Editor = struct {
         // re-emit the node at its old place too, and the move would
         // silently become a copy (see `detachChild`).
         if (node.parent) |parent| _ = try detachChild(doc, parent, node);
-        node.parent = null;
         switch (target.data) {
             .mapping => {
                 const k = key orelse return error.AmbiguousOperation;
                 try doc.mappingAppend(target, try doc.createScalar(k, .plain), node);
                 // The node's source spans describe its old location.
-                clearSpans(node);
+                try clearSpans(doc, node);
             },
             .sequence => {
                 try doc.sequenceAppend(target, node);
-                clearSpans(node);
+                try clearSpans(doc, node);
             },
             else => return error.NotACollection,
         }
@@ -839,28 +848,28 @@ pub const Editor = struct {
 /// chain. Returns false when `child` is not there.
 fn detachChild(doc: *Document, container: *Node, child: *Node) Error!bool {
     switch (container.data) {
-        .mapping => |*m| for (m.pairs.items, 0..) |p, i| {
+        .mapping => |m| for (m.pairs.items, 0..) |p, i| {
             if (p.value != child) continue;
             try internal.dropPairSpan(doc, container, p);
-            _ = m.pairs.orderedRemove(i);
-            p.key.parent = null;
+            _ = try internal.removePair(doc, container, i);
+            try internal.setParent(doc, p.key, null);
             break;
         } else return false,
-        .sequence => |*sq| for (sq.items.items, 0..) |item, i| {
+        .sequence => |sq| for (sq.items.items, 0..) |item, i| {
             if (item != child) continue;
             try internal.dropItemSpan(doc, container, child);
-            _ = sq.items.orderedRemove(i);
+            _ = try internal.removeItem(doc, container, i);
             break;
         } else return false,
         else => return false,
     }
-    child.parent = null;
-    doc.markModified(container);
+    try internal.setParent(doc, child, null);
+    try doc.markModified(container);
     return true;
 }
 
-fn clearSpans(node: *Node) void {
-    node.src = null;
+fn clearSpans(doc: *Document, node: *Node) !void {
+    try internal.setSrc(doc, node, null);
     // Children keep their spans: they still describe their own bytes,
     // which the emitter only uses when the slot itself is original.
 }
@@ -879,21 +888,7 @@ fn clearSpans(node: *Node) void {
 pub fn cloneTree(doc: *Document, root: *Node) CloneError!*Node {
     var anchors = std.StringHashMap(*Node).init(doc.allocator);
     defer anchors.deinit();
-    return cloneNode(doc, root, &anchors, false, false, 0);
-}
-
-/// Same-document clone of a WHOLE tree, for a caller that will swap the
-/// result in as the document's new root. Unlike `cloneTree`, every anchor
-/// a correct tree can name is inside the clone, so an alias whose anchor
-/// has not been seen yet is a forward alias: invalid in parsed input and
-/// reachable only from a hand-built tree. It is refused rather than left
-/// pointing at the pre-clone node — a merge source that reached back into
-/// the tree being replaced could mutate it, and the caller's rollback
-/// (restore `root`) would then be a lie.
-pub fn cloneTreeWhole(doc: *Document, root: *Node) CloneError!*Node {
-    var anchors = std.StringHashMap(*Node).init(doc.allocator);
-    defer anchors.deinit();
-    return cloneNode(doc, root, &anchors, false, true, 0);
+    return cloneNode(doc, root, &anchors, false, 0);
 }
 
 /// Deep-clone a subtree from ANOTHER document into `doc`'s pool.
@@ -906,10 +901,10 @@ pub fn cloneTreeWhole(doc: *Document, root: *Node) CloneError!*Node {
 pub fn cloneTreeInto(doc: *Document, root: *Node) CloneError!*Node {
     var anchors = std.StringHashMap(*Node).init(doc.allocator);
     defer anchors.deinit();
-    return cloneNode(doc, root, &anchors, true, false, 0);
+    return cloneNode(doc, root, &anchors, true, 0);
 }
 
-fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), clear_spans: bool, require_anchor: bool, depth: usize) CloneError!*Node {
+fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), clear_spans: bool, depth: usize) CloneError!*Node {
     // Structural recursion only — an alias is copied as an alias, never
     // followed — so a cycle cannot reach here, but a deep built tree can.
     // The one exception is the cross-document alias below, which is
@@ -925,7 +920,7 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
     // target's own anchor, so a second alias to the same name still
     // clones as an alias, pointing at the copy.
     if (clear_spans and node.data == .alias and anchors.get(node.data.alias.name) == null) {
-        return cloneNode(doc, node.data.alias.target, anchors, clear_spans, require_anchor, depth + 1);
+        return cloneNode(doc, node.data.alias.target, anchors, clear_spans, depth + 1);
     }
 
     const n = try doc.pool.create(Node);
@@ -961,21 +956,18 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
             // Reached only for an anchor defined inside the clone, or
             // for a same-document clone where the source node is a
             // legitimate target.
-            const target = anchors.get(a.name) orelse blk: {
-                if (require_anchor) return error.UnknownAlias;
-                // A same-document subtree clone may legitimately name an
-                // anchor outside the cloned subtree; the reference stays
-                // in this document and is still valid.
-                break :blk a.target;
-            };
+            // A same-document subtree clone may legitimately name an
+            // anchor outside the cloned subtree; the reference stays in
+            // this document and is still valid.
+            const target = anchors.get(a.name) orelse a.target;
             n.data = .{ .alias = .{ .name = try doc.pool.dupe(a.name), .target = target } };
         },
         .mapping => |m| {
             n.data = .{ .mapping = .{ .style = m.style } };
             if (n.anchor) |a| try anchors.put(a, n);
             for (m.pairs.items) |p| {
-                const k = try cloneNode(doc, p.key, anchors, clear_spans, require_anchor, depth + 1);
-                const v = try cloneNode(doc, p.value, anchors, clear_spans, require_anchor, depth + 1);
+                const k = try cloneNode(doc, p.key, anchors, clear_spans, depth + 1);
+                const v = try cloneNode(doc, p.value, anchors, clear_spans, depth + 1);
                 try internal.attachPair(doc, n, k, v);
                 // Preserve the pair's original extent -- but only for a
                 // same-document clone. `src_end` indexes the source the
@@ -997,7 +989,7 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
             n.data = .{ .sequence = .{ .style = sq.style } };
             if (n.anchor) |a| try anchors.put(a, n);
             for (sq.items.items) |item| {
-                const child = try cloneNode(doc, item, anchors, clear_spans, require_anchor, depth + 1);
+                const child = try cloneNode(doc, item, anchors, clear_spans, depth + 1);
                 try internal.attachItem(doc, n, child);
             }
             if (!clear_spans) {
@@ -1894,7 +1886,7 @@ test "a spanned clone replacing a slot is emitted, not silently dropped" {
     var doc = try Document.parse(testing.allocator, "a: 1\ntop:\n  x: 42\n");
     defer doc.deinit();
     const clone = try cloneTree(&doc, doc.pathGet(&.{"top"}).?);
-    try testing.expect(internal.mappingReplace(&doc, doc.root.?, doc.pathGet(&.{"a"}).?, clone));
+    try testing.expect(try internal.mappingReplace(&doc, doc.root.?, doc.pathGet(&.{"a"}).?, clone));
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("a:\n  x: 42\ntop:\n  x: 42\n", out);
@@ -1921,7 +1913,7 @@ test "cloneTreeInto a second document cannot copy the wrong source bytes" {
     const copy = try cloneTreeInto(&b, a.pathGet(&.{"subtree"}).?);
     try testing.expect(copy.src == null);
     // Replace an ORIGINAL slot: the replacement must appear.
-    try testing.expect(internal.mappingReplace(&b, b.root.?, b.pathGet(&.{"other"}).?, copy));
+    try testing.expect(try internal.mappingReplace(&b, b.root.?, b.pathGet(&.{"other"}).?, copy));
     const out = try b.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("small: 1\nother:\n  x: 42\n", out);
@@ -2022,29 +2014,16 @@ test "cloneTreeInto follows an alias anchored outside the subtree" {
     }
 }
 
-test "cloneTreeWhole refuses a forward alias instead of pointing outside" {
-    // The whole-tree clone may only name an anchor it has already
-    // cloned; an alias whose anchor comes LATER in the walk is a forward
-    // alias (invalid in parsed input, reachable from a hand-built tree).
-    // A subtree clone tolerates it because the target may legitimately
-    // live outside the cloned subtree; the whole-tree clone must not,
-    // because the caller swaps it in as the new root and a pointer back
-    // at the pre-clone tree would break the rollback contract.
-    var doc = Document.init(testing.allocator);
+test "cloneTree keeps an alias whose anchor is outside the subtree" {
+    // A same-document subtree clone may name an anchor it did not copy:
+    // the target lives elsewhere in this document, so the reference is
+    // still valid and the clone's alias points at it.
+    var doc = try Document.parse(testing.allocator, "base: &b 1\nsub:\n  x: *b\n");
     defer doc.deinit();
-    const root = try doc.createMapping();
-    doc.root = root;
-    const later = try doc.createMapping();
-    try doc.setAnchor(later, "late");
-    const alias = try doc.pool.create(Node);
-    alias.* = .{ .data = .{ .alias = .{ .name = "late", .target = later } } };
-    try doc.mappingAppend(root, try doc.createScalar("a", .plain), alias);
-    try doc.mappingAppend(root, try doc.createScalar("later", .plain), later);
-
-    // The subtree clone still accepts it: the target is in this document.
-    const clone = try cloneTree(&doc, root);
-    try testing.expect(clone != root);
-    try testing.expectError(error.UnknownAlias, cloneTreeWhole(&doc, root));
+    const clone = try cloneTree(&doc, doc.pathGet(&.{"sub"}).?);
+    const x = clone.lookup("x").?;
+    try testing.expect(x.isAlias());
+    try testing.expect(x.resolveAlias() == doc.pathGet(&.{"base"}).?);
 }
 
 test "a move cannot put an alias ahead of its anchor" {
@@ -2612,6 +2591,190 @@ fn wildcardDeleteBatch(allocator: std.mem.Allocator) !void {
     const out = try doc.write(allocator);
     defer allocator.free(out);
     try testing.expectEqualStrings("items:\n  - {k: 2}\nm:\n  {}\n", out);
+}
+
+test "a batch that fails at any allocation leaves the document byte-identical" {
+    // `apply` edits in place and rolls back through its undo journal, so
+    // every change a batch makes has to be undone exactly -- the list
+    // entries, tombstones, parent links, spans and `modified` flags the
+    // emitter reads. Fail the batch at each of its allocations in turn:
+    // each time the tree must be in exactly the state a fresh parse gives
+    // (bytes alone would not show it: an unmodified container is written
+    // verbatim, whatever stale tombstones it carries).
+    const src =
+        \\# head
+        \\a: 1  # keep
+        \\items:
+        \\  - x
+        \\  - {k: 1}
+        \\  - {k: 2}
+        \\m: &m
+        \\  p: 1
+        \\  q: 2
+        \\ref: *m
+        \\flow: [1, 2, 3]
+        \\
+    ;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing.allocator();
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        failing.fail_index = std.math.maxInt(usize);
+        var doc = try Document.parse(allocator, src);
+        defer doc.deinit();
+        const v1 = try doc.createScalar("X", .plain);
+        const v2 = try doc.createScalar("Y", .plain);
+        const v3 = try doc.createScalar("Z", .plain);
+        const v4 = try doc.createScalar("W", .plain);
+        const v5 = try doc.createScalar("V", .plain);
+        // A replacement carrying the anchor `ref` names: the alias is
+        // re-pointed at it, and that has to be undone too.
+        const m2 = try doc.createMapping();
+        try doc.mappingAppend(m2, try doc.createScalar("r", .plain), try doc.createScalar("1", .plain));
+        try doc.setAnchor(m2, "m");
+        var ed = Editor.init(&doc);
+        failing.fail_index = failing.alloc_index + fail_at;
+        const result = ed.apply(&.{
+            .{ .set = .{ .path = "$.a", .value = v1 } },
+            .{ .set = .{ .path = "$.flow[1]", .value = v2 } },
+            .{ .set = .{ .path = "$.new", .value = v3 } },
+            .{ .delete = "$.items[?k=1]" },
+            .{ .insert = .{ .sequence = "$.items", .position = "$.items[0]", .value = v4, .before = true } },
+            .{ .delete = "$.m.q" },
+            .{ .set = .{ .path = "$.m", .value = m2 } },
+            .{ .move = .{ .from = "$.items[1]", .to = "$.flow" } },
+            .{ .append = .{ .sequence = "$.items", .value = v5 } },
+        });
+        failing.fail_index = std.math.maxInt(usize);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        if (result) |_| {
+            // Every allocation point has been failed once; this run
+            // allocated nothing that could fail, and succeeded.
+            try testing.expect(!std.mem.eql(u8, src, out));
+            break;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqualStrings(src, out);
+            var fresh = try Document.parse(allocator, src);
+            defer fresh.deinit();
+            try expectSameState(doc.root.?, fresh.root.?, doc.root.?, fresh.root.?);
+        }
+    }
+    try testing.expect(fail_at > 20);
+
+    // A batch that fails on an edit's own terms, after replacing the
+    // whole root, is rolled back the same way.
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try testing.expectError(error.AmbiguousOperation, ed.apply(&.{
+        .{ .set = .{ .path = "$", .value = try doc.createScalar("gone", .plain) } },
+        .{ .set = .{ .path = "$[*]", .value = try doc.createScalar("X", .plain) } },
+    }));
+    var fresh = try Document.parse(testing.allocator, src);
+    defer fresh.deinit();
+    try expectSameState(doc.root.?, fresh.root.?, doc.root.?, fresh.root.?);
+}
+
+test "a batch inside another atomic section is undone with it" {
+    // `apply` inside an outer `internal.Transaction` hands its records
+    // to the outer journal when it commits, so the outer section's
+    // rollback undoes the batch too; a batch that fails (here at each of
+    // its allocations, the hand-over included) undoes itself. Either
+    // way, aborting the outer section restores the parsed state.
+    const src = "a: 1\nitems: [x, y]\nm: {k: v}\n";
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing.allocator();
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        failing.fail_index = std.math.maxInt(usize);
+        var doc = try Document.parse(allocator, src);
+        defer doc.deinit();
+        const v1 = try doc.createScalar("2", .plain);
+        const v2 = try doc.createScalar("z", .plain);
+        var ed = Editor.init(&doc);
+        var txn: internal.Transaction = undefined;
+        txn.begin(&doc);
+        failing.fail_index = failing.alloc_index + fail_at;
+        const result = ed.apply(&.{
+            .{ .set = .{ .path = "$.a", .value = v1 } },
+            .{ .delete = "$.items[0]" },
+            .{ .append = .{ .sequence = "$.items", .value = v2 } },
+            .{ .delete = "$.m.k" },
+        });
+        failing.fail_index = std.math.maxInt(usize);
+        txn.abort();
+        try testing.expect(doc.journal == null);
+        var fresh = try Document.parse(allocator, src);
+        defer fresh.deinit();
+        try expectSameState(doc.root.?, fresh.root.?, doc.root.?, fresh.root.?);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings(src, out);
+        if (result) |_| break else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+    try testing.expect(fail_at > 5);
+}
+
+/// `a` (a rolled-back tree) is in the state `b` (a fresh parse of the
+/// same text) is: same shape and scalars, same spans, `modified` flags,
+/// tombstones and pair ends, every child's parent link pointing at its
+/// container, and every alias naming the node at the same place.
+fn expectSameState(a: *const Node, b: *const Node, a_root: *const Node, b_root: *const Node) !void {
+    try testing.expectEqual(b.kind(), a.kind());
+    try testing.expectEqual(b.modified, a.modified);
+    try testing.expectEqual(b.src, a.src);
+    try testing.expectEqual(b.anchor == null, a.anchor == null);
+    switch (a.data) {
+        .scalar => |s| try testing.expectEqualStrings(b.data.scalar.value, s.value),
+        .alias => |al| {
+            // The target, found by the same walk in both trees.
+            try testing.expectEqual(pathIndex(b_root, b.data.alias.target), pathIndex(a_root, al.target));
+        },
+        .mapping => |m| {
+            const bm = b.data.mapping;
+            try testing.expectEqual(bm.pairs.items.len, m.pairs.items.len);
+            try testing.expectEqualSlices([2]usize, bm.dropped.items, m.dropped.items);
+            for (m.pairs.items, bm.pairs.items) |p, q| {
+                try testing.expectEqual(q.src_end, p.src_end);
+                try testing.expect(p.key.parent == a and p.value.parent == a);
+                try expectSameState(p.key, q.key, a_root, b_root);
+                try expectSameState(p.value, q.value, a_root, b_root);
+            }
+        },
+        .sequence => |sq| {
+            const bs = b.data.sequence;
+            try testing.expectEqual(bs.items.items.len, sq.items.items.len);
+            try testing.expectEqualSlices([2]usize, bs.dropped.items, sq.dropped.items);
+            for (sq.items.items, bs.items.items) |x, y| {
+                try testing.expect(x.parent == a);
+                try expectSameState(x, y, a_root, b_root);
+            }
+        },
+    }
+}
+
+/// The pre-order index of `target` under `root`, or null.
+fn pathIndex(root: *const Node, target: *const Node) ?usize {
+    var i: usize = 0;
+    return pathIndexFrom(root, target, &i);
+}
+
+fn pathIndexFrom(node: *const Node, target: *const Node, i: *usize) ?usize {
+    if (node == target) return i.*;
+    i.* += 1;
+    switch (node.data) {
+        .mapping => |m| for (m.pairs.items) |p| {
+            if (pathIndexFrom(p.key, target, i)) |r| return r;
+            if (pathIndexFrom(p.value, target, i)) |r| return r;
+        },
+        .sequence => |sq| for (sq.items.items) |x| {
+            if (pathIndexFrom(x, target, i)) |r| return r;
+        },
+        else => {},
+    }
+    return null;
 }
 
 test "allocation failures in a cross-document clone leak nothing" {
@@ -3240,10 +3403,11 @@ test "deleting or moving an anchored KEY is refused, not silently corrupting" {
 
 test "a batch edit refuses a forward alias instead of stranding it" {
     const allocator = testing.allocator;
-    // `apply` swaps in a WHOLE-tree clone, so an alias whose anchor is
-    // defined LATER (valid only in a hand-built tree) must be refused:
-    // the clone cannot keep pointing at the pre-clone tree, and the
-    // rollback contract assumes the original is discarded.
+    // An alias whose anchor is defined LATER is valid only in a hand-built
+    // tree. `apply` used to deep-clone the whole tree and failed there
+    // (UnknownAlias); it now edits in place, and deleting the anchor the
+    // alias names is refused like any stranding, leaving the tree as it
+    // was.
     var doc = Document.init(allocator);
     defer doc.deinit();
     const root = try doc.createMapping();
@@ -3259,5 +3423,9 @@ test "a batch edit refuses a forward alias instead of stranding it" {
     try doc.mappingAppend(root, try doc.createScalar("def", .plain), anchored);
 
     var ed = Editor.init(&doc);
-    try testing.expectError(error.UnknownAlias, ed.apply(&.{.{ .delete = "$.def" }}));
+    try testing.expectError(error.AnchorReferenced, ed.apply(&.{.{ .delete = "$.def" }}));
+    try testing.expectEqual(@as(usize, 2), root.pairs().?.len);
+    // An edit that strands nothing runs.
+    try ed.set("$.other", try doc.createScalar("1", .plain));
+    try testing.expectEqual(@as(usize, 3), root.pairs().?.len);
 }
