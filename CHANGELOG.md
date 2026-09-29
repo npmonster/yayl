@@ -3,6 +3,23 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Fixed
+
+**`writeAll` was quadratic in the number of documents.** Before
+appending each document after the first, it asked whether the output so
+far already ended in a `...` marker (so no `---` is needed), and
+answered by walking every line of that output to find the last
+non-blank one. That is the whole stream written so far, once per
+document, so N documents cost N x output: 32 KB of tiny documents took
+47 ms, every doubling quadrupled it, and a 1 MiB stream would take
+close to a minute to write back. The last non-blank line is now found
+by scanning back from the end. Output is
+byte-identical: the new function is checked against the old definition
+on all 335,923 strings up to length 7 over the marker's dot, both
+blanks, every line break and one byte of ordinary content. (#5)
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity

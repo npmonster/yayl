@@ -1713,13 +1713,19 @@ fn isTrailer(text: []const u8) bool {
 
 /// True when `text` ends with an explicit `...` end-of-document marker,
 /// which is itself a boundary: the next document needs no `---`.
+///
+/// Only the last line that has anything on it can be that marker, so it
+/// is found from the end. `writeAll` asks this of ALL the output so far,
+/// once per document; walking every line to reach the last one made a
+/// stream of N documents cost N x its output, which is quadratic.
 fn endsStream(text: []const u8) bool {
-    var it: LineIter = .{ .src = text };
-    var last: []const u8 = "";
-    while (it.next()) |line| {
-        if (std.mem.trim(u8, line, " \t").len == 0) continue;
-        last = line;
-    }
+    // Drop the blank lines after the last line with content, and that
+    // line's own trailing blanks: the marker is `...` followed by the end
+    // of the line or a blank, so they cannot change the answer.
+    var end = text.len;
+    while (end > 0 and (ctype.isBlank(text[end - 1]) or ctype.isBreak(text[end - 1]))) end -= 1;
+    if (end == 0) return false;
+    const last = text[markup.lineStart(text, end)..end];
     return std.mem.startsWith(u8, last, "...") and
         (last.len == 3 or last[3] == ' ' or last[3] == '\t');
 }
@@ -2500,6 +2506,78 @@ test "emit options cannot disturb bytes that re-emit verbatim" {
     try testing.expect(std.mem.indexOf(u8, with_new, "fresh:\n   n: 1") != null);
     // ... and the original lines are still exactly as they were.
     try testing.expect(std.mem.indexOf(u8, with_new, "outer:\n      key: v\n      other: w\n") != null);
+}
+
+/// The definition `endsStream` replaced: walk every line, keep the last
+/// one that is not blank. Kept as the oracle for the test below.
+fn endsStreamByLines(text: []const u8) bool {
+    var it: LineIter = .{ .src = text };
+    var last: []const u8 = "";
+    while (it.next()) |line| {
+        if (std.mem.trim(u8, line, " \t").len == 0) continue;
+        last = line;
+    }
+    return std.mem.startsWith(u8, last, "...") and
+        (last.len == 3 or last[3] == ' ' or last[3] == '\t');
+}
+
+test "endsStream agrees with the line-by-line definition on every short input" {
+    // Every string up to length 7 over the bytes that decide the answer:
+    // the marker's dot, both blanks, all three line breaks (`\n`, `\r`, and
+    // `\r\n` by adjacency) and one byte of ordinary content. 335,923
+    // inputs, so a boundary case (CR/LF pairs, blanks around the marker, a
+    // marker not on the last line) cannot slip past a hand-picked list.
+    const alphabet = [_]u8{ '.', ' ', '\t', '\n', '\r', 'x' };
+    var buf: [7]u8 = undefined;
+    var checked: usize = 0;
+    var yes: usize = 0;
+    for (0..buf.len + 1) |len| {
+        var total: usize = 1;
+        for (0..len) |_| total *= alphabet.len;
+        for (0..total) |n| {
+            var rest = n;
+            for (buf[0..len]) |*b| {
+                b.* = alphabet[rest % alphabet.len];
+                rest /= alphabet.len;
+            }
+            const text = buf[0..len];
+            const expected = endsStreamByLines(text);
+            try testing.expectEqual(expected, endsStream(text));
+            checked += 1;
+            if (expected) yes += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 335_923), checked);
+    // Not vacuous: plenty of inputs do end a stream, and plenty do not.
+    try testing.expect(yes > 1000 and yes < checked / 2);
+}
+
+test "endsStream does not read the whole output to answer" {
+    // `writeAll` asks it of everything written so far, once per document.
+    // Reading all of it each time made N documents cost N x output
+    // (32 KB of tiny documents took 47 ms and each doubling quadrupled
+    // it). Here the answer sits in the last four bytes of 32 MiB of short
+    // lines: the old walk needs ~0.2 s in ReleaseSafe and seconds in
+    // Debug, the backwards scan a few nanoseconds. The 20 ms bound is
+    // far from both, so it cannot flake and the regression cannot hide;
+    // the fastest of three calls is judged, to ignore a scheduling stall.
+    const allocator = testing.allocator;
+    const size: usize = 32 * 1024 * 1024;
+    const text = try allocator.alloc(u8, size);
+    defer allocator.free(text);
+    for (text, 0..) |*c, i| c.* = if (i % 2 == 0) 'a' else '\n';
+    @memcpy(text[size - 4 ..], "...\n");
+
+    const io = testing.io;
+    var fastest_ns: i96 = std.math.maxInt(i96);
+    for (0..3) |_| {
+        const start = std.Io.Timestamp.now(io, .awake);
+        const ends = endsStream(text);
+        const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
+        try testing.expect(ends);
+        fastest_ns = @min(fastest_ns, elapsed);
+    }
+    try testing.expect(fastest_ns < 20_000_000);
 }
 
 test "emit options carry the depth bound" {
