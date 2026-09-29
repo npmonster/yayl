@@ -160,6 +160,17 @@ new `value.Limits.max_bytes` (64 MiB by default, like the input limit)
 bounds the text one conversion copies, with `error.LimitExceeded`; a
 document without aliases never copies more text than it holds.
 
+**Merge-key resolution had no size bound, and each merge was
+quadratic.** Every `<<` copies its source's pairs into its mapping, with
+nothing bounding the total but depth: 72 KB of merges of a 1000-key
+mapping built a 2.4 GB document over two minutes, since each copied key
+was also compared with every key already there. The new
+`ParseOptions.max_merge_nodes` (262,144 by default) stops resolution with
+`error.LimitExceeded` (now part of `YamlError`), leaving the document as
+it was; `Document.resolveMergeKeysLimited` takes the bound directly. The
+key check is a hash lookup, so a merge costs what it copies: 100 merges
+of that mapping take a sixth of the time they did.
+
 **The fuzz harness.** Its header claimed Zig 0.16.0 has no
 `std.testing.fuzz`; it has one, whose coverage-guided mode does not build
 on that toolchain (a type error in its own test runner), and the note

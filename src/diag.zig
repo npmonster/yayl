@@ -92,6 +92,10 @@ pub const YamlError = error{
     /// A merge key reaches the mapping it is defined in, directly or
     /// through a chain of aliases, so it would merge into itself.
     MergeKeyRecursive,
+    /// A resource bound was reached: `ParseOptions.max_merge_nodes` while
+    /// resolving merge keys (and `value`'s and `schema`'s own budgets,
+    /// which report it under the same name).
+    LimitExceeded,
 };
 
 /// Diagnostic collector — the fy_diag equivalent.

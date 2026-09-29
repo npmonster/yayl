@@ -643,7 +643,7 @@ pub const Document = struct {
         }
         var doc = docs.items[0];
         if (options.resolve_merge_keys) {
-            doc.resolveMergeKeys() catch |err| {
+            doc.resolveMergeKeysLimited(options.max_merge_nodes) catch |err| {
                 doc.deinit();
                 return err;
             };
@@ -678,7 +678,7 @@ pub const Document = struct {
             for (docs.items) |*doc| doc.deinit();
             docs.deinit(allocator);
         }
-        for (docs.items) |*doc| try doc.resolveMergeKeys();
+        for (docs.items) |*doc| try doc.resolveMergeKeysLimited(options.max_merge_nodes);
         return docs;
     }
 
@@ -1028,7 +1028,15 @@ pub const Document = struct {
         MergeKeyRecursive,
         NestingTooDeep,
         InvalidSyntax,
+        LimitExceeded,
         OutOfMemory,
+    };
+
+    /// One resolution: the visit state of each mapping, and how many
+    /// nodes it may still create by copying merge sources.
+    const MergeRun = struct {
+        seen: std.AutoHashMap(*Node, MergeVisit),
+        remaining: usize,
     };
 
     /// Resolve YAML 1.1 merge keys (`<<`) in place.
@@ -1047,7 +1055,17 @@ pub const Document = struct {
     /// `ParseOptions.resolve_merge_keys` calls this after each document
     /// is built. Resolution re-emits the mappings it touches normalized,
     /// exactly like any other structural mutation.
+    ///
+    /// Every merge copies its source's pairs, so the result can be far
+    /// larger than the document: this stops with `error.LimitExceeded`
+    /// once it would create more than `ParseOptions.max_merge_nodes`
+    /// nodes (see `resolveMergeKeysLimited`).
     pub fn resolveMergeKeys(self: *Document) !void {
+        return self.resolveMergeKeysLimited((ParseOptions{}).max_merge_nodes);
+    }
+
+    /// `resolveMergeKeys` creating at most `max_nodes` nodes.
+    pub fn resolveMergeKeysLimited(self: *Document, max_nodes: usize) !void {
         const old_root = self.root orelse return;
         if (!treeHasMergeKey(old_root, 0)) return;
         const new_root = try edit.cloneTreeWhole(self, old_root);
@@ -1056,9 +1074,9 @@ pub const Document = struct {
         defer if (!ok) {
             self.root = old_root;
         };
-        var seen = std.AutoHashMap(*Node, MergeVisit).init(self.allocator);
-        defer seen.deinit();
-        try self.resolveMergeNode(new_root, &seen, 0);
+        var run: MergeRun = .{ .seen = std.AutoHashMap(*Node, MergeVisit).init(self.allocator), .remaining = max_nodes };
+        defer run.seen.deinit();
+        try self.resolveMergeNode(new_root, &run, 0);
         ok = true;
     }
 
@@ -1098,30 +1116,30 @@ pub const Document = struct {
     fn resolveMergeNode(
         self: *Document,
         node: *Node,
-        seen: *std.AutoHashMap(*Node, MergeVisit),
+        run: *MergeRun,
         depth: usize,
     ) MergeResolveError!void {
         if (depth >= max_merge_depth) return error.NestingTooDeep;
         switch (node.data) {
             .scalar, .alias => {},
             .sequence => |s| {
-                for (s.items.items) |item| try self.resolveMergeNode(item, seen, depth + 1);
+                for (s.items.items) |item| try self.resolveMergeNode(item, run, depth + 1);
             },
             .mapping => {
-                if (seen.get(node)) |state| {
+                if (run.seen.get(node)) |state| {
                     if (state == .done) return;
                     return error.MergeKeyRecursive;
                 }
-                try seen.put(node, .active);
+                try run.seen.put(node, .active);
                 // Nested mappings first, so a merge source is fully
                 // expanded by the time its pairs are copied.
                 const m = &node.data.mapping;
                 for (m.pairs.items) |p| {
-                    try self.resolveMergeNode(p.key, seen, depth + 1);
-                    try self.resolveMergeNode(p.value, seen, depth + 1);
+                    try self.resolveMergeNode(p.key, run, depth + 1);
+                    try self.resolveMergeNode(p.value, run, depth + 1);
                 }
-                try self.resolveMappingMerges(node, seen, depth);
-                try seen.put(node, .done);
+                try self.resolveMappingMerges(node, run, depth);
+                try run.seen.put(node, .done);
             },
         }
     }
@@ -1133,7 +1151,7 @@ pub const Document = struct {
     fn resolveMappingMerges(
         self: *Document,
         map: *Node,
-        seen: *std.AutoHashMap(*Node, MergeVisit),
+        run: *MergeRun,
         depth: usize,
     ) MergeResolveError!void {
         const m = &map.data.mapping;
@@ -1155,7 +1173,14 @@ pub const Document = struct {
             p.key.parent = null;
             p.value.parent = null;
         }
-        for (values.items) |value| try self.mergeValueInto(map, value, seen, depth);
+        // The key texts the mapping holds, so each copied pair's check is
+        // one lookup: scanning the pairs made every merge quadratic.
+        var present: std.StringHashMapUnmanaged(void) = .empty;
+        defer present.deinit(self.allocator);
+        for (m.pairs.items) |p| {
+            if (p.key.scalarValue()) |t| try present.put(self.allocator, t, {});
+        }
+        for (values.items) |value| try self.mergeValueInto(map, value, run, &present, depth);
         self.markModified(map);
     }
 
@@ -1165,17 +1190,18 @@ pub const Document = struct {
         self: *Document,
         map: *Node,
         value: *Node,
-        seen: *std.AutoHashMap(*Node, MergeVisit),
+        run: *MergeRun,
+        present: *std.StringHashMapUnmanaged(void),
         depth: usize,
     ) MergeResolveError!void {
         const resolved = value.resolveAlias();
         switch (resolved.data) {
-            .mapping => try self.mergeOneInto(map, @constCast(resolved), seen, depth),
+            .mapping => try self.mergeOneInto(map, @constCast(resolved), run, present, depth),
             .sequence => |s| {
                 for (s.items.items) |item| {
                     const src = item.resolveAlias();
                     if (src.kind() != .mapping) return error.InvalidMergeKey;
-                    try self.mergeOneInto(map, @constCast(src), seen, depth);
+                    try self.mergeOneInto(map, @constCast(src), run, present, depth);
                 }
             },
             else => return error.InvalidMergeKey,
@@ -1186,38 +1212,29 @@ pub const Document = struct {
         self: *Document,
         map: *Node,
         source: *Node,
-        seen: *std.AutoHashMap(*Node, MergeVisit),
+        run: *MergeRun,
+        present: *std.StringHashMapUnmanaged(void),
         depth: usize,
     ) MergeResolveError!void {
         // Resolve the source before copying from it; a source that is
         // still `active` is a merge cycle.
-        try self.resolveMergeNode(source, seen, depth + 1);
+        try self.resolveMergeNode(source, run, depth + 1);
         for (source.data.mapping.pairs.items) |p| {
-            if (mappingHasKey(map, p.key)) continue;
-            const key = try self.cloneMergeNode(p.key, 0);
-            const value = try self.cloneMergeNode(p.value, 0);
+            // A key the mapping already has wins. Compared on the
+            // RESOLVED text, while `isMergeKeyPair` is style-sensitive:
+            // a quoted `"a": 9` is not a merge key, but it does block a
+            // merged plain `a` -- detection follows the spec form of
+            // `<<`, equality follows how a reader reads a key. Non-scalar
+            // keys never collide, as for `lookup`.
+            const text = p.key.scalarValue();
+            if (text) |t| if (present.contains(t)) continue;
+            const key = try self.cloneMergeNode(p.key, run, 0);
+            const value = try self.cloneMergeNode(p.value, run, 0);
             // Raw attach: a freshly cloned node is detached, so it
             // cannot cycle, and resolveMappingMerges marks the mapping.
             try internal.attachPair(self, map, key, value);
+            if (text) |t| try present.put(self.allocator, t, {});
         }
-    }
-
-    /// True when `map` already has a scalar key with the same text as
-    /// `key`. Non-scalar keys never collide: they cannot match a merge
-    /// source key by text, matching how `lookup` reads keys.
-    ///
-    /// Comparison is on the RESOLVED text, while `isMergeKeyPair` is
-    /// style-sensitive: a quoted `"a": 9` is not a merge key, but it does
-    /// block a merged plain `a`. That asymmetry is deliberate — detection
-    /// follows the spec form of `<<`, equality follows how a reader reads
-    /// a key.
-    fn mappingHasKey(map: *const Node, key: *const Node) bool {
-        const want = key.scalarValue() orelse return false;
-        for (map.data.mapping.pairs.items) |p| {
-            const have = p.key.scalarValue() orelse continue;
-            if (std.mem.eql(u8, have, want)) return true;
-        }
-        return false;
     }
 
     /// Copy one node into this document's pool for insertion at a new
@@ -1227,8 +1244,10 @@ pub const Document = struct {
     /// the source already anchors. An alias is copied as an alias: its
     /// target stays in this document, so the reference remains valid and
     /// the document keeps its anchors.
-    fn cloneMergeNode(self: *Document, node: *Node, depth: usize) !*Node {
+    fn cloneMergeNode(self: *Document, node: *Node, run: *MergeRun, depth: usize) MergeResolveError!*Node {
         if (depth >= max_merge_depth) return error.NestingTooDeep;
+        if (run.remaining == 0) return error.LimitExceeded;
+        run.remaining -= 1;
         const n = try self.pool.create(Node);
         n.* = .{
             .mark = node.mark,
@@ -1246,14 +1265,14 @@ pub const Document = struct {
             .sequence => |s| {
                 n.data = .{ .sequence = .{ .style = s.style } };
                 for (s.items.items) |item| {
-                    try internal.attachItem(self, n, try self.cloneMergeNode(item, depth + 1));
+                    try internal.attachItem(self, n, try self.cloneMergeNode(item, run, depth + 1));
                 }
             },
             .mapping => |m| {
                 n.data = .{ .mapping = .{ .style = m.style } };
                 for (m.pairs.items) |p| {
-                    const key = try self.cloneMergeNode(p.key, depth + 1);
-                    const value = try self.cloneMergeNode(p.value, depth + 1);
+                    const key = try self.cloneMergeNode(p.key, run, depth + 1);
+                    const value = try self.cloneMergeNode(p.value, run, depth + 1);
                     try internal.attachPair(self, n, key, value);
                 }
             },
@@ -3362,6 +3381,34 @@ test "merge keys: a source that itself merges is expanded first" {
     try testing.expectEqualStrings("2", use.lookup("u").?.scalarValue().?);
     const mid = doc.pathGet(&.{"mid"}).?;
     try testing.expectEqualStrings("0", mid.lookup("r").?.scalarValue().?);
+}
+
+test "merge keys: resolution is bounded in the nodes it copies" {
+    // Every `<<: *base` copies the base's pairs into its mapping, and
+    // resolution had no bound but depth: 72 KB of merges of a 1000-key
+    // base built a 2.4 GB arena over two minutes (each copied key was
+    // also checked against every key already there, quadratic per merge).
+    const allocator = testing.allocator;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "base: &b\n");
+    for (0..50) |i| try input.print(allocator, "  k{d}: v\n", .{i});
+    for (0..100) |i| try input.print(allocator, "m{d}: {{<<: *b, own: 1}}\n", .{i});
+
+    // 100 merges x 50 pairs x 2 nodes = 10,000 copies.
+    try testing.expectError(error.LimitExceeded, Document.parseOpts(allocator, input.items, null, .{ .resolve_merge_keys = true, .max_merge_nodes = 5_000 }));
+    var doc = try Document.parseOpts(allocator, input.items, null, .{ .resolve_merge_keys = true, .max_merge_nodes = 10_000 });
+    defer doc.deinit();
+    try testing.expectEqual(@as(usize, 51), doc.pathGet(&.{"m99"}).?.pairs().?.len);
+    try testing.expectEqual(@as(usize, 1 << 18), (ParseOptions{}).max_merge_nodes);
+
+    // A refused resolution leaves the document as it was.
+    var raw = try Document.parse(allocator, input.items);
+    defer raw.deinit();
+    try testing.expectError(error.LimitExceeded, raw.resolveMergeKeysLimited(5_000));
+    const out = try raw.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings(input.items, out);
 }
 
 test "merge keys: a quoted << is an ordinary key" {

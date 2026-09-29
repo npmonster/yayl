@@ -33,6 +33,7 @@ and every one is adjustable through the public API.
 | Simple key length | fixed cap | 1024 characters | not adjustable (spec 7.4.2) |
 | Alias expansion (values) | `value.Limits.max_values` | 1,048,576 | `parseToValueLimited`, `nodeToValueLimited`, `Limits.unlimited` to opt out |
 | Alias expansion (copied text) | `value.Limits.max_bytes` | 64 MiB | `parseToValueLimited`, `nodeToValueLimited` |
+| Merge-key resolution (copied nodes) | `ParseOptions.max_merge_nodes` | 262,144 | `yaml.parseOpts`, `Document.resolveMergeKeysLimited` |
 | Query walks through aliases | each node walked once | linear in the document | not adjustable |
 | Alias expansion (validation) | `schema.Limits.max_nodes` | 1,048,576 | `Schema.validateLimited` |
 | Conversion depth | `value.Limits.max_depth` | 1000 | `parseToValueLimited`, `nodeToValueLimited` |

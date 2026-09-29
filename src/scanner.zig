@@ -75,6 +75,15 @@ pub const Options = struct {
     /// the bytes YAML 1.2 gives you are preserved exactly, and
     /// resolution re-emits the mappings it touches normalized.
     resolve_merge_keys: bool = false,
+    /// Most nodes merge-key resolution may create. Every `<<` copies its
+    /// source's pairs into its mapping, so the result is not bounded by
+    /// the input: with no bound, 72 KB of merges of a 1000-key mapping
+    /// built a 2.4 GB document. Resolution stops with
+    /// `error.LimitExceeded` past it. A node is about nine times the size
+    /// of a `value.Value`, so this is a quarter of `value.Limits.max_values`
+    /// (roughly 55-90 MB of arena at the bound); a config that merges a
+    /// few hundred templates of a hundred nodes each uses a tenth of it.
+    max_merge_nodes: usize = 1 << 18,
 };
 
 /// Position of byte `offset` in `input`, for a diagnostic raised before
