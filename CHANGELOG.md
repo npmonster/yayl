@@ -3,6 +3,32 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Fixed
+
+**Strings with a CR, NUL, ESC, DEL or other control byte were written in
+a style that cannot spell them.** Single quotes and block scalars have no
+escapes, so the byte went out raw: `a\rb` read back as `a b` at the root
+and did not parse as a mapping value, a NUL did not parse at all, and a
+CRLF inside a multi-line string lost its CR. Any string holding an ASCII
+control other than tab and line feed, or DEL, is now written
+double-quoted with escapes, whatever style was asked for. Over the
+corpus and fixtures the only output that changes is corpus G4RS rebuilt
+through `yaml.value`, whose `\b` and `\r\n` were written raw into literal
+blocks and read back changed. (#7)
+
+**A root string with a `---` or `...` line was cut off at that line.**
+A root block scalar's content sits at column 0, where such a line (with
+a blank or nothing after the marker) is a document marker, so
+`"a\n---\nb\n"` read back as `"a\n"`. At column 0 those values now fall
+back to double quotes; below the root, and for lines like `---x` that
+are not markers, the block form is kept. A new sweep writes and re-reads
+every string up to three bytes over control bytes, quotes, blanks and
+indicators (two bytes in each explicitly requested style; five over
+dashes, dots, blanks and line breaks) as a root, a block and flow mapping key and value, a sequence item and
+a nested value, and each comes back unchanged. (#8)
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity

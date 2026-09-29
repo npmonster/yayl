@@ -30,6 +30,7 @@
 //! empty ones, which block layout cannot express.
 
 const std = @import("std");
+const ctype = @import("ctype.zig");
 const diag = @import("diag.zig");
 const document_mod = @import("document.zig");
 const internal = @import("internal.zig");
@@ -1720,7 +1721,7 @@ pub const Emitter = struct {
     // ------------------------------------------------------------------
 
     fn emitScalarValue(self: *Emitter, value: []const u8, prefer: ScalarStyle, indent: usize, block_ok: bool, flow: bool) Error!void {
-        const style = chooseScalarStyle(value, prefer, block_ok, flow);
+        const style = chooseScalarStyle(value, prefer, indent, block_ok, flow);
         switch (style) {
             .plain => try self.write(value),
             .single_quoted => {
@@ -1806,7 +1807,9 @@ pub const Emitter = struct {
         for (0..s.trailing) |_| try self.writeByte('\n');
     }
 
-    fn chooseScalarStyle(value: []const u8, prefer: ScalarStyle, block_ok: bool, flow: bool) ScalarStyle {
+    /// `indent` is the column a block scalar's content lines would be
+    /// written at.
+    fn chooseScalarStyle(value: []const u8, prefer: ScalarStyle, indent: usize, block_ok: bool, flow: bool) ScalarStyle {
         if (value.len == 0) {
             // An empty PLAIN scalar is YAML's null -- `key:` with
             // nothing after it -- and null is not the empty string.
@@ -1815,12 +1818,14 @@ pub const Emitter = struct {
             // requested style for an empty value means the string.
             return if (prefer == .plain) .plain else .double_quoted;
         }
+        // Whatever was asked for: no other style can spell these bytes.
+        if (needsEscape(value)) return .double_quoted;
         const has_break = std.mem.indexOfScalar(u8, value, '\n') != null;
         if (has_break) {
             // Modified scalars keep their parsed block style when the
             // content can be re-emitted losslessly in it.
-            if (block_ok and prefer == .folded and foldedSafe(value)) return .folded;
-            if (block_ok and literalSafe(value)) return .literal;
+            if (block_ok and prefer == .folded and foldedSafe(value, indent)) return .folded;
+            if (block_ok and literalSafe(value, indent)) return .literal;
             return .double_quoted;
         }
         switch (prefer) {
@@ -1841,6 +1846,34 @@ pub const Emitter = struct {
         }
         if (plainSafe(value) and (!flow or flowPlainSafe(value))) return .plain;
         return .single_quoted;
+    }
+
+    /// True when `value` holds a byte only a double-quoted scalar can
+    /// write: an ASCII control other than tab and line feed, or DEL.
+    /// Single quotes and block scalars have no escapes, so the raw byte
+    /// goes out as is -- and a CR is a line break to the reader (a
+    /// quoted `a\rb` folds to `a b`, a literal CRLF comes back LF), a
+    /// NUL is rejected on read, and ESC and DEL are not printable
+    /// (YAML 1.2 5.1). `writeDoubleQuoted` has an escape for each.
+    fn needsEscape(value: []const u8) bool {
+        for (value) |c| {
+            if (c != '\t' and c != '\n' and c < 0x80 and !ctype.isPrintableAscii(c)) return true;
+        }
+        return false;
+    }
+
+    /// Written at column 0 -- a root block scalar's content -- a line
+    /// that starts with `---` or `...` followed by a blank or the end of
+    /// the line is a document marker (spec 9.1.4 `c-forbidden`), so the
+    /// block ends there and the rest reads as another document.
+    fn hasMarkerLine(value: []const u8) bool {
+        var it = std.mem.splitScalar(u8, value, '\n');
+        while (it.next()) |line| {
+            if (line.len < 3) continue;
+            if (!std.mem.eql(u8, line[0..3], "---") and !std.mem.eql(u8, line[0..3], "...")) continue;
+            if (line.len == 3 or ctype.isBlank(line[3])) return true;
+        }
+        return false;
     }
 
     /// Inside `[...]` or `{...}` the flow indicators end the entry or the
@@ -1867,12 +1900,14 @@ pub const Emitter = struct {
     ///   - Any line starting with a tab. Emitted at indent 0 -- a root
     ///     scalar, or a shallow one -- the tab lands exactly where
     ///     indentation is read, and a tab is never valid indentation.
+    ///   - At indent 0, a document marker line (`hasMarkerLine`).
     ///
     /// Each falls back to double-quoted, which can always express the
     /// value.
-    fn literalSafe(value: []const u8) bool {
+    fn literalSafe(value: []const u8, indent: usize) bool {
         const s = stripTrailingNewlines(value);
         if (s.core.len == 0) return false;
+        if (indent == 0 and hasMarkerLine(s.core)) return false;
         var it = std.mem.splitScalar(u8, s.core, '\n');
         var first_content = true;
         while (it.next()) |line| {
@@ -1885,10 +1920,12 @@ pub const Emitter = struct {
     }
 
     /// A folded re-emission must re-parse to exactly `value`: no leading
-    /// blank line, no more-indented lines, no tabs, and no trailing
-    /// whitespace on any line (folding strips those).
-    fn foldedSafe(value: []const u8) bool {
+    /// blank line, no more-indented lines, no tabs, no trailing
+    /// whitespace on any line (folding strips those), and at indent 0
+    /// no document marker line (`hasMarkerLine`).
+    fn foldedSafe(value: []const u8, indent: usize) bool {
         if (value.len == 0) return false;
+        if (indent == 0 and hasMarkerLine(value)) return false;
         switch (value[0]) {
             '\n', ' ', '\t' => return false,
             else => {},
@@ -2344,6 +2381,177 @@ test "a literal block is still chosen when it can express the value" {
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("k: |\n  line one\n  line two\n", out);
+}
+
+/// Where a swept scalar sits. Each place writes it at a different
+/// indent, in block or flow context, with a sibling after it.
+const SweepPlace = enum { root, value, key, item, nested, flow_item, flow_key, flow_value };
+
+/// Write `text` in the requested style at `place`, read the output
+/// back, and report whether exactly `text` came back from that place
+/// (as a string, for `.any`, which is how `yaml.value` builds one). A
+/// sibling follows the scalar in every collection, so a scalar that
+/// swallows or ends the next line is caught as well.
+fn scalarSurvives(allocator: std.mem.Allocator, text: []const u8, style: ScalarStyle, place: SweepPlace) !bool {
+    var doc = Document.init(allocator);
+    defer doc.deinit();
+    const node = try doc.createScalar(text, style);
+    switch (place) {
+        .root => doc.root = node,
+        .item, .flow_item => {
+            const seq = try doc.createSequence();
+            if (place == .flow_item) seq.data.sequence.style = .flow;
+            try doc.sequenceAppend(seq, node);
+            try doc.sequenceAppend(seq, try doc.createScalar("z", .plain));
+            doc.root = seq;
+        },
+        .value, .key, .nested, .flow_key, .flow_value => {
+            const map = try doc.createMapping();
+            if (place == .flow_key or place == .flow_value) map.data.mapping.style = .flow;
+            if (place == .key or place == .flow_key) {
+                try doc.mappingAppend(map, node, try doc.createScalar("v", .plain));
+            } else {
+                try doc.mappingAppend(map, try doc.createScalar("k", .plain), node);
+            }
+            try doc.mappingAppend(map, try doc.createScalar("z", .plain), try doc.createScalar("z", .plain));
+            if (place == .nested) {
+                // A mapping value inside a sequence item, two levels in.
+                const seq = try doc.createSequence();
+                try doc.sequenceAppend(seq, map);
+                try doc.sequenceAppend(seq, try doc.createScalar("z", .plain));
+                doc.root = seq;
+            } else doc.root = map;
+        },
+    }
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+
+    var rt = Document.parse(allocator, out) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
+    defer rt.deinit();
+    var at = rt.root orelse return false;
+    if (place == .nested) {
+        const items = at.items() orelse return false;
+        if (items.len != 2 or !std.mem.eql(u8, items[1].scalarValue() orelse "", "z")) return false;
+        at = items[0];
+    }
+    const back = switch (place) {
+        .root => at,
+        .item, .flow_item => blk: {
+            const items = at.items() orelse return false;
+            if (items.len != 2 or !std.mem.eql(u8, items[1].scalarValue() orelse "", "z")) return false;
+            break :blk items[0];
+        },
+        .value, .key, .nested, .flow_key, .flow_value => blk: {
+            const pairs = at.pairs() orelse return false;
+            if (pairs.len != 2 or !std.mem.eql(u8, pairs[1].key.scalarValue() orelse "", "z")) return false;
+            break :blk if (place == .key or place == .flow_key) pairs[0].key else pairs[0].value;
+        },
+    };
+    const s = switch (back.data) {
+        .scalar => |s| s,
+        else => return false,
+    };
+    if (!std.mem.eql(u8, s.value, text)) return false;
+    return style != .any or document_mod.resolveCoreTag(s.value, s.style) == .str;
+}
+
+/// Run `scalarSurvives` over every string up to `max_len` bytes drawn
+/// from `alphabet`, in every place and each of `styles`. Fails with the
+/// first string that does not survive, after printing it.
+fn sweepScalars(alphabet: []const u8, max_len: usize, styles: []const ScalarStyle) !void {
+    // Tens of thousands of documents: an arena over the leak-checking
+    // allocator, reset per string, keeps the sweep to seconds in Debug.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var buf: [8]u8 = undefined;
+    std.debug.assert(max_len <= buf.len);
+    var digits = [_]usize{0} ** buf.len;
+    for (0..max_len + 1) |len| {
+        @memset(digits[0..len], 0);
+        while (true) {
+            for (digits[0..len], 0..) |d, i| buf[i] = alphabet[d];
+            const text = buf[0..len];
+            for (styles) |style| {
+                // An empty PLAIN scalar is YAML's null, not a string:
+                // it is written bare on purpose (see `chooseScalarStyle`).
+                if (len == 0 and style == .plain) continue;
+                for (std.enums.values(SweepPlace)) |place| {
+                    defer _ = arena.reset(.retain_capacity);
+                    if (!try scalarSurvives(arena.allocator(), text, style, place)) {
+                        std.debug.print("did not survive: \"{f}\" style={t} place={t}\n", .{ std.zig.fmtString(text), style, place });
+                        return error.TestUnexpectedResult;
+                    }
+                }
+            }
+            // Next string of this length (odometer); done when it wraps.
+            var i = len;
+            while (i > 0) {
+                i -= 1;
+                digits[i] += 1;
+                if (digits[i] < alphabet.len) break;
+                digits[i] = 0;
+            } else break;
+        }
+    }
+}
+
+test "every short string survives write and re-read, whatever its bytes" {
+    // A value's bytes, not its author, decide which styles can express
+    // it. Single quotes and block scalars cannot escape anything, so a
+    // CR (a line break to the reader), a NUL (rejected by the reader),
+    // and ESC or DEL (not printable, YAML 1.2 5.1) written raw in them
+    // came back changed or not at all: `a\rb` read back as `a b`, and a
+    // CRLF in a literal block lost its CR. Only double quotes can spell
+    // those; tab stays legal in every style.
+    const alphabet = "a \t\n\r\x00\x1b\x7f\"'\\#:-.%|>";
+    try sweepScalars(alphabet, 3, &.{.any});
+    try sweepScalars(alphabet, 2, &.{ .plain, .single_quoted, .double_quoted, .literal, .folded });
+}
+
+test "a line that would be a document marker keeps a block scalar out of column 0" {
+    // A root block scalar's content sits at column 0, where a `---` or
+    // `...` line (followed by a blank or the end of the line) is a
+    // document marker: `a\n---\nb\n` written as a literal block read
+    // back as `a\n`, the rest a second document.
+    try sweepScalars("-. \na", 5, &.{ .any, .literal, .folded });
+    const cases = [_][]const u8{
+        "a\n---\nb\n", "a\n...\nb\n", "x\n--- y\n", "x\n...\tz\n",
+        "---\nb\n",    "...\n",       "a\n---",     "a\n...x\nb\n",
+        "a\n---x\n",   "a\n ---\n",
+    };
+    for (cases) |text| {
+        for ([_]ScalarStyle{ .any, .literal, .folded }) |style| {
+            for (std.enums.values(SweepPlace)) |place| {
+                if (!try scalarSurvives(testing.allocator, text, style, place)) {
+                    std.debug.print("did not survive: \"{f}\" style={t} place={t}\n", .{ std.zig.fmtString(text), style, place });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+    // The fallback is only for values that need it: a marker-like line
+    // that is not a marker, and any marker line below the root, still
+    // get a block.
+    for ([_]struct { root: bool, text: []const u8, want: []const u8 }{
+        .{ .root = true, .text = "a\n---x\nb\n", .want = "|\na\n---x\nb\n" },
+        .{ .root = true, .text = "a\n....\nb\n", .want = "|\na\n....\nb\n" },
+        .{ .root = true, .text = "a\n---\nb\n", .want = "\"a\\n---\\nb\\n\"\n" },
+        .{ .root = false, .text = "a\n---\nb\n", .want = "k: |\n  a\n  ---\n  b\n" },
+    }) |c| {
+        var doc = Document.init(testing.allocator);
+        defer doc.deinit();
+        const node = try doc.createScalar(c.text, .any);
+        if (c.root) doc.root = node else {
+            doc.root = try doc.createMapping();
+            try doc.pathSet(&.{"k"}, node);
+        }
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
 }
 
 test "a laid-out explicit key puts the value indicator on its own line" {
