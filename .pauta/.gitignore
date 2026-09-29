@@ -1,0 +1,18 @@
+# Written by Pauta. Everything under .pauta/ is per-machine runtime state
+# unless it is listed below as shared. Edit freely; Pauta never overwrites it.
+/*
+!/.gitignore
+!/.gitattributes
+
+# Shared: the cards (the lane folders), board config, playbooks, schedules,
+# installed agent plugins and card attachments.
+!/board/
+!/config.json
+!/skills/
+!/schedules/
+!/agents/
+!/assets/
+
+# Inside the board only the lane folders are shared. The dot-sidecars
+# (.transcripts/, .attention/) are per-machine and can hold agent output.
+/board/.*

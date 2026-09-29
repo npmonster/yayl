@@ -1,0 +1,4 @@
+# Written by Pauta. Card files merge through `pauta merge-card`, which keeps
+# the later `updated:` and the union of both branches' `## Log` lines, and
+# leaves any real disagreement as an ordinary conflict.
+board/*/PLAN-*.md merge=pauta-card
