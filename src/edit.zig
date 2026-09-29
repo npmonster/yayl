@@ -277,12 +277,10 @@ fn filterMatches(candidate: *Node, key: []const u8, value: []const u8) bool {
 
 /// Does `node` or anything under it define the anchor `name`?
 ///
-/// By NAME, not by pointer: `cloneNode` re-registers anchors only for
-/// collections, so a cloned alias to an anchored SCALAR still carries a
-/// target pointer into the pre-clone tree. A name comparison is correct
-/// either way, and an anchor name is what the emitted `*name` actually
-/// refers to. Aliases are leaves here — never followed — so a parsed
-/// alias cycle cannot make this recurse forever.
+/// By NAME, not by pointer: an anchor name is what the emitted `*name`
+/// actually refers to, whatever node a hand-built alias's target pointer
+/// names. Aliases are leaves here — never followed — so a parsed alias
+/// cycle cannot make this recurse forever.
 fn anchorDefinedIn(node: *const Node, name: []const u8, depth: usize) bool {
     if (depth >= max_walk_depth) return false;
     if (node.anchor) |a| {
@@ -716,9 +714,10 @@ pub const Editor = struct {
     }
 
     /// A trailing `..key` descent deletes every node the whole path
-    /// matches, in document order, atomically (the batch machinery
-    /// clones first). The prefix resolves through the full query
-    /// grammar, so `$..in..k` deletes every `k` beneath every `in`.
+    /// matches, in document order, atomically (a failure rolls back
+    /// through the batch's journal). The prefix resolves through the
+    /// full query grammar, so `$..in..k` deletes every `k` beneath
+    /// every `in`.
     /// A victim whose removal would strand an alias refuses the WHOLE
     /// delete.
     fn applyDescendDelete(doc: *Document, segments: []const Segment) Error!void {
@@ -883,9 +882,10 @@ fn clearSpans(doc: *Document, node: *Node) !void {
     // which the emitter only uses when the slot itself is original.
 }
 
-/// Deep-clone a subtree into `doc`'s pool, preserving presentation
-/// spans (so a rolled-back-to clone still round-trips untouched parts
-/// byte-identically) and rebuilding alias targets within the clone.
+/// Deep-clone a subtree into `doc`'s pool, keeping presentation spans
+/// and rebuilding alias targets within the clone. Attached anywhere in
+/// the tree, the clone is written at its new position: the attach drops
+/// the span that no longer describes it (`internal.adopt`).
 ///
 /// SAME-DOCUMENT ONLY. The clone's spans index the source the tree was
 /// parsed from: attaching the result anywhere except back into `doc`'s
@@ -2631,9 +2631,9 @@ test "allocation failures in insert and move batches leak nothing" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, insertMoveBatch, .{});
 }
 
-/// Insert and move go through `Editor.apply`'s clone-and-swap path and
-/// sequence bookkeeping — the allocation-heaviest edits. On any OOM the
-/// original tree must survive intact and leak-free.
+/// Insert and move are the allocation-heaviest edits (journal records,
+/// tombstones, sequence bookkeeping). On any OOM the original tree must
+/// survive intact and leak-free.
 fn insertMoveBatch(allocator: std.mem.Allocator) !void {
     var doc = try Document.parse(allocator,
         \\from:
@@ -3226,9 +3226,10 @@ test "setAnchor defines, clears and refuses what would strand an alias" {
 
 test "an alias to an anchored scalar survives a clone pointing into the clone" {
     // `cloneNode` re-registered anchors only for collections, so after
-    // any `apply` an alias to a SCALAR still pointed at the pre-clone
-    // node -- harmless while scalars were immutable, wrong the moment a
-    // replacement could carry the anchor over.
+    // any `apply` (which then cloned the tree) an alias to a SCALAR still
+    // pointed at the pre-clone node -- harmless while scalars were
+    // immutable, wrong the moment a replacement could carry the anchor
+    // over. `apply` no longer clones; the alias must still resolve.
     var doc = try Document.parse(testing.allocator, "a: &x 1\nb: *x\nc: 3\n");
     defer doc.deinit();
     var ed = Editor.init(&doc);

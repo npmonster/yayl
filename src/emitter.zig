@@ -1374,10 +1374,13 @@ pub const Emitter = struct {
 
     /// Write a pending leading comment block ahead of an entry, one
     /// line per source line at the entry's own column, then the
-    /// indentation the entry itself continues on. The caller must have
-    /// stopped copying the original gap at the entry's line start (see
-    /// the split-gap sites); the empty override (a deletion) writes
-    /// nothing — the tombstoned block is already skipped in the gap.
+    /// indentation the entry itself continues on. The caller has written
+    /// everything before the entry (the original gap up to its entry
+    /// start, or a new entry's separator); indentation and `- `/`? `/`: `
+    /// framing already written on the entry's line is lifted off and put
+    /// back after the block. The empty override (a
+    /// deletion) writes nothing — the tombstoned block is already
+    /// skipped in the gap.
     fn writePendingLeadingText(self: *Emitter, pending: ?[]const u8, col: usize, term: []const u8) Error!void {
         const t = pending orelse return;
         if (t.len == 0) return;
