@@ -217,7 +217,18 @@ pub fn resolve(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*N
     for (path.segments) |seg| {
         var next: std.ArrayList(*Node) = .empty;
         errdefer next.deinit(allocator);
+        // Aliases fan out: many nodes in `current` can resolve to one
+        // target, whose children every one of them would add again --
+        // a step multiplied the list by the fan-out, and a few hundred
+        // bytes of aliases named more matches than memory holds. Each
+        // target is expanded once per step, and a descent never walks a
+        // subtree it has finished (`Descent`).
+        var expanded: std.AutoHashMapUnmanaged(*const Node, void) = .empty;
+        defer expanded.deinit(allocator);
+        var descent: Descent = .{ .allocator = allocator, .out = &next };
+        defer descent.deinit();
         for (current.items) |node| {
+            if ((try expanded.getOrPut(allocator, node.resolveAlias())).found_existing) continue;
             switch (seg) {
                 .key => |k| if (node.lookup(k)) |child| try next.append(allocator, child),
                 .index => |ix| {
@@ -231,10 +242,7 @@ pub fn resolve(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*N
                         for (pairs) |p| try next.append(allocator, p.value);
                     }
                 },
-                .descend => |k| {
-                    try collectDescend(allocator, node, k, &next, 0);
-                    try dedupeNodes(allocator, &next);
-                },
+                .descend => |k| try descent.walk(node, k, 0),
                 .filter => |f| {
                     // Sequences: every item whose mapping carries
                     // key == value. Mappings: every value that does.
@@ -401,41 +409,42 @@ fn refuseIfMoveStrandsAlias(doc: *Document, subtree: *const Node) Error!void {
     if (dependsOnOutsideAnchor(subtree, subtree, 0)) return error.AnchorReferenced;
 }
 
-/// Keep the first occurrence of every node, in order. A descent walk
-/// resolves aliases, so a subtree reachable both directly and through a
-/// `*ref` is walked twice and its matches would be reported twice — and
-/// a caller applying one edit per match would apply it twice.
-fn dedupeNodes(allocator: std.mem.Allocator, list: *std.ArrayList(*Node)) Error!void {
-    var seen: std.AutoHashMapUnmanaged(*Node, void) = .empty;
-    defer seen.deinit(allocator);
-    var w: usize = 0;
-    for (list.items) |node| {
-        const entry = try seen.getOrPut(allocator, node);
-        if (entry.found_existing) continue;
-        list.items[w] = node;
-        w += 1;
-    }
-    list.shrinkRetainingCapacity(w);
-}
+/// A `..key` walk, collecting every `key` match in pre-order into `out`.
+///
+/// It resolves aliases, so one node can be reached along many paths --
+/// exponentially many, for aliases of aliases. A node whose subtree was
+/// walked completely is not walked again: its matches are in `out`
+/// already, so skipping it reports each node once, in the order of its
+/// first encounter, at the cost of the document's size rather than its
+/// paths. A node still being walked is not complete, so an alias to an
+/// enclosing anchor (`&a {k: *a}`, a cycle of infinite depth that parses
+/// fine) still descends until `max_walk_depth` and fails with
+/// NestingTooDeep, rather than aborting the process on the stack.
+const Descent = struct {
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(*Node),
+    done: std.AutoHashMapUnmanaged(*const Node, void) = .empty,
 
-fn collectDescend(allocator: std.mem.Allocator, node: *Node, key: []const u8, out: *std.ArrayList(*Node), depth: usize) Error!void {
-    // Pre-order walk collecting every `key` match, bounded by
-    // `max_walk_depth`. The bound is load-bearing rather than defensive:
-    // this walk resolves aliases, and an alias to an enclosing anchor
-    // (`&a {k: *a}`) is a cycle of infinite depth that parses fine, so
-    // without it eleven bytes of input abort the process.
-    if (depth >= max_walk_depth) return error.NestingTooDeep;
-    const cur = node.resolveAlias();
-    if (cur.pairs()) |pairs| {
-        for (pairs) |p| {
-            const kv = p.key.scalarValue() orelse continue;
-            if (std.mem.eql(u8, kv, key)) try out.append(allocator, p.value);
-        }
-        for (pairs) |p| try collectDescend(allocator, p.value, key, out, depth + 1);
-    } else if (cur.items()) |items| {
-        for (items) |child| try collectDescend(allocator, child, key, out, depth + 1);
+    fn deinit(self: *Descent) void {
+        self.done.deinit(self.allocator);
     }
-}
+
+    fn walk(self: *Descent, node: *Node, key: []const u8, depth: usize) Error!void {
+        if (depth >= max_walk_depth) return error.NestingTooDeep;
+        const cur = node.resolveAlias();
+        if (self.done.contains(cur)) return;
+        if (cur.pairs()) |pairs| {
+            for (pairs) |p| {
+                const kv = p.key.scalarValue() orelse continue;
+                if (std.mem.eql(u8, kv, key)) try self.out.append(self.allocator, p.value);
+            }
+            for (pairs) |p| try self.walk(p.value, key, depth + 1);
+        } else if (cur.items()) |items| {
+            for (items) |child| try self.walk(child, key, depth + 1);
+        }
+        try self.done.put(self.allocator, cur, {});
+    }
+};
 
 /// Payload of `Edit.insert`: splice `value` into `sequence`, before or
 /// after the (single) node matching `position`.
@@ -493,7 +502,10 @@ pub const Editor = struct {
         return found[0];
     }
 
-    /// Query convenience: every match for `path`.
+    /// Query convenience: every match for `path`, each node once, in
+    /// the order first reached. Queries resolve aliases; the cost is
+    /// bounded by the document's size, not by how many alias paths
+    /// reach a node.
     pub fn all(self: *Editor, path: []const u8) Error![]*Node {
         var p = try Path.parse(self.doc.allocator, path);
         defer p.deinit(self.doc.allocator);
@@ -696,33 +708,25 @@ pub const Editor = struct {
         const containers = try resolve(doc.allocator, root, .{ .segments = segments[0 .. segments.len - 1] });
         defer doc.allocator.free(containers);
 
-        // Pre-flight every victim's anchor obligations before removing
-        // anything: a refusal must not leave a half-deleted document.
         var victims: std.ArrayList(*Node) = .empty;
         defer victims.deinit(doc.allocator);
-        for (containers) |container| {
-            try collectDescend(doc.allocator, container, k, &victims, 0);
-        }
-        try dedupeNodes(doc.allocator, &victims);
+        var descent: Descent = .{ .allocator = doc.allocator, .out = &victims };
+        defer descent.deinit();
+        for (containers) |container| try descent.walk(container, k, 0);
         if (victims.items.len == 0) return;
+        // Pre-flight every victim's anchor obligations before removing
+        // anything: a refusal must not leave a half-deleted document.
         for (victims.items) |victim| {
             try refuseIfPairStrandsAlias(doc, victim);
         }
-
-        // Remove the outermost match, then re-collect: an outer match's
-        // subtree can contain further matches, and their pointers do
-        // not survive its removal. Each pass removes at least one pair,
-        // so the loop terminates.
-        while (true) {
-            victims.clearRetainingCapacity();
-            for (containers) |container| {
-                try collectDescend(doc.allocator, container, k, &victims, 0);
-            }
-            if (victims.items.len == 0) break; // all matches removed
-            const victim = victims.items[0];
-            const parent = victim.parent orelse break; // detached with an earlier removal
-            if (parent.kind() != .mapping) break;
-            _ = doc.mappingRemove(parent, k) catch |err| try noopOrOOM(err);
+        // Outermost first (the walk is pre-order), each by identity. A
+        // match inside an earlier one's subtree leaves with it; detaching
+        // it from that detached subtree afterwards changes nothing that
+        // is emitted. (This re-collected the whole tree after every
+        // removal, which was quadratic in the number of matches.)
+        for (victims.items) |victim| {
+            const parent = victim.parent orelse continue;
+            _ = try detachChild(doc, parent, victim);
         }
     }
 
@@ -773,16 +777,6 @@ pub const Editor = struct {
             const removed = try detachChild(doc, v.container, v.node);
             std.debug.assert(removed);
         }
-    }
-
-    /// A delete that matches nothing is a no-op (documented `Edit`
-    /// semantics); OOM must propagate so an atomic batch rolls back
-    /// instead of silently "succeeding".
-    fn noopOrOOM(err: anyerror) Error!void {
-        return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => {},
-        };
     }
 
     fn applyInsert(doc: *Document, ins: Insert) Error!void {
@@ -2445,7 +2439,7 @@ test "an alias to an enclosing anchor is a parsed cycle, and cannot abort the pr
     // mapping and a naive `..key` descent revisits it forever. This is
     // spec-legal and parses: nothing rejects a cycle at parse time.
     //
-    // Before the bound in `collectDescend`, this aborted the process
+    // Before the bound in the descent walk, this aborted the process
     // with a stack overflow — reachable from untrusted input through a
     // documented public path (`$..key`), which is exactly the threat
     // model SECURITY.md states.
@@ -2488,6 +2482,52 @@ test "an alias to an enclosing anchor is a parsed cycle, and cannot abort the pr
         defer allocator.free(via);
         try std.testing.expectEqual(@as(usize, 1), via.len);
         try std.testing.expect(via[0] == hits[0]);
+    }
+}
+
+/// `l0: &l0 x`, then `levels` lines `lN: &lN [*lN-1, ...]` of `fan`
+/// aliases each: a few hundred bytes that name fan^levels paths.
+fn aliasFan(allocator: std.mem.Allocator, fan: usize, levels: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "l0: &l0 x\n");
+    for (1..levels + 1) |l| {
+        try out.print(allocator, "l{d}: &l{d} [", .{ l, l });
+        for (0..fan) |i| try out.print(allocator, "{s}*l{d}", .{ if (i > 0) ", " else "", l - 1 });
+        try out.appendSlice(allocator, "]\n");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "a query through fanned-out aliases costs the document's size, not its paths" {
+    // Descent resolves aliases, and a node reached a second time was
+    // walked again: 20 levels of 10 aliases (~800 bytes) name 10^20
+    // paths, and `all("$..x")` would never return -- through a public
+    // query, from untrusted input. Wildcards multiplied the same way,
+    // one expansion per alias to the same target.
+    const allocator = testing.allocator;
+    const input = try aliasFan(allocator, 10, 20);
+    defer allocator.free(input);
+    var doc = try Document.parse(allocator, input);
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+
+    const none = try ed.all("$..nothing");
+    defer allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    // Every `lN` key, once each, in document order.
+    const keys = try ed.all("$..l0");
+    defer allocator.free(keys);
+    try testing.expectEqual(@as(usize, 1), keys.len);
+
+    // Three wildcard steps below l20: each list holds ten aliases to the
+    // same list, so there are ten distinct items at every depth.
+    const items = try ed.all("$.l20[*][*][*]");
+    defer allocator.free(items);
+    try testing.expectEqual(@as(usize, 10), items.len);
+    for (items, 0..) |a, i| {
+        for (items[0..i]) |b| try testing.expect(a != b);
     }
 }
 

@@ -141,6 +141,17 @@ type violation from `yaml.schema`. `toZig` holds a hand-built `.bigint`
 to the same rule, and a read path (`pathGet`, `byPath`) indexes a
 sequence only with plain digits (`1_0` and `+1` were items 10 and 1).
 
+**A query through aliases of aliases could run forever.** Queries
+resolve aliases, and a node reached again was walked again, so 20
+levels of 10 aliases (about 800 bytes) named 10^20 paths: `all("$..x")`
+never returned, and wildcard steps multiplied the same way. A descent now
+never re-walks a subtree it has finished and each step expands an alias
+target once, so a query costs the document's size (that test runs in
+20 ms). An alias cycle still fails with `error.NestingTooDeep`. Wildcard
+and filter results list each node once, as descent already did, and a
+trailing-descent delete no longer re-walks the document after every
+removal.
+
 **The fuzz harness.** Its header claimed Zig 0.16.0 has no
 `std.testing.fuzz`; it has one, whose coverage-guided mode does not build
 on that toolchain (a type error in its own test runner), and the note

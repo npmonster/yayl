@@ -382,9 +382,12 @@ a move where the anchor and its aliases travel together is allowed.
 `ed.one` returns a borrowed node; `ed.all` and `yaml.edit.resolve`
 return a caller-owned slice — free it with the same allocator.
 
-Recursive descent resolves aliases as it walks, and reports each node
-once: a `k` reachable both directly and through a `*ref` is one match,
-not two, so a per-match edit over `ed.all("$..k")` is applied once.
+Queries resolve aliases as they walk, and report each node once: a `k`
+reachable both directly and through a `*ref` is one match, not two, so
+a per-match edit over `ed.all("$..k")` is applied once. The same holds
+for wildcards and filters, and it keeps a query's cost to the size of
+the document: aliases of aliases can name exponentially many paths to
+the same nodes.
 
 A delete removes EVERY node its path matches, in document order. A
 path of keys and indices names at most one node; a wildcard, filter or
