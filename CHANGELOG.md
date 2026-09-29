@@ -292,6 +292,19 @@ conformance, round-trip, preservation and libfyaml gates produce
 identical output. `SECURITY.md` and the memory model in `docs/USAGE.md`
 now state what a stream costs. (#1)
 
+**Writing a long one-line flow collection was quadratic.** Before
+emitting, the emitter measures the document's indent width, and for
+every mapping pair it took the key's column first, a scan back to the
+start of the key's line, then checked whether it needed it (only a
+block child compares against it). On a flow mapping that sits on one
+line (minified JSON is exactly that) the scan is as long as the line,
+so a `write` cost pairs x line length: 256 KB took 1.4 to 2.3 s, 1 MB
+about 30 s, and every doubling of the input quadrupled it, while
+parsing the same input is linear (about a second at 1 MB). The column
+is now taken only where it is compared, so the same 256 KB writes in
+0.2 to 1.1 ms. Output is byte-identical; the change reorders one
+computation and nothing else. (#4)
+
 ### Changed
 
 - `edit.cloneTreeWhole` is removed. It existed for the clone the undo

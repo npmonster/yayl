@@ -1174,8 +1174,14 @@ pub const Emitter = struct {
                 for (m.pairs.items) |pair| {
                     const ks = pair.key.src orelse continue;
                     if (ks.synthetic) continue;
-                    const key_col = markup.columnOf(self.src, ks.entry_start);
                     if (self.originalEntryColumn(pair.value)) |child_col| {
+                        // The key's column is read only here, and
+                        // `columnOf` scans back to the start of the
+                        // key's line. Taking it for every pair made a
+                        // flow mapping on ONE long line (minified JSON
+                        // is the shape) cost pairs x line length on
+                        // every write: quadratic.
+                        const key_col = markup.columnOf(self.src, ks.entry_start);
                         // A block value on the SAME line as its key (a
                         // compact `- name: a`) measures nothing.
                         if (child_col > key_col) return child_col - key_col;
@@ -2325,6 +2331,67 @@ test "a document with nothing to measure keeps the two-space default" {
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("a: 1\nb: 2\nc:\n  x: 1\n", out);
+}
+
+test "flow collections ahead of a block child do not disturb the measured indent" {
+    // Flow pairs carry no block indentation to measure, so the walk moves
+    // past them to the first block child. Pinned because the measurement
+    // no longer looks at a flow pair's key column at all.
+    var doc = try Document.parse(testing.allocator, "f: {x: 1, y: [1, {z: 2}]}\ntop:\n    a: 1\n");
+    defer doc.deinit();
+    const m = try doc.createMapping();
+    try doc.mappingAppend(m, try doc.createScalar("x", .plain), try doc.createScalar("1", .plain));
+    try doc.pathSet(&.{ "top", "added" }, m);
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("f: {x: 1, y: [1, {z: 2}]}\ntop:\n    a: 1\n    added:\n        x: 1\n", out);
+}
+
+test "writing a long one-line flow collection takes linear time" {
+    // Minified JSON is one line, so `columnOf` (a scan back to the start
+    // of the line) was paid for every pair: pairs x line length on EVERY
+    // write, fourfold per doubling. At 128 KiB that was ~0.5 s in
+    // ReleaseSafe and ~2.6 s in Debug, against tens of microseconds now;
+    // 1 MiB took ~30 s. The bound is generous on purpose: 100 ms sits far
+    // above the linear cost and far below the quadratic one, so a slow CI
+    // machine cannot flake it and the regression cannot hide inside it.
+    // The fastest of three runs is judged, to ignore a scheduling stall.
+    //
+    // Leak-checked, but without `testing.allocator`'s per-allocation stack
+    // traces: parsing tens of thousands of nodes under them takes seconds.
+    var leak_check: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer testing.expect(leak_check.deinit() == .ok) catch @panic("leaked memory");
+    const allocator = leak_check.allocator();
+    const io = testing.io;
+    // A flow mapping of scalars, and a flow sequence of one-pair mappings.
+    for ([_]u8{ '{', '[' }) |open| {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(allocator);
+        try src.append(allocator, open);
+        var i: usize = 0;
+        while (src.items.len < 128 * 1024) : (i += 1) {
+            if (open == '{') {
+                try src.print(allocator, "k{d}: v, ", .{i});
+            } else {
+                try src.print(allocator, "{{a: {d}}}, ", .{i});
+            }
+        }
+        try src.appendSlice(allocator, if (open == '{') "z: 1}\n" else "{}]\n");
+
+        var doc = try Document.parse(allocator, src.items);
+        defer doc.deinit();
+
+        var fastest_ns: i96 = std.math.maxInt(i96);
+        for (0..3) |_| {
+            const start = std.Io.Timestamp.now(io, .awake);
+            const out = try doc.write(allocator);
+            const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
+            defer allocator.free(out);
+            try testing.expectEqualStrings(src.items, out);
+            fastest_ns = @min(fastest_ns, elapsed);
+        }
+        try testing.expect(fastest_ns < 100_000_000);
+    }
 }
 
 test "a modified multi-line flow mapping keeps its layout" {
