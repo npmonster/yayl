@@ -226,6 +226,21 @@ pub fn setItem(doc: *Document, seq: *Node, index: usize, item: *Node) !void {
     slot.* = item;
 }
 
+/// INTERNAL. `node` has just been attached to a slot of the tree by an
+/// edit. A source span it carries describes the slot it was PARSED in --
+/// a same-document `cloneTree` copy keeps its spans, and so does a node
+/// detached from one place and attached in another -- and the emitter,
+/// finding it clean, would copy that other slot's bytes here and carry on
+/// from where that slot ended: `- p` set as the root came back as the
+/// whole old document, and a block sequence item re-wrote the lines
+/// after its source. Clear the span and mark the node, so it re-emits
+/// normalized at its new position like a moved subtree. Its descendants
+/// keep their spans; a modified container lays them out afresh.
+pub fn adopt(doc: *Document, node: *Node) !void {
+    if (node.src != null) try setSrc(doc, node, null);
+    try doc.markModified(node);
+}
+
 /// INTERNAL. Structural append that deliberately skips the `modified`
 /// mark, for the builder composing a parsed tree. Calling this from
 /// outside leaves the subtree looking clean, so it re-emits verbatim
@@ -488,14 +503,10 @@ pub fn mappingReplace(self: *Document, map: *Node, existing: *Node, value: *Node
         if (p.value == existing) {
             try setParent(self, value, map);
             try setPairValue(self, map, i, value);
-            // A replacement must never carry a span into a slot it does
-            // not describe. A spanned replacement (a clone) either
-            // looks clean — the pair's fast path re-emits the ORIGINAL
-            // bytes and the replacement silently vanishes — or re-emits
-            // whatever region its span happens to name. Clear it and
-            // mark it: the value re-emits normalized, like a moved one.
-            try setSrc(self, value, null);
-            try self.markModified(value);
+            // A spanned replacement (a clone) would otherwise look
+            // clean, and the pair's fast path would re-emit the ORIGINAL
+            // bytes: the replacement silently vanished.
+            try adopt(self, value);
             return true;
         }
     }

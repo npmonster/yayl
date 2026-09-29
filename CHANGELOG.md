@@ -185,6 +185,18 @@ instead of its own whole-tree clone. The alias checks that guard a delete
 or replacement now walk the tree only when the doomed subtree defines an
 anchor.
 
+**A same-document clone set as the root or a block sequence item wrote
+the wrong document.** `edit.cloneTree` keeps a copy's source spans, and
+the emitter, finding the copy clean, wrote the bytes of the slot it was
+copied from and carried on from where that slot ended. Set as the root
+of `a: 1\nb: 2\n`, a clone of `$.a` was written `1\nb: 2\n`, which does
+not parse; a clone of `- p` set as the root of `- p\n- q\n` vanished;
+set, appended or inserted as a block sequence item it re-wrote the lines
+after its source. Mapping values were already handled. Every attach now
+clears the attached node's own span and marks it, so it is written at
+its new position like a moved node, and a node set as the root leaves
+its old parent. (Found while checking the undo journal.)
+
 **The fuzz harness.** Its header claimed Zig 0.16.0 has no
 `std.testing.fuzz`; it has one, whose coverage-guided mode does not build
 on that toolchain (a type error in its own test runner), and the note

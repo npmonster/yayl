@@ -636,6 +636,8 @@ pub const Editor = struct {
                 if (sameScalarPresentation(root, value)) return;
             }
             try internal.setRoot(doc, value);
+            try internal.setParent(doc, value, null);
+            try internal.adopt(doc, value);
             return;
         }
         const parent = p.segments[0 .. p.segments.len - 1];
@@ -1890,6 +1892,74 @@ test "a spanned clone replacing a slot is emitted, not silently dropped" {
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("a:\n  x: 42\ntop:\n  x: 42\n", out);
+}
+
+test "a spanned node attached anywhere is written at its new position" {
+    // The same hazard everywhere else a node enters a slot: a
+    // same-document clone keeps the spans of the slot it was copied from,
+    // and the emitter copied that slot's bytes -- then carried on from
+    // where that slot ended. As the root, `- p` came back as the whole
+    // old document (the replacement vanished) and `a: 1` as `1` followed
+    // by the old tail; as a block item it re-wrote the lines after its
+    // source.
+    const Op = enum { set, append, insert };
+    const cases = [_]struct { in: []const u8, op: Op = .set, from: []const u8, to: []const u8, out: []const u8 }{
+        .{ .in = "a: 1\nb: 2\n", .from = "$.a", .to = "$", .out = "1\n" },
+        .{ .in = "a:\n  x: 1\nb: 2\n", .from = "$.a", .to = "$", .out = "x: 1\n" },
+        .{ .in = "- p\n- q\n", .from = "$[0]", .to = "$", .out = "p\n" },
+        .{ .in = "a: 1\nb:\n  - x\n  - y\n", .from = "$.a", .to = "$.b[0]", .out = "a: 1\nb:\n  - 1\n  - y\n" },
+        .{ .in = "a: 1 # c\nb:\n  - x\n", .op = .append, .from = "$.a", .to = "$.b", .out = "a: 1 # c\nb:\n  - x\n  - 1\n" },
+        .{
+            .in = "a:\n  - 1\n  - 2\nb:\n  c:\n    - 1\n",
+            .op = .append,
+            .from = "$.a",
+            .to = "$.b.c",
+            .out = "a:\n  - 1\n  - 2\nb:\n  c:\n    - 1\n    - - 1\n      - 2\n",
+        },
+        .{
+            .in = "a:\n  - 1\n  - 2\nb:\n  c:\n    - 1\n",
+            .op = .insert,
+            .from = "$.a",
+            .to = "$.b.c",
+            .out = "a:\n  - 1\n  - 2\nb:\n  c:\n    - - 1\n      - 2\n    - 1\n",
+        },
+        .{
+            .in = "a: |\n  lit\n  eral\nb:\n  c:\n    - 1\n",
+            .op = .append,
+            .from = "$.a",
+            .to = "$.b.c",
+            .out = "a: |\n  lit\n  eral\nb:\n  c:\n    - 1\n    - |\n      lit\n      eral\n",
+        },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const clone = try cloneTree(&doc, try ed.one(c.from));
+        switch (c.op) {
+            .set => try ed.set(c.to, clone),
+            .append => try ed.apply(&.{.{ .append = .{ .sequence = c.to, .value = clone } }}),
+            .insert => try ed.apply(&.{.{ .insert = .{
+                .sequence = c.to,
+                .position = try std.fmt.allocPrint(doc.pool.allocator(), "{s}[0]", .{c.to}),
+                .value = clone,
+                .before = true,
+            } }}),
+        }
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+
+    // A node of the tree itself set as the root leaves its old parent.
+    var doc = try Document.parse(testing.allocator, "a:\n  x: 1\nb: 2\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.set("$", try ed.one("$.a"));
+    try testing.expect(doc.root.?.parent == null);
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("x: 1\n", out);
 }
 
 test "cloneTreeInto a second document cannot copy the wrong source bytes" {

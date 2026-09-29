@@ -926,14 +926,15 @@ pub const Document = struct {
         if (attachRefusal(map, key)) |reason| return reason;
         if (attachRefusal(map, value)) |reason| return reason;
         try internal.attachPair(self, map, key, value);
-        try self.markModified(map);
+        try internal.adopt(self, key);
+        try internal.adopt(self, value);
     }
 
     /// Append an item to a sequence node, maintaining parent links.
     pub fn sequenceAppend(self: *Document, seq: *Node, item: *Node) !void {
         if (attachRefusal(seq, item)) |reason| return reason;
         try internal.attachItem(self, seq, item);
-        try self.markModified(seq);
+        try internal.adopt(self, item);
     }
 
     /// Insert an item into a sequence at `index`.
@@ -948,7 +949,7 @@ pub const Document = struct {
             .sequence => {
                 try internal.insertItem(self, seq, index, item);
                 try internal.setParent(self, item, seq);
-                try self.markModified(seq);
+                try internal.adopt(self, item);
             },
             else => return error.InvalidSyntax,
         }
