@@ -349,6 +349,8 @@ sequence item.
 var ed = yaml.edit.Editor.init(&doc);
 
 // Query: exactly one match, or every match (caller frees the slice).
+// `one` fails with error.UnknownPath when nothing matches and
+// error.AmbiguousOperation when several do.
 const first = try ed.one("$.store.book[0].title");
 const titles = try ed.all("$.store.book[*].title");
 

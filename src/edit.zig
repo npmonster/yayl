@@ -24,10 +24,12 @@ const internal = @import("internal.zig");
 const Document = document_mod.Document;
 const Node = document_mod.Node;
 
-/// Editing failures: `UnknownPath` covers queries that match nothing
-/// (or not exactly once, for `one`); the `NotA*` errors describe a
-/// value whose shape does not fit the edit; `MoveIntoSubtree` rejects
-/// moving a node into its own subtree.
+/// Editing failures: `UnknownPath` covers queries that match nothing,
+/// and `AmbiguousOperation` a path that must name one node (`one`, and
+/// the targets of `set`, `insert`, `append` and `move`) but matches
+/// several; the `NotA*` errors describe a value whose shape does not
+/// fit the edit; `MoveIntoSubtree` rejects moving a node into its own
+/// subtree.
 pub const Error = error{
     InvalidPath,
     InvalidSyntax,
@@ -508,15 +510,20 @@ pub const Editor = struct {
         return .{ .doc = doc };
     }
 
-    /// Resolve exactly one node, or `error.UnknownPath`.
+    /// Resolve exactly one node: `error.UnknownPath` when the path
+    /// matches nothing, `error.AmbiguousOperation` when it matches
+    /// several (a wildcard, filter or descent can).
     pub fn one(self: *Editor, path: []const u8) Error!*Node {
         var p = try Path.parse(self.doc.allocator, path);
         defer p.deinit(self.doc.allocator);
         const root = self.doc.root orelse return error.UnknownPath;
         const found = try resolve(self.doc.allocator, root, p);
         defer self.doc.allocator.free(found);
-        if (found.len != 1) return error.UnknownPath;
-        return found[0];
+        return switch (found.len) {
+            0 => error.UnknownPath,
+            1 => found[0],
+            else => error.AmbiguousOperation,
+        };
     }
 
     /// Query convenience: every match for `path`, each node once, in
@@ -1094,6 +1101,24 @@ test "path grammar and queries" {
     try testing.expectError(error.InvalidPath, ed.all("$.store["));
     try testing.expectError(error.InvalidPath, ed.all("$.."));
     try testing.expectError(error.UnknownPath, ed.one("$.nope"));
+}
+
+test "one tells a path that matches nothing from one that matches several" {
+    // Both used to be `UnknownPath`, so a caller -- `delete` among them,
+    // before it stopped using `one` -- could not tell "absent" from
+    // "ambiguous".
+    var doc = try Document.parse(testing.allocator, "s:\n  - {k: 1}\n  - {k: 2}\nt: [x]\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try testing.expectError(error.AmbiguousOperation, ed.one("$.s[*]"));
+    try testing.expectError(error.AmbiguousOperation, ed.one("$..k"));
+    try testing.expectError(error.UnknownPath, ed.one("$.s[?k=3]"));
+    try testing.expectEqualStrings("2", (try ed.one("$.s[?k=2].k")).scalarValue().?);
+    try testing.expectEqualStrings("x", (try ed.one("$.t[*]")).scalarValue().?);
+    // The single-target edits report the same.
+    const v = try doc.createScalar("v", .plain);
+    try testing.expectError(error.AmbiguousOperation, ed.apply(&.{.{ .append = .{ .sequence = "$[*]", .value = v } }}));
+    try testing.expectError(error.AmbiguousOperation, ed.apply(&.{.{ .move = .{ .from = "$.s[*]", .to = "$.t" } }}));
 }
 
 test "set creates intermediates and replaces in place" {

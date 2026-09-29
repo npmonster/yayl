@@ -216,6 +216,11 @@ derived from the library's error sets.
   whose anchor comes later) failed with `error.UnknownAlias`. Such a
   batch now runs, and one that would delete or replace the anchor is
   refused with `error.AnchorReferenced`, like any stranding edit.
+- `Editor.one` returns `error.AmbiguousOperation` for a path that
+  matches several nodes; it returned `error.UnknownPath`, as for a path
+  that matches nothing, so the two could not be told apart (asked for in
+  #12). The single-target edits (`insert`, `append`, `move`) report the
+  same, as `set` already did.
 - `value.Limits` has a `max_bytes` field and `ParseOptions` a
   `max_merge_nodes` field (see Fixed); `diag.YamlError` gains
   `LimitExceeded`.
