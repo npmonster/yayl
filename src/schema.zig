@@ -796,6 +796,34 @@ test "validation honours an explicit core tag" {
     }
 }
 
+test "an explicit core tag whose text is not in its grammar is a type violation" {
+    // `Schema.int` accepted `!!int abc` (the tag alone decided), and
+    // `intRange` read `!!int 0b101` as 5 through `std.fmt.parseInt(.., 0)`.
+    const allocator = testing.allocator;
+    const Document = document_mod.Document;
+    for ([_][]const u8{ "!!int abc", "!!int 0b101", "!!int 1_000" }) |text| {
+        var doc = try Document.parse(allocator, text);
+        defer doc.deinit();
+        for ([_]Schema{ Schema.int, Schema.intRange(0, 10), Schema.float }) |sc| {
+            const out = try sc.validate(allocator, doc.root.?, "$");
+            defer {
+                for (out) |*v| v.deinitSelf(allocator);
+                allocator.free(out);
+            }
+            try testing.expectEqual(@as(usize, 1), out.len);
+            try testing.expectEqualStrings("type", out[0].rule);
+        }
+    }
+    var doc = try Document.parse(allocator, "!!float nan");
+    defer doc.deinit();
+    const out = try Schema.float.validate(allocator, doc.root.?, "$");
+    defer {
+        for (out) |*v| v.deinitSelf(allocator);
+        allocator.free(out);
+    }
+    try testing.expectEqual(@as(usize, 1), out.len);
+}
+
 test "validation is depth-bounded, on the document and on the schema" {
     const allocator = testing.allocator;
     const Document = document_mod.Document;

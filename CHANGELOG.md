@@ -129,6 +129,18 @@ mapping value now reads the comment after its key and colon (`push:`,
 block scalar key with no `:`, is refused with `error.InvalidSyntax`. The
 comment sweep now writes a trailing comment on every writable node too.
 
+**An explicit core tag accepted text outside its type's grammar.**
+`!!int` text was read with `std.fmt.parseInt(.., 0)` and `!!float` with
+`std.fmt.parseFloat`, which take much more than the YAML 1.2 core schema:
+`!!int 0b101` converted to 5, `!!int 1_000` to 1000, `!!float nan` to a
+NaN and `!!float 0x10` to 16, although each is a string untagged, and
+`Schema.int` passed `!!int abc`. An explicit core tag now holds only text
+spelled as its type (`!!int 0x1F`, `!!int '7'`, `!!float 1` and `.inf`
+still do); anything else is `error.TypeMismatch` from `yaml.value` and a
+type violation from `yaml.schema`. `toZig` holds a hand-built `.bigint`
+to the same rule, and a read path (`pathGet`, `byPath`) indexes a
+sequence only with plain digits (`1_0` and `+1` were items 10 and 1).
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity

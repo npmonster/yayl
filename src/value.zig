@@ -240,64 +240,37 @@ fn convert(allocator: std.mem.Allocator, node: *const Node, b: *Budget) Error!Va
 ///
 /// `!!str 42` is a string and `!!int '7'` an integer: the tag is an
 /// assertion about the value, so it outranks both the plain-scalar
-/// resolution and the quoting style. A tag whose content cannot be
-/// read as the type it claims (`!!int abc`) is `error.TypeMismatch` —
-/// the document says one thing and means another, and silently
-/// returning a string would hide that. Untagged scalars, and scalars
-/// carrying a non-core tag, resolve exactly as before.
+/// resolution and the quoting style. A tag whose text is not spelled as
+/// the type it claims (`!!int abc`, `!!int 0b101`) is
+/// `error.TypeMismatch` -- the document says one thing and means another,
+/// and silently returning a string would hide that. Untagged scalars,
+/// and scalars carrying a non-core tag, resolve exactly as before.
 fn taggedScalarToValue(allocator: std.mem.Allocator, node: *const Node) Error!Value {
-    const s = node.data.scalar;
-    const explicit = if (node.tag) |uri| document_mod.coreTagFromUri(uri) else null;
-    const t = explicit orelse return scalarToValue(allocator, s.value, s.style);
-
-    return switch (t) {
-        .str => .{ .string = try allocator.dupe(u8, s.value) },
-        .null => if (document_mod.resolveCoreTag(s.value, .plain) == .null)
-            .null
-        else
-            error.TypeMismatch,
-        .bool => switch (document_mod.resolveCoreTag(s.value, .plain)) {
-            .bool => .{ .bool = s.value[0] == 't' or s.value[0] == 'T' },
-            else => error.TypeMismatch,
-        },
-        .int => try taggedInt(allocator, s.value),
-        .float => .{ .float = document_mod.parseCoreFloat(s.value) orelse return error.TypeMismatch },
-    };
+    const t = document_mod.scalarCoreTag(node) orelse return error.TypeMismatch;
+    return typedScalar(allocator, node.data.scalar.value, t);
 }
 
-/// `!!int` on a value too wide for `i64` keeps its exact digits, the
-/// same answer `scalarToValue` gives the untagged form. Tagging a big
-/// number is MORE explicit than leaving it bare, so it must not be less
-/// capable. Text that is not an integer at all is still `TypeMismatch`:
-/// `!!int abc` says one thing and means another.
-fn taggedInt(allocator: std.mem.Allocator, text: []const u8) Error!Value {
-    if (document_mod.parseCoreInt(text)) |i| return .{ .int = i };
-    // Not representable as i64. It is still `!!int` only if the text is a
-    // core-schema integer (the shared rule, so `schema` and `value` agree
-    // on which scalars are bigints); otherwise the tag contradicts it.
-    if (document_mod.resolveCoreTag(text, .plain) != .int) return error.TypeMismatch;
-    return .{ .bigint = try allocator.dupe(u8, text) };
+/// A scalar's text as a Value of core type `t`, which it is spelled as
+/// (`document.coreTextFits`). Tagged or not, an integer too wide for
+/// `i64` keeps its exact digits as `.bigint`: tagging a big number says
+/// more about it, so it must not be less capable.
+fn typedScalar(allocator: std.mem.Allocator, text: []const u8, t: document_mod.CoreTag) Error!Value {
+    return switch (t) {
+        .null => .null,
+        .bool => .{ .bool = text[0] == 't' or text[0] == 'T' },
+        .int => if (document_mod.parseCoreInt(text)) |i| .{ .int = i } else .{ .bigint = try allocator.dupe(u8, text) },
+        // Every text the core float grammar accepts parses; the error is
+        // a guard, not a path.
+        .float => .{ .float = document_mod.parseCoreFloat(text) orelse return error.TypeMismatch },
+        .str => .{ .string = try allocator.dupe(u8, text) },
+    };
 }
 
 /// Interpret a scalar's text under its style (core schema: only plain
 /// scalars get typed). Ignores any explicit tag on the node; conversion
 /// goes through `taggedScalarToValue`, which does not.
 pub fn scalarToValue(allocator: std.mem.Allocator, text: []const u8, style: ScalarStyle) Error!Value {
-    if (style != .plain) return .{ .string = try allocator.dupe(u8, text) };
-    switch (document_mod.resolveCoreTag(text, .plain)) {
-        .null => return .null,
-        .bool => return .{ .bool = text[0] == 't' or text[0] == 'T' },
-        .int => {
-            if (document_mod.parseCoreInt(text)) |i| return .{ .int = i };
-            // Out-of-range integers keep their exact text.
-            return .{ .bigint = try allocator.dupe(u8, text) };
-        },
-        .float => {
-            if (document_mod.parseCoreFloat(text)) |f| return .{ .float = f };
-            return .{ .string = try allocator.dupe(u8, text) };
-        },
-        .str => return .{ .string = try allocator.dupe(u8, text) },
-    }
+    return typedScalar(allocator, text, document_mod.resolveCoreTag(text, style));
 }
 
 /// Materialize a Value as a document tree node (owned by `doc`).
@@ -429,8 +402,10 @@ pub fn toZig(comptime T: type, allocator: std.mem.Allocator, value: Value) Error
         .int => switch (value) {
             .int => |i| return std.math.cast(T, i) orelse error.TypeMismatch,
             .bigint => |t| {
-                const parsed = std.fmt.parseInt(T, t, 0) catch return error.TypeMismatch;
-                return parsed;
+                // A hand-built Value is held to the core spelling too:
+                // base 0 would also take `0b1` and `1_000`.
+                if (document_mod.resolveCoreTag(t, .plain) != .int) return error.TypeMismatch;
+                return std.fmt.parseInt(T, t, 0) catch error.TypeMismatch;
             },
             else => return error.TypeMismatch,
         },
@@ -1270,6 +1245,55 @@ test "conversion is depth-bounded, so a deep built tree errors instead of overfl
             nodeToValueLimited(allocator, root, .{ .max_values = 10 }),
         );
     }
+}
+
+test "an explicit core tag holds text only in its own grammar" {
+    // `!!int` read its text with `std.fmt.parseInt(.., 0)`, and `!!float`
+    // with `std.fmt.parseFloat`, which take far more than YAML 1.2's core
+    // schema: `!!int 0b101` was 5, `!!int 1_000` 1000, `!!float nan` a
+    // NaN and `!!float 0x10` 16, while the same text untagged is a
+    // string. A tag whose text is not in its type's grammar contradicts
+    // the document, like `!!int abc` already did.
+    const allocator = testing.allocator;
+    const bad = [_][]const u8{
+        "!!int 0b101",  "!!int 1_000", "!!int -0x1F", "!!int 0X1F",    "!!int +0o7",
+        "!!float 0x10", "!!float nan", "!!float inf", "!!float 1_0.5", "!!bool yes",
+        "!!null none",  "!!float 0o7",
+    };
+    for (bad) |text| {
+        var doc = try Document.parse(allocator, text);
+        defer doc.deinit();
+        try testing.expectError(error.TypeMismatch, nodeToValue(allocator, doc.root.?));
+    }
+    const good = [_]struct { text: []const u8, want: Value }{
+        .{ .text = "!!int 0x1F", .want = .{ .int = 31 } },
+        .{ .text = "!!int 0o17", .want = .{ .int = 15 } },
+        .{ .text = "!!int +42", .want = .{ .int = 42 } },
+        .{ .text = "!!int '-7'", .want = .{ .int = -7 } },
+        .{ .text = "!!float 1", .want = .{ .float = 1 } },
+        .{ .text = "!!float -.5e1", .want = .{ .float = -5 } },
+        .{ .text = "!!float .inf", .want = .{ .float = std.math.inf(f64) } },
+        .{ .text = "!!null ''", .want = .null },
+    };
+    for (good) |c| {
+        var doc = try Document.parse(allocator, c.text);
+        defer doc.deinit();
+        const v = try nodeToValue(allocator, doc.root.?);
+        defer freeValue(allocator, v);
+        try testing.expect(valueEqlForTest(v, c.want));
+    }
+    // A Value built by hand is held to the same rule.
+    try testing.expectError(error.TypeMismatch, toZig(u8, allocator, .{ .bigint = "0b1" }));
+    try testing.expectEqual(@as(u128, 1 << 100), try toZig(u128, allocator, .{ .bigint = "1267650600228229401496703205376" }));
+}
+
+fn valueEqlForTest(a: Value, b: Value) bool {
+    return switch (a) {
+        .null => b == .null,
+        .int => |i| b == .int and b.int == i,
+        .float => |f| b == .float and (f == b.float),
+        else => false,
+    };
 }
 
 test "an explicit core tag outranks plain-scalar resolution" {

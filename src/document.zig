@@ -389,6 +389,9 @@ fn realSpan(node: *const Node) ?markup.Src {
 /// alias in the middle resolves either way.
 fn walkReadSegment(node: *const Node, seg: []const u8) ?*const Node {
     if (node.items()) |list| {
+        // Plain digits only: `parseInt` also takes `+1` and `1_0`.
+        if (seg.len == 0) return null;
+        for (seg) |c| if (!std.ascii.isDigit(c)) return null;
         const ix = std.fmt.parseInt(usize, seg, 10) catch return null;
         if (ix >= list.len) return null;
         return list[ix];
@@ -420,13 +423,32 @@ pub fn coreTagFromUri(uri: []const u8) ?CoreTag {
 /// `!!str`/`!!int`/... wins: the tag is an assertion about the value,
 /// and resolving `!!str 42` as an integer would contradict it. Plain
 /// resolution is the fallback for an untagged scalar, which is the
-/// common case.
+/// common case. Null when an explicit core tag's text is not spelled as
+/// that type (`!!int abc`, `!!int 0b101`): the document contradicts
+/// itself, and `value` and `schema` both report it.
 ///
 /// `node` must already be alias-resolved and must be a scalar.
-pub fn scalarCoreTag(node: *const Node) CoreTag {
+pub fn scalarCoreTag(node: *const Node) ?CoreTag {
     const s = node.data.scalar;
-    if (node.tag) |uri| if (coreTagFromUri(uri)) |t| return t;
+    if (node.tag) |uri| if (coreTagFromUri(uri)) |t| {
+        return if (coreTextFits(t, s.value)) t else null;
+    };
     return resolveCoreTag(s.value, s.style);
+}
+
+/// Whether `text` is spelled as the core schema (spec 10.3.2) spells a
+/// `tag` value, whatever its quoting: under an explicit tag, `!!int '7'`
+/// is an integer, but `!!int 0b101` is not (the binary form is YAML
+/// 1.1), nor `!!float nan` (`.nan` is). `!!str` takes any text, and
+/// `!!float` the integer spellings too, as its grammar does. This is
+/// what keeps the explicit-tag paths from reading text through
+/// `std.fmt`, which takes far more (`0x10` as a float, `1_000`).
+pub fn coreTextFits(tag: CoreTag, text: []const u8) bool {
+    return switch (tag) {
+        .str => true,
+        .float => looksLikeFloat(text),
+        else => resolveCoreTag(text, .plain) == tag,
+    };
 }
 
 /// Resolve a plain scalar to its YAML 1.2.2 Core Schema tag (spec
@@ -452,6 +474,9 @@ pub fn resolveCoreTag(value: []const u8, style: ScalarStyle) CoreTag {
 /// "does it fit". `value` and `schema` previously each spelled this out,
 /// and disagreed: schema called the overflow a type error.
 pub fn parseCoreInt(text: []const u8) ?i64 {
+    // Base 0 would also take `0b101`, `1_000` and `-0x1F`; only the core
+    // spellings may reach it.
+    std.debug.assert(looksLikeInt(text));
     return std.fmt.parseInt(i64, text, 0) catch null;
 }
 
@@ -3780,6 +3805,17 @@ test "sequenceInsert refuses an ancestor instead of building a cycle" {
     var re = try Document.parse(allocator, out);
     defer re.deinit();
     try std.testing.expectEqual(@as(usize, 1), re.pathGet(&.{"list"}).?.items().?.len);
+}
+
+test "a read path indexes a sequence only with plain decimal digits" {
+    // `std.fmt.parseInt(usize, seg, 10)` also takes `+1` and `1_0`, so
+    // `byPath(&.{"items", "1_0"})` answered item 10.
+    var doc = try Document.parse(testing.allocator, "items: [a, b, c]\n");
+    defer doc.deinit();
+    try testing.expectEqualStrings("b", doc.pathGet(&.{ "items", "1" }).?.scalarValue().?);
+    for ([_][]const u8{ "+1", "1_0", "-0", " 1", "" }) |seg| {
+        try testing.expect(doc.pathGet(&.{ "items", seg }) == null);
+    }
 }
 
 test "parseCoreInt and parseCoreFloat are the one shared scalar rule" {
