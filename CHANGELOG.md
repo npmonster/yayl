@@ -305,6 +305,23 @@ is now taken only where it is compared, so the same 256 KB writes in
 0.2 to 1.1 ms. Output is byte-identical; the change reorders one
 computation and nothing else. (#4)
 
+**`writeAll` was quadratic in the number of documents.** Before
+appending each document after the first, it asked whether the output so
+far already ended in a `...` marker (so no `---` is needed), and
+answered by walking every line of that output to find the last
+non-blank one. That is the whole stream written so far, once per
+document, so N documents cost N x output: 32 KB of tiny documents took
+47 ms, every doubling quadrupled it, and a 1 MiB stream would take
+close to a minute to write back. Scanning back to the start of the
+last line is no better for output with no line break at all (separately
+parsed strings that lack a trailing newline and each open a document):
+the last line is the whole buffer. The answer is now kept as the output
+is written, so each byte is looked at once. Output is byte-identical:
+the tracker is checked against the old definition on all 335,923
+strings up to length 7 over the marker's dot, both blanks, every line
+break and one byte of ordinary content, fed whole, one byte at a time
+and split in two at every position. (#5)
+
 ### Changed
 
 - `edit.cloneTreeWhole` is removed. It existed for the clone the undo
