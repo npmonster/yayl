@@ -591,8 +591,8 @@ an identical scalar to change no byte. On ten seeds (about 950,000
 documents and 2.1 million edit batches) it reported 679 failures on the
 release candidate (430 documents that read back as another tree, 234 that
 did not parse, 15 that lost or gained a document), and 733 on ten fresh
-seeds; it reports none on either set now, and every one of the 2.1 million
-failed batches left the output byte-identical. What it found, now fixed
+seeds; it reports none on either set now, and every failed batch
+(about 840,000 in each set) left the output byte-identical. What it found, now fixed
 and pinned by tests that fail without the fix:
 
 - A tag or anchor on a block collection under a key whose line ends in a
