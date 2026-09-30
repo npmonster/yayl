@@ -104,7 +104,7 @@ pub const Limits = struct {
     ///
     /// 1000, alongside `Emitter.max_depth`, though the two are not
     /// interchangeable: the emitter charges up to two extra levels and
-    /// so admits two fewer.
+    /// so admits up to two fewer.
     max_depth: usize = 1000,
 
     /// No bound. Only for input you produced yourself.
@@ -212,6 +212,9 @@ fn convert(allocator: std.mem.Allocator, node: *const Node, b: *Budget) Error!Va
     try b.enter();
     defer b.leave();
     const cur = node.resolveAlias();
+    // `!!seq 42`, `!!int [1]`: the tag says one kind and the node is
+    // another, as with `!!int abc` (see `taggedScalarToValue`).
+    if (document_mod.tagContradictsKind(cur)) return error.TypeMismatch;
     switch (cur.data) {
         .scalar => |sc| {
             // At most the text is copied (a string or a bigint's digits).
@@ -435,10 +438,22 @@ pub fn toZig(comptime T: type, allocator: std.mem.Allocator, value: Value) Error
             },
             else => return error.TypeMismatch,
         },
-        .float => switch (value) {
-            .int => |i| return @floatFromInt(i),
-            .float => |f| return @floatCast(f),
-            else => return error.TypeMismatch,
+        .float => {
+            // A value the type cannot hold is a mismatch, as for an int
+            // that does not fit (`toZig(u8, 256)`), not an infinity: only
+            // an infinity stays one. A `.bigint` is an integer too.
+            const wide: f64 = switch (value) {
+                .int => |i| @floatFromInt(i),
+                .float => |f| f,
+                .bigint => |t| blk: {
+                    if (document_mod.resolveCoreTag(t, .plain) != .int) return error.TypeMismatch;
+                    break :blk document_mod.parseCoreFloat(t) orelse return error.TypeMismatch;
+                },
+                else => return error.TypeMismatch,
+            };
+            const out: T = @floatCast(wide);
+            if (std.math.isInf(out) and !(value == .float and std.math.isInf(wide))) return error.TypeMismatch;
+            return out;
         },
         .optional => |opt| {
             if (value == .null) return null;
@@ -459,13 +474,26 @@ pub fn toZig(comptime T: type, allocator: std.mem.Allocator, value: Value) Error
             if (ptr.size == .slice) {
                 if (ptr.child == u8) {
                     switch (value) {
-                        .string => |s| return try allocator.dupe(u8, s),
+                        .string => |s| {
+                            // `[:0]const u8` and friends: the sentinel
+                            // follows the text.
+                            if (comptime ptr.sentinel()) |z| {
+                                if (std.mem.indexOfScalar(u8, s, z) != null) return error.TypeMismatch;
+                                const out = try allocator.allocSentinel(u8, s.len, z);
+                                @memcpy(out, s);
+                                return out;
+                            }
+                            return try allocator.dupe(u8, s);
+                        },
                         else => return error.TypeMismatch,
                     }
                 }
                 switch (value) {
                     .sequence => |items| {
-                        const out = try allocator.alloc(ptr.child, items.len);
+                        const out = if (comptime ptr.sentinel()) |z|
+                            try allocator.allocSentinel(ptr.child, items.len, z)
+                        else
+                            try allocator.alloc(ptr.child, items.len);
                         var filled: usize = 0;
                         errdefer {
                             for (out[0..filled]) |item| deinitZig(ptr.child, allocator, item);
@@ -501,7 +529,12 @@ pub fn toZig(comptime T: type, allocator: std.mem.Allocator, value: Value) Error
             if (members.len != 1) return error.TypeMismatch;
             inline for (un.fields) |field| {
                 if (std.mem.eql(u8, field.name, members[0].key)) {
-                    if (field.type == void) return @unionInit(T, field.name, {});
+                    // Written as null by `fromZig`; anything else is data
+                    // the field has nowhere to keep.
+                    if (field.type == void) {
+                        if (members[0].value != .null) return error.TypeMismatch;
+                        return @unionInit(T, field.name, {});
+                    }
                     return @unionInit(T, field.name, try toZig(field.type, allocator, members[0].value));
                 }
             }
@@ -511,6 +544,7 @@ pub fn toZig(comptime T: type, allocator: std.mem.Allocator, value: Value) Error
             .sequence => |items| {
                 if (items.len != arr.len) return error.TypeMismatch;
                 var out: T = undefined;
+                if (comptime arr.len == 0) return out;
                 var filled: usize = 0;
                 errdefer for (out[0..filled]) |item| deinitZig(arr.child, allocator, item);
                 for (items, 0..) |item, i| {
@@ -583,11 +617,20 @@ pub fn deinitZig(comptime T: type, allocator: std.mem.Allocator, value: T) void 
                 return;
             }
             inline for (st.fields) |field| {
-                deinitZig(field.type, allocator, @field(value, field.name));
+                // A `comptime` field was never allocated (see `toZigStruct`).
+                if (comptime !field.is_comptime) deinitZig(field.type, allocator, @field(value, field.name));
             }
         },
         else => {},
     }
+}
+
+/// `[N]u8` or `[N:s]u8`: what a string literal points at.
+fn isByteArray(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .array => |arr| arr.child == u8,
+        else => false,
+    };
 }
 
 /// Duplicate allocation-bearing Zig values so defaults returned by
@@ -606,7 +649,10 @@ fn cloneZig(comptime T: type, allocator: std.mem.Allocator, value: T) Error!T {
                 return out;
             }
             if (ptr.size != .slice) return value;
-            const out = try allocator.alloc(ptr.child, value.len);
+            const out = if (comptime ptr.sentinel()) |z|
+                try allocator.allocSentinel(ptr.child, value.len, z)
+            else
+                try allocator.alloc(ptr.child, value.len);
             var filled: usize = 0;
             errdefer {
                 for (out[0..filled]) |item| deinitZig(ptr.child, allocator, item);
@@ -620,6 +666,7 @@ fn cloneZig(comptime T: type, allocator: std.mem.Allocator, value: T) Error!T {
         },
         .array => |arr| {
             var out: T = undefined;
+            if (comptime arr.len == 0) return out;
             var filled: usize = 0;
             errdefer for (out[0..filled]) |item| deinitZig(arr.child, allocator, item);
             for (value, 0..) |item, i| {
@@ -652,7 +699,7 @@ fn cloneZig(comptime T: type, allocator: std.mem.Allocator, value: T) Error!T {
                 }
                 return out;
             }
-            var out: T = undefined;
+            var out: T = value;
             var initialized = [_]bool{false} ** st.fields.len;
             errdefer {
                 inline for (st.fields, 0..) |field, i| {
@@ -660,8 +707,12 @@ fn cloneZig(comptime T: type, allocator: std.mem.Allocator, value: T) Error!T {
                 }
             }
             inline for (st.fields, 0..) |field, i| {
-                @field(out, field.name) = try cloneZig(field.type, allocator, @field(value, field.name));
-                initialized[i] = true;
+                // A `comptime` field is fixed by the type; there is
+                // nothing to copy.
+                if (comptime !field.is_comptime) {
+                    @field(out, field.name) = try cloneZig(field.type, allocator, @field(value, field.name));
+                    initialized[i] = true;
+                }
             }
             return out;
         },
@@ -682,6 +733,9 @@ fn toZigStruct(comptime T: type, allocator: std.mem.Allocator, members: []const 
     }
 
     inline for (st.fields, 0..) |field, i| {
+        // A `comptime` field is fixed by the type; there is nothing to
+        // read into it.
+        if (comptime field.is_comptime) continue;
         var found = false;
         for (members) |m| {
             if (std.mem.eql(u8, m.key, field.name)) {
@@ -730,8 +784,15 @@ pub fn fromZig(allocator: std.mem.Allocator, value: anytype) Error!Value {
         },
         .float, .comptime_float => return .{ .float = @floatCast(value) },
         .optional => return if (value) |v| fromZig(allocator, v) else .null,
-        .@"enum" => return .{ .string = try allocator.dupe(u8, @tagName(value)) },
+        // A non-exhaustive enum's unnamed values have no name to write
+        // (`@tagName` would be illegal behaviour on them).
+        .@"enum" => return .{ .string = try allocator.dupe(u8, std.enums.tagName(T, value) orelse return error.TypeMismatch) },
         .pointer => |ptr| {
+            // A string literal (`*const [N:0]u8`) is a string, not a
+            // sequence of bytes.
+            if (ptr.size == .one and comptime isByteArray(ptr.child)) {
+                return .{ .string = try allocator.dupe(u8, value) };
+            }
             if (ptr.size == .slice) {
                 if (ptr.child == u8) return .{ .string = try allocator.dupe(u8, value) };
                 const out = try allocator.alloc(Value, value.len);
@@ -1738,4 +1799,112 @@ test "an explicit !!int is no less capable than the bare form" {
     }
     // A tag that lies is still an error.
     try testing.expectError(error.TypeMismatch, nodeToValue(allocator, doc.pathGet(&.{"bad"}).?));
+}
+
+test "a tag is checked against the node's kind, and `!` resolves by kind" {
+    const allocator = testing.allocator;
+
+    // Spec example 6.28 (corpus S4JQ): `! 12` is the string "12".
+    const v = try parseToValue(allocator, "- \"12\"\n- 12\n- ! 12\n");
+    defer freeValue(allocator, v);
+    try testing.expectEqualStrings("12", v.at(0).?.string);
+    try testing.expectEqual(@as(i64, 12), v.at(1).?.int);
+    try testing.expectEqualStrings("12", v.at(2).?.string);
+
+    for ([_][]const u8{ "!!seq 42", "!!map abc", "!!int [1]", "!!str {a: 1}", "!!seq {a: 1}", "!!map [1]", "a: !!bool [x]" }) |in| {
+        errdefer std.debug.print("accepted {s}\n", .{in});
+        try testing.expectError(error.TypeMismatch, parseToValue(allocator, in));
+    }
+    for ([_][]const u8{ "!!seq [1]", "!!map {a: 1}", "!local [1]", "! [1]" }) |in| {
+        const ok = try parseToValue(allocator, in);
+        freeValue(allocator, ok);
+    }
+}
+
+test "a float target refuses what it cannot hold, and takes big integers" {
+    const allocator = testing.allocator;
+
+    // `@floatCast` turned 1e39 into an f32 infinity and 70000 into an f16
+    // one, where an int target refuses the value (`toZig(u8, 256)`); and
+    // a `.bigint` had no float arm at all.
+    try testing.expectError(error.TypeMismatch, toZig(f32, allocator, .{ .float = 1e39 }));
+    try testing.expectError(error.TypeMismatch, toZig(f16, allocator, .{ .int = 70000 }));
+    try testing.expect(std.math.isInf(try toZig(f32, allocator, .{ .float = std.math.inf(f64) })));
+    try testing.expect(std.math.isNan(try toZig(f32, allocator, .{ .float = std.math.nan(f64) })));
+    try testing.expectEqual(@as(f64, 9223372036854775808.0), try toZig(f64, allocator, .{ .bigint = "9223372036854775808" }));
+    try testing.expectEqual(try std.fmt.parseFloat(f64, "151115727451828646838271"), try toZig(f64, allocator, .{ .bigint = "0x1FFFFFFFFFFFFFFFFFFF" }));
+    try testing.expectError(error.TypeMismatch, toZig(f32, allocator, .{ .bigint = "0x1FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF" }));
+    try testing.expectError(error.TypeMismatch, toZig(f64, allocator, .{ .bigint = "1_000" }));
+
+    // Octal is regrouped into hex and rounded once, like the other forms.
+    try testing.expectEqual(@as(f64, 15), document_mod.parseCoreFloat("0o17").?);
+    try testing.expectEqual(@as(f64, 0), document_mod.parseCoreFloat("0o000").?);
+    const max_u66: u128 = (1 << 66) - 1;
+    try testing.expectEqual(@as(f64, @floatFromInt(max_u66)), document_mod.parseCoreFloat("0o" ++ "7" ** 22).?);
+    const mixed: u128 = 0o1234567012345670123456701234567;
+    try testing.expectEqual(@as(f64, @floatFromInt(mixed)), document_mod.parseCoreFloat("0o1234567012345670123456701234567").?);
+    try testing.expect(std.math.isInf(document_mod.parseCoreFloat("0o1" ++ "0" ** 342).?));
+    try testing.expect(!std.math.isInf(document_mod.parseCoreFloat("0o1" ++ "0" ** 340).?));
+
+    // Every width up to 128 bits, against Zig's own correctly rounded
+    // integer conversion, in both radix spellings.
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    for (0..20_000) |_| {
+        const n: u128 = random.int(u128) >> random.uintLessThan(u7, 127);
+        const want: f64 = @floatFromInt(n);
+        var buf: [64]u8 = undefined;
+        try testing.expectEqual(want, document_mod.parseCoreFloat(try std.fmt.bufPrint(&buf, "0x{x}", .{n})).?);
+        try testing.expectEqual(want, document_mod.parseCoreFloat(try std.fmt.bufPrint(&buf, "0o{o}", .{n})).?);
+    }
+}
+
+test "conversions cover the types the contract names" {
+    const allocator = testing.allocator;
+
+    // A non-exhaustive enum's unnamed value has no name: `@tagName` on it
+    // panicked in ReleaseSafe.
+    const NE = enum(u8) { a, b, _ };
+    try testing.expectError(error.TypeMismatch, fromZig(allocator, @as(NE, @enumFromInt(7))));
+    const named = try fromZig(allocator, NE.b);
+    defer freeValue(allocator, named);
+    try testing.expectEqualStrings("b", named.string);
+
+    // A string literal is a string, not a sequence of bytes.
+    const lit = try fromZig(allocator, .{ .name = "yayl" });
+    defer freeValue(allocator, lit);
+    try testing.expectEqualStrings("yayl", lit.get("name").?.string);
+    const bare = try fromZig(allocator, "hello");
+    defer freeValue(allocator, bare);
+    try testing.expectEqualStrings("hello", bare.string);
+
+    // A void union field is written as null, and only null reads back.
+    const U = union(enum) { n: i64, inherit: void };
+    const bad = try parseToValue(allocator, "inherit: 5\n");
+    defer freeValue(allocator, bad);
+    try testing.expectError(error.TypeMismatch, toZig(U, allocator, bad));
+    const good = try parseToValue(allocator, "inherit:\n");
+    defer freeValue(allocator, good);
+    try testing.expectEqual(U.inherit, try toZig(U, allocator, good));
+
+    // Sentinel slices, empty arrays and comptime fields failed to compile
+    // inside the library.
+    const S = struct {
+        z: [:0]const u8,
+        ns: [:0]const i32,
+        empty: [0]u8 = .{},
+        comptime version: u8 = 1,
+    };
+    const src = try parseToValue(allocator, "z: text\nns: [1, 2]\n");
+    defer freeValue(allocator, src);
+    const s = try toZig(S, allocator, src);
+    defer deinitZig(S, allocator, s);
+    try testing.expectEqualStrings("text", s.z);
+    try testing.expectEqual(@as(u8, 0), s.z.ptr[s.z.len]);
+    try testing.expectEqualSlices(i32, &.{ 1, 2 }, s.ns);
+    try testing.expectEqual(@as(i32, 0), s.ns.ptr[s.ns.len]);
+    try testing.expectError(error.TypeMismatch, toZig([:0]const u8, allocator, .{ .string = "a\x00b" }));
+    const back = try fromZig(allocator, s);
+    defer freeValue(allocator, back);
+    try testing.expectEqual(@as(i64, 1), back.get("version").?.int);
 }

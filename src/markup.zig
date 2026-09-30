@@ -154,26 +154,38 @@ pub fn entryStart(source: []const u8, content_start: usize) usize {
     if (prev == '-' and i >= 2 and source[i - 2] == '-') return content_start;
     if (prev == '-' or prev == '?') return i - 1;
     if (prev == '\n' or prev == '\r') {
-        // The indicator may sit alone at the end of the previous line.
-        if (i < 2) return content_start;
-        // Step back over the terminator: one byte for a lone CR or a
-        // lone LF, two for CRLF. The `\r` arm used to step two
-        // unconditionally, which for a LONE CR landed *inside* the
-        // previous line. In `a: 1\rb:\r  - x\rc:\r` that made the key
-        // `c` look as though it sat under the `-` indicator, so its
-        // entry_start pointed at the `-` and an edit re-emitted `- x` a
-        // second time — duplicated content, and output that would not
-        // reparse.
-        var j = i - 1;
-        if (prev == '\n' and j > 0 and source[j - 1] == '\r') j -= 1;
-        while (j > 0 and (source[j - 1] == ' ' or source[j - 1] == '\t')) j -= 1;
-        if (j > 0 and (source[j - 1] == '-' or source[j - 1] == '?')) {
-            // Only when that line holds nothing but the indicator:
-            // every byte before it must be blanks.
-            const ls = lineStart(source, j - 1);
-            for (source[ls .. j - 1]) |c| {
-                if (c != ' ' and c != '\t') return content_start;
+        // The indicator may sit alone at the end of an earlier line, with
+        // only blank and comment lines in between and a comment of its
+        // own after it (`- # c\n  x`). Stopping at the line right above
+        // gave that item the entry_start of its content, so deleting it
+        // left `- # c` behind as a null item, and setting it wrote a new
+        // item ahead of the old dash.
+        var line_end = i;
+        while (line_end > 0) {
+            // Step back over the terminator: one byte for a lone CR or a
+            // lone LF, two for CRLF. The `\r` arm used to step two
+            // unconditionally, which for a LONE CR landed *inside* the
+            // previous line. In `a: 1\rb:\r  - x\rc:\r` that made the key
+            // `c` look as though it sat under the `-` indicator, so its
+            // entry_start pointed at the `-` and an edit re-emitted `- x`
+            // a second time -- duplicated content, and output that would
+            // not reparse.
+            var j = line_end - 1;
+            if (source[j] == '\n' and j > 0 and source[j - 1] == '\r') j -= 1;
+            const ls = lineStart(source, j);
+            const line = source[ls..j];
+            const body = std.mem.trimStart(u8, line, " \t");
+            if (body.len == 0 or body[0] == '#') {
+                line_end = ls;
+                continue;
             }
+            // Only a line holding nothing but the indicator (and a
+            // comment): blanks before it, a blank or the end after it.
+            if (body[0] != '-' and body[0] != '?') return content_start;
+            if (body.len > 1 and body[1] != ' ' and body[1] != '\t') return content_start;
+            const after = std.mem.trimStart(u8, body[1..], " \t");
+            if (after.len > 0 and after[0] != '#') return content_start;
+            const indicator = ls + (line.len - body.len);
             // And only when the content is actually indented UNDER the
             // indicator. A block entry's content sits deeper than its
             // `-`/`?`; content at the same or a lower column belongs to
@@ -184,10 +196,10 @@ pub fn entryStart(source: []const u8, content_start: usize) usize {
             // that line holds nothing but the indicator and a trailing
             // blank. Emitting `c` then re-wrote the item: deleting `$.a`
             // produced `b:\n  - \n- \nc: 1\n`, which does not reparse.
-            if (content_start - lineStart(source, content_start) <= (j - 1) - ls) {
+            if (content_start - lineStart(source, content_start) <= indicator - ls) {
                 return content_start;
             }
-            return j - 1;
+            return indicator;
         }
     }
     return content_start;

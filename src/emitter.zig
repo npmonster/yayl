@@ -35,7 +35,9 @@ const diag = @import("diag.zig");
 const document_mod = @import("document.zig");
 const internal = @import("internal.zig");
 const markup = @import("markup.zig");
+const scanner_mod = @import("scanner.zig");
 const token_mod = @import("token.zig");
+const utf8 = @import("utf8.zig");
 
 const Document = document_mod.Document;
 const Node = document_mod.Node;
@@ -63,6 +65,17 @@ pub const Emitter = struct {
     /// chomping (`|+`, `>+`), which absorbs any blank lines after it into
     /// its value; see `pastKeptBlanks`.
     kept_breaks: bool = false,
+    /// Least column a block scalar written next puts its content at, and
+    /// a comment for its header line: see `placeBlock`.
+    block_floor: usize = 0,
+    header_comment: ?[]const u8 = null,
+    /// Output offset just past the last alias name written, so a value
+    /// indicator written right after it can be kept apart from it (see
+    /// `writeValueIndicator`).
+    alias_end: ?usize = null,
+    /// The `%TAG` directives of the document being written: the handles a
+    /// tag can be written with (see `writeTag`).
+    directives: []const token_mod.TagDirective = &.{},
     /// Nesting levels currently open. Emission is recursive, so this
     /// bounds native stack use; see `max_depth`.
     depth: usize = 0,
@@ -132,6 +145,52 @@ pub const Emitter = struct {
 
     fn writeIndent(self: *Emitter, indent: usize) Error!void {
         for (0..indent) |_| try self.writeByte(' ');
+    }
+
+    /// Write an alias, `*name`. A name YAML cannot spell (it is set on
+    /// the node directly, past `Document.setAnchor`) is refused rather
+    /// than written as output that does not read back.
+    fn writeAlias(self: *Emitter, name: []const u8) Error!void {
+        if (!internal.validAnchorName(name)) return error.InvalidSyntax;
+        try self.writeByte('*');
+        try self.write(name);
+        self.alias_end = self.out.items.len;
+    }
+
+    /// Write an anchor, `&name`; see `writeAlias`.
+    fn writeAnchor(self: *Emitter, name: []const u8) Error!void {
+        if (!internal.validAnchorName(name)) return error.InvalidSyntax;
+        try self.writeByte('&');
+        try self.write(name);
+    }
+
+    /// Write a mapping value indicator (`:` or `: `) after a key. An
+    /// anchor name may hold a `:` (spec 6.9.2 `ns-anchor-char`), so an
+    /// alias key written `*r: v` names the anchor `r:`, which is unknown
+    /// or wrong; after an alias the indicator is kept apart, `*r : v`.
+    fn writeValueIndicator(self: *Emitter, indicator: []const u8) Error!void {
+        if (self.alias_end == self.out.items.len) try self.writeByte(' ');
+        try self.write(indicator);
+    }
+
+    /// Make the key written since `key_start` an explicit one (`? key`)
+    /// when it is too long to be implicit, and say whether it did. An
+    /// implicit key spans at most 1024 characters up to its `:` (spec
+    /// 7.4.2, 8.2.2), and the scanner refuses a longer one, so a long key
+    /// written bare was output that does not parse. The key is measured
+    /// as written (properties, quotes and escapes included), with room
+    /// for a blank before the indicator.
+    fn explicitIfLong(self: *Emitter, key_start: usize) Error!bool {
+        const written = self.out.items[key_start..];
+        const limit = scanner_mod.max_simple_key_chars - 1;
+        if (written.len <= limit) return false;
+        const chars = utf8.countCodepoints(written) catch limit + 1;
+        if (chars <= limit) return false;
+        try self.out.insertSlice(self.allocator, key_start, "? ");
+        if (self.alias_end) |*end| {
+            if (end.* >= key_start) end.* += 2;
+        }
+        return true;
     }
 
     fn newlineAt(self: *Emitter, indent: usize) Error!void {
@@ -361,6 +420,8 @@ pub const Emitter = struct {
     /// byte-faithfully outside modified slots; programmatic documents
     /// emit normalized.
     pub fn emitDocument(self: *Emitter, doc: *const Document) Error!void {
+        self.directives = doc.tag_directives.items;
+        defer self.directives = &.{};
         if (doc.source) |src| {
             self.src = src;
             defer self.src = "";
@@ -390,10 +451,28 @@ pub const Emitter = struct {
             return;
         };
 
-        if (have_directives or doc.explicit_start) try self.write("---\n");
+        if (rootBlockWithProperties(root)) {
+            // Valid YAML without the marker, but libfyaml (and so the
+            // readers built on it) fails a document that opens with
+            // properties and then a block scalar (`&r |-`) with "missing
+            // document start"; on the marker's line it reads fine.
+            try self.write("--- ");
+        } else if (have_directives or doc.explicit_start) try self.write("---\n");
         try self.emitNode(root, 0);
         if (!self.endsWithNewline()) try self.write(self.defaultTerminator());
         if (doc.explicit_end) try self.write("...\n");
+    }
+
+    /// A root scalar with an anchor or tag that will be written as a
+    /// block scalar (see `emitDocument`).
+    fn rootBlockWithProperties(root: *const Node) bool {
+        if (root.anchor == null and root.tag == null) return false;
+        const s = switch (root.data) {
+            .scalar => |s| s,
+            else => return false,
+        };
+        const style = chooseScalarStyle(s.value, s.style, 0, true, false);
+        return style == .literal or style == .folded;
     }
 
     // ------------------------------------------------------------------
@@ -449,19 +528,21 @@ pub const Emitter = struct {
             // Deleted-entry tombstones of the root container can reach
             // into the tail (when the last surviving entry is new).
             const before = self.out.items.len;
-            if (doc.root != null and doc.root.?.src != null) {
-                // A tombstone can consume the terminator that separated
-                // the document's last emission from a surviving tail
-                // comment — deleting the only real entry of a document
-                // with a trailing comment emitted `{}# delta`, which
-                // does not parse. When the first LIVE tail byte is a
-                // comment and the cursor is mid-line, re-own the break.
-                // (Surfaced when `parse` stopped dropping the tail.)
-                if (!self.endsWithNewline() and
-                    self.firstLiveTailByte(doc.root.?, stop, doc.region_end) == '#')
-                {
+            // A tombstone can consume the terminator that separated the
+            // document's last emission from a surviving tail comment --
+            // deleting the only real entry of a document with a trailing
+            // comment emitted `{}# delta`, which does not parse -- and a
+            // replaced root has none of its own (`x...` after an empty
+            // root was set). When the first LIVE tail byte is a comment,
+            // or opens a line of its own in the source (an end marker),
+            // and the cursor is mid-line, re-own the break. (Surfaced
+            // when `parse` stopped dropping the tail.)
+            if (doc.root) |root| if (!self.endsWithNewline()) if (firstLiveTail(root, stop, doc.region_end)) |at| {
+                if (src[at] == '#' or (at == markup.lineStart(src, at) and !ctype.isBreak(src[at]))) {
                     try self.write(self.defaultTerminator());
                 }
+            };
+            if (doc.root != null and doc.root.?.src != null) {
                 try self.writeGap(doc.root.?, stop, doc.region_end);
             } else {
                 try self.write(src[stop..doc.region_end]);
@@ -484,7 +565,22 @@ pub const Emitter = struct {
         const s = node.src orelse {
             // Root replaced by a programmatic node: emit normalized and
             // keep the original tail.
-            _ = try self.emitContent(node, indent);
+            var at = indent;
+            const pending = self.pendingLine();
+            if (pending.len > 0 and !internal.inlineValue(node)) {
+                // A block collection cannot open on the line of a `---`
+                // or after a tab (`--- - x` does not parse): a line of
+                // its own, at column 0.
+                try self.write(self.defaultTerminator());
+                at = 0;
+            } else if (pending.len > 0 and !ctype.isBlank(pending[pending.len - 1])) {
+                // `---` with nothing after it: `---x` is not a marker.
+                try self.writeByte(' ');
+            }
+            self.placeBlock(node, orig_end);
+            defer self.endBlockPlacement();
+            _ = try self.emitContent(node, at);
+            if (self.endsWithNewline()) return self.pastKeptBlanks(node, markup.lineEnd(self.src, orig_end));
             return orig_end;
         };
         if (s.synthetic) return s.end; // empty document: head/tail only
@@ -494,8 +590,10 @@ pub const Emitter = struct {
             // line remainder (or a written trailing comment) and tail
             // from there.
             .scalar, .alias => {
+                self.placeBlock(node, s.end);
+                defer self.endBlockPlacement();
                 _ = try self.emitContent(node, indent);
-                if (self.kept_breaks and self.endsWithNewline()) {
+                if (self.endsWithNewline()) {
                     return self.pastKeptBlanks(node, markup.lineEnd(self.src, s.end));
                 }
                 return self.writeEntryTail(node, s.end);
@@ -673,6 +771,8 @@ pub const Emitter = struct {
             if (try self.openEntryLine(entry_col, pending, self.terminatorAt(gap))) {
                 owed_terminator = true;
             }
+            self.placeNewBlock(value, gap);
+            defer self.endBlockPlacement();
             try self.emitEntry(key, value, entry_col);
             if (value.pending_trailing) |tt| {
                 if (tt.len > 0) {
@@ -681,6 +781,7 @@ pub const Emitter = struct {
                 }
             }
             if (owed_terminator and !self.endsWithNewline()) try self.write(self.defaultTerminator());
+            if (self.endsWithNewline()) return self.pastKeptBlanksIn(container, value, gap);
             return gap;
         }
 
@@ -693,6 +794,7 @@ pub const Emitter = struct {
         if (key_spanned and self.nodeClean(key)) {
             try self.emitted.put(key, {});
             try self.write(src[ks.?.entry_start..ks.?.end]);
+            if (key.data == .alias) self.alias_end = self.out.items.len;
         } else {
             try self.emitted.put(key, {});
             // A modified key keeps its framing -- the `- ` or `? ` in
@@ -700,8 +802,17 @@ pub const Emitter = struct {
             // block collection key's own walk writes that framing with
             // its first entry, as for items (`? ? - a` otherwise).
             if (key_spanned and !framingOwnedByContent(key)) try self.write(src[ks.?.entry_start..ks.?.start]);
-            const stop = try self.emitKeyContent(key, if (ks) |s| markup.columnOf(src, s.start) else entry_col, expl);
+            const key_col = if (ks) |s| markup.columnOf(src, s.start) else entry_col;
+            const key_start = self.out.items.len;
+            const stop = try self.emitKeyContent(key, key_col, expl);
             if (key_spanned and stop > key_end) key_end = stop;
+            // Grown past what an implicit key may hold: `? key`, with the
+            // source's value indicator on the next line at the key's
+            // column, where an explicit key's belongs.
+            if (!expl and key.data == .scalar and try self.explicitIfLong(key_start)) {
+                try self.writeNewlineIndent(key_col);
+                while (key_end < src.len and ctype.isBlank(src[key_end])) key_end += 1;
+            }
         }
 
         // Valueless entry (`key:` / `? key`): emit the original colon
@@ -711,7 +822,7 @@ pub const Emitter = struct {
                 try self.write(src[@min(key_end, pair_end.?)..pair_end.?]);
                 return self.writeEntryTail(value, pair_end.?);
             }
-            try self.writeByte(':');
+            try self.writeValueIndicator(":");
             if (pair_end) |pe| return self.writeEntryTail(value, pe);
             return gap_start;
         }
@@ -777,6 +888,8 @@ pub const Emitter = struct {
                 if (try self.writeCleanSlice(value, vs.entry_start)) |vend| {
                     return self.writeEntryTail(value, pair_end orelse vend);
                 }
+                self.placeBlock(value, pair_end orelse vs.end);
+                defer self.endBlockPlacement();
                 const stop = try self.emitContent(value, markup.columnOf(src, vs.start));
                 // A container walk that reached the line end already
                 // consumed the terminator; deeper slots must not write
@@ -803,12 +916,14 @@ pub const Emitter = struct {
             // Replaced by an empty value node: normalized colon. An
             // explicit key needs none — `? key` is already the whole
             // entry — and `? key: ` would not parse.
-            if (!expl) try self.write(": ");
+            if (!expl) try self.writeValueIndicator(": ");
             _ = try self.emitContent(value, entry_col + self.indent_step);
             if (pair_end) |pe| return self.writeEntryTail(value, pe);
             return gap_start;
         }
         // Brand-new value: layout by its shape.
+        if (pair_end) |pe| self.placeBlock(value, pe) else self.placeNewBlock(value, gap_start);
+        defer self.endBlockPlacement();
         if (expl) {
             // `? key` gaining a value it did not have: the value
             // indicator goes on its own line at the indicator column.
@@ -819,10 +934,10 @@ pub const Emitter = struct {
             try self.write(": ");
             _ = try self.emitContent(value, icol + self.indent_step);
         } else if (internal.inlineValue(value)) {
-            try self.write(": ");
+            try self.writeValueIndicator(": ");
             _ = try self.emitContent(value, entry_col + self.indent_step);
         } else {
-            try self.writeByte(':');
+            try self.writeValueIndicator(":");
             try self.writeNewlineIndent(entry_col + self.indent_step);
             _ = try self.emitContent(value, entry_col + self.indent_step);
         }
@@ -872,6 +987,8 @@ pub const Emitter = struct {
                 owed_terminator = true;
             }
             try self.write("- ");
+            self.placeNewBlock(item, gap);
+            defer self.endBlockPlacement();
             _ = try self.emitContent(item, entry_col + 2);
             if (item.pending_trailing) |tt| {
                 if (tt.len > 0) {
@@ -880,14 +997,35 @@ pub const Emitter = struct {
                 }
             }
             if (owed_terminator and !self.endsWithNewline()) try self.write(self.defaultTerminator());
+            // An item with no content left only its `- ` on the line,
+            // which the next item takes for its own framing (`- - x`, a
+            // nested sequence): the line ends here.
+            if (!self.endsWithNewline() and isEntryFraming(self.pendingLine())) {
+                while (self.out.items.len > 0 and self.out.items[self.out.items.len - 1] == ' ') self.out.items.len -= 1;
+                try self.write(self.defaultTerminator());
+            }
+            if (self.endsWithNewline()) {
+                // The framing this item took from the gap was the next
+                // original item's indentation, and that item's own gap
+                // starts past it: a block ending the line here left it at
+                // column 0 (`- |` inserted first, then `- x`). Put it back.
+                if (nextOriginalItem(container, item)) |next| {
+                    const ns = next.src.?;
+                    if (markup.lineStart(src, ns.entry_start) < gap and gap <= ns.entry_start) {
+                        try self.writeIndent(markup.columnOf(src, ns.entry_start));
+                    }
+                }
+                // A keep-chomped block takes the blank lines after it into
+                // its value; the next entry's gap must not write them again.
+                return self.pastKeptBlanksIn(container, item, gap);
+            }
             return gap;
         };
         if (self.emitted.contains(item)) {
             if (item.anchor) |a| {
                 try self.writeGap(container, gap_start, s.entry_start);
                 try self.breakBeforeEntry(entry_col);
-                try self.writeByte('*');
-                try self.write(a);
+                try self.writeAlias(a);
                 return markup.lineEnd(src, s.end);
             }
             return error.AliasCycle;
@@ -920,6 +1058,8 @@ pub const Emitter = struct {
             if (!framingOwnedByContent(item)) {
                 try self.write(src[s.entry_start..s.start]);
             }
+            self.placeBlock(item, s.end);
+            defer self.endBlockPlacement();
             const stop = try self.emitContent(item, markup.columnOf(src, s.start));
             // A container walk that re-emitted its last entry already
             // consumed the line terminator; writing the remainder on top
@@ -942,6 +1082,39 @@ pub const Emitter = struct {
     /// blank lines there, which were the old block's kept breaks, then
     /// doubled them on every edit (`keep\n\n` read back `keep\n\n\n`).
     /// So those are skipped.
+    /// The first item after `item` in `container` that has source bytes.
+    fn nextOriginalItem(container: *const Node, item: *const Node) ?*const Node {
+        const items = switch (container.data) {
+            .sequence => |sq| sq.items.items,
+            else => return null,
+        };
+        var after = false;
+        for (items) |it| {
+            if (after) if (it.src) |is| if (!is.synthetic) return it;
+            if (it == item) after = true;
+        }
+        return null;
+    }
+
+    /// `pastKeptBlanks` from a brand-new entry's gap in `container`,
+    /// where the blank lines can sit behind a replaced entry's tombstone.
+    fn pastKeptBlanksIn(self: *const Emitter, container: *const Node, node: *const Node, from: usize) usize {
+        if (node.data != .scalar or !self.kept_breaks) return from;
+        var i = from;
+        outer: while (i < self.src.len) {
+            for (Document.droppedOf(container)) |d| {
+                if (i >= d[0] and i < d[1]) {
+                    i = d[1];
+                    continue :outer;
+                }
+            }
+            const next = markup.lineEnd(self.src, i);
+            if (next == i or !ctype.isBlankRun(self.src[i..next])) break;
+            i = next;
+        }
+        return i;
+    }
+
     fn pastKeptBlanks(self: *const Emitter, node: *const Node, le: usize) usize {
         if (node.data != .scalar or !self.kept_breaks) return le;
         var i = le;
@@ -985,8 +1158,7 @@ pub const Emitter = struct {
                 return if (node.src) |sn| sn.end else 0;
             },
             .alias => |a| {
-                try self.writeByte('*');
-                try self.write(a.name);
+                try self.writeAlias(a.name);
                 return if (node.src) |sn| sn.end else 0;
             },
             .mapping => |*m| {
@@ -1302,23 +1474,22 @@ pub const Emitter = struct {
         }
     }
 
-    /// The first byte at/after `from` that a tombstone does not cover,
-    /// up to `to`; 0 when the whole range is deleted or empty. Used to
-    /// decide whether the verbatim tail opens with a comment.
-    fn firstLiveTailByte(self: *const Emitter, container: *const Node, from: usize, to: usize) u8 {
-        const src = self.src;
+    /// The offset of the first byte at/after `from` that a tombstone does
+    /// not cover, up to `to`; null when the whole range is deleted or
+    /// empty. Used to decide how the verbatim tail opens.
+    fn firstLiveTail(container: *const Node, from: usize, to: usize) ?usize {
         var i: usize = from;
         outer: while (i < to) {
             for (Document.droppedOf(container)) |d| {
                 if (d[0] < to and d[1] > i) {
-                    if (d[0] > i) return if (d[0] <= to) src[i] else 0;
+                    if (d[0] > i) return i;
                     i = @max(i, d[1]);
                     continue :outer;
                 }
             }
-            return src[i];
+            return i;
         }
-        return 0;
+        return null;
     }
 
     /// True when `offset` falls inside one of `container`'s tombstoned
@@ -1446,11 +1617,14 @@ pub const Emitter = struct {
     }
 
     /// The lines of a written leading block at `col`, each terminated.
+    /// A line's own leading blanks are replaced by the column: kept, they
+    /// put `  # x` under a block scalar above deep enough to be its
+    /// content.
     fn writeLeadingLines(self: *Emitter, text: []const u8, col: usize, term: []const u8) Error!void {
         var it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |line| {
             try self.writeIndent(col);
-            try self.write(line);
+            try self.write(std.mem.trimStart(u8, line, " \t"));
             try self.write(term);
         }
     }
@@ -1474,8 +1648,7 @@ pub const Emitter = struct {
         // Alias emission: an anchored node that was already written is
         // referenced as *anchor instead of duplicating its content.
         if (self.seen.get(node)) |anchor| {
-            try self.writeByte('*');
-            try self.write(anchor);
+            try self.writeAlias(anchor);
             return;
         }
 
@@ -1513,10 +1686,7 @@ pub const Emitter = struct {
                     try self.emitNode(item, indent + 2);
                 }
             },
-            .alias => |a| {
-                try self.writeByte('*');
-                try self.write(a.name);
-            },
+            .alias => |a| try self.writeAlias(a.name),
         }
     }
 
@@ -1529,8 +1699,10 @@ pub const Emitter = struct {
                 // keys (through `emitFlowNode`) kept theirs, so an alias
                 // to an anchored scalar key emitted `*k` with no `&k`.
                 if (key.anchor) |a| try self.seen.put(key, a);
+                const key_start = self.out.items.len;
                 _ = try self.emitKeyContent(key, indent, false);
-                try self.writeByte(':');
+                if (try self.explicitIfLong(key_start)) try self.newlineAt(indent);
+                try self.writeValueIndicator(":");
             },
             else => {
                 // Explicit key (spec 7.4.2). The key itself is written in
@@ -1752,8 +1924,7 @@ pub const Emitter = struct {
     /// Emit a node in flow style, registering it for alias tracking.
     fn emitFlowNode(self: *Emitter, node: *Node) Error!void {
         if (self.seen.get(node)) |anchor| {
-            try self.writeByte('*');
-            try self.write(anchor);
+            try self.writeAlias(anchor);
             return;
         }
         if (node.anchor) |a| try self.seen.put(node, a);
@@ -1764,8 +1935,7 @@ pub const Emitter = struct {
         try self.enter();
         defer self.leave();
         if (node.anchor) |a| {
-            try self.writeByte('&');
-            try self.write(a);
+            try self.writeAnchor(a);
             try self.writeByte(' ');
         }
         if (node.tag) |t| {
@@ -1774,14 +1944,12 @@ pub const Emitter = struct {
         }
         switch (node.data) {
             .scalar => |s| try self.emitScalarValue(s.value, s.style, 0, false, true),
-            .alias => |a| {
-                try self.writeByte('*');
-                try self.write(a.name);
-            },
+            .alias => |a| try self.writeAlias(a.name),
             .mapping => |*m| {
                 try self.writeByte('{');
                 for (m.pairs.items, 0..) |pair, i| {
                     if (i > 0) try self.write(", ");
+                    const key_start = self.out.items.len;
                     switch (pair.key.data) {
                         .scalar => |s| {
                             // Same rule as the block path: a scalar key's
@@ -1792,7 +1960,8 @@ pub const Emitter = struct {
                         },
                         else => try self.emitFlowNode(pair.key),
                     }
-                    try self.write(": ");
+                    _ = try self.explicitIfLong(key_start);
+                    try self.writeValueIndicator(": ");
                     try self.emitFlowNode(pair.value);
                 }
                 try self.writeByte('}');
@@ -1833,8 +2002,7 @@ pub const Emitter = struct {
     fn writeProperties(self: *Emitter, node: *Node) Error!bool {
         var written = false;
         if (node.anchor) |a| {
-            try self.writeByte('&');
-            try self.write(a);
+            try self.writeAnchor(a);
             written = true;
         }
         if (node.tag) |t| {
@@ -1845,24 +2013,74 @@ pub const Emitter = struct {
         return written;
     }
 
+    /// Write a resolved tag so that it reads back as the same tag. A tag
+    /// with a handle for its prefix -- one of the document's `%TAG`
+    /// directives, else `!!` for the core schema and `!` for a local tag,
+    /// unless the document redefined them -- is written as the handle and
+    /// a suffix. The reader decodes `%XX` in a suffix, so any byte outside
+    /// the tag alphabet (spec 6.8.2 `ns-tag-char`; `!` and the flow
+    /// indicators would end the tag, a blank anywhere) is written as an
+    /// escape and comes back as itself: writing the decoded bytes raw let
+    /// `!!str%0Aadmin:%20true` inject a key. Any other tag is written
+    /// verbatim, `!<tag>`, which is read raw up to the `>`: one holding a
+    /// blank, a `>`, or text that is not printable UTF-8 has no spelling
+    /// and is refused.
     fn writeTag(self: *Emitter, tag: []const u8) Error!void {
-        if (std.mem.startsWith(u8, tag, yaml_tag_prefix)) {
-            try self.write("!!");
-            try self.write(tag[yaml_tag_prefix.len..]);
-        } else if (tag.len > 0 and tag[0] == '!') {
-            try self.write(tag);
-        } else {
-            try self.write("!<");
-            try self.write(tag);
-            try self.writeByte('>');
+        if (std.mem.eql(u8, tag, "!")) return self.write(tag);
+        for (self.directives) |td| {
+            if (tag.len > td.prefix.len and std.mem.startsWith(u8, tag, td.prefix)) {
+                try self.write(td.handle);
+                return self.writeTagSuffix(tag[td.prefix.len..]);
+            }
         }
+        if (!self.redefined("!!") and tag.len > yaml_tag_prefix.len and std.mem.startsWith(u8, tag, yaml_tag_prefix)) {
+            try self.write("!!");
+            return self.writeTagSuffix(tag[yaml_tag_prefix.len..]);
+        }
+        if (!self.redefined("!") and tag.len > 1 and tag[0] == '!') {
+            try self.writeByte('!');
+            return self.writeTagSuffix(tag[1..]);
+        }
+        if (tag.len == 0 or !utf8.valid(tag)) return error.InvalidSyntax;
+        var i: usize = 0;
+        while (utf8.decode(tag, i) catch unreachable) |d| : (i += d.len) {
+            if (d.cp == ' ' or d.cp == '>' or !utf8.isPrintableCodepoint(d.cp) or ctype.isBreak(tag[i])) return error.InvalidSyntax;
+        }
+        try self.write("!<");
+        try self.write(tag);
+        try self.writeByte('>');
     }
 
+    /// Does the document being written give `handle` a prefix of its own?
+    fn redefined(self: *const Emitter, handle: []const u8) bool {
+        for (self.directives) |td| {
+            if (std.mem.eql(u8, td.handle, handle)) return true;
+        }
+        return false;
+    }
+
+    /// A shorthand tag's suffix: tag characters as they are, every other
+    /// byte (a literal `%` included) as a `%XX` escape. `#` is a tag
+    /// character to the spec, but the scanner (like libfyaml's) ends a
+    /// tag there, so it is escaped too.
+    fn writeTagSuffix(self: *Emitter, suffix: []const u8) Error!void {
+        for (suffix) |c| {
+            if (std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "-;/?:@&=+$_.~*'()", c) != null) {
+                try self.writeByte(c);
+            } else {
+                var buf: [3]u8 = undefined;
+                try self.write(std.fmt.bufPrint(&buf, "%{X:0>2}", .{c}) catch unreachable);
+            }
+        }
+    }
     // ------------------------------------------------------------------
     // Scalars
     // ------------------------------------------------------------------
 
     fn emitScalarValue(self: *Emitter, value: []const u8, prefer: ScalarStyle, indent: usize, block_ok: bool, flow: bool) Error!void {
+        // A YAML stream is UTF-8, and no style can spell a byte sequence
+        // that is not: written raw it is output that does not parse.
+        if (!utf8.valid(value)) return error.InvalidUtf8;
         const style = chooseScalarStyle(value, prefer, indent, block_ok, flow);
         self.kept_breaks = (style == .literal or style == .folded) and stripTrailingNewlines(value).trailing > 1;
         switch (style) {
@@ -1883,7 +2101,15 @@ pub const Emitter = struct {
     }
 
     fn writeDoubleQuoted(self: *Emitter, value: []const u8) Error!void {
+        if (hasUnprintable(value)) return self.writeDoubleQuotedEscapingUnprintable(value);
         try self.writeByte('"');
+        try self.writeQuotedBody(value);
+        try self.writeByte('"');
+    }
+
+    /// The inside of a double-quoted scalar: ASCII escapes, other bytes
+    /// as they are.
+    fn writeQuotedBody(self: *Emitter, value: []const u8) Error!void {
         for (value) |c| {
             switch (c) {
                 '"' => try self.write("\\\""),
@@ -1908,6 +2134,23 @@ pub const Emitter = struct {
                 },
             }
         }
+    }
+
+    /// `writeDoubleQuoted` for text with a non-ASCII character that is not
+    /// printable (a C1 control, U+FFFE, U+FFFF): those go out as `\u`
+    /// escapes, everything else as `writeDoubleQuoted` writes it.
+    fn writeDoubleQuotedEscapingUnprintable(self: *Emitter, value: []const u8) Error!void {
+        var i: usize = 0;
+        var run: usize = 0;
+        try self.writeByte('"');
+        while (utf8.decode(value, i) catch null) |d| : (i += d.len) {
+            if (d.len == 1 or utf8.isPrintableCodepoint(d.cp)) continue;
+            try self.writeQuotedBody(value[run..i]);
+            var buf: [8]u8 = undefined;
+            try self.write(std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{d.cp}) catch unreachable);
+            run = i + d.len;
+        }
+        try self.writeQuotedBody(value[run..]);
         try self.writeByte('"');
     }
 
@@ -1924,7 +2167,8 @@ pub const Emitter = struct {
     }
 
     /// Block scalar header: `|` or `>` plus the chomping indicator
-    /// (`-` strip, `+` keep) computed from the trailing-newline count.
+    /// (`-` strip, `+` keep) computed from the trailing-newline count, and
+    /// the comment `placeBlock` moved there, if any.
     fn writeBlockHeader(self: *Emitter, indicator: u8, trailing: usize) Error!void {
         try self.writeByte(indicator);
         if (trailing == 0) {
@@ -1932,10 +2176,67 @@ pub const Emitter = struct {
         } else if (trailing > 1) {
             try self.writeByte('+');
         }
+        if (self.header_comment) |c| {
+            try self.writeByte(' ');
+            try self.write(c);
+            self.header_comment = null;
+        }
         try self.writeByte('\n');
     }
 
-    fn writeLiteral(self: *Emitter, value: []const u8, indent: usize) Error!void {
+    /// A block scalar takes every following line indented at least as far
+    /// as its content, whatever is on it. Written by the faithful emitter
+    /// in place of bytes that ended at `old_end`, it therefore sets its
+    /// content deeper than the comment lines that follow before the next
+    /// content line (`a: |-\n  x\n  # c` read the comment as `x\n# c`),
+    /// and it ends its own last line, so the rest of the old value's line
+    /// cannot join it: a comment there goes on the header line instead
+    /// (`a: |- # c`). Only a scalar can become a block at the top; the
+    /// caller clears this with `endBlockPlacement`.
+    fn placeBlock(self: *Emitter, node: *const Node, old_end: usize) void {
+        if (node.data != .scalar) return;
+        const src = self.src;
+        const nl = markup.newlineAt(src, old_end);
+        const rest = std.mem.trim(u8, src[@min(old_end, nl)..nl], " \t");
+        if (rest.len > 0 and rest[0] == '#') self.header_comment = rest;
+        self.block_floor = self.commentFloor(markup.lineEnd(src, old_end));
+    }
+
+    /// `placeBlock` for a brand-new entry, whose next source line (the
+    /// next original entry's gap) starts at `gap`, or after it when `gap`
+    /// is mid-line.
+    fn placeNewBlock(self: *Emitter, node: *const Node, gap: usize) void {
+        if (node.data != .scalar) return;
+        const src = self.src;
+        const from = if (markup.lineStart(src, gap) == gap) gap else markup.lineEnd(src, gap);
+        self.block_floor = self.commentFloor(from);
+    }
+
+    /// One past the deepest comment line from `start` (a line start) up to
+    /// the next content line, or 0 when there is none.
+    fn commentFloor(self: *const Emitter, start: usize) usize {
+        const src = self.src;
+        var i = start;
+        var floor: usize = 0;
+        while (i < src.len) {
+            const next = markup.lineEnd(src, i);
+            const line = src[i..markup.newlineAt(src, i)];
+            const body = std.mem.trimStart(u8, line, " \t");
+            if (body.len > 0 and body[0] != '#') break;
+            if (body.len > 0) floor = @max(floor, line.len - body.len + 1);
+            if (next == i) break;
+            i = next;
+        }
+        return floor;
+    }
+
+    fn endBlockPlacement(self: *Emitter) void {
+        self.block_floor = 0;
+        self.header_comment = null;
+    }
+
+    fn writeLiteral(self: *Emitter, value: []const u8, requested: usize) Error!void {
+        const indent = @max(requested, self.block_floor);
         const s = stripTrailingNewlines(value);
         try self.writeBlockHeader('|', s.trailing);
 
@@ -1947,7 +2248,8 @@ pub const Emitter = struct {
             try self.writeIndent(indent);
             try self.write(line);
         }
-        for (0..s.trailing) |_| try self.writeByte('\n');
+        // A strip-chomped block still ends its line: see `placeBlock`.
+        for (0..@max(s.trailing, 1)) |_| try self.writeByte('\n');
     }
 
     /// `indent` is the column a block scalar's content lines would be
@@ -2002,6 +2304,24 @@ pub const Emitter = struct {
         for (value) |c| {
             if (c != '\t' and c != '\n' and c < 0x80 and !ctype.isPrintableAscii(c)) return true;
         }
+        return hasUnprintable(value);
+    }
+
+    /// True when `value` (valid UTF-8) holds a non-ASCII character outside
+    /// YAML's printable set (spec 5.1 `c-printable`): a C1 control other
+    /// than NEL, or U+FFFE / U+FFFF. A stream may not carry them raw, so
+    /// only a double-quoted `\u` escape can write them.
+    fn hasUnprintable(value: []const u8) bool {
+        var i: usize = 0;
+        while (i < value.len) {
+            if (value[i] < 0x80) {
+                i += 1;
+                continue;
+            }
+            const d = (utf8.decode(value, i) catch return false) orelse return false;
+            if (!utf8.isPrintableCodepoint(d.cp)) return true;
+            i += d.len;
+        }
         return false;
     }
 
@@ -2024,7 +2344,13 @@ pub const Emitter = struct {
     /// which is all `plainSafe` inspects. A sequence item whose text is
     /// `x, y` emitted bare re-parses as TWO items; one containing `]`
     /// closes the sequence early and leaves a syntax error behind.
+    ///
+    /// A leading `:` is valid plain YAML there (`[:a]`), but libfyaml
+    /// reads it after an anchor or tag as a value indicator (`[&r :a]`
+    /// becomes the mapping `{&r null: a}`), so it is quoted: a reader
+    /// with that quirk is common enough that plain buys nothing here.
     fn flowPlainSafe(value: []const u8) bool {
+        if (value.len > 0 and value[0] == ':') return false;
         return std.mem.indexOfAny(u8, value, ",[]{}") == null;
     }
 
@@ -2050,7 +2376,7 @@ pub const Emitter = struct {
     fn literalSafe(value: []const u8, indent: usize) bool {
         const s = stripTrailingNewlines(value);
         if (s.core.len == 0) return false;
-        if (indent == 0 and hasMarkerLine(s.core)) return false;
+        if (indent == 0 and (hasMarkerLine(s.core) or hasBomLine(s.core))) return false;
         var it = std.mem.splitScalar(u8, s.core, '\n');
         var first_content = true;
         while (it.next()) |line| {
@@ -2068,7 +2394,7 @@ pub const Emitter = struct {
     /// no document marker line (`hasMarkerLine`).
     fn foldedSafe(value: []const u8, indent: usize) bool {
         if (value.len == 0) return false;
-        if (indent == 0 and hasMarkerLine(value)) return false;
+        if (indent == 0 and (hasMarkerLine(value) or hasBomLine(value))) return false;
         switch (value[0]) {
             '\n', ' ', '\t' => return false,
             else => {},
@@ -2089,7 +2415,8 @@ pub const Emitter = struct {
     /// line (k consecutive breaks fold to k-1 newlines). Each value
     /// newline between content lines emits `breaks = newlines + 1`.
     /// Chomping mirrors `writeLiteral`.
-    fn writeFolded(self: *Emitter, value: []const u8, indent: usize) Error!void {
+    fn writeFolded(self: *Emitter, value: []const u8, requested: usize) Error!void {
+        const indent = @max(requested, self.block_floor);
         const s = stripTrailingNewlines(value);
         try self.writeBlockHeader('>', s.trailing);
 
@@ -2112,11 +2439,26 @@ pub const Emitter = struct {
             try self.writeIndent(indent);
             try self.write(line);
         }
-        for (0..s.trailing) |_| try self.writeByte('\n');
+        for (0..@max(s.trailing, 1)) |_| try self.writeByte('\n');
     }
+
+    /// A byte order mark opening a line (at column 0, where a root block
+    /// scalar's lines are written) or a whole plain scalar can land at the
+    /// start of a stream or document, where the reader takes it for an
+    /// encoding mark and drops it (spec 5.2): `\u{FEFF}a` read back `a`.
+    fn hasBomLine(value: []const u8) bool {
+        var it = std.mem.splitScalar(u8, value, '\n');
+        while (it.next()) |line| {
+            if (std.mem.startsWith(u8, line, bom)) return true;
+        }
+        return false;
+    }
+
+    const bom = "\u{FEFF}";
 
     fn plainSafe(value: []const u8) bool {
         if (value.len == 0) return false;
+        if (std.mem.startsWith(u8, value, bom)) return false;
         const first = value[0];
         const last = value[value.len - 1];
         if (first == ' ' or last == ' ') return false;
@@ -3057,4 +3399,254 @@ test "indent inference is depth-bounded, so a deep graft cannot overflow the sta
 
     // A typed error, not a stack overflow in the pre-walk measurement.
     try std.testing.expectError(error.NestingTooDeep, doc.write(allocator));
+}
+
+test "an alias key is kept apart from its value indicator" {
+    const allocator = testing.allocator;
+
+    // `:` may be part of an anchor name, so `*r: v` reads as an alias
+    // named `r:`. A flow mapping whose key is the second use of an
+    // anchored node wrote exactly that, which did not parse.
+    {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        const target = try doc.createSequence();
+        target.data.sequence.style = .flow;
+        try doc.sequenceAppend(target, try doc.createScalar("a", .plain));
+        try doc.setAnchor(target, "r");
+        const map = try doc.createMapping();
+        map.data.mapping.style = .flow;
+        try doc.mappingAppend(map, target, try doc.createScalar("v", .plain));
+        doc.root = try doc.createSequence();
+        doc.root.?.data.sequence.style = .flow;
+        try doc.sequenceAppend(doc.root.?, target);
+        try doc.sequenceAppend(doc.root.?, map);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings("[&r [a], {*r : v}]\n", out);
+        var back = try Document.parse(allocator, out);
+        defer back.deinit();
+    }
+    // A parsed alias key: a pair appended beside it, and a new value set
+    // on it, each re-emit the key and write an indicator after it.
+    const cases = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "a: &r x\nb: {*r : v}\n", .out = "a: &r x\nb: {*r : v, c: d}\n" },
+        .{ .in = "a: &r x\n*r : v\n", .out = "a: &r x\n*r : n\n" },
+    };
+    for (cases, 0..) |c, i| {
+        var doc = try Document.parse(allocator, c.in);
+        defer doc.deinit();
+        if (i == 0) {
+            try doc.mappingAppend(doc.pathGet(&.{"b"}).?, try doc.createScalar("c", .plain), try doc.createScalar("d", .plain));
+        } else {
+            try doc.pathSet(&.{"x"}, try doc.createScalar("n", .plain));
+        }
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+        var back = try Document.parse(allocator, out);
+        defer back.deinit();
+    }
+}
+
+test "a key too long to be implicit is written as an explicit key" {
+    const allocator = testing.allocator;
+
+    // An implicit key spans at most 1024 characters (spec 7.4.2, 8.2.2)
+    // and the scanner refuses a longer one, so a longer key written bare
+    // was output that does not parse. Counted in characters: 1024
+    // two-byte characters are still an implicit key.
+    const long = "k" ** 1100;
+    const wide = "\u{00E9}" ** 1000;
+    for ([_][]const u8{ long, wide }) |text| {
+        for ([_]bool{ false, true }) |flow| {
+            var doc = Document.init(allocator);
+            defer doc.deinit();
+            doc.root = try doc.createMapping();
+            if (flow) doc.root.?.data.mapping.style = .flow;
+            try doc.mappingAppend(doc.root.?, try doc.createScalar(text, .any), try doc.createScalar("v", .plain));
+            const out = try doc.write(allocator);
+            defer allocator.free(out);
+            try testing.expectEqual(text.len == long.len, std.mem.indexOf(u8, out, "? ") != null);
+            var back = try Document.parse(allocator, out);
+            defer back.deinit();
+            try testing.expectEqualStrings("v", back.pathGet(&.{text}).?.scalarValue().?);
+        }
+    }
+
+    // A parsed key given a long value keeps the source's indicator and
+    // value, now under `? `.
+    for ([_][]const u8{ "a: 1\nb: 2\n", "- a: 1\n  b: 2\n", "a:\n  - 1\nb: 2\n" }) |in| {
+        var doc = try Document.parse(allocator, in);
+        defer doc.deinit();
+        const map = if (doc.root.?.items()) |its| its[0] else doc.root.?;
+        const key = map.pairs().?[0].key;
+        key.data.scalar.value = long;
+        try doc.markModified(key);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        var back = try Document.parse(allocator, out);
+        defer back.deinit();
+        const back_map = if (back.root.?.items()) |its| its[0] else back.root.?;
+        try testing.expectEqualStrings(long, back_map.pairs().?[0].key.scalarValue().?);
+        try testing.expectEqualStrings("2", back_map.pairs().?[1].value.scalarValue().?);
+    }
+}
+
+test "text YAML cannot carry raw is escaped, and text it cannot carry at all is refused" {
+    const allocator = testing.allocator;
+
+    // A leading byte order mark is taken for an encoding mark and dropped
+    // (`\u{FEFF}a` read back `a`); C1 controls and U+FFFE are not
+    // printable (spec 5.1) and may not appear raw.
+    for ([_][]const u8{ "\u{FEFF}a", "\u{FEFF}", "a\u{0085}b\u{0090}c", "\u{FFFE}", "x\n\u{FEFF}y\n" }) |text| {
+        for ([_]bool{ false, true }) |as_key| {
+            var doc = Document.init(allocator);
+            defer doc.deinit();
+            const node = try doc.createScalar(text, .any);
+            if (as_key) {
+                doc.root = try doc.createMapping();
+                try doc.mappingAppend(doc.root.?, node, try doc.createScalar("v", .plain));
+            } else doc.root = node;
+            const out = try doc.write(allocator);
+            defer allocator.free(out);
+            try testing.expect(std.mem.indexOf(u8, out, "\u{0090}") == null);
+            try testing.expect(std.mem.indexOf(u8, out, "\u{FFFE}") == null);
+            var back = try Document.parse(allocator, out);
+            defer back.deinit();
+            const got = if (as_key) back.root.?.pairs().?[0].key else back.root.?;
+            try testing.expectEqualStrings(text, got.scalarValue().?);
+        }
+    }
+
+    // Bytes that are not UTF-8 have no spelling in any style.
+    for ([_][]const u8{ "\xff", "a\xc3", "\xed\xa0\x80", "\xc0\x80" }) |text| {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        doc.root = try doc.createMapping();
+        try doc.mappingAppend(doc.root.?, try doc.createScalar("k", .plain), try doc.createScalar(text, .any));
+        try testing.expectError(error.InvalidUtf8, doc.write(allocator));
+    }
+}
+
+test "anchors and tags are written so they read back, or refused" {
+    const allocator = testing.allocator;
+
+    // A tag is set on the node directly, so the emitter is the only place
+    // that can keep it readable. Core and local tags are shorthand, with
+    // `%XX` for anything outside the tag alphabet (which the reader
+    // decodes); others are verbatim.
+    const tags = [_][]const u8{ "!local", "!with space", "!a!b", "!x#y", "!50%", "!a,b", "tag:yaml.org,2002:str", "tag:example.com,2000:app/t", "tag:e.com:\u{00E9}" };
+    for (tags) |tag| {
+        for ([_]bool{ false, true }) |flow| {
+            var doc = Document.init(allocator);
+            defer doc.deinit();
+            doc.root = try doc.createSequence();
+            if (flow) doc.root.?.data.sequence.style = .flow;
+            const item = try doc.createScalar("v", .plain);
+            item.tag = tag;
+            try doc.sequenceAppend(doc.root.?, item);
+            try doc.sequenceAppend(doc.root.?, try doc.createScalar("w", .plain));
+            const out = try doc.write(allocator);
+            defer allocator.free(out);
+            var back = try Document.parse(allocator, out);
+            defer back.deinit();
+            errdefer std.debug.print("tag {s} written as {s}\n", .{ tag, out });
+            try testing.expectEqualStrings(tag, back.root.?.items().?[0].tag.?);
+            try testing.expectEqual(@as(usize, 2), back.root.?.items().?.len);
+        }
+    }
+    for ([_][]const u8{ "tag:a b", "tag:a>b", "", "tag:\x01" }) |tag| {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        doc.root = try doc.createScalar("v", .plain);
+        doc.root.?.tag = tag;
+        try testing.expectError(error.InvalidSyntax, doc.write(allocator));
+    }
+
+    // Anchor names: `setAnchor` refuses what YAML cannot spell, and a name
+    // set directly on the node is refused when written.
+    var doc = Document.init(allocator);
+    defer doc.deinit();
+    doc.root = try doc.createScalar("v", .plain);
+    for ([_][]const u8{ "", "a b", "a,b", "a\x01", "\xff", "\u{FEFF}a", "a\u{0090}" }) |name| {
+        try testing.expectError(error.InvalidSyntax, doc.setAnchor(doc.root.?, name));
+        doc.root.?.anchor = name;
+        try testing.expectError(error.InvalidSyntax, doc.write(allocator));
+    }
+    try doc.setAnchor(doc.root.?, "a:b\u{00E9}");
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("&a:b\u{00E9} v\n", out);
+}
+
+test "output avoids forms libfyaml misreads" {
+    const allocator = testing.allocator;
+
+    // Both are valid YAML that yayl reads correctly, but libfyaml fails
+    // a root block scalar with properties unless it follows `---` on the
+    // marker line, and reads a plain `:a` after properties in a flow
+    // collection as a value indicator.
+    {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        doc.root = try doc.createScalar("a\nb", .literal);
+        try doc.setAnchor(doc.root.?, "r");
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings("--- &r |-\na\nb\n", out);
+    }
+    {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        doc.root = try doc.createSequence();
+        doc.root.?.data.sequence.style = .flow;
+        const item = try doc.createScalar(":a", .plain);
+        try doc.setAnchor(item, "r");
+        try doc.sequenceAppend(doc.root.?, item);
+        try doc.sequenceAppend(doc.root.?, try doc.createScalar("z", .plain));
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings("[&r ':a', z]\n", out);
+    }
+}
+
+test "a tag is written with the document's own handles, and escaped" {
+    const allocator = testing.allocator;
+
+    // The reader decodes `%XX` in a tag suffix, and the emitter wrote the
+    // decoded bytes back raw: a merged, moved or re-emitted node tagged
+    // `!!str%0Aadmin:%20true` wrote a line break and a new key into the
+    // document.
+    const input = "base: &b\n  role: !!str%0Aadmin:%20true user\napp:\n  <<: *b\n  name: x\n";
+    var doc = try Document.parseOpts(allocator, input, null, .{ .resolve_merge_keys = true });
+    defer doc.deinit();
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    var back = try Document.parse(allocator, out);
+    defer back.deinit();
+    try testing.expect(back.pathGet(&.{"admin"}) == null);
+    try testing.expectEqualStrings("tag:yaml.org,2002:str\nadmin: true", back.pathGet(&.{ "app", "role" }).?.tag.?);
+
+    // A `%TAG` handle is used for its prefix, and a redefined `!` or `!!`
+    // is not taken for the default one.
+    const directed =
+        \\%TAG !e! tag:example.com,2000:
+        \\%TAG ! tag:local.example,2000:
+        \\---
+        \\a: !e!x%20y 1
+        \\b: !<!raw> 2
+        \\c: !!str 3
+        \\
+    ;
+    var d2 = try Document.parse(allocator, directed);
+    defer d2.deinit();
+    for (d2.root.?.pairs().?) |p| try d2.markModified(p.value);
+    const out2 = try d2.write(allocator);
+    defer allocator.free(out2);
+    var back2 = try Document.parse(allocator, out2);
+    defer back2.deinit();
+    try testing.expectEqualStrings("tag:example.com,2000:x y", back2.pathGet(&.{"a"}).?.tag.?);
+    try testing.expectEqualStrings("!raw", back2.pathGet(&.{"b"}).?.tag.?);
+    try testing.expectEqualStrings("tag:yaml.org,2002:str", back2.pathGet(&.{"c"}).?.tag.?);
 }

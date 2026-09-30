@@ -582,13 +582,41 @@ pub fn coreTagFromUri(uri: []const u8) ?CoreTag {
 /// that type (`!!int abc`, `!!int 0b101`): the document contradicts
 /// itself, and `value` and `schema` both report it.
 ///
+/// The non-specific tag `!` (`! 12`) makes a scalar a string, as it makes
+/// a collection a sequence or mapping: it resolves by kind, never by
+/// content (spec 10.2.2, kept by the core schema). A core tag naming a
+/// collection (`!!seq 42`) is a contradiction, like `!!int abc`.
+///
 /// `node` must already be alias-resolved and must be a scalar.
 pub fn scalarCoreTag(node: *const Node) ?CoreTag {
     const s = node.data.scalar;
-    if (node.tag) |uri| if (coreTagFromUri(uri)) |t| {
-        return if (coreTextFits(t, s.value)) t else null;
-    };
+    if (node.tag) |uri| {
+        if (std.mem.eql(u8, uri, "!")) return .str;
+        if (coreTagFromUri(uri)) |t| return if (coreTextFits(t, s.value)) t else null;
+        if (tagContradictsKind(node)) return null;
+    }
     return resolveCoreTag(s.value, s.style);
+}
+
+/// True when `node` carries a core-schema tag for a different kind of
+/// node: `!!seq` or `!!map` on a scalar, a scalar type (`!!int`, `!!str`,
+/// ...) on a collection, `!!seq` on a mapping. `value` and `schema`
+/// report it as they report `!!int abc`; application tags are not
+/// checked. `node` must already be alias-resolved.
+pub fn tagContradictsKind(node: *const Node) bool {
+    const uri = node.tag orelse return false;
+    const prefix = "tag:yaml.org,2002:";
+    if (!std.mem.startsWith(u8, uri, prefix)) return false;
+    const name = uri[prefix.len..];
+    const names: NodeKind = if (coreTagFromUri(uri) != null)
+        .scalar
+    else if (std.mem.eql(u8, name, "seq"))
+        .sequence
+    else if (std.mem.eql(u8, name, "map"))
+        .mapping
+    else
+        return false;
+    return names != node.kind();
 }
 
 /// Whether `text` is spelled as the core schema (spec 10.3.2) spells a
@@ -635,13 +663,55 @@ pub fn parseCoreInt(text: []const u8) ?i64 {
     return std.fmt.parseInt(i64, text, 0) catch null;
 }
 
-/// Parse the text of a scalar already classified as a core-schema float,
-/// resolving the `.inf`/`.nan` spellings. Null when the text is not a
-/// float. One home for the rule `value` and `schema` both apply.
+/// Parse the text of a scalar already classified as a core-schema float
+/// or int, resolving the `.inf`/`.nan` spellings and the integer forms.
+/// The result is the nearest `f64`, and an integer beyond `f64` is an
+/// infinity, as a decimal one is. Null when the text is neither. One home
+/// for the rule `value` and `schema` both apply.
 pub fn parseCoreFloat(text: []const u8) ?f64 {
+    // `std.fmt.parseFloat` does not know `0o`, and truncates a long hex
+    // mantissa instead of rounding it (`0x1FFFFFFFFFFFFFFFFFFF` came out
+    // one unit in the last place low), so the radix forms convert here.
+    if (text.len > 2 and text[0] == '0' and looksLikeInt(text)) switch (text[1]) {
+        'o' => return radixToFloat(text[2..], 3),
+        'x' => return radixToFloat(text[2..], 4),
+        else => {},
+    };
     return std.fmt.parseFloat(f64, text) catch floatSpecial(text);
 }
 
+/// Octal (3 bits a digit) or hex (4) digits as the nearest `f64`, ties to
+/// even. The top 64 bits of the value are kept, and every bit below them
+/// is folded into the lowest one: that is all correct rounding needs to
+/// know about them, and 64 bits leave room above it for the 53 kept and
+/// the one rounding bit. One conversion of those 64 bits then rounds once.
+fn radixToFloat(digits: []const u8, bits_per_digit: u3) f64 {
+    var top: u64 = 0;
+    var kept: u32 = 0;
+    var dropped: usize = 0;
+    var sticky = false;
+    for (digits) |c| {
+        const v: u8 = ctype.hexValue(c).?;
+        var b: u3 = bits_per_digit;
+        while (b > 0) {
+            b -= 1;
+            const bit = (v >> b) & 1;
+            if (kept == 0 and bit == 0) continue; // leading zeros
+            if (kept < 64) {
+                top = (top << 1) | bit;
+                kept += 1;
+            } else {
+                sticky = sticky or bit == 1;
+                dropped += 1;
+            }
+        }
+    }
+    if (sticky) top |= 1;
+    // Past 2^1024 the value is an infinity; `ldexp` says so too, but the
+    // exponent must fit its `i32` first.
+    if (dropped > 2048) return std.math.inf(f64);
+    return std.math.ldexp(@as(f64, @floatFromInt(top)), @intCast(dropped));
+}
 /// Core schema int (spec 10.3.2): `[-+]? [0-9]+`, `0o [0-7]+` or
 /// `0x [0-9a-fA-F]+`. The radix forms take no sign and are lowercase
 /// only, so `+0x1F`, `-0x1F`, `0X1F` and `0O7` are all strings.
@@ -846,7 +916,10 @@ pub const Document = struct {
     ) !Document {
         var p = try Parser.initOpts(allocator, d, input, options);
         defer p.deinit();
-        var docs = try parseStream(allocator, &p, 1, input);
+        // What the scanner reads: short of `input` when `.truncate` cut it
+        // at a NUL, and the documents must not keep the bytes it dropped.
+        const read = p.scanner.input;
+        var docs = try parseStream(allocator, &p, 1, read);
         defer docs.deinit(allocator);
         if (docs.items.len == 0) {
             // No node content reached the builder. An input that is
@@ -855,11 +928,11 @@ pub const Document = struct {
             // document there); what arrives here is the genuinely empty
             // input, which still yields a rootless document so
             // `parse("")` and `parseAll("")` agree on the shape.
-            return rootlessDocument(allocator, input);
+            return rootlessDocument(allocator, read);
         }
         var doc = docs.items[0];
         if (options.resolve_merge_keys) {
-            doc.resolveMergeKeysLimited(options.max_merge_nodes) catch |err| {
+            doc.resolveMerges(options.max_merge_nodes, d) catch |err| {
                 doc.deinit();
                 return err;
             };
@@ -888,13 +961,14 @@ pub const Document = struct {
     ) !std.ArrayList(Document) {
         var p = try Parser.initOpts(allocator, d, input, options);
         defer p.deinit();
-        var docs = try parseStream(allocator, &p, null, input);
+        // The scanner's input: see `parseOpts`.
+        var docs = try parseStream(allocator, &p, null, p.scanner.input);
         if (!options.resolve_merge_keys) return docs;
         errdefer {
             for (docs.items) |*doc| doc.deinit();
             docs.deinit(allocator);
         }
-        for (docs.items) |*doc| try doc.resolveMergeKeysLimited(options.max_merge_nodes);
+        for (docs.items) |*doc| try doc.resolveMerges(options.max_merge_nodes, d);
         return docs;
     }
 
@@ -966,6 +1040,7 @@ pub const Document = struct {
                     }
                     // The builder works on the live document copy.
                     builder = Builder.init(d);
+                    builder.?.d = p.d;
                 },
                 .document_end => {
                     if (builder) |*b| b.finish();
@@ -991,6 +1066,18 @@ pub const Document = struct {
                         // successful single-document parse.
                         const last = &docs.items[docs.items.len - 1];
                         if (isTrailer(input[last.region_end..])) last.region_end = input.len;
+                        // Unless content follows with no `---` or
+                        // directive to open another document: then the
+                        // first one did not end (`[1, 2] garbage`,
+                        // `"a"\nb: 1`, `!a !b x`), and stopping here
+                        // returned it as if it were whole. One more event
+                        // says whether that content can begin a document
+                        // (it can after a `...`).
+                        // Looked for from the root's end: the region takes
+                        // the rest of the root's last line.
+                        if (last.root != null) if (firstContentLine(input[last.body_end..])) |line| {
+                            if (line[0] != '%' and !(line[0] == '-' and isMarkerLine(line, 0))) _ = try p.nextEvent();
+                        };
                         break;
                     };
                 },
@@ -1069,15 +1156,13 @@ pub const Document = struct {
     /// replacement carrying the replaced node's anchor as the anchor
     /// moving with the slot, and re-points the aliases at it.
     ///
-    /// A name must be one or more non-blank characters with no flow
-    /// indicator (`,[]{}`), the YAML anchor alphabet.
+    /// A name must be one or more printable, non-blank characters in
+    /// valid UTF-8, with no flow indicator (`,[]{}`) and no byte order
+    /// mark: the YAML anchor alphabet. Anything else is
+    /// `error.InvalidSyntax`.
     pub fn setAnchor(self: *Document, node: *Node, name: ?[]const u8) !void {
         if (name) |n| {
-            if (n.len == 0) return error.InvalidSyntax;
-            for (n) |c| switch (c) {
-                ' ', '\t', '\n', '\r', ',', '[', ']', '{', '}' => return error.InvalidSyntax,
-                else => {},
-            };
+            if (!internal.validAnchorName(n)) return error.InvalidSyntax;
             if (node.anchor) |cur| {
                 if (std.mem.eql(u8, cur, n)) return;
             }
@@ -1263,6 +1348,8 @@ pub const Document = struct {
     const MergeRun = struct {
         seen: std.AutoHashMap(*Node, MergeVisit),
         remaining: usize,
+        /// Where the walk failed, for the diagnostic (see `resolveMerges`).
+        at: ?Mark = null,
     };
 
     /// Resolve YAML 1.1 merge keys (`<<`) in place.
@@ -1292,6 +1379,13 @@ pub const Document = struct {
 
     /// `resolveMergeKeys` creating at most `max_nodes` nodes.
     pub fn resolveMergeKeysLimited(self: *Document, max_nodes: usize) !void {
+        return self.resolveMerges(max_nodes, null);
+    }
+
+    /// `resolveMergeKeysLimited`, recording in `d` what failed and where:
+    /// the parse entry points pass their `Diag`, which a failed merge left
+    /// empty.
+    fn resolveMerges(self: *Document, max_nodes: usize, d: ?*diag.Diag) !void {
         const root = self.root orelse return;
         if (!treeHasMergeKey(root, 0)) return;
         // Atomic through the undo journal (`internal.Journal`), as for
@@ -1301,7 +1395,17 @@ pub const Document = struct {
         errdefer txn.abort();
         var run: MergeRun = .{ .seen = std.AutoHashMap(*Node, MergeVisit).init(self.allocator), .remaining = max_nodes };
         defer run.seen.deinit();
-        try self.resolveMergeNode(root, &run, 0);
+        self.resolveMergeNode(root, &run, 0) catch |err| {
+            const at = run.at orelse root.mark;
+            switch (err) {
+                error.InvalidMergeKey => diag.emitBestEffort(d, .err, at, "merge key value is not a mapping or a sequence of mappings", .{}),
+                error.MergeKeyRecursive => diag.emitBestEffort(d, .err, at, "merge key reaches the mapping it merges into", .{}),
+                error.LimitExceeded => diag.emitBestEffort(d, .err, at, "merge keys would create more than {d} nodes", .{max_nodes}),
+                error.NestingTooDeep => diag.emitBestEffort(d, .err, at, "merge keys are nested too deeply to resolve", .{}),
+                else => {},
+            }
+            return err;
+        };
         try txn.commit();
     }
 
@@ -1353,6 +1457,7 @@ pub const Document = struct {
             .mapping => {
                 if (run.seen.get(node)) |state| {
                     if (state == .done) return;
+                    run.at = node.mark;
                     return error.MergeKeyRecursive;
                 }
                 try run.seen.put(node, .active);
@@ -1425,11 +1530,17 @@ pub const Document = struct {
             .sequence => |s| {
                 for (s.items.items) |item| {
                     const src = item.resolveAlias();
-                    if (src.kind() != .mapping) return error.InvalidMergeKey;
+                    if (src.kind() != .mapping) {
+                        run.at = item.mark;
+                        return error.InvalidMergeKey;
+                    }
                     try self.mergeOneInto(map, @constCast(src), run, present, depth);
                 }
             },
-            else => return error.InvalidMergeKey,
+            else => {
+                run.at = value.mark;
+                return error.InvalidMergeKey;
+            },
         }
     }
 
@@ -2263,6 +2374,8 @@ const StreamEnd = struct {
 /// untouched regions re-emit byte-identically.
 const Builder = struct {
     doc: *Document,
+    /// Where a problem found while building is reported (the parser's).
+    d: ?*diag.Diag = null,
     source: []const u8,
     stack: std.ArrayList(Frame),
     anchors: std.StringHashMap(*Node),
@@ -2346,8 +2459,10 @@ const Builder = struct {
                 try self.attach(n);
             },
             .alias => {
-                const target = self.anchors.get(ev.data.alias) orelse
+                const target = self.anchors.get(ev.data.alias) orelse {
+                    diag.emitBestEffort(self.d, .err, ev.start, "found undefined alias '{s}'", .{ev.data.alias});
                     return error.UnknownAlias;
+                };
                 const n = try self.doc.pool.create(Node);
                 n.* = .{
                     .mark = ev.start,
@@ -2393,9 +2508,17 @@ const Builder = struct {
         switch (parent.data) {
             .sequence => self.growSpan(parent, cs),
             .mapping => {
-                for (parent.data.mapping.pairs.items) |*p| {
-                    if (p.value == coll) {
-                        p.src_end = cs.end;
+                // The collection that just closed belongs to the pair
+                // being built, the last one: searched from the front,
+                // every collection value cost the pairs before it, which
+                // made a mapping of mappings quadratic to parse (80,000
+                // `kN:\n  x: 1` entries took a second).
+                const pairs = parent.data.mapping.pairs.items;
+                var i = pairs.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (pairs[i].value == coll) {
+                        pairs[i].src_end = cs.end;
                         self.growSpan(parent, cs);
                         return;
                     }
@@ -4706,4 +4829,135 @@ test "rootlessDocument carries bytes with no node" {
     const out = try d.write(allocator);
     defer allocator.free(out);
     try std.testing.expectEqualStrings("# c\n", out);
+}
+
+/// Parse time of `input` in milliseconds, fastest of three, under a
+/// leak-checked allocator without per-allocation stack traces (which
+/// would dominate a timing).
+fn parseMillis(input: []const u8) !i96 {
+    var leak_check: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer testing.expect(leak_check.deinit() == .ok) catch @panic("leaked memory");
+    const allocator = leak_check.allocator();
+    var fastest: i96 = std.math.maxInt(i96);
+    for (0..3) |_| {
+        const start = std.Io.Timestamp.now(testing.io, .awake);
+        var doc = try Document.parse(allocator, input);
+        doc.deinit();
+        fastest = @min(fastest, std.Io.Timestamp.now(testing.io, .awake).nanoseconds - start.nanoseconds);
+    }
+    return @divTrunc(fastest, std.time.ns_per_ms);
+}
+
+test "parsing stays linear on shapes that were quadratic" {
+    const allocator = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    // Every open simple key had its span recounted in codepoints on every
+    // token once it passed 1024 bytes: nested flow collections of
+    // multibyte text took 15.7 s for these 10 KB in Debug (70 ms now).
+    try buf.append(allocator, '[');
+    for (0..4) |b| {
+        if (b > 0) try buf.append(allocator, ',');
+        try buf.appendNTimes(allocator, '[', 190);
+        for (0..520) |i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "\u{4E2D}");
+        }
+        try buf.appendNTimes(allocator, ']', 190);
+    }
+    try buf.append(allocator, ']');
+    try testing.expect(try parseMillis(buf.items) < 1000);
+
+    // Each collection value searched its mapping's pairs from the front
+    // for itself: a mapping of mappings, the commonest shape there is,
+    // was quadratic. Judged by growth, which does not depend on the
+    // machine: four times the entries took about 16 times as long, and
+    // take about 4 times as long now.
+    buf.clearRetainingCapacity();
+    for (0..10_000) |i| try buf.print(allocator, "k{d}:\n  x: 1\n", .{i});
+    const small = @max(1, try parseMillis(buf.items));
+    for (10_000..40_000) |i| try buf.print(allocator, "k{d}:\n  x: 1\n", .{i});
+    const large = try parseMillis(buf.items);
+    try testing.expect(large < small * 8);
+
+    // `%TAG` handles were found by a linear search, for the duplicate
+    // check and for every tag: 16,000 of each took 5.5 s in Debug under
+    // the test allocator, and take 0.3 s.
+    buf.clearRetainingCapacity();
+    for (0..16_000) |i| try buf.print(allocator, "%TAG !t{d}! tag:e.com,2000:{d}:\n", .{ i, i });
+    try buf.appendSlice(allocator, "---\n");
+    for (0..16_000) |i| try buf.print(allocator, "- !t{d}!x 1\n", .{i});
+    try testing.expect(try parseMillis(buf.items) < 2000);
+}
+
+test "a truncated input's discarded bytes stay discarded" {
+    const allocator = testing.allocator;
+    // `.truncate` cut the scanner's input at the NUL, but the documents
+    // kept the whole input as their source, so a write emitted the NUL and
+    // everything after it -- bytes no validation had seen, and output a
+    // default parse refuses.
+    const input = "a: 1\n\x00b: 2\n";
+    var doc = try Document.parseOpts(allocator, input, null, .{ .embedded_nul = .truncate });
+    defer doc.deinit();
+    try doc.pathSet(&.{"a"}, try doc.createScalar("9", .plain));
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("a: 9\n", out);
+
+    var docs = try Document.parseAllOpts(allocator, input, null, .{ .embedded_nul = .truncate });
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(allocator);
+    }
+    const all = try writeAll(allocator, docs.items);
+    defer allocator.free(all);
+    try testing.expectEqualStrings("a: 1\n", all);
+}
+
+test "every parse failure leaves a positioned diagnostic" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { in: []const u8, merge: bool = false, err: anyerror, line: usize }{
+        .{ .in = "a: 1\nb: *nope\n", .err = error.UnknownAlias, .line = 2 },
+        .{ .in = "a: 1\nb:\n  <<: 1\n", .merge = true, .err = error.InvalidMergeKey, .line = 3 },
+        .{ .in = "a: 1\nb:\n  <<: [1]\n", .merge = true, .err = error.InvalidMergeKey, .line = 3 },
+        .{ .in = "a: 1\nb: &b\n  <<: *b\n", .merge = true, .err = error.MergeKeyRecursive, .line = 2 },
+        // Invalid UTF-8 was always reported at 1:1.
+        .{ .in = "a: 1\nb: 2\nc: \xff\n", .err = error.InvalidUtf8, .line = 3 },
+    };
+    for (cases) |c| {
+        var d: diag.Diag = .{ .allocator = allocator };
+        defer d.deinit();
+        try testing.expectError(c.err, Document.parseOpts(allocator, c.in, &d, .{ .resolve_merge_keys = c.merge }));
+        errdefer std.debug.print("{s}: {any}\n", .{ c.in, d.list.items });
+        try testing.expectEqual(@as(usize, 1), d.list.items.len);
+        try testing.expectEqual(c.line, d.list.items[0].mark.line);
+    }
+}
+
+test "parse refuses a first document that does not end" {
+    const allocator = testing.allocator;
+    // `parse` stopped at the first document's end event, so a stream that
+    // could not even start another document came back as if whole: the
+    // trailing content was dropped without a word.
+    for ([_][]const u8{ "[1, 2] garbage\n", "\"a\"\nb: 1\n", "!a !b x\n", "&a *b\n" }) |in| {
+        var doc = Document.parse(allocator, in) catch continue;
+        doc.deinit();
+        std.debug.print("accepted {s}\n", .{in});
+        return error.TestUnexpectedResult;
+    }
+    // A malformed LATER document still does not fail a single-document
+    // parse.
+    var doc = try Document.parse(allocator, "a: 1\n---\n[unclosed\n");
+    defer doc.deinit();
+    try testing.expectEqualStrings("1", doc.pathGet(&.{"a"}).?.scalarValue().?);
+}
+
+test "a tag escape that decodes to invalid UTF-8 is refused" {
+    // `!e!%ff` names no tag; libfyaml refuses it, and yayl kept the byte,
+    // which no writer could spell back.
+    try testing.expectError(error.InvalidSyntax, Document.parse(testing.allocator, "%TAG !e! tag:e.com:\n--- !e!%ff x\n"));
+    var ok = try Document.parse(testing.allocator, "%TAG !e! tag:e.com:\n--- !e!%C3%A9 x\n");
+    defer ok.deinit();
+    try testing.expectEqualStrings("tag:e.com:\u{00E9}", ok.root.?.tag.?);
 }

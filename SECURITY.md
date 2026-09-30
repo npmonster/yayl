@@ -28,7 +28,7 @@ and every one is adjustable through the public API.
 | Resource | Bound | Default | Where to change it |
 | --- | --- | --- | --- |
 | Input size (in-memory entry points) | `ParseOptions.max_input_bytes` | 64 MiB | `yaml.parseOpts` / `parseAllOpts` |
-| Input size (files) | `max_bytes` parameter | 64 MiB via `yaml.file.max_bytes_default` | `yaml.file.parseFile` / `parseAllFile` / `readFile` |
+| Input size (files) | `max_bytes` parameter (also the parse's input bound) | 64 MiB via `yaml.file.max_bytes_default` | `yaml.file.parseFile` / `parseAllFile` / `readFile`; `parseFileOpts` / `parseAllFileOpts` take `ParseOptions` |
 | Nesting (scanner/parser) | `ParseOptions.max_nesting` | 200 | `yaml.parseOpts` |
 | Simple key length | fixed cap | 1024 characters | not adjustable (spec 7.4.2) |
 | Alias expansion (values) | `value.Limits.max_values` | 1,048,576 | `parseToValueLimited`, `nodeToValueLimited`, `Limits.unlimited` to opt out |
@@ -36,6 +36,7 @@ and every one is adjustable through the public API.
 | Merge-key resolution (copied nodes) | `ParseOptions.max_merge_nodes` | 262,144 | `yaml.parseOpts`, `Document.resolveMergeKeysLimited` |
 | Query walks through aliases | each node walked once | linear in the document | not adjustable |
 | Alias expansion (validation) | `schema.Limits.max_nodes` | 1,048,576 | `Schema.validateLimited` |
+| Alias expansion (validation text) | `schema.Limits.max_bytes` | 64 MiB | `Schema.validateLimited` |
 | Conversion depth | `value.Limits.max_depth` | 1000 | `parseToValueLimited`, `nodeToValueLimited` |
 | Validation depth | `schema.Limits.max_depth` | 1000 | `Schema.validateLimited` |
 | Edit walk depth (`..key`, clone) | `edit.max_walk_depth` | 1000 | not adjustable |
@@ -75,9 +76,9 @@ They are close but not interchangeable, so do not treat one as a proxy
 for another. Conversion, validation and the edit walks charge one level
 per node on the path; the emitter charges up to two extra where
 emission crosses between its faithful, normalized and flow modes, and
-so admits two fewer levels. Measured on a linear built chain at default
-limits: a 999-node path converts and validates but fails to emit; 1000
-fails everywhere.
+so admits up to two fewer levels. Measured on a linear built chain of
+sequences at default limits, where it crosses once: a 1000-node path
+converts and validates but fails to emit; 1001 fails everywhere.
 
 **Alias cycles.** An alias may name an *enclosing* anchor. `&a [*a]` is
 eight bytes, is accepted by this parser as by libyaml, and describes a
@@ -118,9 +119,12 @@ consume parsed documents as data:
   yayl keeps what the input contained. Lookups (`lookup`, `pathGet`,
   `value.get`) return the **first** match. If your security posture
   depends on rejecting duplicates, check for them yourself.
-- **Merge keys (`<<`) are not resolved.** A `<<` key is an ordinary
-  key carrying an alias or sequence; nothing is flattened into the
-  mapping. Consumers that expect merge semantics must implement them.
+- **Merge keys (`<<`) are resolved only on request.** By default a
+  `<<` key is an ordinary key carrying an alias or sequence, and nothing
+  is flattened into the mapping (YAML 1.2 has no merge keys).
+  `ParseOptions.resolve_merge_keys` or `Document.resolveMergeKeys`
+  applies the YAML 1.1 rule, bounded by `max_merge_nodes` (see the
+  table above).
 
 ### Memory safety
 

@@ -22,7 +22,8 @@ const YamlError = diag.YamlError;
 
 /// Maximum number of characters a simple key may span (YAML 1.2.2
 /// 7.4.2 and 8.2.2, which bound it in Unicode characters, not bytes).
-const max_simple_key_chars: usize = 1024;
+/// The emitter writes a longer key in explicit form (`? key`).
+pub const max_simple_key_chars: usize = 1024;
 
 /// What to do about a NUL byte in the input.
 pub const EmbeddedNul = enum {
@@ -166,6 +167,10 @@ pub const Scanner = struct {
         mark: Mark = .{},
         /// Byte index into `input` where the key starts.
         pos: usize = 0,
+        /// Characters from `pos` to `counted_to`, kept as the key grows so
+        /// `simpleKeyTooLong` counts each byte once.
+        chars: usize = 0,
+        counted_to: usize = 0,
     };
 
     /// Scan `input` under the default `Options`.
@@ -202,7 +207,11 @@ pub const Scanner = struct {
         const eff = input[0..end];
 
         if (!utf8.valid(eff)) {
-            diag.emitBestEffort(d, .err, .{}, "input is not valid UTF-8", .{});
+            // At the first bad byte: a 1:1 mark on a problem further in is
+            // a confidently wrong position (see `markOf`).
+            var i: usize = 0;
+            while (utf8.decode(eff, i) catch null) |r| i += r.len;
+            diag.emitBestEffort(d, .err, markOf(input, i), "input is not valid UTF-8", .{});
             return error.InvalidUtf8;
         }
 
@@ -395,16 +404,24 @@ pub const Scanner = struct {
     // Simple keys and indentation (fy_scan.c roll/unroll indent)
     // ------------------------------------------------------------------
 
-    /// Does the simple key starting at byte offset `start` exceed the
-    /// spec's 1024-*character* bound? A span of N characters is at least
-    /// N bytes, so the byte span is a necessary condition: only a span
-    /// that already overflows the bound in bytes pays for a codepoint
-    /// count, keeping the common case a single integer compare.
-    fn simpleKeyTooLong(self: *Scanner, start: usize) bool {
-        if (self.pos <= start) return false;
-        if (self.pos - start <= max_simple_key_chars) return false;
-        const chars = utf8.countCodepoints(self.input[start..self.pos]) catch return true;
-        return chars > max_simple_key_chars;
+    /// Does simple key `sk` exceed the spec's 1024-*character* bound? A
+    /// span of N characters is at least N bytes, so the byte span is a
+    /// necessary condition: only a span that already overflows the bound
+    /// in bytes pays for a codepoint count, keeping the common case a
+    /// single integer compare. The count is kept on the key and extended
+    /// by the bytes scanned since: this runs for every open key on every
+    /// token, and recounting the whole span each time made multibyte flow
+    /// input (`[[[中,中,...]]]`) about a thousand times slower to scan.
+    fn simpleKeyTooLong(self: *Scanner, sk: *SimpleKey) bool {
+        if (self.pos <= sk.pos) return false;
+        if (self.pos - sk.pos <= max_simple_key_chars) return false;
+        if (sk.counted_to < sk.pos or sk.counted_to > self.pos) {
+            sk.chars = 0;
+            sk.counted_to = sk.pos;
+        }
+        sk.chars += utf8.countCodepoints(self.input[sk.counted_to..self.pos]) catch return true;
+        sk.counted_to = self.pos;
+        return sk.chars > max_simple_key_chars;
     }
 
     fn staleSimpleKeys(self: *Scanner) !void {
@@ -415,7 +432,7 @@ pub const Scanner = struct {
             // 1024-character bound applies in every context.
             const may_span_line = i > 0 and !self.flow_kinds.items[i - 1];
             if (sk.possible and
-                ((!may_span_line and sk.mark.line < self.mark.line) or self.simpleKeyTooLong(sk.pos)))
+                ((!may_span_line and sk.mark.line < self.mark.line) or self.simpleKeyTooLong(sk)))
             {
                 if (sk.required) {
                     return self.fail(self.mark, "simple key was expected", .{});
@@ -434,6 +451,7 @@ pub const Scanner = struct {
             .token_number = self.token_base + self.tokens.items.len,
             .mark = self.mark,
             .pos = self.pos,
+            .counted_to = self.pos,
         };
         try self.removeSimpleKey();
         self.simple_keys.items[self.simple_keys.items.len - 1] = sk;

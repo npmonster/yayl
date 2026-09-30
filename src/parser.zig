@@ -10,6 +10,7 @@ const diag = @import("diag.zig");
 const event_mod = @import("event.zig");
 const scanner_mod = @import("scanner.zig");
 const token_mod = @import("token.zig");
+const utf8 = @import("utf8.zig");
 
 const Diag = diag.Diag;
 const Mark = diag.Mark;
@@ -63,6 +64,10 @@ pub const Parser = struct {
     /// Active %TAG directives of the current document (including the two
     /// default handles). Used to resolve shorthand tags while parsing nodes.
     tag_directives: std.ArrayList(TagDirective) = .empty,
+    /// `tag_directives` by handle. Looked up for the duplicate check and
+    /// for every tag resolved: a linear search there made a document of
+    /// D directives and T tags cost D x T (64,000 directives: 5 s).
+    handle_index: std.StringHashMapUnmanaged(usize) = .empty,
     version_directive: ?VersionDirective = null,
     /// Transient allocations owned by the parser (resolved tags, directive
     /// snapshots handed to events). Valid until `deinit`.
@@ -88,6 +93,7 @@ pub const Parser = struct {
         self.states.deinit(self.allocator);
         self.marks.deinit(self.allocator);
         self.tag_directives.deinit(self.allocator);
+        self.handle_index.deinit(self.allocator);
         for (self.temp_bytes.items) |buf| self.allocator.free(buf);
         self.temp_bytes.deinit(self.allocator);
         for (self.temp_tags.items) |t| self.allocator.free(t);
@@ -273,7 +279,7 @@ pub const Parser = struct {
             implicit = false;
         }
         // Directive state is per-document (fy_parse resets between docs).
-        self.tag_directives.clearRetainingCapacity();
+        self.clearDirectives();
         self.version_directive = null;
         self.state = .document_start;
         return .{
@@ -285,12 +291,21 @@ pub const Parser = struct {
 
     /// Fill `tag_directives` with just the two default handles.
     fn prepareDirectives(self: *Parser) !void {
-        self.tag_directives.clearRetainingCapacity();
+        self.clearDirectives();
         self.version_directive = null;
-        try self.tag_directives.appendSlice(self.allocator, &.{
-            .{ .handle = "!", .prefix = "!" },
-            .{ .handle = "!!", .prefix = "tag:yaml.org,2002:" },
-        });
+        try self.addDirective(.{ .handle = "!", .prefix = "!" });
+        try self.addDirective(.{ .handle = "!!", .prefix = "tag:yaml.org,2002:" });
+    }
+
+    fn clearDirectives(self: *Parser) void {
+        self.tag_directives.clearRetainingCapacity();
+        self.handle_index.clearRetainingCapacity();
+    }
+
+    fn addDirective(self: *Parser, td: TagDirective) !void {
+        try self.handle_index.ensureUnusedCapacity(self.allocator, 1);
+        try self.tag_directives.append(self.allocator, td);
+        self.handle_index.putAssumeCapacity(td.handle, self.tag_directives.items.len - 1);
     }
 
     /// YAML 1.2 spec 6.8.2 `c-tag-handle`: `!`, `!!`, or `!` word+ `!`
@@ -309,7 +324,7 @@ pub const Parser = struct {
     /// Consume directive tokens, validating them, then make sure the
     /// default tag handles are present.
     fn processDirectives(self: *Parser) !void {
-        self.tag_directives.clearRetainingCapacity();
+        self.clearDirectives();
         self.version_directive = null;
 
         while (true) {
@@ -358,15 +373,10 @@ pub const Parser = struct {
                 if (!validTagHandle(d.params[0]) or d.params[1].len == 0) {
                     return self.fail(tok.start, "found malformed %TAG directive", .{});
                 }
-                for (self.tag_directives.items) |td| {
-                    if (std.mem.eql(u8, td.handle, d.params[0])) {
-                        return self.fail(tok.start, "found duplicate %TAG directive", .{});
-                    }
+                if (self.handle_index.contains(d.params[0])) {
+                    return self.fail(tok.start, "found duplicate %TAG directive", .{});
                 }
-                try self.tag_directives.append(self.allocator, .{
-                    .handle = d.params[0],
-                    .prefix = d.params[1],
-                });
+                try self.addDirective(.{ .handle = d.params[0], .prefix = d.params[1] });
             } else {
                 // Unknown directives are ignored; the spec asks for a
                 // warning only (YAML 1.2.2 6.8).
@@ -376,14 +386,8 @@ pub const Parser = struct {
         }
 
         // Ensure the two default handles exist.
-        var have_bang = false;
-        var have_bangbang = false;
-        for (self.tag_directives.items) |td| {
-            if (std.mem.eql(u8, td.handle, "!")) have_bang = true;
-            if (std.mem.eql(u8, td.handle, "!!")) have_bangbang = true;
-        }
-        if (!have_bang) try self.tag_directives.append(self.allocator, .{ .handle = "!", .prefix = "!" });
-        if (!have_bangbang) try self.tag_directives.append(self.allocator, .{ .handle = "!!", .prefix = "tag:yaml.org,2002:" });
+        if (!self.handle_index.contains("!")) try self.addDirective(.{ .handle = "!", .prefix = "!" });
+        if (!self.handle_index.contains("!!")) try self.addDirective(.{ .handle = "!!", .prefix = "tag:yaml.org,2002:" });
     }
 
     fn failWith(self: *Parser, err: YamlError, mark: Mark, comptime fmt: []const u8, args: anytype) YamlError {
@@ -397,30 +401,34 @@ pub const Parser = struct {
             // Verbatim tag.
             return self.trackBytes(try self.allocator.dupe(u8, suffix));
         }
-        for (self.tag_directives.items) |td| {
-            if (std.mem.eql(u8, td.handle, handle)) {
-                var out: std.ArrayList(u8) = .empty;
-                errdefer out.deinit(self.allocator);
-                try out.appendSlice(self.allocator, td.prefix);
-                // Tag suffixes are RFC 2396: %XX escapes are unescaped
-                // when the tag is resolved.
-                var i: usize = 0;
-                while (i < suffix.len) {
-                    if (suffix[i] == '%' and i + 3 <= suffix.len and
-                        ctype.hexValue(suffix[i + 1]) != null and
-                        ctype.hexValue(suffix[i + 2]) != null)
-                    {
-                        const hi = ctype.hexValue(suffix[i + 1]).?;
-                        const lo = ctype.hexValue(suffix[i + 2]).?;
-                        try out.append(self.allocator, (hi << 4) | lo);
-                        i += 3;
-                    } else {
-                        try out.append(self.allocator, suffix[i]);
-                        i += 1;
-                    }
+        if (self.handle_index.get(handle)) |index| {
+            const td = self.tag_directives.items[index];
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(self.allocator);
+            try out.appendSlice(self.allocator, td.prefix);
+            // Tag suffixes are RFC 2396: %XX escapes are unescaped
+            // when the tag is resolved.
+            var i: usize = 0;
+            while (i < suffix.len) {
+                if (suffix[i] == '%' and i + 3 <= suffix.len and
+                    ctype.hexValue(suffix[i + 1]) != null and
+                    ctype.hexValue(suffix[i + 2]) != null)
+                {
+                    const hi = ctype.hexValue(suffix[i + 1]).?;
+                    const lo = ctype.hexValue(suffix[i + 2]).?;
+                    try out.append(self.allocator, (hi << 4) | lo);
+                    i += 3;
+                } else {
+                    try out.append(self.allocator, suffix[i]);
+                    i += 1;
                 }
-                return self.trackBytes(try out.toOwnedSlice(self.allocator));
             }
+            // An escape can spell any byte, but a tag is text:
+            // `!e!%ff` names no tag (libfyaml rejects it too).
+            if (!utf8.valid(out.items)) {
+                return self.fail(self.scanner.mark, "tag is not valid UTF-8 once its escapes are decoded", .{});
+            }
+            return self.trackBytes(try out.toOwnedSlice(self.allocator));
         }
         return self.fail(self.scanner.mark, "found undefined tag handle '{s}'", .{handle});
     }

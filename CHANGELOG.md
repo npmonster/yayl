@@ -340,6 +340,114 @@ parsed stream splits `--- x # c`), and closes the previous document with
 `...` before a directive. Parsed streams are still written back
 byte-identical.
 
+**A hostile tag injected YAML structure when it was written back.** The
+reader decodes `%XX` escapes in a tag, and the emitter wrote the decoded
+bytes raw: `role: !!str%0Aadmin:%20true user` merged, moved or re-emitted
+came out as `role: !!str` and a new key `admin: true user`. Tags are now
+written with a handle for their prefix (the document's own `%TAG`
+handles, else `!!` and `!` unless the document redefined them, which were
+also ignored) and every byte outside the tag alphabet escaped, so they
+read back as themselves; a tag with no spelling (a blank or `>` in a
+verbatim tag) is refused with `error.InvalidSyntax`. A tag escape that
+decodes to invalid UTF-8 (`!e!%ff`) is now a parse error, as in
+libfyaml.
+
+**Programmatic text the emitter could not spell was written raw.**
+Found by a sweep of 310,536 built documents, each re-parsed by yayl and
+by libfyaml:
+
+- An alias used as a key was written `*r: v`, but `:` may be part of an
+  anchor name, so it read back as an alias named `r:` (flow keys, and
+  block keys after a value edit). It is written `*r : v`.
+- A key over 1024 characters was written as an implicit key, which the
+  spec (and yayl's own parser) refuses; it is now written `? key`.
+- A string starting with a byte order mark was written plain at the
+  start of a document, where the reader drops the mark as an encoding
+  mark (`\u{FEFF}a` read back `a`); it is quoted now, and a block
+  scalar line at column 0 never starts with one.
+- C1 controls and U+FFFE/U+FFFF are not printable and may not appear raw;
+  they are written as `\u` escapes in double quotes.
+- A scalar that is not valid UTF-8 was written raw, output neither yayl
+  nor libfyaml parses; the write now fails with `error.InvalidUtf8`. An
+  anchor or alias name YAML cannot spell fails with
+  `error.InvalidSyntax`, and `Document.setAnchor` refuses control
+  characters, non-printable characters, invalid UTF-8 and the byte order
+  mark as well as blanks and flow indicators.
+- Two valid forms that libfyaml misreads are avoided: a root block
+  scalar with an anchor or tag is written after `--- ` on the marker
+  line, and a plain scalar starting with `:` in a flow collection is
+  quoted.
+
+**The value and schema layers disagreed with the core schema in
+places.**
+
+- The non-specific tag `!` resolved by content, so `! 12` was an
+  integer; it is a string (spec example 6.28), as `!` on a collection
+  was already a sequence or mapping.
+- A core tag naming a different kind of node (`!!seq 42`, `!!int [1]`,
+  `!!str {a: 1}`) was accepted; it is `error.TypeMismatch` from
+  `yaml.value` and a type violation from `yaml.schema`, like `!!int abc`.
+- `toZig` into a float returned an infinity for a value the type cannot
+  hold (`1e39` into `f32`, `70000` into `f16`) where an integer target
+  refuses one; it is `error.TypeMismatch` now. A `.bigint` converts to a
+  float instead of failing, and `0o` and long `0x` integers convert to
+  the nearest float: `std.fmt.parseFloat` does not read `0o` and
+  truncated a long hex mantissa (`0x1FFFFFFFFFFFFFFFFFFF` came out one
+  unit in the last place low), so `Schema.floatRange` also refused
+  `0o17`.
+- A tagged union's `void` field accepted any value; only null reads
+  back into it, as `fromZig` writes it.
+- `fromZig` of a non-exhaustive enum's unnamed value panicked in
+  ReleaseSafe; it is `error.TypeMismatch`. A string literal
+  (`.{ .name = "yayl" }`) became a sequence of bytes; it is a string.
+- `toZig` failed to compile inside the library for sentinel slices
+  (`[:0]const u8`), zero-length arrays and structs with `comptime`
+  fields; all three convert.
+
+**Schema validation was not bounded in bytes.** Each violation quotes
+the value it rejects, and aliases repeat it: a 64 KiB anchored string
+behind three levels of ten aliases made 1,000 violations and 62 MB from
+a 65 KB input, and one more level passed 512 MB. `schema.Limits` has a
+`max_bytes` (64 MiB by default, like `value.Limits.max_bytes`) charged
+for violation text and the paths built on the way down.
+
+**Three parse shapes were quadratic.**
+
+- Every open simple key had its span recounted in codepoints on every
+  token once it passed 1024 bytes: nested flow collections of multibyte
+  text scanned at a few kilobytes a second (10 KB took 15.7 s in Debug,
+  and takes 70 ms). The count is kept on the key.
+- Each collection value searched its mapping's pairs from the front, so
+  a mapping of mappings (`kN:\n  x: 1`) was quadratic: 80,000 entries
+  took a second in ReleaseSafe.
+- `%TAG` handles were found by a linear search, for the duplicate check
+  and for every tag: 64,000 directives took 5 s.
+
+**Parsing, diagnostics and files.**
+
+- `.embedded_nul = .truncate` dropped everything after the NUL from the
+  tree but not from the document's source, so a write emitted the NUL and
+  the bytes after it, which a default parse refuses. They stay dropped.
+- `parse` stopped at the first document's end event, so a first document
+  followed by content that cannot begin another (`[1, 2] garbage`,
+  `"a"\nb: 1`, `!a !b x`) came back as if whole, the rest dropped
+  without a word. It fails now; a malformed *later* document still does
+  not fail a single-document parse.
+- An undefined alias and a failed merge-key resolution left the `Diag`
+  empty, and invalid UTF-8 was always reported at 1:1. Each now records
+  a positioned diagnostic.
+- `file.readFile` refused a file of exactly `max_bytes`, which the parse
+  accepts; `parseFile`'s `max_bytes` could lower the parse's input bound
+  but not raise it, and files took no `ParseOptions`. See Changed.
+- `file.writeBytesAtomic` (and `writeFile`) through a symbolic link
+  replaced the link with a regular file and left the real file as it
+  was; it replaces the file the link points to now. The temp file was
+  named after the target plus a suffix, so a long but legal file name
+  failed with `error.NameTooLong`; it has a short name of its own.
+- SECURITY.md said merge keys are never resolved, and SECURITY.md and
+  USAGE said the emitter admits two fewer levels than conversion; it
+  admits up to two fewer, and one on a linear chain.
+
 ### Changed
 
 - `edit.cloneTreeWhole` is removed. It existed for the clone the undo
@@ -362,6 +470,22 @@ byte-identical.
 - `value.Limits` has a `max_bytes` field and `ParseOptions` a
   `max_merge_nodes` field (see Fixed); `diag.YamlError` gains
   `LimitExceeded`.
+- `schema.Limits` has a `max_bytes` field (see Fixed).
+- `yaml.file` gains `parseFileOpts` and `parseAllFileOpts`, which take
+  a `Diag` and `ParseOptions`; `parseFile` and `parseAllFile` pass their
+  `max_bytes` to the parse as `max_input_bytes`, so it can raise the
+  64 MiB default.
+- Writes that used to produce unreadable output now fail:
+  `error.InvalidUtf8` for a scalar that is not UTF-8, `error.InvalidSyntax`
+  for an anchor, alias or tag that YAML cannot spell. `setAnchor` refuses
+  more names (see Fixed).
+- Conversions that used to succeed wrongly now return
+  `error.TypeMismatch`: a tag naming another kind of node, a float out of
+  its target's range, a non-null value for a `void` union field, and an
+  unnamed non-exhaustive enum value. `! 12` converts to a string.
+- `parse` fails on a first document followed by content that cannot
+  begin another document.
+- `writeFile` through a symbolic link replaces the link's target.
 
 ## 0.19.3 — 2026-09-15
 

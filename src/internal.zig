@@ -13,6 +13,7 @@ const std = @import("std");
 const ctype = @import("ctype.zig");
 const document_mod = @import("document.zig");
 const markup = @import("markup.zig");
+const utf8 = @import("utf8.zig");
 
 const Document = document_mod.Document;
 const Node = document_mod.Node;
@@ -250,6 +251,24 @@ pub fn inlineValue(value: *const Node) bool {
         .mapping => |m| m.pairs.items.len == 0 or m.style == .flow,
         .sequence => |s| s.items.items.len == 0 or s.style == .flow,
     };
+}
+
+/// INTERNAL. True when `name` can be written as an anchor or alias name
+/// (spec 6.9.2 `ns-anchor-char`): one or more printable characters in
+/// valid UTF-8, none of them a blank, a line break, a flow indicator or
+/// the byte order mark. `Document.setAnchor` refuses anything else, and
+/// the emitter refuses to write it, since the name would end early or
+/// not read back at all.
+pub fn validAnchorName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    var i: usize = 0;
+    while (utf8.decode(name, i) catch return false) |d| : (i += d.len) {
+        switch (d.cp) {
+            ' ', '\t', '\n', '\r', ',', '[', ']', '{', '}', 0xFEFF => return false,
+            else => if (!utf8.isPrintableCodepoint(d.cp)) return false,
+        }
+    }
+    return true;
 }
 
 /// INTERNAL. Structural append that deliberately skips the `modified`

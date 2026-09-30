@@ -636,19 +636,33 @@ descriptor is the wrong trade; match the string yourself after
 validation if you need it.
 
 Validation resolves aliases and so is bounded by `Limits`, like the
-value layer — see [Untrusted input](#untrusted-input) below. Branch
-exploration under `anyOf`/`oneOf` shares the enclosing budget, so a
-composite cannot multiply the work past the bound.
+value layer — see [Untrusted input](#untrusted-input) below: in nodes
+visited (`max_nodes`), depth (`max_depth`) and the bytes of text it
+copies into violations and paths (`max_bytes`, 64 MiB), since a
+violation quotes the value it rejects. Branch exploration under
+`anyOf`/`oneOf` shares the enclosing budget, so a composite cannot
+multiply the work past the bound.
+
+A tag that names a different kind of node (`!!seq 42`, `!!int [1]`) is
+a type violation, as `!!int abc` is, and the non-specific tag `!`
+resolves by kind (`! 12` is a string).
 
 ## Files
 
 `yaml.file` wraps parsing and writing with production safeguards:
 reads are bounded (`max_bytes`, so a huge file fails with
-`error.StreamTooLong`, not OOM) and writes use atomic replacement (a
-sibling temp file with an exclusive name, file sync, then rename): a
-crash never exposes torn content. This is torn-write protection, not a
-power-loss durability guarantee; sync the containing directory if your
-application requires that guarantee.
+`error.StreamTooLong`, not OOM; a file of exactly `max_bytes` is read)
+and writes use atomic replacement (a sibling temp file with an exclusive
+name, file sync, then rename): a crash never exposes torn content. This
+is torn-write protection, not a power-loss durability guarantee; sync
+the containing directory if your application requires that guarantee.
+Writing through a symbolic link replaces the file it points to and keeps
+the link; a link to nothing is `error.FileNotFound`.
+
+`max_bytes` is the parse's input bound too, so it can raise the default
+64 MiB as well as lower it. `parseFileOpts` and `parseAllFileOpts` take
+every `ParseOptions` field (merge keys, nesting, NUL policy) and a `Diag`;
+their file bound is `options.max_input_bytes`.
 
 ~~~zig
 var threaded: std.Io.Threaded = .init(alloc, .{});
@@ -748,13 +762,15 @@ deep enough to reach it, since `max_nesting` is lower; this bounds
 documents you *built*, through `createSequence`/`sequenceAppend` or
 `value.toNode`. Past it, `Document.write` returns `error.NestingTooDeep`
 instead of overflowing the stack. Conversion, validation and the edit
-walks carry the same default, but the emitter admits two levels fewer:
-it charges extra where emission crosses between its faithful, normalized
-and flow modes. At default limits a 999-node path converts and validates
-and then fails to emit, so treat the bounds as close, not identical.
+walks carry the same default, but the emitter admits up to two levels
+fewer: it charges extra where emission crosses between its faithful,
+normalized and flow modes. At default limits a linear chain of 1000
+built sequences converts and validates and then fails to emit, so treat
+the bounds as close, not identical.
 
-**Reading files** — `yaml.file` applies its own `max_bytes` (64 MiB) at
-read time, before the bytes reach the parser.
+**Reading files** — `yaml.file` applies its `max_bytes` (64 MiB by
+default) at read time, before the bytes reach the parser, and passes the
+same bound to the parse.
 
 ## Memory and error model
 
