@@ -36,7 +36,10 @@ const yaml = @import("yayl");
 
 `yaml.parse` reads the first document of a stream; `yaml.parseAll`
 reads every document (an unmanaged `std.ArrayList(Document)`;
-deinitialize every document, then the list).
+deinitialize every document, then the list). A later document is not
+checked by `parse`, but the first must end: content after it with no
+`---` (or `...`) to start another document (`[1, 2] garbage`) is an
+error, not dropped.
 
 ~~~zig
 var doc = try yaml.parse(alloc,
@@ -121,6 +124,15 @@ the first item is refused even though the alias resolves to the second
 (later anchors shadow earlier ones). The refusal errs on the safe side;
 replace the alias with a plain value if the shadowed node has to go.
 
+Shadowing the other way is refused too: defining a name again ahead of
+an alias that names the earlier definition (`setAnchor`, or a `set`,
+`insert`, `append` or `move` carrying the anchor) would rebind that
+alias once the document is written and read back, so it fails with
+`error.AnchorShadowed` and changes nothing. A `move` that takes a
+definition past its aliases strands them and is `error.AnchorReferenced`.
+YAML gives an alias no properties, so `setAnchor` on one is
+`error.InvalidSyntax`.
+
 An alias may name an *enclosing* anchor, which makes the document
 cyclic — `&a [*a]` parses. The recursive walks are depth-bounded so this
 is `error.NestingTooDeep` rather than a crash, but if you resolve
@@ -149,10 +161,12 @@ aliases only — see `docs/design/merge-keys.md`). An explicit key in the
 mapping wins over a merged one, and among sequence sources the earliest
 wins. A quoted `"<<"` is an ordinary key. The `<<` entry is removed.
 
-Resolution runs on a deep clone that is swapped in only on success, so a
-document that fails — an invalid value (`error.InvalidMergeKey`), a merge
-that reaches itself (`error.MergeKeyRecursive`), a depth or allocation
-failure — keeps its original bytes. It is merge-only: aliases outside the
+Resolution records every change in an undo journal and rolls it back on
+failure, so a document that fails — an invalid value
+(`error.InvalidMergeKey`), a merge that reaches itself
+(`error.MergeKeyRecursive`), more copied nodes than
+`ParseOptions.max_merge_nodes` allows (`error.LimitExceeded`), a depth or
+allocation failure — keeps its original bytes. It is merge-only: aliases outside the
 merged mapping are not inlined and anchors are not purged. For a read-only
 path, `yaml.value.parseToValueResolved` parses with the option on before
 converting.
@@ -323,7 +337,7 @@ on the document model:
 
 | Syntax | Meaning |
 | --- | --- |
-| `$.a.b[0]` | mapping keys and sequence indices (`$` optional) |
+| `$.a.b[0]` | mapping keys and sequence indices (`$` optional; `$ref` is the root key `$ref`, since `$` is the root only before `.`, `[` or nothing) |
 | `[*]` | every child, in document order |
 | `..name` | recursive descent: every `name` at any depth |
 | `[?key=value]` | every child that is a mapping whose `key` equals `value` |
@@ -347,11 +361,14 @@ sequence item.
 var ed = yaml.edit.Editor.init(&doc);
 
 // Query: exactly one match, or every match (caller frees the slice).
+// `one` fails with error.UnknownPath when nothing matches and
+// error.AmbiguousOperation when several do.
 const first = try ed.one("$.store.book[0].title");
 const titles = try ed.all("$.store.book[*].title");
 
-// Edits. `apply` is atomic: edits run on a deep clone of the tree
-// (presentation spans included) and swap in only if ALL succeeded.
+// Edits. `apply` is atomic: edits run in place and every change is
+// journalled, so a failed batch is rolled back (presentation spans
+// included) and the document is left as it was.
 try ed.apply(&.{
     .{ .set    = .{ .path = "$.port", .value = try doc.createScalar("9090", .plain) } },
     .{ .append = .{ .sequence = "$.items", .value = try doc.createScalar("new", .plain) } },
@@ -372,27 +389,36 @@ convention; its structure and values survive, its internal comments
 and blank lines do not. Untouched siblings stay verbatim. Moving a
 node into its own subtree is rejected (`error.MoveIntoSubtree`).
 
-Reads forward through aliases; writes do not. A mutation whose
-container is an alias (`$.b.k` where `b` is a `*ref`) is refused with
-`error.AliasPath` rather than misreported — edit the anchor's side
-instead, and the alias reflects the change. A move that would reorder
+Reads forward through aliases; writes do not. A mutation whose path
+steps through an alias anywhere (`$.b.k` or `$.b.inner.j` where `b` is a
+`*ref`) is refused with `error.AliasPath`, since it would change the
+anchored node every alias shares — edit the anchor's side instead, and
+the alias reflects the change. A move that would reorder
 an alias ahead of its anchor is refused with `error.AnchorReferenced`;
 a move where the anchor and its aliases travel together is allowed.
 
 `ed.one` returns a borrowed node; `ed.all` and `yaml.edit.resolve`
 return a caller-owned slice — free it with the same allocator.
 
-Recursive descent resolves aliases as it walks, and reports each node
-once: a `k` reachable both directly and through a `*ref` is one match,
-not two, so a per-match edit over `ed.all("$..k")` is applied once.
+Queries resolve aliases as they walk, and report each node once: a `k`
+reachable both directly and through a `*ref` is one match, not two, so
+a per-match edit over `ed.all("$..k")` is applied once. The same holds
+for wildcards and filters, and it keeps a query's cost to the size of
+the document: aliases of aliases can name exponentially many paths to
+the same nodes.
 
-A delete whose final segment is a recursive descent removes EVERY node
-it matches, in document order (`delete("$..k")` deletes every `k`
-anywhere beneath the root), atomically: if any removal would strand an
-alias the whole delete is refused with `error.AnchorReferenced` and
-nothing changes. The prefix resolves through the full grammar, so
-`$..in..k` reaches every `k` beneath every `in`. Descent deletes that
-match nothing are a no-op, like every delete.
+A delete removes EVERY node its path matches, in document order. A
+path of keys and indices names at most one node; a wildcard, filter or
+recursive descent can name many: `delete("$.items[*]")` empties the
+list, `delete("$.items[?k=1]")` removes every item whose `k` is `1`,
+`delete("$.items[*].tmp")` removes `tmp` from every item, and
+`delete("$..k")` deletes every `k` anywhere beneath the root. The
+prefix resolves through the full grammar, so `$..in..k` reaches every
+`k` beneath every `in`. It is atomic: if any removal would strand an
+alias the whole delete is refused with `error.AnchorReferenced`, and a
+match reached through an alias is refused with `error.AliasPath`;
+either way nothing changes. A delete that matches
+nothing is a no-op.
 
 To copy a subtree into a *different* document, use
 `yaml.edit.cloneTreeInto(&target_doc, node)`: it deep-clones the node
@@ -434,9 +460,11 @@ entry, newline-joined (`"# one\n# two"`). A blank line breaks the
 attachment, which is what makes "belongs to this entry" decidable. For a
 pair, the value stands in for the entry: an inline value (`host:
 localhost`) reads the pair's comments, and a block value (a mapping or
-sequence on its own line) reads the comments above it. A container's
-trailing comment is the one on its last entry's line, so the collection
-and that entry read the same bytes.
+sequence on its own line) reads the comments above it. Every node that
+starts on a line reads that line's block — a collection and its first
+entry, an item and its mapping's first key. A container's trailing
+comment is the one on its last entry's line, so the collection and that
+entry read the same bytes.
 
 Writes take the same raw form and canonicalize only the spacing:
 
@@ -455,12 +483,28 @@ unchanged scalars, asserted per position by `make preservation`.
 Comments work on brand-new values too: set a value with `pathSet`,
 then annotate it.
 
+A leading block belongs to its line: a write through any node on it
+replaces what is written there, and the block lives as long as the
+outermost node on the line. A collection's first entry shares the
+collection's line, so its block stays above whichever entry is first —
+after that entry is deleted, or another is inserted ahead of it — as a
+comment in the source would; a later entry owns its own line, and its
+block is deleted with it. After an edit, the reads follow the tree as it
+is now; source comments stay where the source put them, so one left
+above a deleted neighbour reads as that neighbour's until the document
+is written and parsed again.
+
 Rejected with `error.InvalidSyntax`, rather than silently dropped at
 emission time: comment text that is not one raw comment (no `#`, or a
 line break in a trailing comment), trailing comments on block
 collections (address the last entry), on the pair's key (the comment
-follows the value), on literal/folded or multi-line scalars (the value
-owns its lines), and anything inside a flow collection. Bytes the
+follows the value), on literal/folded scalars or scalars whose value
+holds a line break (the value owns its lines; a quoted scalar the source
+wrapped over several lines but whose value has no break takes the
+comment, and is rewritten onto one line), anything inside a flow
+collection, and anything inside
+a new or moved subtree, which is laid out afresh without comments (a new
+entry itself takes them). Bytes the
 scanner would refuse on re-parse are refused on the way in, so a write
 never produces a document `parse` cannot read back: malformed UTF-8 is
 `error.InvalidUtf8`, a NUL is `error.InvalidSyntax`. Everything the
@@ -607,19 +651,37 @@ descriptor is the wrong trade; match the string yourself after
 validation if you need it.
 
 Validation resolves aliases and so is bounded by `Limits`, like the
-value layer — see [Untrusted input](#untrusted-input) below. Branch
-exploration under `anyOf`/`oneOf` shares the enclosing budget, so a
-composite cannot multiply the work past the bound.
+value layer — see [Untrusted input](#untrusted-input) below: in nodes
+visited (`max_nodes`), depth (`max_depth`) and the bytes of text it
+copies into violations and paths (`max_bytes`, 64 MiB), since a
+violation quotes the value it rejects. Branch exploration under
+`anyOf`/`oneOf` shares the enclosing budget, so a composite cannot
+multiply the work past the bound.
+
+A tag that names a different kind of node (`!!seq 42`, `!!int [1]`) is
+a type violation, as `!!int abc` is, and the non-specific tag `!`
+resolves by kind (`! 12` is a string).
 
 ## Files
 
 `yaml.file` wraps parsing and writing with production safeguards:
 reads are bounded (`max_bytes`, so a huge file fails with
-`error.StreamTooLong`, not OOM) and writes use atomic replacement (a
-sibling temp file with an exclusive name, file sync, then rename): a
-crash never exposes torn content. This is torn-write protection, not a
-power-loss durability guarantee; sync the containing directory if your
-application requires that guarantee.
+`error.StreamTooLong`, not OOM; a file of exactly `max_bytes` is read)
+and writes use atomic replacement (a sibling temp file with an exclusive
+name, file sync, then rename): a crash never exposes torn content. This
+is torn-write protection, not a power-loss durability guarantee; sync
+the containing directory if your application requires that guarantee.
+Writing through a symbolic link replaces the file it points to and keeps
+the link; a link to nothing is `error.FileNotFound`. The temp file and
+the rename happen in the target's directory, which must be writable.
+Like any replace-by-rename, the new file is a new inode: permissions are
+carried over, but ownership, ACLs and extended attributes are not, and
+other hard links to the old file keep its old content.
+
+`max_bytes` is the parse's input bound too, so it can raise the default
+64 MiB as well as lower it. `parseFileOpts` and `parseAllFileOpts` take
+every `ParseOptions` field (merge keys, nesting, NUL policy) and a `Diag`;
+their file bound is `options.max_input_bytes`.
 
 ~~~zig
 var threaded: std.Io.Threaded = .init(alloc, .{});
@@ -685,6 +747,18 @@ const violations = try schema.validateLimited(alloc, node, "$", .{ .max_nodes = 
 `nodeToValueLimited` takes the same bound, and `Limits.unlimited` opts
 out — only for input you produced yourself.
 
+A count of values does not bound their size: every expanded alias copies
+its strings too, so one large anchored string behind a few levels of
+aliases is few values and a great deal of text. `value.Limits.max_bytes`
+(64 MiB, like the file limit) bounds the scalar and key text one
+conversion copies, with the same `error.LimitExceeded`.
+
+**Resolving merge keys** — `ParseOptions.max_merge_nodes`. Each `<<`
+copies its source's pairs into its mapping, so merges of merges grow the
+same way. Resolution stops at 262,144 copied nodes by default with
+`error.LimitExceeded`, leaving the document as it was;
+`Document.resolveMergeKeysLimited` takes the bound directly.
+
 Both also carry `max_depth` (1000), because a count of values cannot
 stand in for a depth: a linear chain of N nested collections is N values
 but N stack frames. Past it they return `error.NestingTooDeep`.
@@ -707,18 +781,24 @@ deep enough to reach it, since `max_nesting` is lower; this bounds
 documents you *built*, through `createSequence`/`sequenceAppend` or
 `value.toNode`. Past it, `Document.write` returns `error.NestingTooDeep`
 instead of overflowing the stack. Conversion, validation and the edit
-walks carry the same default, but the emitter admits two levels fewer:
-it charges extra where emission crosses between its faithful, normalized
-and flow modes. At default limits a 999-node path converts and validates
-and then fails to emit, so treat the bounds as close, not identical.
+walks carry the same default, but the emitter admits up to two levels
+fewer: it charges extra where emission crosses between its faithful,
+normalized and flow modes. At default limits a linear chain of 1000
+built sequences converts and validates and then fails to emit, so treat
+the bounds as close, not identical.
 
-**Reading files** — `yaml.file` applies its own `max_bytes` (64 MiB) at
-read time, before the bytes reach the parser.
+**Reading files** — `yaml.file` applies its `max_bytes` (64 MiB by
+default) at read time, before the bytes reach the parser, and passes the
+same bound to the parse.
 
 ## Memory and error model
 
-* Every `Document` owns an arena (`yaml.Pool`); nodes, strings,
-  copied source bytes, and edits live until `Document.deinit()`.
+* Every `Document` owns an arena (`yaml.Pool`); nodes, strings, and
+  edits live until `Document.deinit()`. The input a document was parsed
+  from is kept as well, and the documents of one stream (`parseAll`)
+  share a single copy of it, freed with the last of them: a stream costs
+  its input once plus each document's own tree, not the input once per
+  document. Documents can be released in any order.
 * `parseToValue`, `nodeToValue`, and `fromZig` return fully owned
   trees. Release them with `freeValue` and the same allocator.
 * `toZig` owns all slice storage in its result, including

@@ -124,6 +124,27 @@ These need answering before phase 2, and reviewers should push back:
    both as skip categories in places. A comment API must not quietly
    widen what it claims to support.
 
+## Answered: ownership and fate under edits
+
+A leading block belongs to a **line**, not a node: every node starting on
+it (a collection and its first entry, an item and its mapping's first
+key, a key and its inline value) reads it, and a write through any of
+them replaces it. It lives as long as the outermost node on the line. A
+collection's first entry shares the collection's line, so its block stays
+above whichever entry is first after a delete or an insert, as a source
+comment does; a later entry owns its own line, and its block is deleted
+with it. Which entry is first is read from the tree as it is now, not
+from the source lines. Nothing inside a new or moved subtree takes a
+comment (the emitter lays those out afresh), and a write there is
+refused rather than dropped.
+
+The gate for it is the second comment sweep in `tests/preservation.zig`:
+every writable position takes a comment, then one of five edits next to
+it (delete the entry, its neighbours or the first entry; insert before
+it), and the output must re-parse to the tree the same edit gives without
+the comment, write the comment at most once, and put it where the
+in-memory reads said it was.
+
 ## Explicitly out of scope
 
 - Comment reflow, re-wrapping, or normalisation of `#` spacing.

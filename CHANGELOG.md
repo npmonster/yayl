@@ -3,6 +3,569 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Fixed
+
+**Strings with a CR, NUL, ESC, DEL or other control byte were written in
+a style that cannot spell them.** Single quotes and block scalars have no
+escapes, so the byte went out raw: `a\rb` read back as `a b` at the root
+and did not parse as a mapping value, a NUL did not parse at all, and a
+CRLF inside a multi-line string lost its CR. Any string holding an ASCII
+control other than tab and line feed, or DEL, is now written
+double-quoted with escapes, whatever style was asked for. Over the
+corpus and fixtures the only output that changes is corpus G4RS rebuilt
+through `yaml.value`, whose `\b` and `\r\n` were written raw into literal
+blocks and read back changed. (#7)
+
+**A root string with a `---` or `...` line was cut off at that line.**
+A root block scalar's content sits at column 0, where such a line (with
+a blank or nothing after the marker) is a document marker, so
+`"a\n---\nb\n"` read back as `"a\n"`. At column 0 those values now fall
+back to double quotes; below the root, and for lines like `---x` that
+are not markers, the block form is kept. A new sweep writes and re-reads
+every string up to three bytes over control bytes, quotes, blanks and
+indicators (two bytes in each explicitly requested style; five over
+dashes, dots, blanks and line breaks) as a root, a block and flow mapping key and value, a sequence item and
+a nested value, and each comes back unchanged. (#8)
+
+**An edit under a root that shares its line with `---` dropped a dash.**
+`--- {a: 1}` with `$.a` set to 2 was written `--{a: 2}`, valid YAML that
+reads back as a mapping keyed `--{a`; flow, tagged, anchored and
+replaced scalar roots were all affected. `markup.entryStart` took the
+marker's last dash for a `- ` block-entry indicator, so the root's entry
+started inside `---` and a modified root was re-emitted without it. A
+dash directly after another dash is no longer taken for an indicator. A
+new preservation sweep sets every scalar of seventeen marker-line
+streams (flow and scalar roots, tags, anchors, comments, CRLF, BOM,
+directives, several documents) and checks that exactly that scalar's
+bytes change. (#9)
+
+**An empty item in a flow sequence was written as nothing.** Setting an
+item of `s: [a, b]` to the empty plain scalar (YAML's null) wrote
+`s: [, b]`, which does not parse, or `s: [a, ]`, which has one item. An
+empty plain scalar stays unwritten where YAML allows it (`key:`, `- `,
+`{k: }`), but as a flow sequence item with no anchor or tag it is now
+written `null`, so the item keeps its place and its value. (#10)
+
+**An anchor set on a parsed mapping key was silently dropped.**
+`setAnchor` on the key of `k: v` succeeded, but the document was written
+back as `k: v`: the emitter copied a key's source bytes whenever it had
+any, without asking whether the key had been modified since. Keys now
+follow the same rule as values, so `&x k: v` is written, clearing the
+anchor writes `k: v`, and a key's `- ` or `? ` framing and untouched
+sibling keys keep their bytes. (#11)
+
+**A delete matching several nodes reported success and deleted
+nothing.** `Editor.delete("$.items[*]")` and `delete("$.items[?k=1]")`
+left the document unchanged when they matched several nodes, and failed
+with `error.AmbiguousOperation` when they matched exactly one: the target
+was looked up with `one`, whose "not exactly one" error was taken for
+"no match". A delete now removes every node its path matches, as a
+trailing `..` descent already did: `[*]` empties a list or mapping,
+`[?k=v]` removes every matching item, and a wildcard or filter earlier
+in the path (`$.items[*].tmp`) applies to every item. A path of keys and
+indices still names at most one node, and matching nothing is still a
+no-op. It is all or nothing: a match whose removal would strand an alias
+(`error.AnchorReferenced`) or that is reached through an alias container
+(`error.AliasPath`) refuses the whole delete. Behaviour change: deletes
+that match several nodes used to be silent no-ops. (#12)
+
+**Writing a leading comment corrupted or lost the document in many
+positions.** A new preservation sweep writes a comment on every writable
+node of every fixture and corpus document and reads it back: 733 of 2,334
+writes failed. The causes:
+
+- On the first key of a sequence item or an explicit key, the `- ` or
+  `? ` was written twice (`- - k: v`, a nested sequence), and on an item
+  holding a mapping the same happened to the item's `- `.
+- On the root, the old comment block was removed and the new one never
+  written.
+- Several nodes start on one entry line (an item and its first key, a
+  block value and its first entry, a key and its inline value), and a
+  written block went to whichever node was named. The first key of an
+  item then recorded its tombstone in the wrong container, so the old
+  block survived next to the new one. A block now belongs to the
+  outermost node starting on the line; every node there reads and
+  writes that one block.
+- A `# ...` content line of a block scalar was read as the next entry's
+  comment, and a node made only of properties (`a: &anchor`, `- !!str`)
+  had a span running to the next token, taking the comment lines in
+  between (and a trailing `# comment` on it was not read at all).
+- A comment written for an empty node was accepted and dropped; it is now
+  refused with `error.InvalidSyntax`, as the read side has nothing there.
+- A written block for an explicit key's value dropped the `: ` indicator.
+
+A modified mapping key is also re-emitted under the rules for keys: since
+the #11 fix, a multi-line key given a comment or an anchor came out as a
+literal block, a different mapping.
+
+**A modified keep-chomped block scalar grew on every write.** A `|+` or
+`>+` block keeps its trailing line breaks as value, and in the source
+they sit after its slot. When the node was modified (a new anchor, tag
+or comment, or a new value with trailing breaks) the block was re-written
+with its whole value and then those source blank lines were written
+again, which the keep chomping took in: `keep\n\n` read back as
+`keep\n\n\n`. The blank lines are now skipped after a re-written keep
+block.
+
+**Edits inside a compact collection after an explicit `: ` or `? `
+changed or broke the document.** With `? a` / `: - b` (the value's first
+entry on the `: ` line), replacing or deleting that entry tombstoned the
+whole line, `: ` included: `$.a[0]` set gave `? a\n  - X`, a different
+tree, and a compact mapping value (`: x: 1`) no longer parsed after any
+edit. A re-emitted value also broke its line after the `: `. The first
+entry's line keeps the framing of the nodes around it (`- `, `? `, `: `)
+whatever the edit, as it already did for a sequence item's `- `, and a
+modified collection key no longer writes its `? ` twice or leaves a blank
+line before `: value`.
+
+**A trailing comment on an empty value could be written but not read.**
+`push: # c` read no comment (an empty value's span is a point borrowed
+from the next token), so a comment written there did not read back; an
+empty item or document took the write and never emitted it. An empty
+mapping value now reads the comment after its key and colon (`push:`,
+`? key`), and a trailing comment on an empty item or document, or after a
+block scalar key with no `:`, is refused with `error.InvalidSyntax`. The
+comment sweep now writes a trailing comment on every writable node too.
+
+**An explicit core tag accepted text outside its type's grammar.**
+`!!int` text was read with `std.fmt.parseInt(.., 0)` and `!!float` with
+`std.fmt.parseFloat`, which take much more than the YAML 1.2 core schema:
+`!!int 0b101` converted to 5, `!!int 1_000` to 1000, `!!float nan` to a
+NaN and `!!float 0x10` to 16, although each is a string untagged, and
+`Schema.int` passed `!!int abc`. An explicit core tag now holds only text
+spelled as its type (`!!int 0x1F`, `!!int '7'`, `!!float 1` and `.inf`
+still do); anything else is `error.TypeMismatch` from `yaml.value` and a
+type violation from `yaml.schema`. `toZig` holds a hand-built `.bigint`
+to the same rule, and a read path (`pathGet`, `byPath`) indexes a
+sequence only with plain digits (`1_0` and `+1` were items 10 and 1).
+
+**A query through aliases of aliases could run forever.** Queries
+resolve aliases, and a node reached again was walked again, so 20
+levels of 10 aliases (about 800 bytes) named 10^20 paths: `all("$..x")`
+never returned, and wildcard steps multiplied the same way. A descent now
+never re-walks a subtree it has finished and each step expands an alias
+target once, so a query costs the document's size (that test runs in
+20 ms). An alias cycle still fails with `error.NestingTooDeep`. Wildcard
+and filter results list each node once, as descent already did, and a
+trailing-descent delete no longer re-walks the document after every
+removal.
+
+**Converting aliases to Values was bounded in count but not in bytes.**
+`value.Limits.max_values` counts Values, but every expanded alias copies
+its strings: one 64 KiB anchored string behind four levels of ten aliases
+is only 10^4 Values, and asked for about 700 MB from a 65 KiB input. The
+new `value.Limits.max_bytes` (64 MiB by default, like the input limit)
+bounds the text one conversion copies, with `error.LimitExceeded`; a
+document without aliases never copies more text than it holds.
+
+**Merge-key resolution had no size bound, and each merge was
+quadratic.** Every `<<` copies its source's pairs into its mapping, with
+nothing bounding the total but depth: 72 KB of merges of a 1000-key
+mapping built a 2.4 GB document over two minutes, since each copied key
+was also compared with every key already there. The new
+`ParseOptions.max_merge_nodes` (262,144 by default) stops resolution with
+`error.LimitExceeded` (now part of `YamlError`), leaving the document as
+it was; `Document.resolveMergeKeysLimited` takes the bound directly. The
+key check is a hash lookup, so a merge costs what it copies: 100 merges
+of that mapping take a sixth of the time they did.
+
+**Every edit cost the size of the whole document.** `Editor.apply` (and
+so every `set`, `delete`, `insert`, `append` and `move`) deep-cloned the
+tree to stay atomic, and the clone was left in the document's arena: 800
+single-key sets on an 8,000-key mapping took 20 s and grew the arena by
+4.3 GB. A batch now edits in place and records each change in an undo
+journal, which a failed batch rolls back, so the document is left as it
+was (spans, tombstones, parent links and `modified` flags included; a
+new test fails a nine-edit batch at each of its allocations and compares
+the whole tree with a fresh parse; a second batch covers root, descent,
+wildcard and block-item changes, and merge resolution is failed at each
+of its allocations the same way). The same 800 sets take 74 ms and
+leave the arena as it was. Merge-key resolution uses the same journal
+instead of its own whole-tree clone. The alias checks that guard a delete
+or replacement now walk the tree only when the doomed subtree defines an
+anchor.
+
+**A same-document clone set as the root or a block sequence item wrote
+the wrong document.** `edit.cloneTree` keeps a copy's source spans, and
+the emitter, finding the copy clean, wrote the bytes of the slot it was
+copied from and carried on from where that slot ended. Set as the root
+of `a: 1\nb: 2\n`, a clone of `$.a` was written `1\nb: 2\n`, which does
+not parse; a clone of `- p` set as the root of `- p\n- q\n` vanished;
+set, appended or inserted as a block sequence item it re-wrote the lines
+after its source. Mapping values were already handled. Every attach now
+clears the attached node's own span and marks it, so it is written at
+its new position like a moved node, and a node set as the root leaves
+its old parent. (Found while checking the undo journal.)
+
+**A written leading comment next to a structural edit broke the
+document or went to the wrong entry.** The comment sweep only wrote
+comments; a second sweep now follows every write with one of five edits
+next to it (delete the entry, its neighbours or the first entry; insert
+before it), 7,334 cases, and checks that the output re-parses to the
+tree the same edit gives without the comment, writes it at most once,
+and puts it where the in-memory reads said it was. Run against the code
+before these fixes it reports 1,936 failures: 102 outputs that do not
+parse, 8 changed trees, and the rest comments that read back from a
+different node than the one holding them in memory.
+
+- A block written above a collection's first entry, with that entry then
+  deleted or moved, was followed by the entry's indentation on top of the
+  successor's own: `items:\n  # new\n    - name: y` (unparseable), or a
+  mapping silently re-nested one level down.
+- A block on a new first item left the original item after it at
+  column 0, which did not parse.
+- After an insert ahead of an item, a block written on that item went
+  above the new first item: which entry shares a collection's line is
+  now read from the tree as it is, not from the source lines. The reads
+  follow the same rule, and a block on an entry that has since become
+  first is still read.
+- A collection's trailing comment read its source end, stale once its
+  last entry changed; it now reads its last entry's. A `? key` with no
+  value reads the comment written on its value, which follows the key.
+- Comments written inside a new subtree (`$.c.x` after setting `$.c` to a
+  new mapping) were accepted, read back in memory and dropped on write;
+  they are refused with `error.InvalidSyntax`, as the emitter lays those
+  subtrees out afresh. A block on an emptied block value is kept above
+  its `{}`.
+- A block written on a root sharing the `---` line came out as
+  `--- \n    # new\n    {a: 1}`; the root now moves below it, at column 0
+  (`---\n# new\n{a: 1}`).
+
+A block written through any node on a line now replaces what is written
+above that line, and lives as long as the outermost node on it: a
+collection's first entry shares the collection's line, so its block
+stays above whichever entry is first, as a source comment does, while a
+later entry's block is deleted with it (`Document.setLeadingComments`,
+USAGE). A leading block on an empty first entry (`- ` over `- b`) is now
+written above the line it shares with its collection, where it reads
+back, instead of being refused.
+
+**Edits beside property lines and bare indicators.** Three edits wrote
+YAML that does not parse, all on main:
+
+- A new first entry of a collection whose anchor or tag sits on a line of
+  its own went above that line: `&sequence\n- a` with an item inserted
+  first became `- zz\n&sequence\n- a`, and setting its first entry
+  moved that entry above it too. The preservation sweep skipped every
+  such collection for this reason; it now sweeps them (488 deletes, 428
+  sets, 173 inserts and 1,997 moves over the fixtures, up from 474, 418,
+  166 and 1,955), where the code before this fix fails 16 of them.
+- Emptying a collection whose `-` stood alone on the line above it
+  (`-\n  - x`) wrote its `[]` at column 0, outside the item.
+- Deleting an explicit-key pair whose `:` stood on a line of its own
+  (`? a\n  :`) left the `:` behind (`{}\n  :`). A valueless pair now ends
+  at its value indicator wherever it is, which also makes the position
+  after that `:` a trailing comment position of the value.
+
+**A write one level below an alias went through it.** `error.AliasPath`
+fired only when the container being edited was itself the alias: with
+`a: &x {k: 1, inner: {j: 2}}` and `b: *x`, `delete("$.b.k")` was refused
+but `delete("$.b.inner.j")`, `set` of the same path, `$.b..j`, and an
+insert, append or move through `$.b` edited the anchored mapping that
+every alias shares. Queries now report when a match was reached by
+stepping out of an alias, at any step or inside a descent, and every
+write refuses that. A descent over the whole document reaches an
+anchored node directly first, so `delete("$..j")` still deletes it.
+
+**The fuzz harness.** Its header claimed Zig 0.16.0 has no
+`std.testing.fuzz`; it has one, whose coverage-guided mode does not build
+on that toolchain (a type error in its own test runner), and the note
+now says so. Its list of expected errors was kept by hand and lacked
+`AliasPath`, so the edit API's correct refusal of a write through an
+alias would have been reported as a harness failure; the list is now
+derived from the library's error sets.
+
+**`parseAll` copied the whole stream into every document.** Each
+document of a multi-document stream duplicated the *entire* input into
+its own arena (its spans are offsets into the stream), so memory was
+documents x stream: doubling the input quadrupled it, a 32 KiB stream of
+tiny documents held 180 MB, and 1 MiB of `---\na: 1\n` (116,509
+documents) wanted about 114 GiB, enough to exhaust a 64 GB machine,
+while `max_input_bytes` (64 MiB) bounded nothing. The stream is now
+copied once and shared by reference count: the last document to be
+deinitialized frees it, documents stay valid in any order of release,
+and the same 1 MiB stream holds about 190 MB (about 1.6 KB per document,
+linear). Emitted bytes, spans and the public API are unchanged; the
+conformance, round-trip, preservation and libfyaml gates produce
+identical output. `SECURITY.md` and the memory model in `docs/USAGE.md`
+now state what a stream costs. (#1)
+
+**Writing a long one-line flow collection was quadratic.** Before
+emitting, the emitter measures the document's indent width, and for
+every mapping pair it took the key's column first, a scan back to the
+start of the key's line, then checked whether it needed it (only a
+block child compares against it). On a flow mapping that sits on one
+line (minified JSON is exactly that) the scan is as long as the line,
+so a `write` cost pairs x line length: 256 KB took 1.4 to 2.3 s, 1 MB
+about 30 s, and every doubling of the input quadrupled it, while
+parsing the same input is linear (about a second at 1 MB). The column
+is now taken only where it is compared, so the same 256 KB writes in
+0.2 to 1.1 ms. Output is byte-identical; the change reorders one
+computation and nothing else. (#4)
+
+**`writeAll` was quadratic in the number of documents.** Before
+appending each document after the first, it asked whether the output so
+far already ended in a `...` marker (so no `---` is needed), and
+answered by walking every line of that output to find the last
+non-blank one. That is the whole stream written so far, once per
+document, so N documents cost N x output: 32 KB of tiny documents took
+47 ms, every doubling quadrupled it, and a 1 MiB stream would take
+close to a minute to write back. Scanning back to the start of the
+last line is no better when a document ends mid-line (see the next
+entry): the last line can be the whole buffer. The answer is now kept as
+the output is written, so each byte is looked at once, and each document
+is emitted on its own before it is joined on, so its emitter no longer
+measures the line the previous document ended on (16,000 such documents
+took 11 s to write, and take 9 ms). Parsed streams are written back
+byte-identical:
+the tracker is checked against the old definition on all 335,923
+strings up to length 7 over the marker's dot, both blanks, every line
+break and one byte of ordinary content, fed whole, one byte at a time
+and split in two at every position. (#5)
+
+**`writeAll` merged documents when one ended mid-line.** A document
+parsed from text with no final line break is written back without one,
+and the next document's bytes were appended to its last line, where a
+`---` is not a marker: `--- x` and `--- y` were written `--- x--- y`,
+one document holding `x--- y`. The same went for `x` then `--- y`, and
+for `y` after a `...` with no line break (`x\n...y`, one document; with a
+blank after the marker, a parse error). A directive after a document that
+did not end with `...` became part of it (`x` then `%YAML 1.2\n--- y`
+read back `x %YAML 1.2`), and a comment starting the next document was
+glued to the value (`x# c`). `writeAll` now ends the line first unless the
+next document's bytes only finish it with blanks or a comment (how a
+parsed stream splits `--- x # c`), and closes the previous document with
+`...` before a directive. Parsed streams are still written back
+byte-identical.
+
+**A hostile tag injected YAML structure when it was written back.** The
+reader decodes `%XX` escapes in a tag, and the emitter wrote the decoded
+bytes raw: `role: !!str%0Aadmin:%20true user` merged, moved or re-emitted
+came out as `role: !!str` and a new key `admin: true user`. Tags are now
+written with a handle for their prefix (the document's own `%TAG`
+handles, else `!!` and `!` unless the document redefined them, which were
+also ignored) and every byte outside the tag alphabet escaped, so they
+read back as themselves; a tag with no spelling (a blank or `>` in a
+verbatim tag) is refused with `error.InvalidSyntax`. A tag escape that
+decodes to invalid UTF-8 (`!e!%ff`) is now a parse error, as in
+libfyaml.
+
+**Programmatic text the emitter could not spell was written raw.**
+Found by a sweep of 310,536 built documents, each re-parsed by yayl and
+by libfyaml:
+
+- An alias used as a key was written `*r: v`, but `:` may be part of an
+  anchor name, so it read back as an alias named `r:` (flow keys, and
+  block keys after a value edit). It is written `*r : v`.
+- A key over 1024 characters was written as an implicit key, which the
+  spec (and yayl's own parser) refuses; it is now written `? key`.
+- A string starting with a byte order mark was written plain at the
+  start of a document, where the reader drops the mark as an encoding
+  mark (`\u{FEFF}a` read back `a`); it is quoted now, and a block
+  scalar line at column 0 never starts with one.
+- C1 controls and U+FFFE/U+FFFF are not printable and may not appear raw;
+  they are written as `\u` escapes in double quotes.
+- A scalar that is not valid UTF-8 was written raw, output neither yayl
+  nor libfyaml parses; the write now fails with `error.InvalidUtf8`. An
+  anchor or alias name YAML cannot spell fails with
+  `error.InvalidSyntax`, and `Document.setAnchor` refuses control
+  characters, non-printable characters, invalid UTF-8 and the byte order
+  mark as well as blanks and flow indicators.
+- Two valid forms that libfyaml misreads are avoided: a root block
+  scalar with an anchor or tag is written after `--- ` on the marker
+  line, and a plain scalar starting with `:` in a flow collection is
+  quoted.
+
+**The value and schema layers disagreed with the core schema in
+places.**
+
+- The non-specific tag `!` resolved by content, so `! 12` was an
+  integer; it is a string (spec example 6.28), as `!` on a collection
+  was already a sequence or mapping.
+- A core tag naming a different kind of node (`!!seq 42`, `!!int [1]`,
+  `!!str {a: 1}`) was accepted; it is `error.TypeMismatch` from
+  `yaml.value` and a type violation from `yaml.schema`, like `!!int abc`.
+- `toZig` into a float returned an infinity for a value the type cannot
+  hold (`1e39` into `f32`, `70000` into `f16`) where an integer target
+  refuses one; it is `error.TypeMismatch` now. A `.bigint` converts to a
+  float instead of failing, and `0o` and long `0x` integers convert to
+  the nearest float: `std.fmt.parseFloat` does not read `0o` and
+  truncated a long hex mantissa (`0x1FFFFFFFFFFFFFFFFFFF` came out one
+  unit in the last place low), so `Schema.floatRange` also refused
+  `0o17`.
+- A tagged union's `void` field accepted any value; only null reads
+  back into it, as `fromZig` writes it.
+- `fromZig` of a non-exhaustive enum's unnamed value panicked in
+  ReleaseSafe; it is `error.TypeMismatch`. A string literal
+  (`.{ .name = "yayl" }`) became a sequence of bytes; it is a string.
+- `toZig` failed to compile inside the library for sentinel slices
+  (`[:0]const u8`), zero-length arrays and structs with `comptime`
+  fields; all three convert.
+
+**Schema validation was not bounded in bytes.** Each violation quotes
+the value it rejects, and aliases repeat it: a 64 KiB anchored string
+behind three levels of ten aliases made 1,000 violations and 62 MB from
+a 65 KB input, and one more level passed 512 MB. `schema.Limits` has a
+`max_bytes` (64 MiB by default, like `value.Limits.max_bytes`) charged
+for violation text and the paths built on the way down.
+
+**Three parse shapes were quadratic.**
+
+- Every open simple key had its span recounted in codepoints on every
+  token once it passed 1024 bytes: nested flow collections of multibyte
+  text scanned at a few kilobytes a second (10 KB took 15.7 s in Debug,
+  and takes 70 ms). The count is kept on the key.
+- Each collection value searched its mapping's pairs from the front, so
+  a mapping of mappings (`kN:\n  x: 1`) was quadratic: 80,000 entries
+  took a second in ReleaseSafe.
+- `%TAG` handles were found by a linear search, for the duplicate check
+  and for every tag: 64,000 directives took 5 s.
+
+**Parsing, diagnostics and files.**
+
+- `.embedded_nul = .truncate` dropped everything after the NUL from the
+  tree but not from the document's source, so a write emitted the NUL and
+  the bytes after it, which a default parse refuses. They stay dropped.
+- `parse` stopped at the first document's end event, so a first document
+  followed by content that cannot begin another (`[1, 2] garbage`,
+  `"a"\nb: 1`, `!a !b x`) came back as if whole, the rest dropped
+  without a word. It fails now; a malformed *later* document still does
+  not fail a single-document parse.
+- An undefined alias and a failed merge-key resolution left the `Diag`
+  empty, and invalid UTF-8 was always reported at 1:1. Each now records
+  a positioned diagnostic.
+- `file.readFile` refused a file of exactly `max_bytes`, which the parse
+  accepts; `parseFile`'s `max_bytes` could lower the parse's input bound
+  but not raise it, and files took no `ParseOptions`. See Changed.
+- `file.writeBytesAtomic` (and `writeFile`) through a symbolic link
+  replaced the link with a regular file and left the real file as it
+  was; it replaces the file the link points to now. The temp file was
+  named after the target plus a suffix, so a long but legal file name
+  failed with `error.NameTooLong`; it has a short name of its own.
+- SECURITY.md said merge keys are never resolved, and SECURITY.md and
+  USAGE said the emitter admits two fewer levels than conversion; it
+  admits up to two fewer, and one on a linear chain.
+
+**Edits wrote YAML that did not parse, or that read back as another
+tree.** A randomized differential over the fixtures and the corpus (about
+63,000 edits and batches, each written, read back and compared with the
+tree in memory) found these; each is pinned by a regression test:
+
+- Any edit to a document opening with a byte order mark: its three bytes
+  were counted as columns, so the first entry moved three columns in.
+  The preservation sweep skipped such documents for this reason; it now
+  sweeps them (42 variant documents, up from 28).
+- A block scalar written by an edit took in what followed it: a comment
+  after the old value on its line (`a: 1 # c` set to `x\ny` read back
+  `y # c`), comment lines indented as deep as its content, and, for
+  keep chomping, the blank lines after it. A block scalar now ends its
+  own line, sits deeper than the comments after it, moves a same-line
+  comment onto its header (`a: |- # c`), and a keep-chomped one takes
+  over the blank lines it would absorb.
+- A new block collection replacing a root that shared its line with
+  `---` or a tab was written on that line (`--- - x`); content was glued
+  to a document marker (`{}...`, `x...`, `---x`).
+- An item whose dash carried a comment (`- # c\n  x`) had its span start
+  at its content, so deleting it left a null item and setting it wrote
+  the new item above the old dash.
+- An empty new item left only `- ` on its line, and the next item read it
+  as its own framing (`- - x`, a nested sequence); an item inserted
+  first with a block scalar left the next item at column 0; once every
+  original entry of a collection was gone, new ones went to the
+  enclosing item's column (`-\n  - 42` refilled wrote `- x`).
+- A written leading comment kept the caller's own indentation, which
+  could put it inside a block scalar above; it is written at the entry's
+  column, as documented.
+- A replaced flow-mapping value lost its `:` when the colon was not
+  right after the key (`{"foo"\n: "bar"}`, `{foo, b: 1}`).
+- A new entry after a keep-chomped block in a CRLF document was written
+  between the CR and the LF; a comment in a flow collection of a
+  CR-terminated document hid a delete.
+- An anchor set on, changed on or cleared from a parsed block collection
+  or an empty value was never written; an empty key with an anchor or
+  tag lost the blank before its `:` (`&c: b` defines `c:`).
+- Deleting an entry with a null key (`: a`) left it in the output, and
+  moving one copied it.
+- A trailing comment written on the last entry of a file with no final
+  line break was dropped; a new entry after a whitespace-only last line
+  went inside the block scalar above it.
+- Setting a node as a value of its own descendant panicked in ReleaseSafe;
+  it is `error.WouldCycle`, as the append paths already returned.
+- An anchor set on an alias was silently never written (YAML gives
+  aliases no properties); it is `error.InvalidSyntax`.
+- Defining an anchor name again ahead of an alias bound to the earlier
+  definition (`setAnchor`, or a set, insert, append or move carrying the
+  anchor) rebinds that alias once the document is written and read back,
+  while in memory it kept its target; such an edit is refused with the
+  new `error.AnchorShadowed`.
+- A path starting `$` and a key character took the `$` for the root:
+  `delete("$ref")` deleted `ref`. `$` is the root only before `.`, `[`
+  or nothing, and text after a segment (`$.items[0]name`) is an invalid
+  path.
+- A set whose parent path matched several nodes reported
+  `error.UnknownPath`; it is `error.AmbiguousOperation`.
+- A replaced sequence item lost the comment on its line (a mapping
+  value's kept it); it stays, on the block header for a block scalar. An
+  item under a line holding several indicators (`- -` over a comment
+  line) had its span start at its content, so deleting it left a null
+  item. A new block scalar in a CRLF document broke its lines with `\n`.
+  Clearing a collection's anchor that stood on a line of its own left the
+  line empty.
+- `writeAll` wrote nothing for a document built with no root, so its
+  neighbours read back as one document; it writes an explicit empty
+  document (`---`). A byte order mark opening a later document became
+  content of it (`\u{FEFF}b: 2` a key); it is dropped there.
+- `defaultTerminator` rescanned the source for its first line break on
+  every call, a scan as long as the document for one written on a single
+  line; it is taken once.
+
+### Changed
+
+- `edit.cloneTreeWhole` is removed. It existed for the clone the undo
+  journal replaced, and nothing else called it; `cloneTree` (same
+  document) and `cloneTreeInto` (another document) are unchanged.
+- `edit.Error` and `edit.CloneError` no longer list `UnknownAlias`, which
+  only `cloneTreeWhole` returned. With it went the other effect of that
+  clone: any batch on a hand-built tree holding a forward alias (one
+  whose anchor comes later) failed with `error.UnknownAlias`. Such a
+  batch now runs, and one that would delete or replace the anchor is
+  refused with `error.AnchorReferenced`, like any stranding edit.
+- `Editor.one` returns `error.AmbiguousOperation` for a path that
+  matches several nodes; it returned `error.UnknownPath`, as for a path
+  that matches nothing, so the two could not be told apart (asked for in
+  #12). The single-target edits (`insert`, `append`, `move`) report the
+  same, as `set` already did.
+- `Document.markModified` and `Document.retargetAliases` return an error
+  union (`!void`): a batch records their changes in its undo journal,
+  which can run out of memory. Callers add `try`.
+- `value.Limits` has a `max_bytes` field and `ParseOptions` a
+  `max_merge_nodes` field (see Fixed); `diag.YamlError` gains
+  `LimitExceeded`.
+- `schema.Limits` has a `max_bytes` field (see Fixed).
+- `yaml.file` gains `parseFileOpts` and `parseAllFileOpts`, which take
+  a `Diag` and `ParseOptions`; `parseFile` and `parseAllFile` pass their
+  `max_bytes` to the parse as `max_input_bytes`, so it can raise the
+  64 MiB default.
+- Writes that used to produce unreadable output now fail:
+  `error.InvalidUtf8` for a scalar that is not UTF-8, `error.InvalidSyntax`
+  for an anchor, alias or tag that YAML cannot spell. `setAnchor` refuses
+  more names (see Fixed).
+- Conversions that used to succeed wrongly now return
+  `error.TypeMismatch`: a tag naming another kind of node, a float out of
+  its target's range, a non-null value for a `void` union field, and an
+  unnamed non-exhaustive enum value. `! 12` converts to a string.
+- `parse` fails on a first document followed by content that cannot
+  begin another document.
+- `writeFile` through a symbolic link replaces the link's target.
+- `edit.Error` gains `AnchorShadowed` (see Fixed), which `setAnchor` can
+  return too; `setAnchor` on an alias is `error.InvalidSyntax`.
+- A path starting `$` followed by a key character is a key (`$ref`),
+  and text after a segment is `error.InvalidPath`.
+- A block scalar the emitter writes always ends its last line, and a
+  written leading comment is written at the entry's column.
+
 ## 0.19.3 — 2026-09-15
 
 An independent review of the 0.19.2 tree found five high-severity

@@ -77,6 +77,17 @@ pub const Limits = struct {
     /// `error.LimitExceeded` on the value that would exceed it.
     max_values: usize = 1 << 20,
 
+    /// Maximum bytes of text one conversion may copy: every string,
+    /// big integer and mapping key. `Value` holds its strings, so an
+    /// expanded alias copies them each time -- and the value budget
+    /// cannot see that: one 64 KiB anchored string behind four levels of
+    /// ten aliases is only 10^4 Values, but 640 MiB of copies from a
+    /// 65 KiB input. Conversion stops with `error.LimitExceeded` on the
+    /// text that would exceed it. The default matches the input limit
+    /// (`max_input_bytes`): a document without aliases never copies more
+    /// text than it holds.
+    max_bytes: usize = 64 << 20,
+
     /// Deepest nesting one conversion will descend before returning
     /// `error.NestingTooDeep`.
     ///
@@ -93,7 +104,7 @@ pub const Limits = struct {
     ///
     /// 1000, alongside `Emitter.max_depth`, though the two are not
     /// interchangeable: the emitter charges up to two extra levels and
-    /// so admits two fewer.
+    /// so admits up to two fewer.
     max_depth: usize = 1000,
 
     /// No bound. Only for input you produced yourself.
@@ -104,6 +115,7 @@ pub const Limits = struct {
     /// budget, set `max_values` and leave `max_depth` alone.
     pub const unlimited: Limits = .{
         .max_values = std.math.maxInt(usize),
+        .max_bytes = std.math.maxInt(usize),
         .max_depth = std.math.maxInt(usize),
     };
 };
@@ -154,7 +166,7 @@ pub fn nodeToValue(allocator: std.mem.Allocator, node: *const Node) Error!Value 
 /// `nodeToValue` with an explicit expansion bound. Pass
 /// `Limits.unlimited` only for input you produced yourself.
 pub fn nodeToValueLimited(allocator: std.mem.Allocator, node: *const Node, limits: Limits) Error!Value {
-    var budget: Budget = .{ .remaining = limits.max_values, .max_depth = limits.max_depth };
+    var budget: Budget = .{ .remaining = limits.max_values, .bytes = limits.max_bytes, .max_depth = limits.max_depth };
     return convert(allocator, node, &budget);
 }
 
@@ -164,6 +176,8 @@ pub fn nodeToValueLimited(allocator: std.mem.Allocator, node: *const Node, limit
 /// exceeded it rather than firing after the work is done.
 const Budget = struct {
     remaining: usize,
+    /// Bytes of text it may still copy.
+    bytes: usize,
     depth: usize = 0,
     max_depth: usize,
 
@@ -171,6 +185,12 @@ const Budget = struct {
     fn charge(self: *Budget) Error!void {
         if (self.remaining == 0) return error.LimitExceeded;
         self.remaining -= 1;
+    }
+
+    /// The length of text about to be copied (a scalar's, a key's).
+    fn chargeBytes(self: *Budget, n: usize) Error!void {
+        if (n > self.bytes) return error.LimitExceeded;
+        self.bytes -= n;
     }
 
     /// Open one nesting level, or fail. Paired with `leave`.
@@ -192,8 +212,15 @@ fn convert(allocator: std.mem.Allocator, node: *const Node, b: *Budget) Error!Va
     try b.enter();
     defer b.leave();
     const cur = node.resolveAlias();
+    // `!!seq 42`, `!!int [1]`: the tag says one kind and the node is
+    // another, as with `!!int abc` (see `taggedScalarToValue`).
+    if (document_mod.tagContradictsKind(cur)) return error.TypeMismatch;
     switch (cur.data) {
-        .scalar => return taggedScalarToValue(allocator, cur),
+        .scalar => |sc| {
+            // At most the text is copied (a string or a bigint's digits).
+            try b.chargeBytes(sc.value.len);
+            return taggedScalarToValue(allocator, cur);
+        },
         .alias => unreachable, // resolveAlias never returns alias
         .sequence => |sq| {
             var out = try allocator.alloc(Value, sq.items.items.len);
@@ -220,10 +247,12 @@ fn convert(allocator: std.mem.Allocator, node: *const Node, b: *Budget) Error!Va
             }
             for (m.pairs.items, 0..) |p, i| {
                 const k = p.key.resolveAlias();
-                const key_copy = try allocator.dupe(u8, switch (k.data) {
-                    .scalar => |s| s.value,
+                const key_text = switch (k.data) {
+                    .scalar => |ks| ks.value,
                     else => return error.TypeMismatch,
-                });
+                };
+                try b.chargeBytes(key_text.len);
+                const key_copy = try allocator.dupe(u8, key_text);
                 errdefer allocator.free(key_copy);
                 out[i] = .{
                     .key = key_copy,
@@ -240,64 +269,37 @@ fn convert(allocator: std.mem.Allocator, node: *const Node, b: *Budget) Error!Va
 ///
 /// `!!str 42` is a string and `!!int '7'` an integer: the tag is an
 /// assertion about the value, so it outranks both the plain-scalar
-/// resolution and the quoting style. A tag whose content cannot be
-/// read as the type it claims (`!!int abc`) is `error.TypeMismatch` —
-/// the document says one thing and means another, and silently
-/// returning a string would hide that. Untagged scalars, and scalars
-/// carrying a non-core tag, resolve exactly as before.
+/// resolution and the quoting style. A tag whose text is not spelled as
+/// the type it claims (`!!int abc`, `!!int 0b101`) is
+/// `error.TypeMismatch` -- the document says one thing and means another,
+/// and silently returning a string would hide that. Untagged scalars,
+/// and scalars carrying a non-core tag, resolve exactly as before.
 fn taggedScalarToValue(allocator: std.mem.Allocator, node: *const Node) Error!Value {
-    const s = node.data.scalar;
-    const explicit = if (node.tag) |uri| document_mod.coreTagFromUri(uri) else null;
-    const t = explicit orelse return scalarToValue(allocator, s.value, s.style);
-
-    return switch (t) {
-        .str => .{ .string = try allocator.dupe(u8, s.value) },
-        .null => if (document_mod.resolveCoreTag(s.value, .plain) == .null)
-            .null
-        else
-            error.TypeMismatch,
-        .bool => switch (document_mod.resolveCoreTag(s.value, .plain)) {
-            .bool => .{ .bool = s.value[0] == 't' or s.value[0] == 'T' },
-            else => error.TypeMismatch,
-        },
-        .int => try taggedInt(allocator, s.value),
-        .float => .{ .float = document_mod.parseCoreFloat(s.value) orelse return error.TypeMismatch },
-    };
+    const t = document_mod.scalarCoreTag(node) orelse return error.TypeMismatch;
+    return typedScalar(allocator, node.data.scalar.value, t);
 }
 
-/// `!!int` on a value too wide for `i64` keeps its exact digits, the
-/// same answer `scalarToValue` gives the untagged form. Tagging a big
-/// number is MORE explicit than leaving it bare, so it must not be less
-/// capable. Text that is not an integer at all is still `TypeMismatch`:
-/// `!!int abc` says one thing and means another.
-fn taggedInt(allocator: std.mem.Allocator, text: []const u8) Error!Value {
-    if (document_mod.parseCoreInt(text)) |i| return .{ .int = i };
-    // Not representable as i64. It is still `!!int` only if the text is a
-    // core-schema integer (the shared rule, so `schema` and `value` agree
-    // on which scalars are bigints); otherwise the tag contradicts it.
-    if (document_mod.resolveCoreTag(text, .plain) != .int) return error.TypeMismatch;
-    return .{ .bigint = try allocator.dupe(u8, text) };
+/// A scalar's text as a Value of core type `t`, which it is spelled as
+/// (`document.coreTextFits`). Tagged or not, an integer too wide for
+/// `i64` keeps its exact digits as `.bigint`: tagging a big number says
+/// more about it, so it must not be less capable.
+fn typedScalar(allocator: std.mem.Allocator, text: []const u8, t: document_mod.CoreTag) Error!Value {
+    return switch (t) {
+        .null => .null,
+        .bool => .{ .bool = text[0] == 't' or text[0] == 'T' },
+        .int => if (document_mod.parseCoreInt(text)) |i| .{ .int = i } else .{ .bigint = try allocator.dupe(u8, text) },
+        // Every text the core float grammar accepts parses; the error is
+        // a guard, not a path.
+        .float => .{ .float = document_mod.parseCoreFloat(text) orelse return error.TypeMismatch },
+        .str => .{ .string = try allocator.dupe(u8, text) },
+    };
 }
 
 /// Interpret a scalar's text under its style (core schema: only plain
 /// scalars get typed). Ignores any explicit tag on the node; conversion
 /// goes through `taggedScalarToValue`, which does not.
 pub fn scalarToValue(allocator: std.mem.Allocator, text: []const u8, style: ScalarStyle) Error!Value {
-    if (style != .plain) return .{ .string = try allocator.dupe(u8, text) };
-    switch (document_mod.resolveCoreTag(text, .plain)) {
-        .null => return .null,
-        .bool => return .{ .bool = text[0] == 't' or text[0] == 'T' },
-        .int => {
-            if (document_mod.parseCoreInt(text)) |i| return .{ .int = i };
-            // Out-of-range integers keep their exact text.
-            return .{ .bigint = try allocator.dupe(u8, text) };
-        },
-        .float => {
-            if (document_mod.parseCoreFloat(text)) |f| return .{ .float = f };
-            return .{ .string = try allocator.dupe(u8, text) };
-        },
-        .str => return .{ .string = try allocator.dupe(u8, text) },
-    }
+    return typedScalar(allocator, text, document_mod.resolveCoreTag(text, style));
 }
 
 /// Materialize a Value as a document tree node (owned by `doc`).
@@ -429,15 +431,29 @@ pub fn toZig(comptime T: type, allocator: std.mem.Allocator, value: Value) Error
         .int => switch (value) {
             .int => |i| return std.math.cast(T, i) orelse error.TypeMismatch,
             .bigint => |t| {
-                const parsed = std.fmt.parseInt(T, t, 0) catch return error.TypeMismatch;
-                return parsed;
+                // A hand-built Value is held to the core spelling too:
+                // base 0 would also take `0b1` and `1_000`.
+                if (document_mod.resolveCoreTag(t, .plain) != .int) return error.TypeMismatch;
+                return std.fmt.parseInt(T, t, 0) catch error.TypeMismatch;
             },
             else => return error.TypeMismatch,
         },
-        .float => switch (value) {
-            .int => |i| return @floatFromInt(i),
-            .float => |f| return @floatCast(f),
-            else => return error.TypeMismatch,
+        .float => {
+            // A value the type cannot hold is a mismatch, as for an int
+            // that does not fit (`toZig(u8, 256)`), not an infinity: only
+            // an infinity stays one. A `.bigint` is an integer too.
+            const wide: f64 = switch (value) {
+                .int => |i| @floatFromInt(i),
+                .float => |f| f,
+                .bigint => |t| blk: {
+                    if (document_mod.resolveCoreTag(t, .plain) != .int) return error.TypeMismatch;
+                    break :blk document_mod.parseCoreFloat(t) orelse return error.TypeMismatch;
+                },
+                else => return error.TypeMismatch,
+            };
+            const out: T = @floatCast(wide);
+            if (std.math.isInf(out) and !(value == .float and std.math.isInf(wide))) return error.TypeMismatch;
+            return out;
         },
         .optional => |opt| {
             if (value == .null) return null;
@@ -458,13 +474,26 @@ pub fn toZig(comptime T: type, allocator: std.mem.Allocator, value: Value) Error
             if (ptr.size == .slice) {
                 if (ptr.child == u8) {
                     switch (value) {
-                        .string => |s| return try allocator.dupe(u8, s),
+                        .string => |s| {
+                            // `[:0]const u8` and friends: the sentinel
+                            // follows the text.
+                            if (comptime ptr.sentinel()) |z| {
+                                if (std.mem.indexOfScalar(u8, s, z) != null) return error.TypeMismatch;
+                                const out = try allocator.allocSentinel(u8, s.len, z);
+                                @memcpy(out, s);
+                                return out;
+                            }
+                            return try allocator.dupe(u8, s);
+                        },
                         else => return error.TypeMismatch,
                     }
                 }
                 switch (value) {
                     .sequence => |items| {
-                        const out = try allocator.alloc(ptr.child, items.len);
+                        const out = if (comptime ptr.sentinel()) |z|
+                            try allocator.allocSentinel(ptr.child, items.len, z)
+                        else
+                            try allocator.alloc(ptr.child, items.len);
                         var filled: usize = 0;
                         errdefer {
                             for (out[0..filled]) |item| deinitZig(ptr.child, allocator, item);
@@ -500,7 +529,12 @@ pub fn toZig(comptime T: type, allocator: std.mem.Allocator, value: Value) Error
             if (members.len != 1) return error.TypeMismatch;
             inline for (un.fields) |field| {
                 if (std.mem.eql(u8, field.name, members[0].key)) {
-                    if (field.type == void) return @unionInit(T, field.name, {});
+                    // Written as null by `fromZig`; anything else is data
+                    // the field has nowhere to keep.
+                    if (field.type == void) {
+                        if (members[0].value != .null) return error.TypeMismatch;
+                        return @unionInit(T, field.name, {});
+                    }
                     return @unionInit(T, field.name, try toZig(field.type, allocator, members[0].value));
                 }
             }
@@ -510,6 +544,7 @@ pub fn toZig(comptime T: type, allocator: std.mem.Allocator, value: Value) Error
             .sequence => |items| {
                 if (items.len != arr.len) return error.TypeMismatch;
                 var out: T = undefined;
+                if (comptime arr.len == 0) return out;
                 var filled: usize = 0;
                 errdefer for (out[0..filled]) |item| deinitZig(arr.child, allocator, item);
                 for (items, 0..) |item, i| {
@@ -582,11 +617,20 @@ pub fn deinitZig(comptime T: type, allocator: std.mem.Allocator, value: T) void 
                 return;
             }
             inline for (st.fields) |field| {
-                deinitZig(field.type, allocator, @field(value, field.name));
+                // A `comptime` field was never allocated (see `toZigStruct`).
+                if (comptime !field.is_comptime) deinitZig(field.type, allocator, @field(value, field.name));
             }
         },
         else => {},
     }
+}
+
+/// `[N]u8` or `[N:s]u8`: what a string literal points at.
+fn isByteArray(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .array => |arr| arr.child == u8,
+        else => false,
+    };
 }
 
 /// Duplicate allocation-bearing Zig values so defaults returned by
@@ -605,7 +649,10 @@ fn cloneZig(comptime T: type, allocator: std.mem.Allocator, value: T) Error!T {
                 return out;
             }
             if (ptr.size != .slice) return value;
-            const out = try allocator.alloc(ptr.child, value.len);
+            const out = if (comptime ptr.sentinel()) |z|
+                try allocator.allocSentinel(ptr.child, value.len, z)
+            else
+                try allocator.alloc(ptr.child, value.len);
             var filled: usize = 0;
             errdefer {
                 for (out[0..filled]) |item| deinitZig(ptr.child, allocator, item);
@@ -619,6 +666,7 @@ fn cloneZig(comptime T: type, allocator: std.mem.Allocator, value: T) Error!T {
         },
         .array => |arr| {
             var out: T = undefined;
+            if (comptime arr.len == 0) return out;
             var filled: usize = 0;
             errdefer for (out[0..filled]) |item| deinitZig(arr.child, allocator, item);
             for (value, 0..) |item, i| {
@@ -651,7 +699,7 @@ fn cloneZig(comptime T: type, allocator: std.mem.Allocator, value: T) Error!T {
                 }
                 return out;
             }
-            var out: T = undefined;
+            var out: T = value;
             var initialized = [_]bool{false} ** st.fields.len;
             errdefer {
                 inline for (st.fields, 0..) |field, i| {
@@ -659,8 +707,12 @@ fn cloneZig(comptime T: type, allocator: std.mem.Allocator, value: T) Error!T {
                 }
             }
             inline for (st.fields, 0..) |field, i| {
-                @field(out, field.name) = try cloneZig(field.type, allocator, @field(value, field.name));
-                initialized[i] = true;
+                // A `comptime` field is fixed by the type; there is
+                // nothing to copy.
+                if (comptime !field.is_comptime) {
+                    @field(out, field.name) = try cloneZig(field.type, allocator, @field(value, field.name));
+                    initialized[i] = true;
+                }
             }
             return out;
         },
@@ -681,6 +733,9 @@ fn toZigStruct(comptime T: type, allocator: std.mem.Allocator, members: []const 
     }
 
     inline for (st.fields, 0..) |field, i| {
+        // A `comptime` field is fixed by the type; there is nothing to
+        // read into it.
+        if (comptime field.is_comptime) continue;
         var found = false;
         for (members) |m| {
             if (std.mem.eql(u8, m.key, field.name)) {
@@ -729,8 +784,15 @@ pub fn fromZig(allocator: std.mem.Allocator, value: anytype) Error!Value {
         },
         .float, .comptime_float => return .{ .float = @floatCast(value) },
         .optional => return if (value) |v| fromZig(allocator, v) else .null,
-        .@"enum" => return .{ .string = try allocator.dupe(u8, @tagName(value)) },
+        // A non-exhaustive enum's unnamed values have no name to write
+        // (`@tagName` would be illegal behaviour on them).
+        .@"enum" => return .{ .string = try allocator.dupe(u8, std.enums.tagName(T, value) orelse return error.TypeMismatch) },
         .pointer => |ptr| {
+            // A string literal (`*const [N:0]u8`) is a string, not a
+            // sequence of bytes.
+            if (ptr.size == .one and comptime isByteArray(ptr.child)) {
+                return .{ .string = try allocator.dupe(u8, value) };
+            }
             if (ptr.size == .slice) {
                 if (ptr.child == u8) return .{ .string = try allocator.dupe(u8, value) };
                 const out = try allocator.alloc(Value, value.len);
@@ -1181,6 +1243,32 @@ test "alias expansion is bounded, and the bound is configurable" {
     defer freeValue(allocator, v2);
 }
 
+test "alias expansion is bounded in bytes as well as in values" {
+    // The value budget counts Values, but every expanded alias copies its
+    // strings: one 64 KiB anchored string reached through four levels of
+    // ten aliases is 10^4 Values -- well inside the value budget -- and
+    // 640 MiB of copies from a 65 KiB input.
+    const allocator = testing.allocator;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "l0: &l0 \"");
+    try input.appendNTimes(allocator, 'x', 64 << 10);
+    try input.appendSlice(allocator, "\"\n");
+    for (1..5) |l| {
+        try input.print(allocator, "l{d}: &l{d} [", .{ l, l });
+        for (0..10) |i| try input.print(allocator, "{s}*l{d}", .{ if (i > 0) ", " else "", l - 1 });
+        try input.appendSlice(allocator, "]\n");
+    }
+    try testing.expectError(error.LimitExceeded, parseToValueLimited(allocator, input.items, .{ .max_bytes = 1 << 20 }));
+    // The default is a bound too (asserted directly, so the test does not
+    // copy 64 MiB every run), above the input limit's 64 MiB of text.
+    try testing.expectEqual(@as(usize, 64 << 20), (Limits{}).max_bytes);
+    // The bound is configurable, and ordinary documents are far below it.
+    try testing.expectError(error.LimitExceeded, parseToValueLimited(allocator, "a: bcdef\n", .{ .max_bytes = 4 }));
+    const v = try parseToValueLimited(allocator, "a: bcdef\n", .{ .max_bytes = 6 });
+    freeValue(allocator, v);
+}
+
 /// A linear chain of `depth` nested sequences, built through the public
 /// document API. Parsed input does not reach this depth at default
 /// limits — `max_nesting` is 200 per style — but "parsed input is safe"
@@ -1270,6 +1358,55 @@ test "conversion is depth-bounded, so a deep built tree errors instead of overfl
             nodeToValueLimited(allocator, root, .{ .max_values = 10 }),
         );
     }
+}
+
+test "an explicit core tag holds text only in its own grammar" {
+    // `!!int` read its text with `std.fmt.parseInt(.., 0)`, and `!!float`
+    // with `std.fmt.parseFloat`, which take far more than YAML 1.2's core
+    // schema: `!!int 0b101` was 5, `!!int 1_000` 1000, `!!float nan` a
+    // NaN and `!!float 0x10` 16, while the same text untagged is a
+    // string. A tag whose text is not in its type's grammar contradicts
+    // the document, like `!!int abc` already did.
+    const allocator = testing.allocator;
+    const bad = [_][]const u8{
+        "!!int 0b101",  "!!int 1_000", "!!int -0x1F", "!!int 0X1F",    "!!int +0o7",
+        "!!float 0x10", "!!float nan", "!!float inf", "!!float 1_0.5", "!!bool yes",
+        "!!null none",  "!!float 0o7",
+    };
+    for (bad) |text| {
+        var doc = try Document.parse(allocator, text);
+        defer doc.deinit();
+        try testing.expectError(error.TypeMismatch, nodeToValue(allocator, doc.root.?));
+    }
+    const good = [_]struct { text: []const u8, want: Value }{
+        .{ .text = "!!int 0x1F", .want = .{ .int = 31 } },
+        .{ .text = "!!int 0o17", .want = .{ .int = 15 } },
+        .{ .text = "!!int +42", .want = .{ .int = 42 } },
+        .{ .text = "!!int '-7'", .want = .{ .int = -7 } },
+        .{ .text = "!!float 1", .want = .{ .float = 1 } },
+        .{ .text = "!!float -.5e1", .want = .{ .float = -5 } },
+        .{ .text = "!!float .inf", .want = .{ .float = std.math.inf(f64) } },
+        .{ .text = "!!null ''", .want = .null },
+    };
+    for (good) |c| {
+        var doc = try Document.parse(allocator, c.text);
+        defer doc.deinit();
+        const v = try nodeToValue(allocator, doc.root.?);
+        defer freeValue(allocator, v);
+        try testing.expect(valueEqlForTest(v, c.want));
+    }
+    // A Value built by hand is held to the same rule.
+    try testing.expectError(error.TypeMismatch, toZig(u8, allocator, .{ .bigint = "0b1" }));
+    try testing.expectEqual(@as(u128, 1 << 100), try toZig(u128, allocator, .{ .bigint = "1267650600228229401496703205376" }));
+}
+
+fn valueEqlForTest(a: Value, b: Value) bool {
+    return switch (a) {
+        .null => b == .null,
+        .int => |i| b == .int and b.int == i,
+        .float => |f| b == .float and (f == b.float),
+        else => false,
+    };
 }
 
 test "an explicit core tag outranks plain-scalar resolution" {
@@ -1662,4 +1799,112 @@ test "an explicit !!int is no less capable than the bare form" {
     }
     // A tag that lies is still an error.
     try testing.expectError(error.TypeMismatch, nodeToValue(allocator, doc.pathGet(&.{"bad"}).?));
+}
+
+test "a tag is checked against the node's kind, and `!` resolves by kind" {
+    const allocator = testing.allocator;
+
+    // Spec example 6.28 (corpus S4JQ): `! 12` is the string "12".
+    const v = try parseToValue(allocator, "- \"12\"\n- 12\n- ! 12\n");
+    defer freeValue(allocator, v);
+    try testing.expectEqualStrings("12", v.at(0).?.string);
+    try testing.expectEqual(@as(i64, 12), v.at(1).?.int);
+    try testing.expectEqualStrings("12", v.at(2).?.string);
+
+    for ([_][]const u8{ "!!seq 42", "!!map abc", "!!int [1]", "!!str {a: 1}", "!!seq {a: 1}", "!!map [1]", "a: !!bool [x]" }) |in| {
+        errdefer std.debug.print("accepted {s}\n", .{in});
+        try testing.expectError(error.TypeMismatch, parseToValue(allocator, in));
+    }
+    for ([_][]const u8{ "!!seq [1]", "!!map {a: 1}", "!local [1]", "! [1]" }) |in| {
+        const ok = try parseToValue(allocator, in);
+        freeValue(allocator, ok);
+    }
+}
+
+test "a float target refuses what it cannot hold, and takes big integers" {
+    const allocator = testing.allocator;
+
+    // `@floatCast` turned 1e39 into an f32 infinity and 70000 into an f16
+    // one, where an int target refuses the value (`toZig(u8, 256)`); and
+    // a `.bigint` had no float arm at all.
+    try testing.expectError(error.TypeMismatch, toZig(f32, allocator, .{ .float = 1e39 }));
+    try testing.expectError(error.TypeMismatch, toZig(f16, allocator, .{ .int = 70000 }));
+    try testing.expect(std.math.isInf(try toZig(f32, allocator, .{ .float = std.math.inf(f64) })));
+    try testing.expect(std.math.isNan(try toZig(f32, allocator, .{ .float = std.math.nan(f64) })));
+    try testing.expectEqual(@as(f64, 9223372036854775808.0), try toZig(f64, allocator, .{ .bigint = "9223372036854775808" }));
+    try testing.expectEqual(try std.fmt.parseFloat(f64, "151115727451828646838271"), try toZig(f64, allocator, .{ .bigint = "0x1FFFFFFFFFFFFFFFFFFF" }));
+    try testing.expectError(error.TypeMismatch, toZig(f32, allocator, .{ .bigint = "0x1FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF" }));
+    try testing.expectError(error.TypeMismatch, toZig(f64, allocator, .{ .bigint = "1_000" }));
+
+    // Octal is regrouped into hex and rounded once, like the other forms.
+    try testing.expectEqual(@as(f64, 15), document_mod.parseCoreFloat("0o17").?);
+    try testing.expectEqual(@as(f64, 0), document_mod.parseCoreFloat("0o000").?);
+    const max_u66: u128 = (1 << 66) - 1;
+    try testing.expectEqual(@as(f64, @floatFromInt(max_u66)), document_mod.parseCoreFloat("0o" ++ "7" ** 22).?);
+    const mixed: u128 = 0o1234567012345670123456701234567;
+    try testing.expectEqual(@as(f64, @floatFromInt(mixed)), document_mod.parseCoreFloat("0o1234567012345670123456701234567").?);
+    try testing.expect(std.math.isInf(document_mod.parseCoreFloat("0o1" ++ "0" ** 342).?));
+    try testing.expect(!std.math.isInf(document_mod.parseCoreFloat("0o1" ++ "0" ** 340).?));
+
+    // Every width up to 128 bits, against Zig's own correctly rounded
+    // integer conversion, in both radix spellings.
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    for (0..20_000) |_| {
+        const n: u128 = random.int(u128) >> random.uintLessThan(u7, 127);
+        const want: f64 = @floatFromInt(n);
+        var buf: [64]u8 = undefined;
+        try testing.expectEqual(want, document_mod.parseCoreFloat(try std.fmt.bufPrint(&buf, "0x{x}", .{n})).?);
+        try testing.expectEqual(want, document_mod.parseCoreFloat(try std.fmt.bufPrint(&buf, "0o{o}", .{n})).?);
+    }
+}
+
+test "conversions cover the types the contract names" {
+    const allocator = testing.allocator;
+
+    // A non-exhaustive enum's unnamed value has no name: `@tagName` on it
+    // panicked in ReleaseSafe.
+    const NE = enum(u8) { a, b, _ };
+    try testing.expectError(error.TypeMismatch, fromZig(allocator, @as(NE, @enumFromInt(7))));
+    const named = try fromZig(allocator, NE.b);
+    defer freeValue(allocator, named);
+    try testing.expectEqualStrings("b", named.string);
+
+    // A string literal is a string, not a sequence of bytes.
+    const lit = try fromZig(allocator, .{ .name = "yayl" });
+    defer freeValue(allocator, lit);
+    try testing.expectEqualStrings("yayl", lit.get("name").?.string);
+    const bare = try fromZig(allocator, "hello");
+    defer freeValue(allocator, bare);
+    try testing.expectEqualStrings("hello", bare.string);
+
+    // A void union field is written as null, and only null reads back.
+    const U = union(enum) { n: i64, inherit: void };
+    const bad = try parseToValue(allocator, "inherit: 5\n");
+    defer freeValue(allocator, bad);
+    try testing.expectError(error.TypeMismatch, toZig(U, allocator, bad));
+    const good = try parseToValue(allocator, "inherit:\n");
+    defer freeValue(allocator, good);
+    try testing.expectEqual(U.inherit, try toZig(U, allocator, good));
+
+    // Sentinel slices, empty arrays and comptime fields failed to compile
+    // inside the library.
+    const S = struct {
+        z: [:0]const u8,
+        ns: [:0]const i32,
+        empty: [0]u8 = .{},
+        comptime version: u8 = 1,
+    };
+    const src = try parseToValue(allocator, "z: text\nns: [1, 2]\n");
+    defer freeValue(allocator, src);
+    const s = try toZig(S, allocator, src);
+    defer deinitZig(S, allocator, s);
+    try testing.expectEqualStrings("text", s.z);
+    try testing.expectEqual(@as(u8, 0), s.z.ptr[s.z.len]);
+    try testing.expectEqualSlices(i32, &.{ 1, 2 }, s.ns);
+    try testing.expectEqual(@as(i32, 0), s.ns.ptr[s.ns.len]);
+    try testing.expectError(error.TypeMismatch, toZig([:0]const u8, allocator, .{ .string = "a\x00b" }));
+    const back = try fromZig(allocator, s);
+    defer freeValue(allocator, back);
+    try testing.expectEqual(@as(i64, 1), back.get("version").?.int);
 }

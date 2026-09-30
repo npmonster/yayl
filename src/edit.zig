@@ -11,10 +11,10 @@
 //! Query results are deterministic: document order, wildcards and
 //! recursion yield in encounter order.
 //!
-//! All edits run through `Editor`. A `batch` applies every edit to a
-//! deep clone of the document tree and swaps it in only when the whole
-//! batch succeeded — a failure (unknown path, OOM, cycle) leaves the
-//! original document byte-identical, including its round-trip spans.
+//! All edits run through `Editor`. A batch (`apply`) edits the tree in
+//! place and records every change in an undo journal; a failure
+//! (unknown path, OOM, cycle) rolls the journal back, leaving the
+//! document byte-identical, including its round-trip spans.
 
 const std = @import("std");
 const document_mod = @import("document.zig");
@@ -24,10 +24,15 @@ const internal = @import("internal.zig");
 const Document = document_mod.Document;
 const Node = document_mod.Node;
 
-/// Editing failures: `UnknownPath` covers queries that match nothing
-/// (or not exactly once, for `one`); the `NotA*` errors describe a
-/// value whose shape does not fit the edit; `MoveIntoSubtree` rejects
-/// moving a node into its own subtree.
+/// Editing failures: `UnknownPath` covers queries that match nothing,
+/// and `AmbiguousOperation` a path that must name one node (`one`, and
+/// the targets of `set`, `insert`, `append` and `move`) but matches
+/// several; the `NotA*` errors describe a value whose shape does not
+/// fit the edit; `MoveIntoSubtree` rejects moving a node into its own
+/// subtree. `AnchorReferenced` refuses an edit that would strand an
+/// alias, and `AnchorShadowed` one after which an alias would bind to a
+/// different definition once written and read back (see
+/// `Document.setAnchor`).
 pub const Error = error{
     InvalidPath,
     InvalidSyntax,
@@ -40,11 +45,8 @@ pub const Error = error{
     NestingTooDeep,
     WouldCycle,
     AnchorReferenced,
+    AnchorShadowed,
     AliasPath,
-    /// A whole-tree clone met a forward alias (an alias whose anchor is
-    /// defined later). `cloneTreeWhole` refuses it rather than pointing
-    /// the clone back at the pre-clone tree.
-    UnknownAlias,
     OutOfMemory,
 };
 
@@ -56,7 +58,6 @@ pub const CloneError = error{
     NestingTooDeep,
     InvalidSyntax,
     OutOfMemory,
-    UnknownAlias,
 };
 
 /// Refuse a MUTATION whose container is an alias node.
@@ -72,7 +73,8 @@ pub const CloneError = error{
 /// disagreeing. Editing the shared target through the anchor side works
 /// and is the supported route; whether writes should forward through an
 /// alias the way reads do is a semantic decision, not something to
-/// settle by accident.
+/// settle by accident. An alias EARLIER in the path is refused by
+/// `resolveForWrite`: this checks the container the write lands in.
 fn refuseAliasContainer(container: *const Node) Error!void {
     if (container.data == .alias) return error.AliasPath;
 }
@@ -107,7 +109,8 @@ pub const Segment = union(enum) {
 };
 
 /// A parsed path. Parse with `Path.parse` (grammar in the module docs).
-/// `$` at the start is optional and denotes the root.
+/// `$` at the start is optional and denotes the root when a `.` or `[`
+/// (or nothing) follows it; otherwise it begins a key (`$ref`).
 pub const Path = struct {
     segments: []const Segment,
 
@@ -117,8 +120,11 @@ pub const Path = struct {
         errdefer segments.deinit(allocator);
 
         var i: usize = 0;
-        // Optional root marker.
-        if (i < input.len and input[i] == '$') i += 1;
+        // Optional root marker -- only where a segment or nothing follows:
+        // `$ref` and `$schema` are ordinary keys (OpenAPI and JSON Schema
+        // are full of them), and reading the `$` as the root made
+        // `delete("$ref")` delete the key `ref` instead.
+        if (input.len > 0 and input[0] == '$' and (input.len == 1 or input[1] == '.' or input[1] == '[')) i = 1;
 
         while (i < input.len) {
             const c = input[i];
@@ -191,7 +197,9 @@ pub const Path = struct {
                     return error.InvalidPath;
                 }
             } else {
-                // Bare leading key (`a.b` without `$` or `.`).
+                // Bare leading key (`a.b` without `$` or `.`), and only
+                // leading: after a segment, `$.items[0]name` is not a path.
+                if (i != 0) return error.InvalidPath;
                 const start = i;
                 while (i < input.len and input[i] != '.' and input[i] != '[') i += 1;
                 try segments.append(allocator, .{ .key = input[start..i] });
@@ -208,6 +216,16 @@ pub const Path = struct {
 /// Evaluate `path` against `root`. Results are in document order;
 /// aliases are followed (bounded). Caller owns the returned slice.
 pub fn resolve(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*Node {
+    var via_alias = false;
+    return resolveTracked(allocator, root, path, &via_alias);
+}
+
+/// `resolve`, also reporting in `via_alias` whether a match was reached
+/// by stepping out of an alias into its target's entries, at any step.
+/// Reads forward through aliases; a write must not, at any depth: an
+/// edit at `$.b.inner.j` with `b` an alias changes the anchored node
+/// every alias shares (see `resolveForWrite`).
+fn resolveTracked(allocator: std.mem.Allocator, root: *Node, path: Path, via_alias: *bool) Error![]*Node {
     var results: std.ArrayList(*Node) = .empty;
     errdefer results.deinit(allocator);
     var current: std.ArrayList(*Node) = .empty;
@@ -217,7 +235,22 @@ pub fn resolve(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*N
     for (path.segments) |seg| {
         var next: std.ArrayList(*Node) = .empty;
         errdefer next.deinit(allocator);
+        // Aliases fan out: many nodes in `current` can resolve to one
+        // target, whose children every one of them would add again --
+        // a step multiplied the list by the fan-out, and a few hundred
+        // bytes of aliases named more matches than memory holds. Each
+        // target is expanded once per step, and a descent never walks a
+        // subtree it has finished (`Descent`).
+        var expanded: std.AutoHashMapUnmanaged(*const Node, void) = .empty;
+        defer expanded.deinit(allocator);
+        var descent: Descent = .{ .allocator = allocator, .out = &next };
+        defer descent.deinit();
         for (current.items) |node| {
+            if ((try expanded.getOrPut(allocator, node.resolveAlias())).found_existing) continue;
+            const before = next.items.len;
+            defer if (node.data == .alias and next.items.len > before) {
+                via_alias.* = true;
+            };
             switch (seg) {
                 .key => |k| if (node.lookup(k)) |child| try next.append(allocator, child),
                 .index => |ix| {
@@ -231,10 +264,7 @@ pub fn resolve(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*N
                         for (pairs) |p| try next.append(allocator, p.value);
                     }
                 },
-                .descend => |k| {
-                    try collectDescend(allocator, node, k, &next, 0);
-                    try dedupeNodes(allocator, &next);
-                },
+                .descend => |k| try descent.walk(node, k, 0),
                 .filter => |f| {
                     // Sequences: every item whose mapping carries
                     // key == value. Mappings: every value that does.
@@ -250,11 +280,34 @@ pub fn resolve(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*N
                 },
             }
         }
+        if (descent.via_alias) via_alias.* = true;
         current.deinit(allocator);
         current = next;
     }
     try results.appendSlice(allocator, current.items);
     return results.toOwnedSlice(allocator);
+}
+
+/// `resolve` for a write: a match reached through an alias is refused
+/// with `error.AliasPath`.
+fn resolveForWrite(allocator: std.mem.Allocator, root: *Node, path: Path) Error![]*Node {
+    var via_alias = false;
+    const found = try resolveTracked(allocator, root, path, &via_alias);
+    if (via_alias and found.len > 0) {
+        allocator.free(found);
+        return error.AliasPath;
+    }
+    return found;
+}
+
+/// The single node of `found`: `error.UnknownPath` for none,
+/// `error.AmbiguousOperation` for several.
+fn exactlyOne(found: []const *Node) Error!*Node {
+    return switch (found.len) {
+        0 => error.UnknownPath,
+        1 => found[0],
+        else => error.AmbiguousOperation,
+    };
 }
 
 fn filterMatches(candidate: *Node, key: []const u8, value: []const u8) bool {
@@ -272,12 +325,10 @@ fn filterMatches(candidate: *Node, key: []const u8, value: []const u8) bool {
 
 /// Does `node` or anything under it define the anchor `name`?
 ///
-/// By NAME, not by pointer: `cloneNode` re-registers anchors only for
-/// collections, so a cloned alias to an anchored SCALAR still carries a
-/// target pointer into the pre-clone tree. A name comparison is correct
-/// either way, and an anchor name is what the emitted `*name` actually
-/// refers to. Aliases are leaves here — never followed — so a parsed
-/// alias cycle cannot make this recurse forever.
+/// By NAME, not by pointer: an anchor name is what the emitted `*name`
+/// actually refers to, whatever node a hand-built alias's target pointer
+/// names. Aliases are leaves here — never followed — so a parsed alias
+/// cycle cannot make this recurse forever.
 fn anchorDefinedIn(node: *const Node, name: []const u8, depth: usize) bool {
     if (depth >= max_walk_depth) return false;
     if (node.anchor) |a| {
@@ -336,7 +387,29 @@ fn anchorMovesWith(existing: *const Node, replacement: *const Node) ?[]const u8 
 /// Refuse an edit that removes a node an alias still needs.
 fn refuseIfAnchorReferenced(doc: *Document, doomed: *const Node) Error!void {
     const root = doc.root orelse return;
+    // Nothing to strand without an anchor in the doomed subtree -- the
+    // common case, answered from the subtree alone. The alias scan below
+    // walks the whole document, and ran for every replace and delete.
+    if (!anchorIn(doomed, 0)) return;
     if (aliasWouldDangle(root, doomed, 0)) return error.AnchorReferenced;
+}
+
+/// Does `node`, or anything under it, carry an anchor? Aliases are
+/// leaves; the walk never follows one. Past the depth bound it answers
+/// yes, which only costs the full check.
+fn anchorIn(node: *const Node, depth: usize) bool {
+    if (depth >= max_walk_depth) return true;
+    if (node.anchor != null) return true;
+    switch (node.data) {
+        .mapping => |m| for (m.pairs.items) |pair| {
+            if (anchorIn(pair.key, depth + 1) or anchorIn(pair.value, depth + 1)) return true;
+        },
+        .sequence => |sq| for (sq.items.items) |item| {
+            if (anchorIn(item, depth + 1)) return true;
+        },
+        else => {},
+    }
+    return false;
 }
 
 /// Refuse removing the mapping pair whose VALUE is `target` when an alias
@@ -397,45 +470,57 @@ fn dependsOnOutsideAnchor(subtree: *const Node, node: *const Node, depth: usize)
 /// self-contained move stays allowed.
 fn refuseIfMoveStrandsAlias(doc: *Document, subtree: *const Node) Error!void {
     const root = doc.root orelse return;
-    if (aliasWouldDangle(root, subtree, 0)) return error.AnchorReferenced;
+    if (anchorIn(subtree, 0) and aliasWouldDangle(root, subtree, 0)) return error.AnchorReferenced;
     if (dependsOnOutsideAnchor(subtree, subtree, 0)) return error.AnchorReferenced;
 }
 
-/// Keep the first occurrence of every node, in order. A descent walk
-/// resolves aliases, so a subtree reachable both directly and through a
-/// `*ref` is walked twice and its matches would be reported twice — and
-/// a caller applying one edit per match would apply it twice.
-fn dedupeNodes(allocator: std.mem.Allocator, list: *std.ArrayList(*Node)) Error!void {
-    var seen: std.AutoHashMapUnmanaged(*Node, void) = .empty;
-    defer seen.deinit(allocator);
-    var w: usize = 0;
-    for (list.items) |node| {
-        const entry = try seen.getOrPut(allocator, node);
-        if (entry.found_existing) continue;
-        list.items[w] = node;
-        w += 1;
-    }
-    list.shrinkRetainingCapacity(w);
-}
+/// A `..key` walk, collecting every `key` match in pre-order into `out`.
+///
+/// It resolves aliases, so one node can be reached along many paths --
+/// exponentially many, for aliases of aliases. A node whose subtree was
+/// walked completely is not walked again: its matches are in `out`
+/// already, so skipping it reports each node once, in the order of its
+/// first encounter, at the cost of the document's size rather than its
+/// paths. A node still being walked is not complete, so an alias to an
+/// enclosing anchor (`&a {k: *a}`, a cycle of infinite depth that parses
+/// fine) still descends until `max_walk_depth` and fails with
+/// NestingTooDeep, rather than aborting the process on the stack.
+const Descent = struct {
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(*Node),
+    done: std.AutoHashMapUnmanaged(*const Node, void) = .empty,
+    /// Aliases the walk is inside, and whether it matched anything there.
+    alias_depth: usize = 0,
+    via_alias: bool = false,
 
-fn collectDescend(allocator: std.mem.Allocator, node: *Node, key: []const u8, out: *std.ArrayList(*Node), depth: usize) Error!void {
-    // Pre-order walk collecting every `key` match, bounded by
-    // `max_walk_depth`. The bound is load-bearing rather than defensive:
-    // this walk resolves aliases, and an alias to an enclosing anchor
-    // (`&a {k: *a}`) is a cycle of infinite depth that parses fine, so
-    // without it eleven bytes of input abort the process.
-    if (depth >= max_walk_depth) return error.NestingTooDeep;
-    const cur = node.resolveAlias();
-    if (cur.pairs()) |pairs| {
-        for (pairs) |p| {
-            const kv = p.key.scalarValue() orelse continue;
-            if (std.mem.eql(u8, kv, key)) try out.append(allocator, p.value);
-        }
-        for (pairs) |p| try collectDescend(allocator, p.value, key, out, depth + 1);
-    } else if (cur.items()) |items| {
-        for (items) |child| try collectDescend(allocator, child, key, out, depth + 1);
+    fn deinit(self: *Descent) void {
+        self.done.deinit(self.allocator);
     }
-}
+
+    fn walk(self: *Descent, node: *Node, key: []const u8, depth: usize) Error!void {
+        if (depth >= max_walk_depth) return error.NestingTooDeep;
+        const cur = node.resolveAlias();
+        if (self.done.contains(cur)) return;
+        const through = node.data == .alias;
+        if (through) self.alias_depth += 1;
+        defer if (through) {
+            self.alias_depth -= 1;
+        };
+        if (cur.pairs()) |pairs| {
+            for (pairs) |p| {
+                const kv = p.key.scalarValue() orelse continue;
+                if (std.mem.eql(u8, kv, key)) {
+                    try self.out.append(self.allocator, p.value);
+                    if (self.alias_depth > 0) self.via_alias = true;
+                }
+            }
+            for (pairs) |p| try self.walk(p.value, key, depth + 1);
+        } else if (cur.items()) |items| {
+            for (items) |child| try self.walk(child, key, depth + 1);
+        }
+        try self.done.put(self.allocator, cur, {});
+    }
+};
 
 /// Payload of `Edit.insert`: splice `value` into `sequence`, before or
 /// after the (single) node matching `position`.
@@ -456,7 +541,12 @@ pub const Edit = union(enum) {
     /// keeps its place and source span, and emitted output stays
     /// byte-identical. A different style or tag is a real edit.
     set: struct { path: []const u8, value: *Node },
-    /// Delete the (single) node at `path`. No match is not an error.
+    /// Delete every node `path` matches: a path of keys and indices
+    /// names at most one, a wildcard (`[*]`), filter (`[?k=v]`) or
+    /// descent (`..k`) can name many, and each is removed. No match is
+    /// not an error. All or nothing: if removing any match would strand
+    /// an alias (`error.AnchorReferenced`) or a match is reached through
+    /// an alias at any step (`error.AliasPath`), nothing is removed.
     delete: []const u8,
     /// Insert `value` into the sequence at `path`, before or after the
     /// (single) node at `position`.
@@ -468,8 +558,8 @@ pub const Edit = union(enum) {
     move: struct { from: []const u8, to: []const u8, key: ?[]const u8 = null },
 };
 
-/// High-level editor over one document. Single operations apply
-/// directly; `batch` is atomic (copy-apply-swap).
+/// High-level editor over one document. Every edit goes through
+/// `apply`, which is atomic: a failed batch is rolled back.
 pub const Editor = struct {
     doc: *Document,
 
@@ -477,18 +567,33 @@ pub const Editor = struct {
         return .{ .doc = doc };
     }
 
-    /// Resolve exactly one node, or `error.UnknownPath`.
+    /// Resolve exactly one node: `error.UnknownPath` when the path
+    /// matches nothing, `error.AmbiguousOperation` when it matches
+    /// several (a wildcard, filter or descent can).
     pub fn one(self: *Editor, path: []const u8) Error!*Node {
         var p = try Path.parse(self.doc.allocator, path);
         defer p.deinit(self.doc.allocator);
         const root = self.doc.root orelse return error.UnknownPath;
         const found = try resolve(self.doc.allocator, root, p);
         defer self.doc.allocator.free(found);
-        if (found.len != 1) return error.UnknownPath;
-        return found[0];
+        return exactlyOne(found);
     }
 
-    /// Query convenience: every match for `path`.
+    /// `one` for the target of a write: a node reached through an alias
+    /// is refused (`error.AliasPath`).
+    fn oneForWrite(self: *Editor, path: []const u8) Error!*Node {
+        var p = try Path.parse(self.doc.allocator, path);
+        defer p.deinit(self.doc.allocator);
+        const root = self.doc.root orelse return error.UnknownPath;
+        const found = try resolveForWrite(self.doc.allocator, root, p);
+        defer self.doc.allocator.free(found);
+        return exactlyOne(found);
+    }
+
+    /// Query convenience: every match for `path`, each node once, in
+    /// the order first reached. Queries resolve aliases; the cost is
+    /// bounded by the document's size, not by how many alias paths
+    /// reach a node.
     pub fn all(self: *Editor, path: []const u8) Error![]*Node {
         var p = try Path.parse(self.doc.allocator, path);
         defer p.deinit(self.doc.allocator);
@@ -504,24 +609,39 @@ pub const Editor = struct {
         return self.apply(&.{.{ .delete = path }});
     }
 
-    /// Apply every edit atomically: work happens on a deep clone; the
-    /// clone is swapped in only if all edits succeeded.
+    /// Apply every edit atomically: all of them, or none. Each change is
+    /// recorded in an undo journal as it is made (`internal.Journal`),
+    /// and a failed batch rolls the recorded changes back, leaving the
+    /// document byte-identical. The cost is that of the edits, not of the
+    /// document: this used to deep-clone the whole tree on every call.
     pub fn apply(self: *Editor, edits: []const Edit) Error!void {
-        const doc = self.doc;
-        const old_root = doc.root;
-        // The WHOLE tree is swapped in, so a forward alias (an alias
-        // whose anchor is defined later -- valid only in a hand-built
-        // tree) must be refused rather than left pointing at the
-        // pre-clone tree, which the rollback contract assumes is gone.
-        // `cloneTree` tolerates one; `cloneTreeWhole` does not.
-        const new_root = if (old_root) |r| try cloneTreeWhole(doc, r) else null;
-        doc.root = new_root;
-        var ok = false;
-        defer if (!ok) {
-            doc.root = old_root; // roll back: discard the clone
+        var txn: internal.Transaction = undefined;
+        txn.begin(self.doc);
+        errdefer txn.abort();
+        var anchored = false;
+        for (edits) |edit| {
+            if (!anchored) anchored = self.placesAnchor(edit);
+            try applyOne(self.doc, edit);
+        }
+        // An anchor this batch attached or moved can shadow a definition
+        // the aliases after it were bound to, or stop shadowing one: the
+        // written document would bind them elsewhere. Checked only then,
+        // so an ordinary edit still costs what it changes.
+        if (anchored) if (self.doc.root) |root| {
+            if (!try internal.aliasesBindInOrder(self.doc.allocator, root, null, null)) return error.AnchorShadowed;
         };
-        for (edits) |edit| try applyOne(doc, edit);
-        ok = true;
+        try txn.commit();
+    }
+
+    /// Does `edit` attach or move a subtree that carries an anchor?
+    fn placesAnchor(self: *Editor, edit: Edit) bool {
+        return switch (edit) {
+            .set => |s| anchorIn(s.value, 0),
+            .insert => |i| anchorIn(i.value, 0),
+            .append => |a| anchorIn(a.value, 0),
+            .move => |m| if (self.one(m.from)) |n| anchorIn(n, 0) else |_| true,
+            .delete => false,
+        };
     }
 
     fn applyOne(doc: *Document, edit: Edit) Error!void {
@@ -541,7 +661,7 @@ pub const Editor = struct {
                 if (ed.one(s.path)) |existing| {
                     if (!sameScalarPresentation(existing, s.value)) {
                         if (anchorMovesWith(existing, s.value)) |name| {
-                            doc.retargetAliases(name, s.value);
+                            try doc.retargetAliases(name, s.value);
                         } else {
                             try refuseIfAnchorReferenced(doc, existing);
                         }
@@ -550,25 +670,21 @@ pub const Editor = struct {
                 try applySet(doc, s.path, s.value);
             },
             .delete => |path| {
-                // A trailing descent deletes EVERY match: unlike `set`
-                // there is no single deterministic target to require,
-                // and the old behaviour — an error on one match, a
-                // silent no-op on several — was exactly backwards.
+                // A delete removes EVERY match: unlike `set` there is no
+                // single deterministic target to require, and the old
+                // behaviour — an error on one match, a silent no-op on
+                // several — was exactly backwards. A trailing descent
+                // re-collects as it goes (its matches can nest).
                 var p = try Path.parse(doc.allocator, path);
                 defer p.deinit(doc.allocator);
                 if (p.segments.len > 0 and p.segments[p.segments.len - 1] == .descend) {
                     return applyDescendDelete(doc, p.segments);
                 }
-                const target = ed.one(path) catch |err| {
-                    try noopOrOOM(err);
-                    return; // no match: no-op
-                };
-                try refuseIfPairStrandsAlias(doc, target);
-                try applyDelete(doc, path);
+                try applyDelete(doc, p.segments);
             },
             .insert => |ins| try applyInsert(doc, ins),
             .append => |app| {
-                const seq = try ed.one(app.sequence);
+                const seq = try ed.oneForWrite(app.sequence);
                 try refuseAliasContainer(seq);
                 if (!seq.isSequence()) return error.NotASequence;
                 try doc.sequenceAppend(seq, app.value);
@@ -593,15 +709,24 @@ pub const Editor = struct {
     /// through the general resolver and must match exactly once.
     fn setContainer(doc: *Document, parent: []const Segment, may_create: bool) Error!*Node {
         if (may_create and allPlainKeys(parent)) {
+            // The part of the walk that exists must not step through an
+            // alias (the rest is created).
+            var cur = doc.root;
+            for (parent) |seg| {
+                const c = cur orelse break;
+                if (c.data == .alias) return error.AliasPath;
+                cur = c.lookup(seg.key);
+            }
             const keys = try doc.allocator.alloc([]const u8, parent.len);
             defer doc.allocator.free(keys);
             for (parent, 0..) |seg, i| keys[i] = seg.key;
             return doc.mappingWalkOrCreate(keys);
         }
         const root = doc.root orelse return error.UnknownPath;
-        const found = try resolve(doc.allocator, root, .{ .segments = parent });
+        const found = try resolveForWrite(doc.allocator, root, .{ .segments = parent });
         defer doc.allocator.free(found);
-        if (found.len != 1) return error.UnknownPath;
+        if (found.len == 0) return error.UnknownPath;
+        if (found.len > 1) return error.AmbiguousOperation;
         return found[0];
     }
 
@@ -612,7 +737,9 @@ pub const Editor = struct {
             if (doc.root) |root| {
                 if (sameScalarPresentation(root, value)) return;
             }
-            doc.root = value;
+            try internal.setRoot(doc, value);
+            try internal.setParent(doc, value, null);
+            try internal.adopt(doc, value);
             return;
         }
         const parent = p.segments[0 .. p.segments.len - 1];
@@ -632,7 +759,7 @@ pub const Editor = struct {
                     // `lookup` only matches values of the mapping `cur`,
                     // so the in-place replace must succeed; falling
                     // through would append a duplicate key.
-                    if (!internal.mappingReplace(doc, cur, existing, value)) return error.InvalidSyntax;
+                    if (!try internal.mappingReplace(doc, cur, existing, value)) return error.InvalidSyntax;
                     return;
                 }
                 try doc.mappingAppend(cur, try doc.createScalar(last, .plain), value);
@@ -647,7 +774,7 @@ pub const Editor = struct {
                     if (ix < items.len) {
                         if (sameScalarPresentation(items[ix], value)) return;
                         if (emitter_mod.Emitter.rewritableInFlow(value) and
-                            internal.sequenceReplace(doc, cur, ix, value))
+                            try internal.sequenceReplace(doc, cur, ix, value))
                         {
                             return;
                         }
@@ -657,8 +784,16 @@ pub const Editor = struct {
                 // and values carrying properties use ordinary removal and
                 // insertion. Their layout is normalized at the measured
                 // sibling indentation.
+                // The replaced item's trailing comment stays on its line:
+                // a mapping value's does (its key keeps the line), and an
+                // item's went with the old item.
+                const items: []const *Node = cur.items() orelse &.{};
+                const comment = if (ix < items.len) items[ix].trailingComment(doc) else null;
                 _ = (try doc.sequenceRemove(cur, ix)) orelse return error.UnknownPath;
                 try doc.sequenceInsert(cur, ix, value);
+                if (comment) |c| if (value.pending_trailing == null and (value.data == .scalar or value.data == .alias)) {
+                    try internal.setPendingTrailing(doc, value, try doc.pool.dupe(c));
+                };
             },
             // Wildcards, filters and recursive descent can match any
             // number of nodes: not a single deterministic target.
@@ -684,92 +819,96 @@ pub const Editor = struct {
     }
 
     /// A trailing `..key` descent deletes every node the whole path
-    /// matches, in document order, atomically (the batch machinery
-    /// clones first). The prefix resolves through the full query
-    /// grammar, so `$..in..k` deletes every `k` beneath every `in`.
+    /// matches, in document order, atomically (a failure rolls back
+    /// through the batch's journal). The prefix resolves through the
+    /// full query grammar, so `$..in..k` deletes every `k` beneath
+    /// every `in`.
     /// A victim whose removal would strand an alias refuses the WHOLE
     /// delete.
     fn applyDescendDelete(doc: *Document, segments: []const Segment) Error!void {
         const k = segments[segments.len - 1].descend;
         const root = doc.root orelse return;
-        const containers = try resolve(doc.allocator, root, .{ .segments = segments[0 .. segments.len - 1] });
+        var through_alias = false;
+        const containers = try resolveTracked(doc.allocator, root, .{ .segments = segments[0 .. segments.len - 1] }, &through_alias);
         defer doc.allocator.free(containers);
 
-        // Pre-flight every victim's anchor obligations before removing
-        // anything: a refusal must not leave a half-deleted document.
         var victims: std.ArrayList(*Node) = .empty;
         defer victims.deinit(doc.allocator);
-        for (containers) |container| {
-            try collectDescend(doc.allocator, container, k, &victims, 0);
-        }
-        try dedupeNodes(doc.allocator, &victims);
+        var descent: Descent = .{ .allocator = doc.allocator, .out = &victims };
+        defer descent.deinit();
+        for (containers) |container| try descent.walk(container, k, 0);
         if (victims.items.len == 0) return;
+        // Pre-flight every victim's anchor obligations before removing
+        // anything: a refusal must not leave a half-deleted document.
         for (victims.items) |victim| {
             try refuseIfPairStrandsAlias(doc, victim);
         }
-
-        // Remove the outermost match, then re-collect: an outer match's
-        // subtree can contain further matches, and their pointers do
-        // not survive its removal. Each pass removes at least one pair,
-        // so the loop terminates.
-        while (true) {
-            victims.clearRetainingCapacity();
-            for (containers) |container| {
-                try collectDescend(doc.allocator, container, k, &victims, 0);
-            }
-            if (victims.items.len == 0) break; // all matches removed
-            const victim = victims.items[0];
-            const parent = victim.parent orelse break; // detached with an earlier removal
-            if (parent.kind() != .mapping) break;
-            _ = doc.mappingRemove(parent, k) catch |err| try noopOrOOM(err);
+        // A match found only through an alias sits in the anchored node
+        // every alias shares, as for `applyDelete`.
+        if (through_alias or descent.via_alias) return error.AliasPath;
+        // Outermost first (the walk is pre-order), each by identity. A
+        // match inside an earlier one's subtree leaves with it; detaching
+        // it from that detached subtree afterwards changes nothing that
+        // is emitted. (This re-collected the whole tree after every
+        // removal, which was quadratic in the number of matches.)
+        for (victims.items) |victim| {
+            const parent = victim.parent orelse continue;
+            _ = try detachChild(doc, parent, victim);
         }
     }
 
-    fn applyDelete(doc: *Document, path: []const u8) Error!void {
-        var p = try Path.parse(doc.allocator, path);
-        defer p.deinit(doc.allocator);
-        if (p.segments.len == 0) return error.AmbiguousOperation;
+    /// Delete every node `segments` matches, atomically. A path of keys
+    /// and indices names at most one node; a wildcard or filter, at the
+    /// end or in the middle, can name many, and each is removed. No
+    /// match is a no-op. Every guard runs before anything is removed, so
+    /// a refusal leaves the document as it was.
+    fn applyDelete(doc: *Document, segments: []const Segment) Error!void {
         const root = doc.root orelse return;
-        var cur = root;
-        // Keys and indices both step to exactly one node, so either can
-        // address the parent. Wildcards, filters and recursive descent
-        // can match many: not a single deterministic target.
-        for (p.segments[0 .. p.segments.len - 1]) |seg| {
-            switch (seg) {
-                .key => |k| cur = cur.lookup(k) orelse return,
-                .index => |ix| {
-                    const items = cur.items() orelse return;
-                    if (ix >= items.len) return;
-                    cur = items[ix];
-                },
-                else => return error.AmbiguousOperation,
+        if (segments.len == 0) {
+            try refuseIfPairStrandsAlias(doc, root);
+            return error.AmbiguousOperation;
+        }
+        var through_alias = false;
+        const containers = try resolveTracked(doc.allocator, root, .{ .segments = segments[0 .. segments.len - 1] }, &through_alias);
+        defer doc.allocator.free(containers);
+
+        // Each victim with the container it is removed from, found one
+        // container at a time so a container that is an alias is seen:
+        // reads forward through it, writes do not.
+        const Victim = struct { container: *Node, node: *Node };
+        var victims: std.ArrayList(Victim) = .empty;
+        defer victims.deinit(doc.allocator);
+        var seen: std.AutoHashMapUnmanaged(*Node, void) = .empty;
+        defer seen.deinit(doc.allocator);
+        for (containers) |container| {
+            const hits = try resolveTracked(doc.allocator, container, .{ .segments = segments[segments.len - 1 ..] }, &through_alias);
+            defer doc.allocator.free(hits);
+            for (hits) |hit| {
+                // One node reached twice (a descent in the prefix, or an
+                // alias) is one deletion.
+                if ((try seen.getOrPut(doc.allocator, hit)).found_existing) continue;
+                try victims.append(doc.allocator, .{ .container = container, .node = hit });
             }
         }
-        // Before the removal, not after: `mappingRemove` rejects a
-        // non-mapping and `noopOrOOM` swallowed that as "matched
+        if (victims.items.len == 0) return;
+        for (victims.items) |v| try refuseIfPairStrandsAlias(doc, v.node);
+        // Before the removal, not after: `mappingRemove` rejected a
+        // non-mapping and the old no-op path swallowed that as "matched
         // nothing", so `delete("$.b.k")` through an alias reported
-        // SUCCESS and deleted nothing.
-        try refuseAliasContainer(cur);
-        switch (p.segments[p.segments.len - 1]) {
-            .key => |k| _ = doc.mappingRemove(cur, k) catch |err| try noopOrOOM(err),
-            .index => |ix| _ = doc.sequenceRemove(cur, ix) catch |err| try noopOrOOM(err),
-            else => return error.AmbiguousOperation,
+        // SUCCESS and deleted nothing. Through an alias at ANY step, not
+        // only the last: `$.b.inner.j` deleted from the anchored node.
+        if (through_alias) return error.AliasPath;
+        // By identity, in document order: positions shift as items go,
+        // and a mapping may repeat a key.
+        for (victims.items) |v| {
+            const removed = try detachChild(doc, v.container, v.node);
+            std.debug.assert(removed);
         }
-    }
-
-    /// A delete that matches nothing is a no-op (documented `Edit`
-    /// semantics); OOM must propagate so an atomic batch rolls back
-    /// instead of silently "succeeding".
-    fn noopOrOOM(err: anyerror) Error!void {
-        return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => {},
-        };
     }
 
     fn applyInsert(doc: *Document, ins: Insert) Error!void {
         var ed = Editor{ .doc = doc };
-        const seq = try ed.one(ins.sequence);
+        const seq = try ed.oneForWrite(ins.sequence);
         try refuseAliasContainer(seq);
         const items = seq.items() orelse return error.NotASequence;
         const anchor = try ed.one(ins.position);
@@ -786,75 +925,70 @@ pub const Editor = struct {
 
     fn applyMove(doc: *Document, from: []const u8, to: []const u8, key: ?[]const u8) Error!void {
         var ed = Editor{ .doc = doc };
-        const node = try ed.one(from);
-        const target = try ed.one(to);
+        const node = try ed.oneForWrite(from);
+        const target = try ed.oneForWrite(to);
         try refuseIfMoveStrandsAlias(doc, node);
         // Detaching a mapping value drops the whole pair, key included
         // (see the detach loop below), so an anchor on that key leaves
         // with it. `refuseIfMoveStrandsAlias` only sees the value tree.
         if (pairKeyOf(node)) |pair_key| try refuseIfAnchorReferenced(doc, pair_key);
+        try refuseAliasContainer(target);
         // Reject moving a node into its own subtree.
         var anc: ?*Node = target;
         while (anc) |a| : (anc = a.parent) {
             if (a == node) return error.MoveIntoSubtree;
         }
-        // Detach from the current parent. Marking the parent is not
-        // enough: the flag has to reach the root, or an ANCESTOR still
-        // counts as clean and re-emits this whole subtree verbatim from
-        // the source -- reinstating the node we just detached while it
-        // also appears at its destination, so a move silently becomes a
-        // copy. `markModified` is what walks the chain.
-        if (node.parent) |parent| {
-            switch (parent.data) {
-                .mapping => |*m| {
-                    for (m.pairs.items, 0..) |p, i| {
-                        if (p.value == node) {
-                            try internal.dropPairSpan(doc, parent, p);
-                            _ = m.pairs.orderedRemove(i);
-                            doc.markModified(parent);
-                            break;
-                        }
-                    }
-                },
-                .sequence => |*sq| {
-                    for (sq.items.items, 0..) |item, i| {
-                        if (item == node) {
-                            try internal.dropItemSpan(doc, parent, node);
-                            _ = sq.items.orderedRemove(i);
-                            doc.markModified(parent);
-                            break;
-                        }
-                    }
-                },
-                else => {},
-            }
-        }
-        node.parent = null;
+        // Detach from the current parent. An ancestor left clean would
+        // re-emit the node at its old place too, and the move would
+        // silently become a copy (see `detachChild`).
+        if (node.parent) |parent| _ = try detachChild(doc, parent, node);
         switch (target.data) {
             .mapping => {
                 const k = key orelse return error.AmbiguousOperation;
+                // The attach drops the span of the node's old place
+                // (`internal.adopt`).
                 try doc.mappingAppend(target, try doc.createScalar(k, .plain), node);
-                // The node's source spans describe its old location.
-                clearSpans(node);
             },
             .sequence => {
                 try doc.sequenceAppend(target, node);
-                clearSpans(node);
             },
             else => return error.NotACollection,
         }
     }
 };
 
-fn clearSpans(node: *Node) void {
-    node.src = null;
-    // Children keep their spans: they still describe their own bytes,
-    // which the emitter only uses when the slot itself is original.
+/// Remove `child` from `container` by identity -- the pair whose value
+/// it is, or the item it is -- tombstoning its bytes, and mark the
+/// container modified. The flag has to reach the root, or an ANCESTOR
+/// still counts as clean and re-emits the subtree verbatim from the
+/// source, reinstating what was removed; `markModified` walks the
+/// chain. Returns false when `child` is not there.
+fn detachChild(doc: *Document, container: *Node, child: *Node) Error!bool {
+    switch (container.data) {
+        .mapping => |m| for (m.pairs.items, 0..) |p, i| {
+            if (p.value != child) continue;
+            try internal.dropPairSpan(doc, container, p);
+            _ = try internal.removePair(doc, container, i);
+            try internal.setParent(doc, p.key, null);
+            break;
+        } else return false,
+        .sequence => |sq| for (sq.items.items, 0..) |item, i| {
+            if (item != child) continue;
+            try internal.dropItemSpan(doc, container, child);
+            _ = try internal.removeItem(doc, container, i);
+            break;
+        } else return false,
+        else => return false,
+    }
+    try internal.setParent(doc, child, null);
+    try doc.markModified(container);
+    return true;
 }
 
-/// Deep-clone a subtree into `doc`'s pool, preserving presentation
-/// spans (so a rolled-back-to clone still round-trips untouched parts
-/// byte-identically) and rebuilding alias targets within the clone.
+/// Deep-clone a subtree into `doc`'s pool, keeping presentation spans
+/// and rebuilding alias targets within the clone. Attached anywhere in
+/// the tree, the clone is written at its new position: the attach drops
+/// the span that no longer describes it (`internal.adopt`).
 ///
 /// SAME-DOCUMENT ONLY. The clone's spans index the source the tree was
 /// parsed from: attaching the result anywhere except back into `doc`'s
@@ -866,21 +1000,7 @@ fn clearSpans(node: *Node) void {
 pub fn cloneTree(doc: *Document, root: *Node) CloneError!*Node {
     var anchors = std.StringHashMap(*Node).init(doc.allocator);
     defer anchors.deinit();
-    return cloneNode(doc, root, &anchors, false, false, 0);
-}
-
-/// Same-document clone of a WHOLE tree, for a caller that will swap the
-/// result in as the document's new root. Unlike `cloneTree`, every anchor
-/// a correct tree can name is inside the clone, so an alias whose anchor
-/// has not been seen yet is a forward alias: invalid in parsed input and
-/// reachable only from a hand-built tree. It is refused rather than left
-/// pointing at the pre-clone node — a merge source that reached back into
-/// the tree being replaced could mutate it, and the caller's rollback
-/// (restore `root`) would then be a lie.
-pub fn cloneTreeWhole(doc: *Document, root: *Node) CloneError!*Node {
-    var anchors = std.StringHashMap(*Node).init(doc.allocator);
-    defer anchors.deinit();
-    return cloneNode(doc, root, &anchors, false, true, 0);
+    return cloneNode(doc, root, &anchors, false, 0);
 }
 
 /// Deep-clone a subtree from ANOTHER document into `doc`'s pool.
@@ -893,10 +1013,10 @@ pub fn cloneTreeWhole(doc: *Document, root: *Node) CloneError!*Node {
 pub fn cloneTreeInto(doc: *Document, root: *Node) CloneError!*Node {
     var anchors = std.StringHashMap(*Node).init(doc.allocator);
     defer anchors.deinit();
-    return cloneNode(doc, root, &anchors, true, false, 0);
+    return cloneNode(doc, root, &anchors, true, 0);
 }
 
-fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), clear_spans: bool, require_anchor: bool, depth: usize) CloneError!*Node {
+fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), clear_spans: bool, depth: usize) CloneError!*Node {
     // Structural recursion only — an alias is copied as an alias, never
     // followed — so a cycle cannot reach here, but a deep built tree can.
     // The one exception is the cross-document alias below, which is
@@ -912,7 +1032,7 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
     // target's own anchor, so a second alias to the same name still
     // clones as an alias, pointing at the copy.
     if (clear_spans and node.data == .alias and anchors.get(node.data.alias.name) == null) {
-        return cloneNode(doc, node.data.alias.target, anchors, clear_spans, require_anchor, depth + 1);
+        return cloneNode(doc, node.data.alias.target, anchors, clear_spans, depth + 1);
     }
 
     const n = try doc.pool.create(Node);
@@ -948,21 +1068,18 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
             // Reached only for an anchor defined inside the clone, or
             // for a same-document clone where the source node is a
             // legitimate target.
-            const target = anchors.get(a.name) orelse blk: {
-                if (require_anchor) return error.UnknownAlias;
-                // A same-document subtree clone may legitimately name an
-                // anchor outside the cloned subtree; the reference stays
-                // in this document and is still valid.
-                break :blk a.target;
-            };
+            // A same-document subtree clone may legitimately name an
+            // anchor outside the cloned subtree; the reference stays in
+            // this document and is still valid.
+            const target = anchors.get(a.name) orelse a.target;
             n.data = .{ .alias = .{ .name = try doc.pool.dupe(a.name), .target = target } };
         },
         .mapping => |m| {
             n.data = .{ .mapping = .{ .style = m.style } };
             if (n.anchor) |a| try anchors.put(a, n);
             for (m.pairs.items) |p| {
-                const k = try cloneNode(doc, p.key, anchors, clear_spans, require_anchor, depth + 1);
-                const v = try cloneNode(doc, p.value, anchors, clear_spans, require_anchor, depth + 1);
+                const k = try cloneNode(doc, p.key, anchors, clear_spans, depth + 1);
+                const v = try cloneNode(doc, p.value, anchors, clear_spans, depth + 1);
                 try internal.attachPair(doc, n, k, v);
                 // Preserve the pair's original extent -- but only for a
                 // same-document clone. `src_end` indexes the source the
@@ -984,7 +1101,7 @@ fn cloneNode(doc: *Document, node: *Node, anchors: *std.StringHashMap(*Node), cl
             n.data = .{ .sequence = .{ .style = sq.style } };
             if (n.anchor) |a| try anchors.put(a, n);
             for (sq.items.items) |item| {
-                const child = try cloneNode(doc, item, anchors, clear_spans, require_anchor, depth + 1);
+                const child = try cloneNode(doc, item, anchors, clear_spans, depth + 1);
                 try internal.attachItem(doc, n, child);
             }
             if (!clear_spans) {
@@ -1087,6 +1204,24 @@ test "path grammar and queries" {
     try testing.expectError(error.InvalidPath, ed.all("$.store["));
     try testing.expectError(error.InvalidPath, ed.all("$.."));
     try testing.expectError(error.UnknownPath, ed.one("$.nope"));
+}
+
+test "one tells a path that matches nothing from one that matches several" {
+    // Both used to be `UnknownPath`, so a caller -- `delete` among them,
+    // before it stopped using `one` -- could not tell "absent" from
+    // "ambiguous".
+    var doc = try Document.parse(testing.allocator, "s:\n  - {k: 1}\n  - {k: 2}\nt: [x]\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try testing.expectError(error.AmbiguousOperation, ed.one("$.s[*]"));
+    try testing.expectError(error.AmbiguousOperation, ed.one("$..k"));
+    try testing.expectError(error.UnknownPath, ed.one("$.s[?k=3]"));
+    try testing.expectEqualStrings("2", (try ed.one("$.s[?k=2].k")).scalarValue().?);
+    try testing.expectEqualStrings("x", (try ed.one("$.t[*]")).scalarValue().?);
+    // The single-target edits report the same.
+    const v = try doc.createScalar("v", .plain);
+    try testing.expectError(error.AmbiguousOperation, ed.apply(&.{.{ .append = .{ .sequence = "$[*]", .value = v } }}));
+    try testing.expectError(error.AmbiguousOperation, ed.apply(&.{.{ .move = .{ .from = "$.s[*]", .to = "$.t" } }}));
 }
 
 test "set creates intermediates and replaces in place" {
@@ -1485,6 +1620,51 @@ fn deleteBatch(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("a: 1\n", out);
 }
 
+test "a new first entry goes below the container's own property line" {
+    // Properties on a line of their own are the container's header; the
+    // new item was written above them (`- zz\n&sequence\n- a`), which
+    // does not parse. The preservation sweep skipped every such
+    // container for this; it now sweeps them.
+    const cases = [_]struct { in: []const u8, seq: []const u8, out: []const u8 }{
+        .{ .in = "&sequence\n- a\n", .seq = "$", .out = "&sequence\n- zz\n- a\n" },
+        .{ .in = "sequence: !!seq\n- entry\n- !!seq\n - nested\n", .seq = "$.sequence[1]", .out = "sequence: !!seq\n- entry\n- !!seq\n - zz\n - nested\n" },
+        .{ .in = "k: &a\n  - x\n", .seq = "$.k", .out = "k: &a\n  - zz\n  - x\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const pos = try std.fmt.allocPrint(testing.allocator, "{s}[0]", .{c.seq});
+        defer testing.allocator.free(pos);
+        try ed.apply(&.{.{ .insert = .{ .sequence = c.seq, .position = pos, .value = try doc.createScalar("zz", .plain), .before = true } }});
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+}
+
+test "emptying a collection under an indicator alone on its line" {
+    // `-` over `  - x`: the deleted entry's tombstone took the next
+    // line's indentation, and `[]` landed at column 0, out of the item.
+    // And an explicit key's `:` on a line of its own belongs to its
+    // pair: it stayed behind when the pair was deleted (`{}\n  :`).
+    const cases = [_]struct { in: []const u8, del: []const u8, out: []const u8 }{
+        .{ .in = "- a\n-\n  - x\n", .del = "$[1][0]", .out = "- a\n-\n  []\n" },
+        .{ .in = "-\n foo: bar\n-\n - x\n", .del = "$[1][0]", .out = "-\n foo: bar\n-\n []\n" },
+        .{ .in = "k:\n  ? a\n  :\nx: 1\n", .del = "$.k.a", .out = "k:\n  {}\nx: 1\n" },
+        .{ .in = "k:\n  ? a\n  :\n  ? b\n  : c\nx: 1\n", .del = "$.k.a", .out = "k:\n  ? b\n  : c\nx: 1\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete(c.del);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+}
+
 test "emptying a collection keeps the value's placement under its key" {
     // Removing a container's LAST entry leaves `{}` / `[]` behind. The
     // bytes between the key's colon and the (now departed) first entry
@@ -1881,10 +2061,78 @@ test "a spanned clone replacing a slot is emitted, not silently dropped" {
     var doc = try Document.parse(testing.allocator, "a: 1\ntop:\n  x: 42\n");
     defer doc.deinit();
     const clone = try cloneTree(&doc, doc.pathGet(&.{"top"}).?);
-    try testing.expect(internal.mappingReplace(&doc, doc.root.?, doc.pathGet(&.{"a"}).?, clone));
+    try testing.expect(try internal.mappingReplace(&doc, doc.root.?, doc.pathGet(&.{"a"}).?, clone));
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("a:\n  x: 42\ntop:\n  x: 42\n", out);
+}
+
+test "a spanned node attached anywhere is written at its new position" {
+    // The same hazard everywhere else a node enters a slot: a
+    // same-document clone keeps the spans of the slot it was copied from,
+    // and the emitter copied that slot's bytes -- then carried on from
+    // where that slot ended. As the root, `- p` came back as the whole
+    // old document (the replacement vanished) and `a: 1` as `1` followed
+    // by the old tail; as a block item it re-wrote the lines after its
+    // source.
+    const Op = enum { set, append, insert };
+    const cases = [_]struct { in: []const u8, op: Op = .set, from: []const u8, to: []const u8, out: []const u8 }{
+        .{ .in = "a: 1\nb: 2\n", .from = "$.a", .to = "$", .out = "1\n" },
+        .{ .in = "a:\n  x: 1\nb: 2\n", .from = "$.a", .to = "$", .out = "x: 1\n" },
+        .{ .in = "- p\n- q\n", .from = "$[0]", .to = "$", .out = "p\n" },
+        .{ .in = "a: 1\nb:\n  - x\n  - y\n", .from = "$.a", .to = "$.b[0]", .out = "a: 1\nb:\n  - 1\n  - y\n" },
+        .{ .in = "a: 1 # c\nb:\n  - x\n", .op = .append, .from = "$.a", .to = "$.b", .out = "a: 1 # c\nb:\n  - x\n  - 1\n" },
+        .{
+            .in = "a:\n  - 1\n  - 2\nb:\n  c:\n    - 1\n",
+            .op = .append,
+            .from = "$.a",
+            .to = "$.b.c",
+            .out = "a:\n  - 1\n  - 2\nb:\n  c:\n    - 1\n    - - 1\n      - 2\n",
+        },
+        .{
+            .in = "a:\n  - 1\n  - 2\nb:\n  c:\n    - 1\n",
+            .op = .insert,
+            .from = "$.a",
+            .to = "$.b.c",
+            .out = "a:\n  - 1\n  - 2\nb:\n  c:\n    - - 1\n      - 2\n    - 1\n",
+        },
+        .{
+            .in = "a: |\n  lit\n  eral\nb:\n  c:\n    - 1\n",
+            .op = .append,
+            .from = "$.a",
+            .to = "$.b.c",
+            .out = "a: |\n  lit\n  eral\nb:\n  c:\n    - 1\n    - |\n      lit\n      eral\n",
+        },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const clone = try cloneTree(&doc, try ed.one(c.from));
+        switch (c.op) {
+            .set => try ed.set(c.to, clone),
+            .append => try ed.apply(&.{.{ .append = .{ .sequence = c.to, .value = clone } }}),
+            .insert => try ed.apply(&.{.{ .insert = .{
+                .sequence = c.to,
+                .position = try std.fmt.allocPrint(doc.pool.allocator(), "{s}[0]", .{c.to}),
+                .value = clone,
+                .before = true,
+            } }}),
+        }
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+
+    // A node of the tree itself set as the root leaves its old parent.
+    var doc = try Document.parse(testing.allocator, "a:\n  x: 1\nb: 2\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.set("$", try ed.one("$.a"));
+    try testing.expect(doc.root.?.parent == null);
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("x: 1\n", out);
 }
 
 test "cloneTreeInto a second document cannot copy the wrong source bytes" {
@@ -1908,7 +2156,7 @@ test "cloneTreeInto a second document cannot copy the wrong source bytes" {
     const copy = try cloneTreeInto(&b, a.pathGet(&.{"subtree"}).?);
     try testing.expect(copy.src == null);
     // Replace an ORIGINAL slot: the replacement must appear.
-    try testing.expect(internal.mappingReplace(&b, b.root.?, b.pathGet(&.{"other"}).?, copy));
+    try testing.expect(try internal.mappingReplace(&b, b.root.?, b.pathGet(&.{"other"}).?, copy));
     const out = try b.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("small: 1\nother:\n  x: 42\n", out);
@@ -1948,7 +2196,11 @@ test "cloneTreeInto keeps no pointers into the source document" {
         try testing.expect(clone.tag.?.ptr != node.tag.?.ptr);
         const cloned_value = clone.data.mapping.pairs.items[0].value;
         try testing.expect(cloned_value.pending_trailing.?.ptr != inner.pending_trailing.?.ptr);
-        try testing.expect(cloned_value.pending_leading.?.ptr != inner.pending_leading.?.ptr);
+        // A leading block is held by the node that starts its line: for
+        // an inline value, the key (`Document.setLeadingComments`).
+        const inner_key = a.pathGet(&.{"subtree"}).?.pairs().?[0].key;
+        const cloned_key = clone.data.mapping.pairs.items[0].key;
+        try testing.expect(cloned_key.pending_leading.?.ptr != inner_key.pending_leading.?.ptr);
         break :blk clone;
     };
     // `a` and its pool are gone. Nothing below may read through it.
@@ -1956,7 +2208,7 @@ test "cloneTreeInto keeps no pointers into the source document" {
     try testing.expectEqualStrings("tag:yaml.org,2002:map", copy.tag.?);
     const value = copy.data.mapping.pairs.items[0].value;
     try testing.expectEqualStrings("# trailing", value.pending_trailing.?);
-    try testing.expectEqualStrings("# leading", value.pending_leading.?);
+    try testing.expectEqualStrings("# leading", copy.data.mapping.pairs.items[0].key.pending_leading.?);
     // Spans are cleared, and `src_end` is a span like any other.
     try testing.expect(copy.src == null);
     try testing.expect(copy.data.mapping.pairs.items[0].src_end == null);
@@ -2005,29 +2257,16 @@ test "cloneTreeInto follows an alias anchored outside the subtree" {
     }
 }
 
-test "cloneTreeWhole refuses a forward alias instead of pointing outside" {
-    // The whole-tree clone may only name an anchor it has already
-    // cloned; an alias whose anchor comes LATER in the walk is a forward
-    // alias (invalid in parsed input, reachable from a hand-built tree).
-    // A subtree clone tolerates it because the target may legitimately
-    // live outside the cloned subtree; the whole-tree clone must not,
-    // because the caller swaps it in as the new root and a pointer back
-    // at the pre-clone tree would break the rollback contract.
-    var doc = Document.init(testing.allocator);
+test "cloneTree keeps an alias whose anchor is outside the subtree" {
+    // A same-document subtree clone may name an anchor it did not copy:
+    // the target lives elsewhere in this document, so the reference is
+    // still valid and the clone's alias points at it.
+    var doc = try Document.parse(testing.allocator, "base: &b 1\nsub:\n  x: *b\n");
     defer doc.deinit();
-    const root = try doc.createMapping();
-    doc.root = root;
-    const later = try doc.createMapping();
-    try doc.setAnchor(later, "late");
-    const alias = try doc.pool.create(Node);
-    alias.* = .{ .data = .{ .alias = .{ .name = "late", .target = later } } };
-    try doc.mappingAppend(root, try doc.createScalar("a", .plain), alias);
-    try doc.mappingAppend(root, try doc.createScalar("later", .plain), later);
-
-    // The subtree clone still accepts it: the target is in this document.
-    const clone = try cloneTree(&doc, root);
-    try testing.expect(clone != root);
-    try testing.expectError(error.UnknownAlias, cloneTreeWhole(&doc, root));
+    const clone = try cloneTree(&doc, doc.pathGet(&.{"sub"}).?);
+    const x = clone.lookup("x").?;
+    try testing.expect(x.isAlias());
+    try testing.expect(x.resolveAlias() == doc.pathGet(&.{"base"}).?);
 }
 
 test "a move cannot put an alias ahead of its anchor" {
@@ -2422,7 +2661,7 @@ test "an alias to an enclosing anchor is a parsed cycle, and cannot abort the pr
     // mapping and a naive `..key` descent revisits it forever. This is
     // spec-legal and parses: nothing rejects a cycle at parse time.
     //
-    // Before the bound in `collectDescend`, this aborted the process
+    // Before the bound in the descent walk, this aborted the process
     // with a stack overflow — reachable from untrusted input through a
     // documented public path (`$..key`), which is exactly the threat
     // model SECURITY.md states.
@@ -2468,6 +2707,52 @@ test "an alias to an enclosing anchor is a parsed cycle, and cannot abort the pr
     }
 }
 
+/// `l0: &l0 x`, then `levels` lines `lN: &lN [*lN-1, ...]` of `fan`
+/// aliases each: a few hundred bytes that name fan^levels paths.
+fn aliasFan(allocator: std.mem.Allocator, fan: usize, levels: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "l0: &l0 x\n");
+    for (1..levels + 1) |l| {
+        try out.print(allocator, "l{d}: &l{d} [", .{ l, l });
+        for (0..fan) |i| try out.print(allocator, "{s}*l{d}", .{ if (i > 0) ", " else "", l - 1 });
+        try out.appendSlice(allocator, "]\n");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "a query through fanned-out aliases costs the document's size, not its paths" {
+    // Descent resolves aliases, and a node reached a second time was
+    // walked again: 20 levels of 10 aliases (~800 bytes) name 10^20
+    // paths, and `all("$..x")` would never return -- through a public
+    // query, from untrusted input. Wildcards multiplied the same way,
+    // one expansion per alias to the same target.
+    const allocator = testing.allocator;
+    const input = try aliasFan(allocator, 10, 20);
+    defer allocator.free(input);
+    var doc = try Document.parse(allocator, input);
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+
+    const none = try ed.all("$..nothing");
+    defer allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    // Every `lN` key, once each, in document order.
+    const keys = try ed.all("$..l0");
+    defer allocator.free(keys);
+    try testing.expectEqual(@as(usize, 1), keys.len);
+
+    // Three wildcard steps below l20: each list holds ten aliases to the
+    // same list, so there are ten distinct items at every depth.
+    const items = try ed.all("$.l20[*][*][*]");
+    defer allocator.free(items);
+    try testing.expectEqual(@as(usize, 10), items.len);
+    for (items, 0..) |a, i| {
+        for (items[0..i]) |b| try testing.expect(a != b);
+    }
+}
+
 test "the edit walks are depth-bounded on a built tree too" {
     const allocator = std.testing.allocator;
 
@@ -2494,9 +2779,9 @@ test "allocation failures in insert and move batches leak nothing" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, insertMoveBatch, .{});
 }
 
-/// Insert and move go through `Editor.apply`'s clone-and-swap path and
-/// sequence bookkeeping — the allocation-heaviest edits. On any OOM the
-/// original tree must survive intact and leak-free.
+/// Insert and move are the allocation-heaviest edits (journal records,
+/// tombstones, sequence bookkeeping). On any OOM the original tree must
+/// survive intact and leak-free.
 fn insertMoveBatch(allocator: std.mem.Allocator) !void {
     var doc = try Document.parse(allocator,
         \\from:
@@ -2520,6 +2805,307 @@ fn insertMoveBatch(allocator: std.mem.Allocator) !void {
     });
     const out = try doc.write(allocator);
     defer allocator.free(out);
+}
+
+test "allocation failures in a wildcard and filter delete leak nothing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, wildcardDeleteBatch, .{});
+}
+
+/// A delete with several matches resolves per container, collects and
+/// de-duplicates its victims, then detaches each: every step allocates.
+fn wildcardDeleteBatch(allocator: std.mem.Allocator) !void {
+    var doc = try Document.parse(allocator,
+        \\items:
+        \\  - {k: 1, j: 1}
+        \\  - {k: 2, j: 2}
+        \\  - {k: 1, j: 3}
+        \\m:
+        \\  a: 1
+        \\  b: 2
+        \\
+    );
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{
+        .{ .delete = "$.items[?k=1]" },
+        .{ .delete = "$.items[*].j" },
+        .{ .delete = "$.m[*]" },
+    });
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("items:\n  - {k: 2}\nm:\n  {}\n", out);
+}
+
+test "a batch that fails at any allocation leaves the document byte-identical" {
+    // `apply` edits in place and rolls back through its undo journal, so
+    // every change a batch makes has to be undone exactly -- the list
+    // entries, tombstones, parent links, spans and `modified` flags the
+    // emitter reads. Fail the batch at each of its allocations in turn:
+    // each time the tree must be in exactly the state a fresh parse gives
+    // (bytes alone would not show it: an unmodified container is written
+    // verbatim, whatever stale tombstones it carries).
+    const src =
+        \\# head
+        \\a: 1  # keep
+        \\items:
+        \\  - x
+        \\  - {k: 1}
+        \\  - {k: 2}
+        \\m: &m
+        \\  p: 1
+        \\  q: 2
+        \\ref: *m
+        \\flow: [1, 2, 3]
+        \\
+    ;
+    const Batch = struct {
+        fn make(doc: *Document, buf: []Edit) anyerror![]const Edit {
+            const v1 = try doc.createScalar("X", .plain);
+            const v2 = try doc.createScalar("Y", .plain);
+            const v3 = try doc.createScalar("Z", .plain);
+            const v4 = try doc.createScalar("W", .plain);
+            const v5 = try doc.createScalar("V", .plain);
+            // A replacement carrying the anchor `ref` names: the alias is
+            // re-pointed at it, and that has to be undone too.
+            const m2 = try doc.createMapping();
+            try doc.mappingAppend(m2, try doc.createScalar("r", .plain), try doc.createScalar("1", .plain));
+            try doc.setAnchor(m2, "m");
+            const edits = [_]Edit{
+                .{ .set = .{ .path = "$.a", .value = v1 } },
+                .{ .set = .{ .path = "$.flow[1]", .value = v2 } },
+                .{ .set = .{ .path = "$.new", .value = v3 } },
+                .{ .delete = "$.items[?k=1]" },
+                .{ .insert = .{ .sequence = "$.items", .position = "$.items[0]", .value = v4, .before = true } },
+                .{ .delete = "$.m.q" },
+                .{ .set = .{ .path = "$.m", .value = m2 } },
+                .{ .move = .{ .from = "$.items[1]", .to = "$.flow" } },
+                .{ .append = .{ .sequence = "$.items", .value = v5 } },
+            };
+            @memcpy(buf[0..edits.len], &edits);
+            return buf[0..edits.len];
+        }
+    };
+    try testing.expect(try rollbackAtEveryAllocation(src, Batch.make) > 20);
+
+    // A batch that fails on an edit's own terms, after replacing the
+    // whole root, is rolled back the same way.
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try testing.expectError(error.AmbiguousOperation, ed.apply(&.{
+        .{ .set = .{ .path = "$", .value = try doc.createScalar("gone", .plain) } },
+        .{ .set = .{ .path = "$[*]", .value = try doc.createScalar("X", .plain) } },
+    }));
+    var fresh = try Document.parse(testing.allocator, src);
+    defer fresh.deinit();
+    try expectSameState(doc.root.?, fresh.root.?, doc.root.?, fresh.root.?);
+}
+
+test "a batch inside another atomic section is undone with it" {
+    // `apply` inside an outer `internal.Transaction` hands its records
+    // to the outer journal when it commits, so the outer section's
+    // rollback undoes the batch too; a batch that fails (here at each of
+    // its allocations, the hand-over included) undoes itself. Either
+    // way, aborting the outer section restores the parsed state.
+    const src = "a: 1\nitems: [x, y]\nm: {k: v}\n";
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing.allocator();
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        failing.fail_index = std.math.maxInt(usize);
+        var doc = try Document.parse(allocator, src);
+        defer doc.deinit();
+        const v1 = try doc.createScalar("2", .plain);
+        const v2 = try doc.createScalar("z", .plain);
+        var ed = Editor.init(&doc);
+        var txn: internal.Transaction = undefined;
+        txn.begin(&doc);
+        failing.fail_index = failing.alloc_index + fail_at;
+        const result = ed.apply(&.{
+            .{ .set = .{ .path = "$.a", .value = v1 } },
+            .{ .delete = "$.items[0]" },
+            .{ .append = .{ .sequence = "$.items", .value = v2 } },
+            .{ .delete = "$.m.k" },
+        });
+        failing.fail_index = std.math.maxInt(usize);
+        txn.abort();
+        try testing.expect(doc.journal == null);
+        var fresh = try Document.parse(allocator, src);
+        defer fresh.deinit();
+        try expectSameState(doc.root.?, fresh.root.?, doc.root.?, fresh.root.?);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings(src, out);
+        if (result) |_| break else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+    try testing.expect(fail_at > 5);
+}
+
+test "the journal undoes every other kind of change too" {
+    // The paths the first batch does not take: a block item replaced
+    // (remove then insert) by a same-document clone, intermediate
+    // mappings created, a descent and a wildcard delete, a move into a
+    // mapping, and the root replaced.
+    const src =
+        \\a: 1
+        \\items:
+        \\  - x
+        \\  - {k: 1}
+        \\m: &m
+        \\  p: 1
+        \\ref: *m
+        \\flow: [1, 2]
+        \\
+    ;
+    const Batch = struct {
+        fn make(doc: *Document, buf: []Edit) anyerror![]const Edit {
+            var ed = Editor.init(doc);
+            const clone = try cloneTree(doc, try ed.one("$.m"));
+            const root = try doc.createMapping();
+            try doc.mappingAppend(root, try doc.createScalar("only", .plain), try doc.createScalar("1", .plain));
+            const edits = [_]Edit{
+                .{ .set = .{ .path = "$.items[0]", .value = clone } },
+                .{ .set = .{ .path = "$.n1.n2.leaf", .value = try doc.createScalar("L", .plain) } },
+                .{ .delete = "$..k" },
+                .{ .delete = "$.flow[*]" },
+                .{ .move = .{ .from = "$.a", .to = "$.m", .key = "moved" } },
+                .{ .set = .{ .path = "$", .value = root } },
+            };
+            @memcpy(buf[0..edits.len], &edits);
+            return buf[0..edits.len];
+        }
+    };
+    try testing.expect(try rollbackAtEveryAllocation(src, Batch.make) > 20);
+}
+
+test "merge resolution that fails at any allocation leaves the tree as parsed" {
+    const src =
+        \\base: &b {a: 1, b: 2}
+        \\more: &c {d: 4}
+        \\use:
+        \\  <<: [*b, *c]
+        \\  e: 5
+        \\
+    ;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing.allocator();
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        failing.fail_index = std.math.maxInt(usize);
+        var doc = try Document.parse(allocator, src);
+        defer doc.deinit();
+        failing.fail_index = failing.alloc_index + fail_at;
+        const result = doc.resolveMergeKeys();
+        failing.fail_index = std.math.maxInt(usize);
+        if (result) |_| break else |err| try testing.expectEqual(error.OutOfMemory, err);
+        var fresh = try Document.parse(allocator, src);
+        defer fresh.deinit();
+        try expectSameState(doc.root.?, fresh.root.?, doc.root.?, fresh.root.?);
+    }
+    try testing.expect(fail_at > 3);
+    // A budget refusal rolls back the same way.
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    try testing.expectError(error.LimitExceeded, doc.resolveMergeKeysLimited(2));
+    var fresh = try Document.parse(testing.allocator, src);
+    defer fresh.deinit();
+    try expectSameState(doc.root.?, fresh.root.?, doc.root.?, fresh.root.?);
+}
+
+/// Parse `src`, build a batch with `make` (its values are made before
+/// anything fails), and apply it failing at each of its allocations in
+/// turn: each time, the tree must be in exactly the state a fresh parse
+/// gives. Returns how many allocation points were failed before the
+/// batch ran through.
+fn rollbackAtEveryAllocation(src: []const u8, make: *const fn (*Document, []Edit) anyerror![]const Edit) !usize {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const allocator = failing.allocator();
+    var fail_at: usize = 0;
+    while (true) : (fail_at += 1) {
+        failing.fail_index = std.math.maxInt(usize);
+        var doc = try Document.parse(allocator, src);
+        defer doc.deinit();
+        var buf: [16]Edit = undefined;
+        const edits = try make(&doc, &buf);
+        var ed = Editor.init(&doc);
+        failing.fail_index = failing.alloc_index + fail_at;
+        const result = ed.apply(edits);
+        failing.fail_index = std.math.maxInt(usize);
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        if (result) |_| {
+            // Every allocation point has been failed once; this run
+            // allocated nothing that could fail, and succeeded.
+            try testing.expect(!std.mem.eql(u8, src, out));
+            return fail_at;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqualStrings(src, out);
+            var fresh = try Document.parse(allocator, src);
+            defer fresh.deinit();
+            try expectSameState(doc.root.?, fresh.root.?, doc.root.?, fresh.root.?);
+        }
+    }
+}
+
+/// `a` (a rolled-back tree) is in the state `b` (a fresh parse of the
+/// same text) is: same shape and scalars, same spans, `modified` flags,
+/// tombstones and pair ends, every child's parent link pointing at its
+/// container, and every alias naming the node at the same place.
+fn expectSameState(a: *const Node, b: *const Node, a_root: *const Node, b_root: *const Node) !void {
+    try testing.expectEqual(b.kind(), a.kind());
+    try testing.expectEqual(b.modified, a.modified);
+    try testing.expectEqual(b.src, a.src);
+    try testing.expectEqual(b.anchor == null, a.anchor == null);
+    switch (a.data) {
+        .scalar => |s| try testing.expectEqualStrings(b.data.scalar.value, s.value),
+        .alias => |al| {
+            // The target, found by the same walk in both trees.
+            try testing.expectEqual(pathIndex(b_root, b.data.alias.target), pathIndex(a_root, al.target));
+        },
+        .mapping => |m| {
+            const bm = b.data.mapping;
+            try testing.expectEqual(bm.pairs.items.len, m.pairs.items.len);
+            try testing.expectEqualSlices([2]usize, bm.dropped.items, m.dropped.items);
+            for (m.pairs.items, bm.pairs.items) |p, q| {
+                try testing.expectEqual(q.src_end, p.src_end);
+                try testing.expect(p.key.parent == a and p.value.parent == a);
+                try expectSameState(p.key, q.key, a_root, b_root);
+                try expectSameState(p.value, q.value, a_root, b_root);
+            }
+        },
+        .sequence => |sq| {
+            const bs = b.data.sequence;
+            try testing.expectEqual(bs.items.items.len, sq.items.items.len);
+            try testing.expectEqualSlices([2]usize, bs.dropped.items, sq.dropped.items);
+            for (sq.items.items, bs.items.items) |x, y| {
+                try testing.expect(x.parent == a);
+                try expectSameState(x, y, a_root, b_root);
+            }
+        },
+    }
+}
+
+/// The pre-order index of `target` under `root`, or null.
+fn pathIndex(root: *const Node, target: *const Node) ?usize {
+    var i: usize = 0;
+    return pathIndexFrom(root, target, &i);
+}
+
+fn pathIndexFrom(node: *const Node, target: *const Node, i: *usize) ?usize {
+    if (node == target) return i.*;
+    i.* += 1;
+    switch (node.data) {
+        .mapping => |m| for (m.pairs.items) |p| {
+            if (pathIndexFrom(p.key, target, i)) |r| return r;
+            if (pathIndexFrom(p.value, target, i)) |r| return r;
+        },
+        .sequence => |sq| for (sq.items.items) |x| {
+            if (pathIndexFrom(x, target, i)) |r| return r;
+        },
+        else => {},
+    }
+    return null;
 }
 
 test "allocation failures in a cross-document clone leak nothing" {
@@ -2620,6 +3206,85 @@ test "a modified scalar or flow sequence item keeps its `- `" {
     const out = try doc.write(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("- a # c\n- b\n", out);
+}
+
+test "an edit under a root that shares its line with `---` keeps the marker" {
+    // `markup.entryStart` took the marker's third dash for a `- `
+    // indicator, so the root's entry_start (and the document's
+    // body_start) pointed inside `---`. An untouched root re-emitted
+    // from there, dash and all; a modified one from its content, and
+    // `--- {a: 1}` with `$.a` set to 2 was written `--{a: 2}`: valid
+    // YAML meaning a mapping keyed `--{a`.
+    const cases = [_]struct { in: []const u8, path: []const u8, out: []const u8 }{
+        .{ .in = "--- {a: 1}\n", .path = "$.a", .out = "--- {a: 2}\n" },
+        .{ .in = "--- [1, 2]\n", .path = "$[0]", .out = "--- [2, 2]\n" },
+        .{ .in = "--- !!map {a: 1}\n", .path = "$.a", .out = "--- !!map {a: 2}\n" },
+        .{ .in = "--- &r {a: 1}\n", .path = "$.a", .out = "--- &r {a: 2}\n" },
+        .{ .in = "--- foo\n", .path = "$", .out = "--- 2\n" },
+        .{ .in = "--- {a: 1} # c\n", .path = "$.a", .out = "--- {a: 2} # c\n" },
+        // Controls: the marker on its own line, and no marker.
+        .{ .in = "---\n{a: 1}\n", .path = "$.a", .out = "---\n{a: 2}\n" },
+        .{ .in = "{a: 1}\n", .path = "$.a", .out = "{a: 2}\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.set(c.path, try doc.createScalar("2", .plain));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+}
+
+test "edits inside a compact collection after an explicit `: ` keep the indicator" {
+    // `? a` / `: - b` puts the value's first entry on the `: ` line. The
+    // indicator belongs to the value, not to that entry, but a delete or
+    // replace tombstoned the whole line with it (`? a\n  - X`, a
+    // different tree), and a re-emitted value broke its line after the
+    // `: `, leaving mis-indented entries that did not parse.
+    const Case = struct { in: []const u8, edit: Edit, out: []const u8 };
+    const x: *Node = undefined; // replaced per case below
+    const cases = [_]Case{
+        .{ .in = "? a\n: - b\n  - c\n", .edit = .{ .set = .{ .path = "$.a[0]", .value = x } }, .out = "? a\n: - X\n  - c\n" },
+        .{ .in = "? a\n: - b\n  - c\n", .edit = .{ .set = .{ .path = "$.a[1]", .value = x } }, .out = "? a\n: - b\n  - X\n" },
+        .{ .in = "? a\n: - b\n  - c\n", .edit = .{ .delete = "$.a[0]" }, .out = "? a\n: - c\n" },
+        .{ .in = "? a\n: - b\n  - c\n", .edit = .{ .delete = "$.a[1]" }, .out = "? a\n: - b\n" },
+        .{ .in = "? a\n: - b\n  - c\n", .edit = .{ .append = .{ .sequence = "$.a", .value = x } }, .out = "? a\n: - b\n  - c\n  - X\n" },
+        .{ .in = "? a\n: x: 1\n  y: 2\n", .edit = .{ .set = .{ .path = "$.a.x", .value = x } }, .out = "? a\n: x: X\n  y: 2\n" },
+        .{ .in = "? a\n: x: 1\n  y: 2\n", .edit = .{ .set = .{ .path = "$.a.y", .value = x } }, .out = "? a\n: x: 1\n  y: X\n" },
+        .{ .in = "? a\n: x: 1\n  y: 2\n", .edit = .{ .delete = "$.a.x" }, .out = "? a\n: y: 2\n" },
+        .{ .in = "? a\n: x: 1\n  y: 2\n", .edit = .{ .delete = "$.a.y" }, .out = "? a\n: x: 1\n" },
+        .{ .in = "? a\n: x: 1\n  y: 2\n", .edit = .{ .set = .{ .path = "$.a.z", .value = x } }, .out = "? a\n: x: 1\n  y: 2\n  z: X\n" },
+        .{ .in = "- ? a\n  : x: 1\n    y: 2\n", .edit = .{ .set = .{ .path = "$[0].a.y", .value = x } }, .out = "- ? a\n  : x: 1\n    y: X\n" },
+        .{ .in = "- ? a\n  : x: 1\n    y: 2\n", .edit = .{ .delete = "$[0].a.x" }, .out = "- ? a\n  : y: 2\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        const v = try doc.createScalar("X", .plain);
+        var e = c.edit;
+        switch (e) {
+            .set => |*st| st.value = v,
+            .append => |*ap| ap.value = v,
+            else => {},
+        }
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{e});
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+        var again = try Document.parse(testing.allocator, out);
+        again.deinit();
+    }
+    // A key that is a compact collection after `? `: modifying it wrote
+    // the `? ` for the key and again with its first entry (`? ? - x`).
+    var doc = try Document.parse(testing.allocator, "? - x\n  - y\n: v\n");
+    defer doc.deinit();
+    try doc.setAnchor(doc.root.?.pairs().?[0].key.items().?[1], "z");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("? - x\n  - &z y\n: v\n", out);
 }
 
 test "emptying a container keeps the comments between its entries" {
@@ -2797,9 +3462,10 @@ test "setAnchor defines, clears and refuses what would strand an alias" {
 
 test "an alias to an anchored scalar survives a clone pointing into the clone" {
     // `cloneNode` re-registered anchors only for collections, so after
-    // any `apply` an alias to a SCALAR still pointed at the pre-clone
-    // node -- harmless while scalars were immutable, wrong the moment a
-    // replacement could carry the anchor over.
+    // any `apply` (which then cloned the tree) an alias to a SCALAR still
+    // pointed at the pre-clone node -- harmless while scalars were
+    // immutable, wrong the moment a replacement could carry the anchor
+    // over. `apply` no longer clones; the alias must still resolve.
     var doc = try Document.parse(testing.allocator, "a: &x 1\nb: *x\nc: 3\n");
     defer doc.deinit();
     var ed = Editor.init(&doc);
@@ -2856,6 +3522,91 @@ test "a trailing descent delete removes every match" {
     try testing.expect(re.pathGet(&.{"k"}) == null);
     try testing.expect(re.pathGet(&.{ "inner", "k" }) == null);
     try testing.expectEqualStrings("4", re.pathGet(&.{"other"}).?.scalarValue().?);
+}
+
+test "a wildcard or filter delete removes every match" {
+    // `one` answers UnknownPath for several matches as well as none, and
+    // delete took any error for "no match": a delete matching several
+    // nodes reported success and removed nothing, while one matching a
+    // single node reached a final-segment switch that knew only keys and
+    // indices, and failed with AmbiguousOperation.
+    const cases = [_]struct { in: []const u8, path: []const u8, out: []const u8 }{
+        // [*] over 3, 1 and 0 items.
+        .{ .in = "items:\n  - a\n  - b\n  - c\nk: v\n", .path = "$.items[*]", .out = "items:\n  []\nk: v\n" },
+        .{ .in = "items:\n  - a\nk: v\n", .path = "$.items[*]", .out = "items:\n  []\nk: v\n" },
+        .{ .in = "items: []\nk: v\n", .path = "$.items[*]", .out = "items: []\nk: v\n" },
+        // [?k=v] with 2, 1 and 0 matches.
+        .{ .in = "items:\n  - {k: 1}\n  - {k: 1}\n  - {k: 2}\n", .path = "$.items[?k=1]", .out = "items:\n  - {k: 2}\n" },
+        .{ .in = "items:\n  - {k: 1}\n  - {k: 2}\n", .path = "$.items[?k=1]", .out = "items:\n  - {k: 2}\n" },
+        .{ .in = "items:\n  - {k: 1}\n  - {k: 2}\n", .path = "$.items[?k=9]", .out = "items:\n  - {k: 1}\n  - {k: 2}\n" },
+        // Mappings: [*] takes every entry, [?k=v] every matching value
+        // -- by identity, so of two entries with the same key only the
+        // matching one goes.
+        .{ .in = "m:\n  a: 1\n  b: 2\nk: v\n", .path = "$.m[*]", .out = "m:\n  {}\nk: v\n" },
+        .{ .in = "a: {k: 1}\na: {k: 2}\nb: {k: 1}\n", .path = "$[?k=1]", .out = "a: {k: 2}\n" },
+        // In the middle of a path: each item's `k`.
+        .{ .in = "items:\n  - k: 1\n    j: 1\n  - k: 2\n    j: 2\n", .path = "$.items[*].k", .out = "items:\n  - j: 1\n  - j: 2\n" },
+        .{ .in = "items:\n  - k: 1\n    j: 1\n", .path = "$.items[*].k", .out = "items:\n  - j: 1\n" },
+        // An alias item goes like any other; its anchor stays.
+        .{ .in = "a: &x 1\nitems: [*x, 2]\n", .path = "$.items[*]", .out = "a: &x 1\nitems: []\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.delete(c.path);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+        // And nothing the path matches is left.
+        var re = try Document.parse(testing.allocator, out);
+        defer re.deinit();
+        var red = Editor.init(&re);
+        const left = try red.all(c.path);
+        defer testing.allocator.free(left);
+        try testing.expectEqual(@as(usize, 0), left.len);
+    }
+}
+
+test "a wildcard delete refuses atomically, and not through an alias" {
+    const cases = [_]struct { in: []const u8, path: []const u8, err: Error }{
+        // An anchored item an alias still names: nothing is removed,
+        // not even the items before it.
+        .{ .in = "items:\n  - a\n  - &x b\n  - c\nref: *x\n", .path = "$.items[*]", .err = error.AnchorReferenced },
+        .{ .in = "items:\n  - {k: 1}\n  - &x {k: 1}\nref: *x\n", .path = "$.items[?k=1]", .err = error.AnchorReferenced },
+        // Writes do not forward through an alias, whatever the count.
+        .{ .in = "a: &s [1, 2]\nb: *s\n", .path = "$.b[*]", .err = error.AliasPath },
+        .{ .in = "a: &s [{k: 1}]\nb: *s\n", .path = "$.b[?k=1]", .err = error.AliasPath },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try testing.expectError(c.err, ed.delete(c.path));
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.in, out);
+    }
+    // In a batch: a later failing edit rolls the deletes back too.
+    const src = "items:\n  - a\n  - b\nk: v\n";
+    var doc = try Document.parse(testing.allocator, src);
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try testing.expectError(error.AmbiguousOperation, ed.apply(&.{
+        .{ .delete = "$.items[*]" },
+        .{ .set = .{ .path = "$[*]", .value = try doc.createScalar("x", .plain) } },
+    }));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(src, out);
+    // An anchored item nobody references is simply deleted.
+    var doc2 = try Document.parse(testing.allocator, "items:\n  - &x a\n  - b\n");
+    defer doc2.deinit();
+    var ed2 = Editor.init(&doc2);
+    try ed2.delete("$.items[*]");
+    const out2 = try doc2.write(testing.allocator);
+    defer testing.allocator.free(out2);
+    try testing.expectEqualStrings("items:\n  []\n", out2);
 }
 
 test "descent reports a node reached through an alias once" {
@@ -2935,6 +3686,48 @@ test "descent delete under a prefix removes matches only within it" {
     try testing.expectEqualStrings("out:\n  k: 1\nin:\n  {}\n", out);
 }
 
+test "a write through an alias is refused at any depth, not only the last" {
+    // `error.AliasPath` fired only when the IMMEDIATE container was the
+    // alias: one level deeper the write went through it and edited the
+    // anchored node every alias shares.
+    for ([_][]const u8{
+        "a: &x {k: 1, inner: {j: 2}, list: [1]}\nb: *x\n",
+        "a: &x\n  k: 1\n  inner:\n    j: 2\n  list:\n    - 1\nb: *x\n",
+    }) |src| {
+        var doc = try Document.parse(testing.allocator, src);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const v = try doc.createScalar("9", .plain);
+        const edits = [_]Edit{
+            .{ .delete = "$.b.k" },
+            .{ .delete = "$.b.inner.j" },
+            .{ .delete = "$.b.inner[*]" },
+            .{ .delete = "$.b..j" },
+            .{ .set = .{ .path = "$.b.inner.j", .value = v } },
+            .{ .set = .{ .path = "$.b.inner.new", .value = v } },
+            .{ .set = .{ .path = "$.b.list[0]", .value = v } },
+            .{ .append = .{ .sequence = "$.b.list", .value = v } },
+            .{ .insert = .{ .sequence = "$.b.list", .position = "$.b.list[0]", .value = v, .before = true } },
+            .{ .move = .{ .from = "$.b.inner.j", .to = "$", .key = "z" } },
+            .{ .move = .{ .from = "$.a.k", .to = "$.b.inner", .key = "z" } },
+        };
+        for (edits) |e| {
+            try testing.expectError(error.AliasPath, ed.apply(&.{e}));
+            const out = try doc.write(testing.allocator);
+            defer testing.allocator.free(out);
+            try testing.expectEqualStrings(src, out);
+        }
+        // Reads still go through, and the anchor side is writable.
+        try testing.expectEqualStrings("2", (try ed.one("$.b.inner.j")).scalarValue().?);
+        try ed.set("$.a.inner.j", try doc.createScalar("3", .plain));
+        try testing.expectEqualStrings("3", (try ed.one("$.b.inner.j")).scalarValue().?);
+        // A descent over the whole document reaches the anchored node
+        // directly first, so it deletes there.
+        try ed.delete("$..j");
+        try testing.expectError(error.UnknownPath, ed.one("$.a.inner.j"));
+    }
+}
+
 test "deleting or moving an anchored KEY is refused, not silently corrupting" {
     const allocator = testing.allocator;
 
@@ -2984,10 +3777,11 @@ test "deleting or moving an anchored KEY is refused, not silently corrupting" {
 
 test "a batch edit refuses a forward alias instead of stranding it" {
     const allocator = testing.allocator;
-    // `apply` swaps in a WHOLE-tree clone, so an alias whose anchor is
-    // defined LATER (valid only in a hand-built tree) must be refused:
-    // the clone cannot keep pointing at the pre-clone tree, and the
-    // rollback contract assumes the original is discarded.
+    // An alias whose anchor is defined LATER is valid only in a hand-built
+    // tree. `apply` used to deep-clone the whole tree and failed there
+    // (UnknownAlias); it now edits in place, and deleting the anchor the
+    // alias names is refused like any stranding, leaving the tree as it
+    // was.
     var doc = Document.init(allocator);
     defer doc.deinit();
     const root = try doc.createMapping();
@@ -3003,5 +3797,224 @@ test "a batch edit refuses a forward alias instead of stranding it" {
     try doc.mappingAppend(root, try doc.createScalar("def", .plain), anchored);
 
     var ed = Editor.init(&doc);
-    try testing.expectError(error.UnknownAlias, ed.apply(&.{.{ .delete = "$.def" }}));
+    try testing.expectError(error.AnchorReferenced, ed.apply(&.{.{ .delete = "$.def" }}));
+    try testing.expectEqual(@as(usize, 2), root.pairs().?.len);
+    // An edit that strands nothing runs.
+    try ed.set("$.other", try doc.createScalar("1", .plain));
+    try testing.expectEqual(@as(usize, 3), root.pairs().?.len);
+}
+
+/// Structural equality for the edit regression table: kind, scalar text,
+/// anchor, tag and alias name, recursively.
+fn sameTreeForTest(a: ?*const Node, b: ?*const Node) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    if (x.kind() != y.kind()) return false;
+    if (!std.meta.eql(x.anchor == null, y.anchor == null)) return false;
+    if (x.anchor) |n| if (!std.mem.eql(u8, n, y.anchor.?)) return false;
+    if ((x.tag == null) != (y.tag == null)) return false;
+    if (x.tag) |t| if (!std.mem.eql(u8, t, y.tag.?)) return false;
+    return switch (x.data) {
+        .scalar => |s| std.mem.eql(u8, s.value, y.data.scalar.value),
+        .alias => |al| std.mem.eql(u8, al.name, y.data.alias.name),
+        .mapping => |m| m.pairs.items.len == y.data.mapping.pairs.items.len and for (m.pairs.items, y.data.mapping.pairs.items) |p, q| {
+            if (!sameTreeForTest(p.key, q.key) or !sameTreeForTest(p.value, q.value)) break false;
+        } else true,
+        .sequence => |sq| sq.items.items.len == y.data.sequence.items.items.len and for (sq.items.items, y.data.sequence.items.items) |i, j| {
+            if (!sameTreeForTest(i, j)) break false;
+        } else true,
+    };
+}
+
+test "edits keep the meaning in the shapes the preservation sweep skips" {
+    // Found by a randomized differential over the fixtures and corpus
+    // (edit, write, read back, compare with the tree in memory). Each
+    // output was wrong -- unparseable, or read back as another tree --
+    // and each is pinned as the bytes now written.
+    const allocator = testing.allocator;
+    const Op = union(enum) {
+        set: struct { p: []const u8, v: []const u8, s: @import("token.zig").ScalarStyle = .plain },
+        set_seq: []const u8,
+        set_map: []const u8,
+        delete: []const u8,
+        append: struct { p: []const u8, v: []const u8, s: @import("token.zig").ScalarStyle = .plain },
+        insert: struct { p: []const u8, pos: []const u8, v: []const u8, s: @import("token.zig").ScalarStyle = .plain },
+        move: struct { from: []const u8, to: []const u8, key: []const u8 },
+        anchor: struct { p: []const u8, name: ?[]const u8 },
+        lead: struct { p: []const u8, t: []const u8 },
+        trail: struct { p: []const u8, t: []const u8 },
+    };
+    const bom = "\xEF\xBB\xBF";
+    const cases = [_]struct { in: []const u8, ops: []const Op, out: []const u8 }{
+        // Any edit to a document opening with a byte order mark.
+        .{ .in = bom ++ "a: 1\nb: 2\n", .ops = &.{.{ .set = .{ .p = "$.b", .v = "3" } }}, .out = bom ++ "a: 1\nb: 3\n" },
+        .{ .in = bom ++ "a: 1\nb: 2\n", .ops = &.{.{ .trail = .{ .p = "$.b", .t = "# t" } }}, .out = bom ++ "a: 1\nb: 2 # t\n" },
+        // A block scalar written by an edit took in what followed it.
+        .{ .in = "a: 1 # c\n", .ops = &.{.{ .set = .{ .p = "$.a", .v = "x\ny" } }}, .out = "a: |- # c\n  x\n  y\n" },
+        .{ .in = "a:\n  b: 1 # note\n", .ops = &.{.{ .set = .{ .p = "$.a.b", .v = "x\ny", .s = .literal } }}, .out = "a:\n  b: |- # note\n    x\n    y\n" },
+        .{ .in = "a: 1 # c\n", .ops = &.{.{ .set = .{ .p = "$", .v = "x\n", .s = .literal } }}, .out = "| # c\nx\n" },
+        .{ .in = "a: 1\n# tail\n", .ops = &.{.{ .set = .{ .p = "$", .v = "x\n", .s = .literal } }}, .out = "|\n x\n# tail\n" },
+        .{ .in = "a:\n  b: 1\n  # c\nd: 2\n", .ops = &.{.{ .set = .{ .p = "$.a", .v = "x\ny" } }}, .out = "a: |-\n   x\n   y\n  # c\nd: 2\n" },
+        .{ .in = "a: 1\n", .ops = &.{.{ .set = .{ .p = "$", .v = "x\n\n", .s = .literal } }}, .out = "|+\nx\n\n" },
+        .{ .in = "- 1\n\n- 2\n", .ops = &.{.{ .set = .{ .p = "$[0]", .v = "x\n\n", .s = .literal } }}, .out = "- |+\n  x\n\n- 2\n" },
+        .{ .in = "a:\n  - 1\n\nb: 2\n", .ops = &.{.{ .append = .{ .p = "$.a", .v = "x\n\n", .s = .literal } }}, .out = "a:\n  - 1\n  - |+\n    x\n\nb: 2\n" },
+        .{ .in = "a: |\n  t\nb: 2\n", .ops = &.{.{ .lead = .{ .p = "$.b", .t = "  # x" } }}, .out = "a: |\n  t\n# x\nb: 2\n" },
+        // Indentation and item framing around new and replaced items.
+        .{ .in = "a:\n  - x\n", .ops = &.{.{ .insert = .{ .p = "$.a", .pos = "$.a[0]", .v = "q\n", .s = .literal } }}, .out = "a:\n  - |\n    q\n  - x\n" },
+        .{ .in = "a:\n  - x\n  - y\n", .ops = &.{.{ .insert = .{ .p = "$.a", .pos = "$.a[0]", .v = "" } }}, .out = "a:\n  -\n  - x\n  - y\n" },
+        .{ .in = "- - x\n  - y\n", .ops = &.{.{ .set = .{ .p = "$[0][0]", .v = "" } }}, .out = "- -\n  - y\n" },
+        .{ .in = "-\n  - 42\n", .ops = &.{.{ .set = .{ .p = "$[0][0]", .v = "x" } }}, .out = "-\n  - x\n" },
+        .{ .in = "- - one\n  - two\n", .ops = &.{ .{ .set = .{ .p = "$[0][0]", .v = "z" } }, .{ .set = .{ .p = "$[0][1]", .v = "z" } } }, .out = "- - z\n  - z\n" },
+        .{ .in = "- - x\n", .ops = &.{.{ .set = .{ .p = "$[0][0]", .v = "a\nb", .s = .literal } }}, .out = "- - |-\n    a\n    b\n" },
+        .{ .in = "- !!map\n  foo: bar\n", .ops = &.{ .{ .delete = "$[0].foo" }, .{ .set = .{ .p = "$[0].k", .v = "v" } } }, .out = "- !!map\n  k: v\n" },
+        .{ .in = "- :\n", .ops = &.{.{ .set = .{ .p = "$[0][\"\"]", .v = "a\nb", .s = .literal } }}, .out = "- : |-\n    a\n    b\n" },
+        .{ .in = "- # c\n  x\n- z\n", .ops = &.{.{ .delete = "$[0]" }}, .out = "- z\n" },
+        .{ .in = "- # c\n  x\n- z\n", .ops = &.{.{ .set = .{ .p = "$[0]", .v = "NEW" } }}, .out = "- NEW\n- z\n" },
+        .{ .in = "- # c\n  x\n", .ops = &.{.{ .append = .{ .p = "$", .v = "y" } }}, .out = "- # c\n  x\n- y\n" },
+        .{ .in = "- -\n    # c\n    x\n  - y\n", .ops = &.{.{ .delete = "$[0][0]" }}, .out = "- - y\n" },
+        // A replaced item keeps its line's comment, as a mapping value does.
+        .{ .in = "- 1 # c\n- 2\n", .ops = &.{.{ .set = .{ .p = "$[0]", .v = "9" } }}, .out = "- 9 # c\n- 2\n" },
+        .{ .in = "- 1 # c\n- 2\n", .ops = &.{.{ .set = .{ .p = "$[0]", .v = "x\ny", .s = .literal } }}, .out = "- |- # c\n  x\n  y\n- 2\n" },
+        // A new block scalar breaks its lines as the document does.
+        .{ .in = "a: 1\r\nb: 2\r\n", .ops = &.{.{ .set = .{ .p = "$.a", .v = "x\ny", .s = .literal } }}, .out = "a: |-\r\n  x\r\n  y\r\nb: 2\r\n" },
+        // Document markers.
+        .{ .in = "--- a\n", .ops = &.{.{ .set_seq = "$" }}, .out = "---\n- x\n" },
+        .{ .in = "--- a\n", .ops = &.{.{ .set_map = "$" }}, .out = "---\nk: x\n" },
+        .{ .in = "\ta\n", .ops = &.{.{ .set_seq = "$" }}, .out = "- x\n" },
+        .{ .in = "a: 1\n...\n", .ops = &.{.{ .delete = "$.a" }}, .out = "{}\n...\n" },
+        .{ .in = "---\n...\n", .ops = &.{.{ .set = .{ .p = "$", .v = "x" } }}, .out = "---\nx\n...\n" },
+        .{ .in = "---", .ops = &.{.{ .set = .{ .p = "$", .v = "x" } }}, .out = "--- x" },
+        // Flow mappings whose `:` does not follow the key directly.
+        .{ .in = "{\"foo\"\n: \"bar\"}\n", .ops = &.{.{ .set = .{ .p = "$.foo", .v = "x" } }}, .out = "{\"foo\"\n: x}\n" },
+        .{ .in = "{foo, b: 1}\n", .ops = &.{.{ .set = .{ .p = "$.foo", .v = "x" } }}, .out = "{foo: x, b: 1}\n" },
+        // CRLF and CR line breaks.
+        .{ .in = "- |+\r\n  a\r\n\r\n", .ops = &.{.{ .append = .{ .p = "$", .v = "c" } }}, .out = "- |+\r\n  a\r\n\r\n- c\r\n" },
+        .{ .in = "k: |+\r\n  a\r\n\r\n", .ops = &.{.{ .set = .{ .p = "$.j", .v = "c" } }}, .out = "k: |+\r\n  a\r\n\r\nj: c\r\n" },
+        .{ .in = "- |\r\n  a\r\n", .ops = &.{.{ .append = .{ .p = "$", .v = "c" } }}, .out = "- |\r\n  a\r\n- c\r\n" },
+        .{ .in = "[a, # c\rb]\r", .ops = &.{.{ .delete = "$[1]" }}, .out = "[a]\r" },
+        // Properties of a parsed collection, of an empty value and key.
+        .{ .in = "a:\n  b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = "x" } }}, .out = "a: &x\n  b: 1\n" },
+        .{ .in = "a: &x\n  b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = null } }}, .out = "a:\n  b: 1\n" },
+        .{ .in = "a: &x\n  b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = "y" } }}, .out = "a: &y\n  b: 1\n" },
+        .{ .in = "b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$", .name = "r" } }}, .out = "&r\nb: 1\n" },
+        .{ .in = "&col\nkey: v\n", .ops = &.{.{ .anchor = .{ .p = "$", .name = null } }}, .out = "key: v\n" },
+        .{ .in = "- k: v\n- j: w\n", .ops = &.{.{ .anchor = .{ .p = "$[0]", .name = "y" } }}, .out = "- &y\n  k: v\n- j: w\n" },
+        .{ .in = "top:\n  - k: v\n  - j: w\n", .ops = &.{.{ .anchor = .{ .p = "$.top[0]", .name = "y" } }}, .out = "top:\n  - &y\n    k: v\n  - j: w\n" },
+        .{ .in = "a:\nb: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = "x" } }}, .out = "a: &x\nb: 1\n" },
+        .{ .in = "!!str : a\n", .ops = &.{.{ .set = .{ .p = "$[\"\"]", .v = "b" } }}, .out = "!!str : b\n" },
+        // Properties that are not the collection's own are left alone:
+        // ones running over lines, a first key's, a deleted first key's.
+        .{ .in = "key: &anchor\n !!map\n  a: b\n", .ops = &.{.{ .set = .{ .p = "$.key.a", .v = "c" } }}, .out = "key: &anchor\n !!map\n  a: c\n" },
+        .{ .in = "top:\n  &k 'key' : v\n  j: w\n", .ops = &.{.{ .set = .{ .p = "$.top.j", .v = "x" } }}, .out = "top:\n  &k 'key' : v\n  j: x\n" },
+        .{ .in = "-\n  !!null : a\n  b: x\n", .ops = &.{.{ .delete = "$[0][\"\"]" }}, .out = "-\n  b: x\n" },
+        .{ .in = "&c : a\n", .ops = &.{.{ .set = .{ .p = "$[\"\"]", .v = "b" } }}, .out = "&c : b\n" },
+        // A null key's entry.
+        .{ .in = ": a\nb: c\n", .ops = &.{.{ .delete = "$[\"\"]" }}, .out = "b: c\n" },
+        .{ .in = ": a\nb: c\n", .ops = &.{.{ .move = .{ .from = "$[\"\"]", .to = "$", .key = "mv" } }}, .out = "b: c\nmv: a\n" },
+        // No final line break.
+        .{ .in = "a: |\n  x\n  ", .ops = &.{.{ .set = .{ .p = "$.new", .v = "y" } }}, .out = "a: |\n  x\nnew: y" },
+        .{ .in = "a: 1", .ops = &.{.{ .trail = .{ .p = "$.a", .t = "# d" } }}, .out = "a: 1 # d\n" },
+        .{ .in = "- 1", .ops = &.{.{ .trail = .{ .p = "$[0]", .t = "# d" } }}, .out = "- 1 # d\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        for (c.ops) |op| switch (op) {
+            .set => |s| try ed.set(s.p, try doc.createScalar(s.v, s.s)),
+            .set_seq => |p| {
+                const q = try doc.createSequence();
+                try doc.sequenceAppend(q, try doc.createScalar("x", .plain));
+                try ed.set(p, q);
+            },
+            .set_map => |p| {
+                const m = try doc.createMapping();
+                try doc.mappingAppend(m, try doc.createScalar("k", .plain), try doc.createScalar("x", .plain));
+                try ed.set(p, m);
+            },
+            .delete => |p| try ed.delete(p),
+            .append => |a| try ed.apply(&.{.{ .append = .{ .sequence = a.p, .value = try doc.createScalar(a.v, a.s) } }}),
+            .insert => |i| try ed.apply(&.{.{ .insert = .{ .sequence = i.p, .position = i.pos, .value = try doc.createScalar(i.v, i.s), .before = true } }}),
+            .move => |m| try ed.apply(&.{.{ .move = .{ .from = m.from, .to = m.to, .key = m.key } }}),
+            .anchor => |a| try doc.setAnchor(try ed.one(a.p), a.name),
+            .lead => |l| try doc.setLeadingComments(try ed.one(l.p), l.t),
+            .trail => |t| try doc.setTrailingComment(try ed.one(t.p), t.t),
+        };
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        errdefer std.debug.print("{f}: wrote {f}\n", .{ std.zig.fmtString(c.in), std.zig.fmtString(out) });
+        try testing.expectEqualStrings(c.out, out);
+        var back = try Document.parse(allocator, out);
+        defer back.deinit();
+        try testing.expect(sameTreeForTest(doc.root, back.root));
+    }
+}
+
+test "an edit that would rebind an alias, or build a cycle, is refused" {
+    const allocator = testing.allocator;
+    // A later `&x` shadows an earlier one for the aliases after it, once
+    // written and read back: in memory `*x` kept its target, and the
+    // written document meant another.
+    {
+        var doc = try Document.parse(allocator, "- &x 1\n- 2\n- *x\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try testing.expectError(error.AnchorShadowed, doc.setAnchor(try ed.one("$[1]"), "x"));
+        // After every alias it is harmless.
+        try doc.sequenceAppend(doc.root.?, try doc.createScalar("3", .plain));
+        try doc.setAnchor(try ed.one("$[3]"), "x");
+    }
+    {
+        var doc = try Document.parse(allocator, "a: &x 1\nb: 0\nc: *x\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const v = try doc.createScalar("NEW", .plain);
+        try doc.setAnchor(v, "x");
+        try testing.expectError(error.AnchorShadowed, ed.set("$.b", v));
+        const same = try doc.write(allocator);
+        defer allocator.free(same);
+        try testing.expectEqualStrings("a: &x 1\nb: 0\nc: *x\n", same);
+    }
+    // Moving a definition past its alias strands the alias.
+    {
+        var doc = try Document.parse(allocator, "a: &x 1\nb: *x\nc: {}\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try testing.expectError(error.AnchorReferenced, ed.apply(&.{.{ .move = .{ .from = "$.a", .to = "$.c", .key = "a" } }}));
+    }
+    // YAML gives an alias no properties.
+    {
+        var doc = try Document.parse(allocator, "a: &x 1\nb: *x\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const alias = doc.root.?.pairs().?[1].value;
+        try testing.expectError(error.InvalidSyntax, doc.setAnchor(alias, "q"));
+        _ = &ed;
+    }
+    // A node set as a value of its own descendant: a parent cycle, which
+    // panicked in `markModified` (the append paths already refused it).
+    {
+        var doc = try Document.parse(allocator, "a:\n  b: 1\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try testing.expectError(error.WouldCycle, ed.set("$.a.b", doc.root.?));
+        try testing.expectError(error.WouldCycle, doc.pathSet(&.{ "a", "b" }, doc.root.?));
+    }
+}
+
+test "the path grammar reads `$ref` as a key, and refuses text after a segment" {
+    const allocator = testing.allocator;
+    // `$` followed by a key character was taken for the root marker, so
+    // `delete("$ref")` deleted `ref` (OpenAPI and JSON Schema documents
+    // are full of `$ref` and `$schema`).
+    var doc = try Document.parse(allocator, "$ref: '#/defs/a'\nref: keep\nitems: [a]\nl: [{k: 1}, {k: 2}]\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.delete("$ref");
+    try testing.expect(doc.root.?.lookup("$ref") == null);
+    try testing.expectEqualStrings("keep", doc.root.?.lookup("ref").?.scalarValue().?);
+    try testing.expectError(error.InvalidPath, ed.all("$.items[0]name"));
+    try testing.expectError(error.InvalidPath, ed.all("items[0]name"));
+    // A set whose parent matches several nodes names no single target.
+    try testing.expectError(error.AmbiguousOperation, ed.set("$.l[*].k", try doc.createScalar("3", .plain)));
 }

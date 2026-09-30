@@ -47,6 +47,17 @@ pub const Limits = struct {
     /// `Emitter.max_depth`.
     max_depth: usize = 1000,
 
+    /// Maximum bytes of text one validation may copy: the paths and
+    /// details of its violations, and the paths it builds on the way
+    /// down. Past it, `error.LimitExceeded`.
+    ///
+    /// A node count does not bound this, for the reason
+    /// `value.Limits.max_bytes` exists: a violation quotes the offending
+    /// scalar, and one 64 KiB anchored string behind three levels of ten
+    /// aliases is only 1,000 nodes but 64 MB of violations from a 65 KB
+    /// input. Same default as `value.Limits.max_bytes`.
+    max_bytes: usize = 64 << 20,
+
     /// No bound. Only for input you produced yourself.
     ///
     /// This lifts the depth bound as well, which re-arms the stack
@@ -55,6 +66,7 @@ pub const Limits = struct {
     pub const unlimited: Limits = .{
         .max_nodes = std.math.maxInt(usize),
         .max_depth = std.math.maxInt(usize),
+        .max_bytes = std.math.maxInt(usize),
     };
 };
 
@@ -198,7 +210,7 @@ pub const Schema = struct {
             for (violations.items) |*v| v.deinitSelf(allocator);
             violations.deinit(allocator);
         }
-        var budget: Budget = .{ .remaining = limits.max_nodes, .max_depth = limits.max_depth };
+        var budget: Budget = .{ .remaining = limits.max_nodes, .bytes = limits.max_bytes, .max_depth = limits.max_depth };
         try checkSchema(self, allocator, node, path, &violations, &budget);
         return violations.toOwnedSlice(allocator);
     }
@@ -228,16 +240,26 @@ pub fn freeViolations(allocator: std.mem.Allocator, violations: []Violation) voi
 
 /// Append one violation, owning its path and detail strings: a
 /// failure while building or appending releases the partial pair.
-fn appendViolation(allocator: std.mem.Allocator, out: *std.ArrayList(Violation), path: []const u8, rule: []const u8, comptime fmt: []const u8, args: anytype) Error!void {
+fn appendViolation(allocator: std.mem.Allocator, out: *std.ArrayList(Violation), b: *Budget, path: []const u8, rule: []const u8, comptime fmt: []const u8, args: anytype) Error!void {
     const path_copy = try allocator.dupe(u8, path);
     errdefer allocator.free(path_copy);
     const detail = try std.fmt.allocPrint(allocator, fmt, args);
     errdefer allocator.free(detail);
+    try b.chargeBytes(path_copy.len + detail.len);
     try out.append(allocator, .{ .path = path_copy, .rule = rule, .detail = detail });
 }
 
-fn typeErr(allocator: std.mem.Allocator, path: []const u8, want: []const u8, out: *std.ArrayList(Violation)) Error!void {
-    return appendViolation(allocator, out, path, "type", "expected {s}", .{want});
+fn typeErr(allocator: std.mem.Allocator, b: *Budget, path: []const u8, want: []const u8, out: *std.ArrayList(Violation)) Error!void {
+    return appendViolation(allocator, out, b, path, "type", "expected {s}", .{want});
+}
+
+/// The path of a child node, charged to the byte budget: keys reached
+/// through aliases repeat, and each level copies its parent's path.
+fn childPath(allocator: std.mem.Allocator, b: *Budget, comptime fmt: []const u8, args: anytype) Error![]u8 {
+    const p = try std.fmt.allocPrint(allocator, fmt, args);
+    errdefer allocator.free(p);
+    try b.chargeBytes(p.len);
+    return p;
 }
 
 /// Does `branch` match `node`? Runs a full validation into a scratch
@@ -281,6 +303,8 @@ fn checkNodeCoreTag(node: *const Node) ?document_mod.CoreTag {
 /// composition cannot escape either bound.
 const Budget = struct {
     remaining: usize,
+    /// Bytes of text still allowed (see `Limits.max_bytes`).
+    bytes: usize,
     depth: usize = 0,
     max_depth: usize,
 
@@ -288,6 +312,11 @@ const Budget = struct {
     fn charge(self: *Budget) Error!void {
         if (self.remaining == 0) return error.LimitExceeded;
         self.remaining -= 1;
+    }
+
+    fn chargeBytes(self: *Budget, n: usize) Error!void {
+        if (n > self.bytes) return error.LimitExceeded;
+        self.bytes -= n;
     }
 
     /// Open one nesting level, or fail. Paired with `leave`.
@@ -312,79 +341,81 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
     switch (schema.kind) {
         .any => {},
         .scalar => {
-            if (!cur.isScalar()) try typeErr(allocator, path, "a scalar", out);
+            if (!cur.isScalar() or document_mod.tagContradictsKind(cur)) try typeErr(allocator, b, path, "a scalar", out);
         },
         .str => {
             // Through `checkNodeCoreTag`, like every other scalar arm,
             // so an explicit `!!str` is honoured here too.
-            if (checkNodeCoreTag(cur) != .str) try typeErr(allocator, path, "a string", out);
+            if (checkNodeCoreTag(cur) != .str) try typeErr(allocator, b, path, "a string", out);
         },
         .bool => {
-            if (checkNodeCoreTag(cur) != .bool) try typeErr(allocator, path, "a boolean", out);
+            if (checkNodeCoreTag(cur) != .bool) try typeErr(allocator, b, path, "a boolean", out);
         },
         .int => {
-            if (checkNodeCoreTag(cur) != .int) try typeErr(allocator, path, "an integer", out);
+            if (checkNodeCoreTag(cur) != .int) try typeErr(allocator, b, path, "an integer", out);
         },
         .float => {
             const k = checkNodeCoreTag(cur);
-            if (k != .float and k != .int) try typeErr(allocator, path, "a number", out);
+            if (k != .float and k != .int) try typeErr(allocator, b, path, "a number", out);
         },
         .str_enum => |values| {
-            if (checkNodeCoreTag(cur) != .str) return typeErr(allocator, path, "a string", out);
-            const s = cur.scalarValue() orelse return typeErr(allocator, path, "a string", out);
+            if (checkNodeCoreTag(cur) != .str) return typeErr(allocator, b, path, "a string", out);
+            const s = cur.scalarValue() orelse return typeErr(allocator, b, path, "a string", out);
             for (values) |v| {
                 if (std.mem.eql(u8, v, s)) return;
             }
-            try appendViolation(allocator, out, path, "enum", "'{s}' is not one of the allowed values", .{s});
+            try appendViolation(allocator, out, b, path, "enum", "'{s}' is not one of the allowed values", .{s});
         },
         .int_range => |r| {
             const k = checkNodeCoreTag(cur);
-            if (k != .int) return typeErr(allocator, path, "an integer", out);
+            if (k != .int) return typeErr(allocator, b, path, "an integer", out);
             const text = cur.scalarValue().?;
             // A core integer too wide for i64 is still an integer
             // (`value` calls it .bigint), so it is a RANGE violation --
             // not the "expected an integer" type error this used to
             // report, which was false.
             const v = document_mod.parseCoreInt(text) orelse {
-                try appendViolation(allocator, out, path, "range", "'{s}' is outside [{d}, {d}]", .{ text, r.min, r.max });
+                try appendViolation(allocator, out, b, path, "range", "'{s}' is outside [{d}, {d}]", .{ text, r.min, r.max });
                 return;
             };
             if (v < r.min or v > r.max) {
-                try appendViolation(allocator, out, path, "range", "{d} is outside [{d}, {d}]", .{ v, r.min, r.max });
+                try appendViolation(allocator, out, b, path, "range", "{d} is outside [{d}, {d}]", .{ v, r.min, r.max });
             }
         },
         .float_range => |r| {
             const k = checkNodeCoreTag(cur);
-            if (k != .float and k != .int) return typeErr(allocator, path, "a number", out);
+            if (k != .float and k != .int) return typeErr(allocator, b, path, "a number", out);
             const text = cur.scalarValue().?;
             const v = document_mod.parseCoreFloat(text) orelse {
-                try typeErr(allocator, path, "a number", out);
+                try typeErr(allocator, b, path, "a number", out);
                 return;
             };
             // A NaN fails every comparison, so test for it rather than
             // letting `v < min` quietly report it as in range.
             if (std.math.isNan(v) or v < r.min or v > r.max) {
-                try appendViolation(allocator, out, path, "range", "{d} is outside [{d}, {d}]", .{ v, r.min, r.max });
+                try appendViolation(allocator, out, b, path, "range", "{d} is outside [{d}, {d}]", .{ v, r.min, r.max });
             }
         },
         .str_len => |r| {
-            if (checkNodeCoreTag(cur) != .str) return typeErr(allocator, path, "a string", out);
-            const s = cur.scalarValue() orelse return typeErr(allocator, path, "a string", out);
+            if (checkNodeCoreTag(cur) != .str) return typeErr(allocator, b, path, "a string", out);
+            const s = cur.scalarValue() orelse return typeErr(allocator, b, path, "a string", out);
             const n = std.unicode.utf8CountCodepoints(s) catch s.len;
             if (n < r.min or n > r.max) {
-                try appendViolation(allocator, out, path, "length", "length {d} is outside [{d}, {d}]", .{ n, r.min, r.max });
+                try appendViolation(allocator, out, b, path, "length", "length {d} is outside [{d}, {d}]", .{ n, r.min, r.max });
             }
         },
         .seq => |spec| {
-            const list = cur.items() orelse return typeErr(allocator, path, "a sequence", out);
+            const list = cur.items() orelse return typeErr(allocator, b, path, "a sequence", out);
+            // `!!map [a]`, `!!int [1]`: tagged as another kind.
+            if (document_mod.tagContradictsKind(cur)) return typeErr(allocator, b, path, "a sequence", out);
             if (spec.min_len) |min| if (list.len < min) {
-                try appendViolation(allocator, out, path, "length", "{d} items, at least {d} required", .{ list.len, min });
+                try appendViolation(allocator, out, b, path, "length", "{d} items, at least {d} required", .{ list.len, min });
             };
             if (spec.max_len) |max| if (list.len > max) {
-                try appendViolation(allocator, out, path, "length", "{d} items, at most {d} allowed", .{ list.len, max });
+                try appendViolation(allocator, out, b, path, "length", "{d} items, at most {d} allowed", .{ list.len, max });
             };
             for (list, 0..) |item, i| {
-                const child_path = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path, i });
+                const child_path = try childPath(allocator, b, "{s}[{d}]", .{ path, i });
                 defer allocator.free(child_path);
                 try checkSchema(spec.items, allocator, item, child_path, out, b);
             }
@@ -408,17 +439,18 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
             }
             switch (schema.kind) {
                 .any_of => if (matched == 0) {
-                    try appendViolation(allocator, out, path, "any_of", "matches none of the {d} allowed forms", .{branches.len});
+                    try appendViolation(allocator, out, b, path, "any_of", "matches none of the {d} allowed forms", .{branches.len});
                 },
                 .one_of => if (matched != 1) {
-                    try appendViolation(allocator, out, path, "one_of", "matches {d} of the {d} allowed forms, exactly one required", .{ matched, branches.len });
+                    try appendViolation(allocator, out, b, path, "one_of", "matches {d} of the {d} allowed forms, exactly one required", .{ matched, branches.len });
                 },
                 else => unreachable,
             }
         },
         .map => |map_spec| {
             const fields = map_spec.fields;
-            const pairs = cur.pairs() orelse return typeErr(allocator, path, "a mapping", out);
+            const pairs = cur.pairs() orelse return typeErr(allocator, b, path, "a mapping", out);
+            if (document_mod.tagContradictsKind(cur)) return typeErr(allocator, b, path, "a mapping", out);
             // Required keys.
             for (fields) |field| {
                 if (!field.required) continue;
@@ -431,11 +463,9 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
                     }
                 }
                 if (!found) {
-                    const child = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ path, field.key });
-                    errdefer allocator.free(child);
-                    const detail = try std.fmt.allocPrint(allocator, "required key '{s}' is missing", .{field.key});
-                    errdefer allocator.free(detail);
-                    try out.append(allocator, .{ .path = child, .rule = "required", .detail = detail });
+                    const child = try childPath(allocator, b, "{s}.{s}", .{ path, field.key });
+                    defer allocator.free(child);
+                    try appendViolation(allocator, out, b, child, "required", "required key '{s}' is missing", .{field.key});
                 }
             }
             // Per-field and unknown-key checks.
@@ -449,13 +479,13 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
                     // scalar key: no field claims it, so no schema
                     // applies.
                     if (map_spec.deny_unknown) {
-                        const child_path = try std.fmt.allocPrint(allocator, "{s}.?", .{path});
+                        const child_path = try childPath(allocator, b, "{s}.?", .{path});
                         defer allocator.free(child_path);
-                        try appendViolation(allocator, out, child_path, "unknown", "unknown non-scalar key (a {s})", .{@tagName(p.key.resolveAlias().kind())});
+                        try appendViolation(allocator, out, b, child_path, "unknown", "unknown non-scalar key (a {s})", .{@tagName(p.key.resolveAlias().kind())});
                     }
                     continue;
                 };
-                const child_path = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ path, kv });
+                const child_path = try childPath(allocator, b, "{s}.{s}", .{ path, kv });
                 defer allocator.free(child_path);
                 var matched = false;
                 for (fields) |field| {
@@ -466,7 +496,7 @@ fn checkSchema(schema: *const Schema, allocator: std.mem.Allocator, node: *const
                     }
                 }
                 if (!matched and map_spec.deny_unknown) {
-                    try appendViolation(allocator, out, child_path, "unknown", "unknown key '{s}'", .{kv});
+                    try appendViolation(allocator, out, b, child_path, "unknown", "unknown key '{s}'", .{kv});
                 }
             }
         },
@@ -796,6 +826,34 @@ test "validation honours an explicit core tag" {
     }
 }
 
+test "an explicit core tag whose text is not in its grammar is a type violation" {
+    // `Schema.int` accepted `!!int abc` (the tag alone decided), and
+    // `intRange` read `!!int 0b101` as 5 through `std.fmt.parseInt(.., 0)`.
+    const allocator = testing.allocator;
+    const Document = document_mod.Document;
+    for ([_][]const u8{ "!!int abc", "!!int 0b101", "!!int 1_000" }) |text| {
+        var doc = try Document.parse(allocator, text);
+        defer doc.deinit();
+        for ([_]Schema{ Schema.int, Schema.intRange(0, 10), Schema.float }) |sc| {
+            const out = try sc.validate(allocator, doc.root.?, "$");
+            defer {
+                for (out) |*v| v.deinitSelf(allocator);
+                allocator.free(out);
+            }
+            try testing.expectEqual(@as(usize, 1), out.len);
+            try testing.expectEqualStrings("type", out[0].rule);
+        }
+    }
+    var doc = try Document.parse(allocator, "!!float nan");
+    defer doc.deinit();
+    const out = try Schema.float.validate(allocator, doc.root.?, "$");
+    defer {
+        for (out) |*v| v.deinitSelf(allocator);
+        allocator.free(out);
+    }
+    try testing.expectEqual(@as(usize, 1), out.len);
+}
+
 test "validation is depth-bounded, on the document and on the schema" {
     const allocator = testing.allocator;
     const Document = document_mod.Document;
@@ -972,4 +1030,83 @@ test "an integer too wide for i64 is a range violation, not a type error" {
         defer freeViolations(allocator, vs);
         try testing.expectEqual(@as(usize, 0), vs.len);
     }
+}
+
+test "validation is bounded in bytes as well as in nodes" {
+    const allocator = testing.allocator;
+
+    // Every violation quotes the offending scalar, and aliases repeat it:
+    // one 1 KiB anchored string behind two levels of ten aliases is 100
+    // violations and 100 KiB of detail from a 1.1 KiB input. The node
+    // bound alone let the same shape with a 64 KiB string and one more
+    // level build 64 MB of violations.
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "s: &s ");
+    try input.appendNTimes(allocator, 'x', 1024);
+    try input.appendSlice(allocator, "\nl1: &l1 [*s, *s, *s, *s, *s, *s, *s, *s, *s, *s]\n");
+    try input.appendSlice(allocator, "l2: [*l1, *l1, *l1, *l1, *l1, *l1, *l1, *l1, *l1, *l1]\n");
+    var doc = try document_mod.Document.parse(allocator, input.items);
+    defer doc.deinit();
+
+    const ok = Schema.strEnum(&.{"ok"});
+    const inner = Schema.seq(&ok);
+    const outer = Schema.seq(&inner);
+    const node = doc.pathGet(&.{"l2"}).?;
+
+    const all = try outer.validate(allocator, node, "$");
+    defer freeViolations(allocator, all);
+    try testing.expectEqual(@as(usize, 100), all.len);
+    try testing.expectEqual(@as(usize, 64 << 20), (Limits{}).max_bytes);
+    try testing.expectError(error.LimitExceeded, outer.validateLimited(allocator, node, "$", .{ .max_bytes = 50_000 }));
+}
+
+test "a tag is checked against the node's kind, and `!` resolves by kind" {
+    const allocator = testing.allocator;
+
+    // `!!seq 42` and `!!int [1]` contradict themselves as `!!int abc`
+    // does, and were accepted; `! 12` is a string (spec 6.28), and was
+    // resolved as an integer.
+    const seq_int = Schema.seq(&Schema.int);
+    const any_map = Schema.map(&.{});
+    const cases = [_]struct { in: []const u8, schema: *const Schema, violations: usize }{
+        .{ .in = "!!seq 42", .schema = &Schema.int, .violations = 1 },
+        .{ .in = "!!map abc", .schema = &Schema.str, .violations = 1 },
+        .{ .in = "!!map abc", .schema = &Schema.scalar, .violations = 1 },
+        .{ .in = "!!int [1]", .schema = &seq_int, .violations = 1 },
+        .{ .in = "!!map [1]", .schema = &seq_int, .violations = 1 },
+        .{ .in = "!!str {a: 1}", .schema = &any_map, .violations = 1 },
+        .{ .in = "!!seq [1]", .schema = &seq_int, .violations = 0 },
+        .{ .in = "!!map {a: 1}", .schema = &any_map, .violations = 0 },
+        .{ .in = "! 12", .schema = &Schema.str, .violations = 0 },
+        .{ .in = "! 12", .schema = &Schema.int, .violations = 1 },
+        .{ .in = "!local [1]", .schema = &seq_int, .violations = 0 },
+    };
+    for (cases) |c| {
+        var doc = try document_mod.Document.parse(allocator, c.in);
+        defer doc.deinit();
+        const got = try c.schema.validate(allocator, doc.root.?, "$");
+        defer freeViolations(allocator, got);
+        errdefer std.debug.print("{s}: {d} violations\n", .{ c.in, got.len });
+        try testing.expectEqual(c.violations, got.len);
+    }
+}
+
+test "a float range takes every core integer spelling" {
+    const allocator = testing.allocator;
+    // `0o17` is a core int, and ints satisfy float ranges; it was read
+    // with `std.fmt.parseFloat`, which does not know the octal form.
+    const range = Schema.floatRange(0, 100);
+    for ([_][]const u8{ "0o17", "0x1F", "15", "!!int 0o17", "!!float 15" }) |in| {
+        var doc = try document_mod.Document.parse(allocator, in);
+        defer doc.deinit();
+        const got = try range.validate(allocator, doc.root.?, "$");
+        defer freeViolations(allocator, got);
+        try testing.expectEqual(@as(usize, 0), got.len);
+    }
+    var doc = try document_mod.Document.parse(allocator, "0o777");
+    defer doc.deinit();
+    const got = try range.validate(allocator, doc.root.?, "$");
+    defer freeViolations(allocator, got);
+    try testing.expectEqualStrings("range", got[0].rule);
 }

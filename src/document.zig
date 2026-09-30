@@ -244,11 +244,23 @@ pub const Node = struct {
     /// programmatically has no source bytes and reads null until
     /// something is written.
     pub fn trailingComment(self: *const Node, doc: *const Document) ?[]const u8 {
+        if (!trailingPlaced(self)) return null;
+        // A block collection's trailing comment is its LAST entry's, as
+        // the entries are now: after an edit its source end is another
+        // entry's line, or a deleted one's.
+        const last: ?*const Node = switch (self.data) {
+            .mapping => |m| if (m.style == .block and m.pairs.items.len > 0) m.pairs.items[m.pairs.items.len - 1].value else null,
+            .sequence => |sq| if (sq.style == .block and sq.items.items.len > 0) sq.items.items[sq.items.items.len - 1] else null,
+            else => null,
+        };
+        if (last) |l| return l.trailingComment(doc);
+        // `? key # c` with no value: the comment after the key is its
+        // empty value's (where it is written), and both read it.
+        if (emptyValueAfterKey(self, doc.source orelse "")) |v| return v.trailingComment(doc);
         if (self.pending_trailing) |t| return if (t.len == 0) null else t;
         const doc_src = doc.source orelse return null;
-        const s = self.src orelse return null;
-        if (s.synthetic) return null;
-        const span = markup.trailingCommentSpan(doc_src, s.end) orelse return null;
+        const at = trailingAnchor(self, doc_src) orelse return null;
+        const span = markup.trailingCommentSpan(doc_src, at) orelse return null;
         return doc_src[span[0]..span[1]];
     }
 
@@ -261,24 +273,280 @@ pub const Node = struct {
     /// line; for an inline value (`host: localhost`) the value stands in
     /// for the pair and reads the pair's block, so key and value read
     /// the same bytes; for a block value (a mapping or sequence on its
-    /// own line) the comments above it are its own. Free-floating
+    /// own line) the comments above it are its own. Every node starting
+    /// on a line reads that line's block: a collection and its first
+    /// entry, an item and its mapping's first key. Free-floating
     /// comments -- separated by a blank line, or in the document head
     /// before `---` -- attach to nothing.
+    ///
+    /// After an edit the reads follow the tree as it is now: which entry
+    /// is first, and a block written on an entry wherever that entry now
+    /// is. Nothing inside a new or moved subtree reads a comment -- the
+    /// emitter lays it out afresh, without any. Source comments are read
+    /// where the source put them, so a comment left above a deleted
+    /// neighbour reads as that neighbour's until the document is written
+    /// and parsed again.
     pub fn leadingComments(self: *const Node, doc: *const Document) ?[]const u8 {
-        if (self.pending_leading) |t| return if (t.len == 0) null else t;
-        const doc_src = doc.source orelse return null;
-        const s = self.src orelse return null;
-        if (s.synthetic) return null;
-        const span = markup.leadingCommentSpan(doc_src, s.entry_start) orelse return null;
-        return doc_src[span[0]..span[1]];
+        const src = doc.source orelse return null;
+        const owner = leadingOwner(self, src);
+        if (!leadingPlaced(owner)) return null;
+        // A block written on any node that starts on the line is written
+        // above it -- including one written on an entry that has since
+        // become its container's first (an earlier sibling deleted).
+        var c: ?*const Node = owner;
+        while (c) |n| : (c = nextOnLine(n, src)) {
+            if (ownerPending(n, src)) |t| if (t.len > 0) return t;
+        }
+        if (owner.pending_leading) |t| if (t.len == 0) return null; // deleted
+        const span = doc.leadingSourceSpan(owner) orelse return null;
+        return src[span[0]..span[1]];
     }
 };
+
+/// Where a node's trailing comment is looked for: after its content, or
+/// for an empty mapping value (`push:`, `? key`) -- whose span is a point
+/// borrowed from the next token -- after its key and colon, on the
+/// key's line. Null for other empty nodes: an empty item or document has
+/// no bytes to hang a comment on.
+fn trailingAnchor(node: *const Node, source: []const u8) ?usize {
+    const s = node.src orelse return null;
+    if (!s.synthetic) return s.end;
+    const parent = node.parent orelse return null;
+    switch (parent.data) {
+        .mapping => |m| for (m.pairs.items) |pair| {
+            if (pair.value != node) continue;
+            const ks = realSpan(pair.key) orelse return null;
+            // Past the value indicator, which for an explicit key can sit
+            // on a line of its own (`? a` over `: # c`).
+            const after = pair.src_end orelse markup.colonEnd(source, ks.end);
+            // `? >` with no `:` on its line: after the key is inside the
+            // block scalar's content, not a comment position.
+            if (after == ks.end) switch (pair.key.data) {
+                .scalar => |k| if (k.style == .literal or k.style == .folded) return null,
+                else => {},
+            };
+            return after;
+        },
+        else => {},
+    }
+    return null;
+}
+
+/// The empty value of the pair keyed by `key` when nothing -- no `:` --
+/// stands between them, so the value's trailing comment follows the key.
+fn emptyValueAfterKey(key: *const Node, source: []const u8) ?*const Node {
+    const p = key.parent orelse return null;
+    const ps = p.pairs() orelse return null;
+    for (ps) |pair| {
+        if (pair.key != key) continue;
+        const vs = pair.value.src orelse return null;
+        const ks = realSpan(key) orelse return null;
+        if (!vs.synthetic) return null;
+        const at = trailingAnchor(pair.value, source) orelse return null;
+        return if (at == ks.end) pair.value else null;
+    }
+    return null;
+}
+
+/// The node that holds the leading comment block of `node`'s entry
+/// line. Several nodes start on one line: a sequence item's mapping and
+/// its first key share the item's `- `, a block collection shares its
+/// line with its first entry, and an inline value (`k: v`) sits on its
+/// key's line. All of them read the block above that line, so a
+/// written block belongs to the outermost of them: every node on the
+/// line then reads the same block, its old lines are tombstoned in the
+/// gap that holds them, and the emitter writes the new ones once, where
+/// that node is emitted. Without this the first key of an item recorded
+/// its tombstone in the item's list while the lines sat in the
+/// sequence's gap, and the old block survived beside the new one.
+///
+/// The climb follows the tree as it is NOW, not the source lines: a
+/// node shares its container's line only while it is the container's
+/// first entry. After an insert ahead of it, the old first item has a
+/// line of its own again, and a block written on it goes above it --
+/// reading source lines, it went above the new first item instead. A
+/// new first entry takes the container's line, and a new inline value
+/// its key's, as the emitter lays them out.
+fn leadingOwner(node: anytype, source: []const u8) @TypeOf(node) {
+    var n = node;
+    var guard: usize = 0;
+    climb: while (n.parent) |p| : (guard += 1) {
+        if (guard >= Node.max_parent_walk) break;
+        // A flow collection's entries share its line but have no line of
+        // their own; they stay themselves (and unwritable).
+        if (Document.insideFlow(n)) break;
+        switch (p.data) {
+            .mapping => |m| for (m.pairs.items, 0..) |pair, i| {
+                if (pair.key == n) {
+                    if (i != 0 or !startsOnFirstEntryLine(p, source)) break :climb;
+                    n = p;
+                    continue :climb;
+                }
+                if (pair.value == n) {
+                    // After a synthetic key (`: v`) the value is the
+                    // entry's first byte and owns its line, climbing as
+                    // a key would: the key has no bytes to hold a block.
+                    if (pair.key.src) |ks| if (ks.synthetic) {
+                        if (i != 0 or !startsOnFirstEntryLine(p, source)) break :climb;
+                        n = p;
+                        continue :climb;
+                    };
+                    // An inline value hands over to its key.
+                    if (!valueOnKeyLine(pair, source)) break :climb;
+                    n = pair.key;
+                    continue :climb;
+                }
+            },
+            .sequence => |sq| {
+                if (sq.items.items.len == 0 or sq.items.items[0] != n) break;
+                if (!startsOnFirstEntryLine(p, source)) break;
+                n = p;
+                continue :climb;
+            },
+            else => {},
+        }
+        break;
+    }
+    return n;
+}
+
+/// True when a block collection begins on its first entry's line -- the
+/// line whatever entry is first now takes. Not when its properties end
+/// a line of their own (`k: &a !!map` over `  x: 1`): the first entry
+/// then has a line, and a block, of its own.
+fn startsOnFirstEntryLine(container: *const Node, source: []const u8) bool {
+    const cs = realSpan(container) orelse return true;
+    return markup.propertiesLineEnd(source, cs.start) == null;
+}
+
+/// True when a mapping value sits on its key's line: by the source when
+/// both have bytes of their own, and by the emitter's layout otherwise
+/// (`internal.inlineValue`). An empty value's point span is on the key's
+/// line.
+fn valueOnKeyLine(pair: Pair, source: []const u8) bool {
+    // A new key: the value is laid out after it.
+    const ks = realSpan(pair.key) orelse return internal.inlineValue(pair.value);
+    const vs = pair.value.src orelse return internal.inlineValue(pair.value);
+    if (vs.synthetic) return true;
+    return markup.lineStart(source, vs.entry_start) == markup.lineStart(source, ks.start);
+}
+
+/// True when the faithful emitter reaches `node` by walking entries --
+/// the root, or an entry of a container that itself has source bytes,
+/// all the way up. Below a node with none (a new or moved subtree, a
+/// replaced root) everything is laid out afresh: comments written there
+/// are never emitted, and source comments no longer describe it.
+fn walkedFaithfully(node: *const Node) bool {
+    var cur = node.parent;
+    var guard: usize = 0;
+    while (cur) |c| : (guard += 1) {
+        if (guard >= Node.max_parent_walk) return false;
+        if (realSpan(c) == null) return false;
+        cur = c.parent;
+    }
+    return true;
+}
+
+/// The written block the emitter puts above `owner`'s line, if any. For a
+/// key that is the pair's (`internal.pairLeadingOverride`), which a value
+/// carried into the pair can hold.
+fn ownerPending(owner: *const Node, source: []const u8) ?[]const u8 {
+    if (owner.parent) |p| if (p.pairs()) |ps| for (ps) |pair| {
+        if (pair.key == owner) return internal.pairLeadingOverride(source, pair.key, pair.value);
+    };
+    return owner.pending_leading;
+}
+
+/// The next node that starts on `node`'s line, going in: a block
+/// collection's first entry (for a mapping its key, or the value after a
+/// synthetic key), or null. A key's inline value is covered by the key
+/// (`ownerPending`).
+fn nextOnLine(node: anytype, source: []const u8) ?@TypeOf(node) {
+    switch (node.data) {
+        .mapping => |m| {
+            if (m.style == .flow or m.pairs.items.len == 0 or !startsOnFirstEntryLine(node, source)) return null;
+            const first = m.pairs.items[0];
+            if (first.key.src) |ks| if (ks.synthetic) return first.value;
+            return first.key;
+        },
+        .sequence => |sq| {
+            if (sq.style == .flow or sq.items.items.len == 0 or !startsOnFirstEntryLine(node, source)) return null;
+            return sq.items.items[0];
+        },
+        else => return null,
+    }
+}
+
+/// True when a trailing comment on `node` is written where it reads
+/// back: an entry the faithful emitter walks to, or a root with source
+/// bytes (a replaced root is laid out afresh, without one).
+fn trailingPlaced(node: *const Node) bool {
+    if (!walkedFaithfully(node)) return false;
+    return node.parent != null or node.src != null;
+}
+
+/// True when a leading block on `owner` (see `leadingOwner`) is written
+/// where it reads back: `owner` is walked faithfully, and a block value
+/// -- the one owner that is not an entry -- has the source line the
+/// emitter writes its block above.
+fn leadingPlaced(owner: *const Node) bool {
+    if (!walkedFaithfully(owner)) return false;
+    if (Document.isMappingValue(owner)) return realSpan(owner) != null;
+    return true;
+}
+
+/// Where the bytes that can hold `owner`'s leading block begin: past
+/// whatever precedes its entry -- the previous entry of its container,
+/// the key of a value, the container's own start for a first entry --
+/// so the content lines of a block scalar above (`  # text`) are never
+/// read as a comment. The root's is its document's region, except that
+/// a root sharing its line with `---` has none: the head before the
+/// marker is free-floating.
+fn leadingFloor(owner: *const Node, doc: *const Document) usize {
+    const s = owner.src.?;
+    const parent = owner.parent orelse {
+        const src = doc.source.?;
+        const ls = markup.lineStart(src, s.entry_start);
+        if (s.entry_start > ls + 3 and std.mem.startsWith(u8, src[ls..], "---")) return ls;
+        return doc.region_start;
+    };
+    // Only real spans count: an empty node's span is a point borrowed
+    // from the NEXT token (`a: &anchor` then `b:`), which would put the
+    // floor past the lines above this entry.
+    var floor: usize = if (realSpan(parent)) |cs| cs.entry_start else 0;
+    switch (parent.data) {
+        .mapping => |m| for (m.pairs.items) |pair| {
+            if (pair.key == owner) break;
+            if (pair.value == owner) {
+                if (realSpan(pair.key)) |ks| floor = @max(floor, ks.end);
+                break;
+            }
+            if (realSpan(pair.key)) |ks| floor = @max(floor, ks.end);
+            if (realSpan(pair.value)) |vs| floor = @max(floor, vs.end);
+        },
+        .sequence => |sq| for (sq.items.items) |item| {
+            if (item == owner) break;
+            if (realSpan(item)) |is| floor = @max(floor, is.end);
+        },
+        else => {},
+    }
+    return floor;
+}
+
+/// A node's span when it covers bytes of its own, not a synthetic point.
+fn realSpan(node: *const Node) ?markup.Src {
+    const s = node.src orelse return null;
+    return if (s.synthetic) null else s;
+}
 
 /// One `byPath` segment: a decimal number indexes a sequence, anything
 /// else is a mapping key. The accessors forward through aliases, so an
 /// alias in the middle resolves either way.
 fn walkReadSegment(node: *const Node, seg: []const u8) ?*const Node {
     if (node.items()) |list| {
+        // Plain digits only: `parseInt` also takes `+1` and `1_0`.
+        if (seg.len == 0) return null;
+        for (seg) |c| if (!std.ascii.isDigit(c)) return null;
         const ix = std.fmt.parseInt(usize, seg, 10) catch return null;
         if (ix >= list.len) return null;
         return list[ix];
@@ -310,13 +578,60 @@ pub fn coreTagFromUri(uri: []const u8) ?CoreTag {
 /// `!!str`/`!!int`/... wins: the tag is an assertion about the value,
 /// and resolving `!!str 42` as an integer would contradict it. Plain
 /// resolution is the fallback for an untagged scalar, which is the
-/// common case.
+/// common case. Null when an explicit core tag's text is not spelled as
+/// that type (`!!int abc`, `!!int 0b101`): the document contradicts
+/// itself, and `value` and `schema` both report it.
+///
+/// The non-specific tag `!` (`! 12`) makes a scalar a string, as it makes
+/// a collection a sequence or mapping: it resolves by kind, never by
+/// content (spec 10.2.2, kept by the core schema). A core tag naming a
+/// collection (`!!seq 42`) is a contradiction, like `!!int abc`.
 ///
 /// `node` must already be alias-resolved and must be a scalar.
-pub fn scalarCoreTag(node: *const Node) CoreTag {
+pub fn scalarCoreTag(node: *const Node) ?CoreTag {
     const s = node.data.scalar;
-    if (node.tag) |uri| if (coreTagFromUri(uri)) |t| return t;
+    if (node.tag) |uri| {
+        if (std.mem.eql(u8, uri, "!")) return .str;
+        if (coreTagFromUri(uri)) |t| return if (coreTextFits(t, s.value)) t else null;
+        if (tagContradictsKind(node)) return null;
+    }
     return resolveCoreTag(s.value, s.style);
+}
+
+/// True when `node` carries a core-schema tag for a different kind of
+/// node: `!!seq` or `!!map` on a scalar, a scalar type (`!!int`, `!!str`,
+/// ...) on a collection, `!!seq` on a mapping. `value` and `schema`
+/// report it as they report `!!int abc`; application tags are not
+/// checked. `node` must already be alias-resolved.
+pub fn tagContradictsKind(node: *const Node) bool {
+    const uri = node.tag orelse return false;
+    const prefix = "tag:yaml.org,2002:";
+    if (!std.mem.startsWith(u8, uri, prefix)) return false;
+    const name = uri[prefix.len..];
+    const names: NodeKind = if (coreTagFromUri(uri) != null)
+        .scalar
+    else if (std.mem.eql(u8, name, "seq"))
+        .sequence
+    else if (std.mem.eql(u8, name, "map"))
+        .mapping
+    else
+        return false;
+    return names != node.kind();
+}
+
+/// Whether `text` is spelled as the core schema (spec 10.3.2) spells a
+/// `tag` value, whatever its quoting: under an explicit tag, `!!int '7'`
+/// is an integer, but `!!int 0b101` is not (the binary form is YAML
+/// 1.1), nor `!!float nan` (`.nan` is). `!!str` takes any text, and
+/// `!!float` the integer spellings too, as its grammar does. This is
+/// what keeps the explicit-tag paths from reading text through
+/// `std.fmt`, which takes far more (`0x10` as a float, `1_000`).
+pub fn coreTextFits(tag: CoreTag, text: []const u8) bool {
+    return switch (tag) {
+        .str => true,
+        .float => looksLikeFloat(text),
+        else => resolveCoreTag(text, .plain) == tag,
+    };
 }
 
 /// Resolve a plain scalar to its YAML 1.2.2 Core Schema tag (spec
@@ -342,16 +657,61 @@ pub fn resolveCoreTag(value: []const u8, style: ScalarStyle) CoreTag {
 /// "does it fit". `value` and `schema` previously each spelled this out,
 /// and disagreed: schema called the overflow a type error.
 pub fn parseCoreInt(text: []const u8) ?i64 {
+    // Base 0 would also take `0b101`, `1_000` and `-0x1F`; only the core
+    // spellings may reach it.
+    std.debug.assert(looksLikeInt(text));
     return std.fmt.parseInt(i64, text, 0) catch null;
 }
 
-/// Parse the text of a scalar already classified as a core-schema float,
-/// resolving the `.inf`/`.nan` spellings. Null when the text is not a
-/// float. One home for the rule `value` and `schema` both apply.
+/// Parse the text of a scalar already classified as a core-schema float
+/// or int, resolving the `.inf`/`.nan` spellings and the integer forms.
+/// The result is the nearest `f64`, and an integer beyond `f64` is an
+/// infinity, as a decimal one is. Null when the text is neither. One home
+/// for the rule `value` and `schema` both apply.
 pub fn parseCoreFloat(text: []const u8) ?f64 {
+    // `std.fmt.parseFloat` does not know `0o`, and truncates a long hex
+    // mantissa instead of rounding it (`0x1FFFFFFFFFFFFFFFFFFF` came out
+    // one unit in the last place low), so the radix forms convert here.
+    if (text.len > 2 and text[0] == '0' and looksLikeInt(text)) switch (text[1]) {
+        'o' => return radixToFloat(text[2..], 3),
+        'x' => return radixToFloat(text[2..], 4),
+        else => {},
+    };
     return std.fmt.parseFloat(f64, text) catch floatSpecial(text);
 }
 
+/// Octal (3 bits a digit) or hex (4) digits as the nearest `f64`, ties to
+/// even. The top 64 bits of the value are kept, and every bit below them
+/// is folded into the lowest one: that is all correct rounding needs to
+/// know about them, and 64 bits leave room above it for the 53 kept and
+/// the one rounding bit. One conversion of those 64 bits then rounds once.
+fn radixToFloat(digits: []const u8, bits_per_digit: u3) f64 {
+    var top: u64 = 0;
+    var kept: u32 = 0;
+    var dropped: usize = 0;
+    var sticky = false;
+    for (digits) |c| {
+        const v: u8 = ctype.hexValue(c).?;
+        var b: u3 = bits_per_digit;
+        while (b > 0) {
+            b -= 1;
+            const bit = (v >> b) & 1;
+            if (kept == 0 and bit == 0) continue; // leading zeros
+            if (kept < 64) {
+                top = (top << 1) | bit;
+                kept += 1;
+            } else {
+                sticky = sticky or bit == 1;
+                dropped += 1;
+            }
+        }
+    }
+    if (sticky) top |= 1;
+    // Past 2^1024 the value is an infinity; `ldexp` says so too, but the
+    // exponent must fit its `i32` first.
+    if (dropped > 2048) return std.math.inf(f64);
+    return std.math.ldexp(@as(f64, @floatFromInt(top)), @intCast(dropped));
+}
 /// Core schema int (spec 10.3.2): `[-+]? [0-9]+`, `0o [0-7]+` or
 /// `0x [0-9a-fA-F]+`. The radix forms take no sign and are lowercase
 /// only, so `+0x1F`, `-0x1F`, `0X1F` and `0O7` are all strings.
@@ -429,6 +789,43 @@ fn looksLikeFloat(value: []const u8) bool {
     return i == value.len;
 }
 
+/// One immutable copy of a parsed stream, shared by every `Document`
+/// parsed from it.
+///
+/// Node spans are absolute byte offsets into the stream, so each document
+/// needs the stream's bytes (not only its own region) for as long as it
+/// lives. Giving every document its own copy costs documents x stream:
+/// doubling the input quadrupled the memory, and 1 MiB of 9-byte documents
+/// wanted ~114 GiB. One copy, released with the last document that
+/// references it, costs one stream and leaves every document valid however
+/// its siblings are freed.
+const SharedSource = struct {
+    allocator: std.mem.Allocator,
+    bytes: []u8,
+    refs: std.atomic.Value(usize),
+
+    /// Copy `input`. The caller holds the first reference.
+    fn create(allocator: std.mem.Allocator, input: []const u8) !*SharedSource {
+        const self = try allocator.create(SharedSource);
+        errdefer allocator.destroy(self);
+        const bytes = try allocator.dupe(u8, input);
+        self.* = .{ .allocator = allocator, .bytes = bytes, .refs = .init(1) };
+        return self;
+    }
+
+    fn retain(self: *SharedSource) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    /// Drop one reference; the last one frees the copy.
+    fn release(self: *SharedSource) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const allocator = self.allocator;
+        allocator.free(self.bytes);
+        allocator.destroy(self);
+    }
+};
+
 /// A parsed YAML document. All nodes live in `pool`; `deinit` releases
 /// everything in one go.
 pub const Document = struct {
@@ -439,17 +836,20 @@ pub const Document = struct {
     tag_directives: std.ArrayList(TagDirective) = .empty,
     explicit_start: bool = false,
     explicit_end: bool = false,
-    /// The original input this document was parsed from, duplicated
-    /// into the pool so the document owns its bytes. Null for
-    /// programmatically built documents. Every parsed document carries
-    /// its own copy (a multi-document stream duplicates once per
-    /// document); this is what makes byte-faithful round trips
-    /// possible.
+    /// The original input this document was parsed from, kept so the
+    /// document owns its bytes. Null for programmatically built
+    /// documents. This is what makes byte-faithful round trips possible.
+    /// The documents of one stream (`parseAll`) read it through a single
+    /// shared copy, reference-counted by `shared_source`, so a stream of
+    /// any number of documents holds the input once.
     ///
     /// PORT NOTE: libfyaml borrows the reader's buffer instead; here
     /// the copy keeps the documented ownership model (a Document is
     /// valid after the caller frees the input).
     source: ?[]const u8 = null,
+    /// Owner of `source` (null exactly when `source` is null). Internal:
+    /// `deinit` drops this document's reference.
+    shared_source: ?*SharedSource = null,
     /// Round-trip region of this document within `source`:
     /// [region_start, body_start) is the verbatim head (directives,
     /// `---`, leading comments), the root node's span is the body, and
@@ -461,6 +861,10 @@ pub const Document = struct {
     body_start: usize = 0,
     body_end: usize = 0,
     region_end: usize = 0,
+    /// INTERNAL. The undo log of the atomic batch in progress
+    /// (`edit.Editor.apply`, merge resolution), or null. Transient: only
+    /// `internal.Transaction` sets it.
+    journal: ?*internal.Journal = null,
 
     pub fn init(allocator: std.mem.Allocator) Document {
         return .{ .allocator = allocator, .pool = Pool.init(allocator) };
@@ -469,7 +873,24 @@ pub const Document = struct {
     pub fn deinit(self: *Document) void {
         self.tag_directives.deinit(self.allocator);
         self.pool.deinit();
+        if (self.shared_source) |shared| shared.release();
         self.* = undefined;
+    }
+
+    /// Read the stream through `shared`, taking a reference that `deinit`
+    /// drops. Cannot fail, so a document can be published for cleanup
+    /// before anything that can.
+    fn shareSource(self: *Document, shared: *SharedSource) void {
+        shared.retain();
+        self.shared_source = shared;
+        self.source = shared.bytes;
+    }
+
+    /// Give this document a copy of `input` that no other document shares.
+    fn ownSource(self: *Document, input: []const u8) !void {
+        const shared = try SharedSource.create(self.allocator, input);
+        self.shared_source = shared;
+        self.source = shared.bytes;
     }
 
     /// Parse the first document of `input`. Extra documents in the same
@@ -495,7 +916,10 @@ pub const Document = struct {
     ) !Document {
         var p = try Parser.initOpts(allocator, d, input, options);
         defer p.deinit();
-        var docs = try parseStream(allocator, &p, 1, input);
+        // What the scanner reads: short of `input` when `.truncate` cut it
+        // at a NUL, and the documents must not keep the bytes it dropped.
+        const read = p.scanner.input;
+        var docs = try parseStream(allocator, &p, 1, read);
         defer docs.deinit(allocator);
         if (docs.items.len == 0) {
             // No node content reached the builder. An input that is
@@ -504,11 +928,11 @@ pub const Document = struct {
             // document there); what arrives here is the genuinely empty
             // input, which still yields a rootless document so
             // `parse("")` and `parseAll("")` agree on the shape.
-            return rootlessDocument(allocator, input);
+            return rootlessDocument(allocator, read);
         }
         var doc = docs.items[0];
         if (options.resolve_merge_keys) {
-            doc.resolveMergeKeys() catch |err| {
+            doc.resolveMerges(options.max_merge_nodes, d) catch |err| {
                 doc.deinit();
                 return err;
             };
@@ -537,13 +961,14 @@ pub const Document = struct {
     ) !std.ArrayList(Document) {
         var p = try Parser.initOpts(allocator, d, input, options);
         defer p.deinit();
-        var docs = try parseStream(allocator, &p, null, input);
+        // The scanner's input: see `parseOpts`.
+        var docs = try parseStream(allocator, &p, null, p.scanner.input);
         if (!options.resolve_merge_keys) return docs;
         errdefer {
             for (docs.items) |*doc| doc.deinit();
             docs.deinit(allocator);
         }
-        for (docs.items) |*doc| try doc.resolveMergeKeys();
+        for (docs.items) |*doc| try doc.resolveMerges(options.max_merge_nodes, d);
         return docs;
     }
 
@@ -554,7 +979,7 @@ pub const Document = struct {
     fn rootlessDocument(allocator: std.mem.Allocator, input: []const u8) !Document {
         var d = Document.init(allocator);
         errdefer d.deinit();
-        d.source = try d.pool.dupe(input);
+        try d.ownSource(input);
         d.region_start = 0;
         d.body_start = input.len;
         d.body_end = input.len;
@@ -567,6 +992,12 @@ pub const Document = struct {
         var doc: ?Document = null;
         var builder: ?Builder = null;
         var cursor: usize = 0;
+        // ONE copy of the stream for every document parsed from it (see
+        // `SharedSource`). This function holds the creating reference
+        // until it returns, so a failure before the first document, or
+        // after every document is already freed, cannot leak the copy.
+        var stream_source: ?*SharedSource = null;
+        defer if (stream_source) |shared| shared.release();
         errdefer {
             // Release every finished document plus the one in flight.
             for (docs.items) |*d| d.deinit();
@@ -587,10 +1018,13 @@ pub const Document = struct {
                     const d = &doc.?;
                     d.version = ev.data.document_start.version;
                     d.explicit_start = !ev.data.document_start.implicit;
-                    // Copy the stream input into this document's pool so
-                    // presentation spans stay valid for the document's
-                    // whole lifetime.
-                    d.source = try d.pool.dupe(input);
+                    // Presentation spans are offsets into the stream, so
+                    // the document keeps the stream's bytes alive for its
+                    // whole lifetime. The copy is made once and shared:
+                    // copying it per document made memory documents x
+                    // stream.
+                    if (stream_source == null) stream_source = try SharedSource.create(allocator, input);
+                    d.shareSource(stream_source.?);
                     d.region_start = cursor;
                     // Copy directive strings into the pool so the document
                     // does not depend on the parser's lifetime. The two
@@ -606,6 +1040,7 @@ pub const Document = struct {
                     }
                     // The builder works on the live document copy.
                     builder = Builder.init(d);
+                    builder.?.d = p.d;
                 },
                 .document_end => {
                     if (builder) |*b| b.finish();
@@ -631,6 +1066,18 @@ pub const Document = struct {
                         // successful single-document parse.
                         const last = &docs.items[docs.items.len - 1];
                         if (isTrailer(input[last.region_end..])) last.region_end = input.len;
+                        // Unless content follows with no `---` or
+                        // directive to open another document: then the
+                        // first one did not end (`[1, 2] garbage`,
+                        // `"a"\nb: 1`, `!a !b x`), and stopping here
+                        // returned it as if it were whole. One more event
+                        // says whether that content can begin a document
+                        // (it can after a `...`).
+                        // Looked for from the root's end: the region takes
+                        // the rest of the root's last line.
+                        if (last.root != null and !last.explicit_end) if (firstContentLine(input[last.body_end..])) |line| {
+                            if (line[0] != '%' and !(line[0] == '-' and isMarkerLine(line, 0))) _ = try p.nextEvent();
+                        };
                         break;
                     };
                 },
@@ -709,17 +1156,24 @@ pub const Document = struct {
     /// replacement carrying the replaced node's anchor as the anchor
     /// moving with the slot, and re-points the aliases at it.
     ///
-    /// A name must be one or more non-blank characters with no flow
-    /// indicator (`,[]{}`), the YAML anchor alphabet.
+    /// A name must be one or more printable, non-blank characters in
+    /// valid UTF-8, with no flow indicator (`,[]{}`) and no byte order
+    /// mark: the YAML anchor alphabet. Anything else is
+    /// `error.InvalidSyntax`.
     pub fn setAnchor(self: *Document, node: *Node, name: ?[]const u8) !void {
+        // YAML gives an alias no properties (spec 7.1): one set here was
+        // silently never written.
+        if (node.data == .alias and name != null) return error.InvalidSyntax;
         if (name) |n| {
-            if (n.len == 0) return error.InvalidSyntax;
-            for (n) |c| switch (c) {
-                ' ', '\t', '\n', '\r', ',', '[', ']', '{', '}' => return error.InvalidSyntax,
-                else => {},
-            };
+            if (!internal.validAnchorName(n)) return error.InvalidSyntax;
             if (node.anchor) |cur| {
                 if (std.mem.eql(u8, cur, n)) return;
+            }
+            // A name defined again shadows the earlier definition for the
+            // aliases after it, once written and read back; refused while
+            // any of them still names the earlier node.
+            if (self.root) |root| {
+                if (!try internal.aliasesBindInOrder(self.allocator, root, node, n)) return error.AnchorShadowed;
             }
         } else if (node.anchor == null) return;
         if (node.anchor) |cur| {
@@ -728,28 +1182,28 @@ pub const Document = struct {
             }
         }
         node.anchor = if (name) |n| try self.pool.dupe(n) else null;
-        self.markModified(node);
+        try self.markModified(node);
     }
 
     /// Point every alias in this document named `name` at `target`.
     /// Used when the node carrying an anchor is replaced by one that
     /// carries the same name: the aliases follow the anchor.
-    pub fn retargetAliases(self: *Document, name: []const u8, target: *Node) void {
+    pub fn retargetAliases(self: *Document, name: []const u8, target: *Node) !void {
         const root = self.root orelse return;
-        retarget(root, name, target, 0);
+        try self.retarget(root, name, target, 0);
     }
 
-    fn retarget(node: *Node, name: []const u8, target: *Node, depth: usize) void {
+    fn retarget(self: *Document, node: *Node, name: []const u8, target: *Node, depth: usize) !void {
         if (depth >= max_alias_walk) return;
         switch (node.data) {
-            .alias => |*a| if (std.mem.eql(u8, a.name, name)) {
-                a.target = target;
+            .alias => |a| if (std.mem.eql(u8, a.name, name)) {
+                try internal.setAliasTarget(self, node, target);
             },
             .mapping => |m| for (m.pairs.items) |p| {
-                retarget(p.key, name, target, depth + 1);
-                retarget(p.value, name, target, depth + 1);
+                try self.retarget(p.key, name, target, depth + 1);
+                try self.retarget(p.value, name, target, depth + 1);
             },
-            .sequence => |s| for (s.items.items) |item| retarget(item, name, target, depth + 1),
+            .sequence => |sq| for (sq.items.items) |item| try self.retarget(item, name, target, depth + 1),
             .scalar => {},
         }
     }
@@ -784,17 +1238,18 @@ pub const Document = struct {
 
     /// Append a key/value pair to a mapping node, maintaining parent links.
     pub fn mappingAppend(self: *Document, map: *Node, key: *Node, value: *Node) !void {
-        if (attachRefusal(map, key)) |reason| return reason;
-        if (attachRefusal(map, value)) |reason| return reason;
+        if (internal.attachRefusal(map, key)) |reason| return reason;
+        if (internal.attachRefusal(map, value)) |reason| return reason;
         try internal.attachPair(self, map, key, value);
-        self.markModified(map);
+        try internal.adopt(self, key);
+        try internal.adopt(self, value);
     }
 
     /// Append an item to a sequence node, maintaining parent links.
     pub fn sequenceAppend(self: *Document, seq: *Node, item: *Node) !void {
-        if (attachRefusal(seq, item)) |reason| return reason;
+        if (internal.attachRefusal(seq, item)) |reason| return reason;
         try internal.attachItem(self, seq, item);
-        self.markModified(seq);
+        try internal.adopt(self, item);
     }
 
     /// Insert an item into a sequence at `index`.
@@ -804,12 +1259,12 @@ pub const Document = struct {
     /// then tripped its parent-cycle assert -- a panic reachable through
     /// the public API (and through `Editor`'s insert/set).
     pub fn sequenceInsert(self: *Document, seq: *Node, index: usize, item: *Node) !void {
-        if (attachRefusal(seq, item)) |reason| return reason;
+        if (internal.attachRefusal(seq, item)) |reason| return reason;
         switch (seq.data) {
-            .sequence => |*s| {
-                try s.items.insert(self.pool.allocator(), index, item);
-                item.parent = seq;
-                self.markModified(seq);
+            .sequence => {
+                try internal.insertItem(self, seq, index, item);
+                try internal.setParent(self, item, seq);
+                try internal.adopt(self, item);
             },
             else => return error.InvalidSyntax,
         }
@@ -826,14 +1281,14 @@ pub const Document = struct {
     /// to contain no aliases.
     pub fn mappingRemove(self: *Document, map: *Node, key: []const u8) !?*Node {
         switch (map.data) {
-            .mapping => |*m| {
+            .mapping => |m| {
                 for (m.pairs.items, 0..) |p, i| {
                     if (std.mem.eql(u8, p.key.scalarValue() orelse continue, key)) {
                         try internal.dropPairSpan(self, map, p);
-                        const removed = m.pairs.orderedRemove(i);
-                        removed.value.parent = null;
-                        removed.key.parent = null;
-                        self.markModified(map);
+                        const removed = try internal.removePair(self, map, i);
+                        try internal.setParent(self, removed.value, null);
+                        try internal.setParent(self, removed.key, null);
+                        try self.markModified(map);
                         return removed.value;
                     }
                 }
@@ -846,15 +1301,15 @@ pub const Document = struct {
     /// Remove the sequence item at `index`.
     pub fn sequenceRemove(self: *Document, seq: *Node, index: usize) !?*Node {
         switch (seq.data) {
-            .sequence => |*s| {
+            .sequence => |s| {
                 if (index >= s.items.items.len) return null;
                 // Tombstone BEFORE detaching: the span depends on where
                 // the following item starts (as in `mappingRemove`).
                 const removed = s.items.items[index];
                 try internal.dropItemSpan(self, seq, removed);
-                _ = s.items.orderedRemove(index);
-                removed.parent = null;
-                self.markModified(seq);
+                _ = try internal.removeItem(self, seq, index);
+                try internal.setParent(self, removed, null);
+                try self.markModified(seq);
                 return removed;
             },
             else => return error.InvalidSyntax,
@@ -893,7 +1348,17 @@ pub const Document = struct {
         MergeKeyRecursive,
         NestingTooDeep,
         InvalidSyntax,
+        LimitExceeded,
         OutOfMemory,
+    };
+
+    /// One resolution: the visit state of each mapping, and how many
+    /// nodes it may still create by copying merge sources.
+    const MergeRun = struct {
+        seen: std.AutoHashMap(*Node, MergeVisit),
+        remaining: usize,
+        /// Where the walk failed, for the diagnostic (see `resolveMerges`).
+        at: ?Mark = null,
     };
 
     /// Resolve YAML 1.1 merge keys (`<<`) in place.
@@ -903,28 +1368,54 @@ pub const Document = struct {
     /// those. A key the mapping already has wins; among sequence sources
     /// the earliest wins. The `<<` pair is removed afterwards.
     ///
-    /// The work runs on a deep clone that is swapped in only on success
-    /// (the `edit.apply` contract), so a document that fails to resolve —
-    /// an invalid value, a merge that reaches itself, a depth or
-    /// allocation failure — is left byte-identical, spans included. A
-    /// document with no `<<` is returned untouched, without a clone.
+    /// It is atomic (the `edit.apply` contract, through the same undo
+    /// journal): a document that fails to resolve — an invalid value, a
+    /// merge that reaches itself, a size, depth or allocation failure —
+    /// is left byte-identical, spans included. A document with no `<<` is
+    /// returned untouched.
     ///
     /// `ParseOptions.resolve_merge_keys` calls this after each document
     /// is built. Resolution re-emits the mappings it touches normalized,
     /// exactly like any other structural mutation.
+    ///
+    /// Every merge copies its source's pairs, so the result can be far
+    /// larger than the document: this stops with `error.LimitExceeded`
+    /// once it would create more than `ParseOptions.max_merge_nodes`
+    /// nodes (see `resolveMergeKeysLimited`).
     pub fn resolveMergeKeys(self: *Document) !void {
-        const old_root = self.root orelse return;
-        if (!treeHasMergeKey(old_root, 0)) return;
-        const new_root = try edit.cloneTreeWhole(self, old_root);
-        self.root = new_root;
-        var ok = false;
-        defer if (!ok) {
-            self.root = old_root;
+        return self.resolveMergeKeysLimited((ParseOptions{}).max_merge_nodes);
+    }
+
+    /// `resolveMergeKeys` creating at most `max_nodes` nodes.
+    pub fn resolveMergeKeysLimited(self: *Document, max_nodes: usize) !void {
+        return self.resolveMerges(max_nodes, null);
+    }
+
+    /// `resolveMergeKeysLimited`, recording in `d` what failed and where:
+    /// the parse entry points pass their `Diag`, which a failed merge left
+    /// empty.
+    fn resolveMerges(self: *Document, max_nodes: usize, d: ?*diag.Diag) !void {
+        const root = self.root orelse return;
+        if (!treeHasMergeKey(root, 0)) return;
+        // Atomic through the undo journal (`internal.Journal`), as for
+        // `edit.Editor.apply`: a failure rolls every change back.
+        var txn: internal.Transaction = undefined;
+        txn.begin(self);
+        errdefer txn.abort();
+        var run: MergeRun = .{ .seen = std.AutoHashMap(*Node, MergeVisit).init(self.allocator), .remaining = max_nodes };
+        defer run.seen.deinit();
+        self.resolveMergeNode(root, &run, 0) catch |err| {
+            const at = run.at orelse root.mark;
+            switch (err) {
+                error.InvalidMergeKey => diag.emitBestEffort(d, .err, at, "merge key value is not a mapping or a sequence of mappings", .{}),
+                error.MergeKeyRecursive => diag.emitBestEffort(d, .err, at, "merge key reaches the mapping it merges into", .{}),
+                error.LimitExceeded => diag.emitBestEffort(d, .err, at, "merge keys would create more than {d} nodes", .{max_nodes}),
+                error.NestingTooDeep => diag.emitBestEffort(d, .err, at, "merge keys are nested too deeply to resolve", .{}),
+                else => {},
+            }
+            return err;
         };
-        var seen = std.AutoHashMap(*Node, MergeVisit).init(self.allocator);
-        defer seen.deinit();
-        try self.resolveMergeNode(new_root, &seen, 0);
-        ok = true;
+        try txn.commit();
     }
 
     /// True when any mapping pair in `node` is a merge key. Structural
@@ -963,30 +1454,31 @@ pub const Document = struct {
     fn resolveMergeNode(
         self: *Document,
         node: *Node,
-        seen: *std.AutoHashMap(*Node, MergeVisit),
+        run: *MergeRun,
         depth: usize,
     ) MergeResolveError!void {
         if (depth >= max_merge_depth) return error.NestingTooDeep;
         switch (node.data) {
             .scalar, .alias => {},
             .sequence => |s| {
-                for (s.items.items) |item| try self.resolveMergeNode(item, seen, depth + 1);
+                for (s.items.items) |item| try self.resolveMergeNode(item, run, depth + 1);
             },
             .mapping => {
-                if (seen.get(node)) |state| {
+                if (run.seen.get(node)) |state| {
                     if (state == .done) return;
+                    run.at = node.mark;
                     return error.MergeKeyRecursive;
                 }
-                try seen.put(node, .active);
+                try run.seen.put(node, .active);
                 // Nested mappings first, so a merge source is fully
                 // expanded by the time its pairs are copied.
                 const m = &node.data.mapping;
                 for (m.pairs.items) |p| {
-                    try self.resolveMergeNode(p.key, seen, depth + 1);
-                    try self.resolveMergeNode(p.value, seen, depth + 1);
+                    try self.resolveMergeNode(p.key, run, depth + 1);
+                    try self.resolveMergeNode(p.value, run, depth + 1);
                 }
-                try self.resolveMappingMerges(node, seen, depth);
-                try seen.put(node, .done);
+                try self.resolveMappingMerges(node, run, depth);
+                try run.seen.put(node, .done);
             },
         }
     }
@@ -998,7 +1490,7 @@ pub const Document = struct {
     fn resolveMappingMerges(
         self: *Document,
         map: *Node,
-        seen: *std.AutoHashMap(*Node, MergeVisit),
+        run: *MergeRun,
         depth: usize,
     ) MergeResolveError!void {
         const m = &map.data.mapping;
@@ -1016,12 +1508,19 @@ pub const Document = struct {
             const p = m.pairs.items[i];
             if (!isMergeKeyPair(p)) continue;
             try internal.dropPairSpan(self, map, p);
-            _ = m.pairs.orderedRemove(i);
-            p.key.parent = null;
-            p.value.parent = null;
+            _ = try internal.removePair(self, map, i);
+            try internal.setParent(self, p.key, null);
+            try internal.setParent(self, p.value, null);
         }
-        for (values.items) |value| try self.mergeValueInto(map, value, seen, depth);
-        self.markModified(map);
+        // The key texts the mapping holds, so each copied pair's check is
+        // one lookup: scanning the pairs made every merge quadratic.
+        var present: std.StringHashMapUnmanaged(void) = .empty;
+        defer present.deinit(self.allocator);
+        for (m.pairs.items) |p| {
+            if (p.key.scalarValue()) |t| try present.put(self.allocator, t, {});
+        }
+        for (values.items) |value| try self.mergeValueInto(map, value, run, &present, depth);
+        try self.markModified(map);
     }
 
     /// Add the pairs a merge value contributes to `map`, in source order,
@@ -1030,20 +1529,27 @@ pub const Document = struct {
         self: *Document,
         map: *Node,
         value: *Node,
-        seen: *std.AutoHashMap(*Node, MergeVisit),
+        run: *MergeRun,
+        present: *std.StringHashMapUnmanaged(void),
         depth: usize,
     ) MergeResolveError!void {
         const resolved = value.resolveAlias();
         switch (resolved.data) {
-            .mapping => try self.mergeOneInto(map, @constCast(resolved), seen, depth),
+            .mapping => try self.mergeOneInto(map, @constCast(resolved), run, present, depth),
             .sequence => |s| {
                 for (s.items.items) |item| {
                     const src = item.resolveAlias();
-                    if (src.kind() != .mapping) return error.InvalidMergeKey;
-                    try self.mergeOneInto(map, @constCast(src), seen, depth);
+                    if (src.kind() != .mapping) {
+                        run.at = item.mark;
+                        return error.InvalidMergeKey;
+                    }
+                    try self.mergeOneInto(map, @constCast(src), run, present, depth);
                 }
             },
-            else => return error.InvalidMergeKey,
+            else => {
+                run.at = value.mark;
+                return error.InvalidMergeKey;
+            },
         }
     }
 
@@ -1051,38 +1557,29 @@ pub const Document = struct {
         self: *Document,
         map: *Node,
         source: *Node,
-        seen: *std.AutoHashMap(*Node, MergeVisit),
+        run: *MergeRun,
+        present: *std.StringHashMapUnmanaged(void),
         depth: usize,
     ) MergeResolveError!void {
         // Resolve the source before copying from it; a source that is
         // still `active` is a merge cycle.
-        try self.resolveMergeNode(source, seen, depth + 1);
+        try self.resolveMergeNode(source, run, depth + 1);
         for (source.data.mapping.pairs.items) |p| {
-            if (mappingHasKey(map, p.key)) continue;
-            const key = try self.cloneMergeNode(p.key, 0);
-            const value = try self.cloneMergeNode(p.value, 0);
+            // A key the mapping already has wins. Compared on the
+            // RESOLVED text, while `isMergeKeyPair` is style-sensitive:
+            // a quoted `"a": 9` is not a merge key, but it does block a
+            // merged plain `a` -- detection follows the spec form of
+            // `<<`, equality follows how a reader reads a key. Non-scalar
+            // keys never collide, as for `lookup`.
+            const text = p.key.scalarValue();
+            if (text) |t| if (present.contains(t)) continue;
+            const key = try self.cloneMergeNode(p.key, run, 0);
+            const value = try self.cloneMergeNode(p.value, run, 0);
             // Raw attach: a freshly cloned node is detached, so it
             // cannot cycle, and resolveMappingMerges marks the mapping.
             try internal.attachPair(self, map, key, value);
+            if (text) |t| try present.put(self.allocator, t, {});
         }
-    }
-
-    /// True when `map` already has a scalar key with the same text as
-    /// `key`. Non-scalar keys never collide: they cannot match a merge
-    /// source key by text, matching how `lookup` reads keys.
-    ///
-    /// Comparison is on the RESOLVED text, while `isMergeKeyPair` is
-    /// style-sensitive: a quoted `"a": 9` is not a merge key, but it does
-    /// block a merged plain `a`. That asymmetry is deliberate — detection
-    /// follows the spec form of `<<`, equality follows how a reader reads
-    /// a key.
-    fn mappingHasKey(map: *const Node, key: *const Node) bool {
-        const want = key.scalarValue() orelse return false;
-        for (map.data.mapping.pairs.items) |p| {
-            const have = p.key.scalarValue() orelse continue;
-            if (std.mem.eql(u8, have, want)) return true;
-        }
-        return false;
     }
 
     /// Copy one node into this document's pool for insertion at a new
@@ -1092,8 +1589,10 @@ pub const Document = struct {
     /// the source already anchors. An alias is copied as an alias: its
     /// target stays in this document, so the reference remains valid and
     /// the document keeps its anchors.
-    fn cloneMergeNode(self: *Document, node: *Node, depth: usize) !*Node {
+    fn cloneMergeNode(self: *Document, node: *Node, run: *MergeRun, depth: usize) MergeResolveError!*Node {
         if (depth >= max_merge_depth) return error.NestingTooDeep;
+        if (run.remaining == 0) return error.LimitExceeded;
+        run.remaining -= 1;
         const n = try self.pool.create(Node);
         n.* = .{
             .mark = node.mark,
@@ -1111,14 +1610,14 @@ pub const Document = struct {
             .sequence => |s| {
                 n.data = .{ .sequence = .{ .style = s.style } };
                 for (s.items.items) |item| {
-                    try internal.attachItem(self, n, try self.cloneMergeNode(item, depth + 1));
+                    try internal.attachItem(self, n, try self.cloneMergeNode(item, run, depth + 1));
                 }
             },
             .mapping => |m| {
                 n.data = .{ .mapping = .{ .style = m.style } };
                 for (m.pairs.items) |p| {
-                    const key = try self.cloneMergeNode(p.key, depth + 1);
-                    const value = try self.cloneMergeNode(p.value, depth + 1);
+                    const key = try self.cloneMergeNode(p.key, run, depth + 1);
+                    const value = try self.cloneMergeNode(p.value, run, depth + 1);
                     try internal.attachPair(self, n, key, value);
                 }
             },
@@ -1147,9 +1646,10 @@ pub const Document = struct {
     /// line, so address it through that entry. A comment is not
     /// addressable inside a flow collection, and a block scalar's value
     /// owns every line after its header, so `setTrailingComment`
-    /// rejects containers, flow-positioned nodes, and literal/folded
-    /// scalars with `error.InvalidSyntax` rather than silently dropping
-    /// the write at emission time.
+    /// rejects containers, flow-positioned nodes, literal/folded scalars
+    /// and nodes inside a new or moved subtree (laid out afresh, without
+    /// comments) with `error.InvalidSyntax` rather than silently
+    /// dropping the write at emission time.
     pub fn setTrailingComment(self: *Document, node: *Node, text: ?[]const u8) !void {
         // Validate the position first: a write that emission would
         // silently drop must fail here instead.
@@ -1157,7 +1657,7 @@ pub const Document = struct {
         const t = text orelse {
             if (node.trailingComment(self) == null) return; // nothing to delete
             node.pending_trailing = "";
-            self.markModified(node);
+            try self.markModified(node);
             return;
         };
         try validateTrailingText(t);
@@ -1167,7 +1667,7 @@ pub const Document = struct {
             if (std.mem.eql(u8, cur, t)) return;
         }
         node.pending_trailing = try self.pool.dupe(t);
-        self.markModified(node);
+        try self.markModified(node);
     }
 
     /// Set the node's leading comment block: the own-line comments
@@ -1178,14 +1678,26 @@ pub const Document = struct {
     /// document's line-terminator convention; a deleted block's lines
     /// disappear whole.
     ///
+    /// The block belongs to the line, not to one node: a write through
+    /// any node starting on it replaces what is written above that line,
+    /// and the block lives as long as the outermost of those nodes. A
+    /// collection's first entry shares the collection's line, so a block
+    /// written there stays above whichever entry is first -- after that
+    /// entry is deleted, or another inserted ahead of it -- as a comment
+    /// in the source would; a later entry owns its own line, and its
+    /// block is deleted with it.
+    ///
     /// Like `setTrailingComment`, set-to-same is a no-op. Rejects nodes
     /// whose comment block cannot be rewritten honestly — a root scalar
     /// (its head is free-floating), a scalar sitting as a block value
     /// (no gap of its own to rewrite), anything inside a flow
-    /// collection, and a block separated from this document's region —
-    /// with `error.InvalidSyntax`.
-    pub fn setLeadingComments(self: *Document, node: *Node, text: ?[]const u8) !void {
+    /// collection or inside a new or moved subtree (laid out afresh,
+    /// without comments), and a block separated from this document's
+    /// region — with `error.InvalidSyntax`.
+    pub fn setLeadingComments(self: *Document, node_in: *Node, text: ?[]const u8) !void {
         const t: ?[]const u8 = if (text) |raw| try normalizeLeadingText(raw) else null;
+        // The block belongs to the outermost node starting on this line.
+        const node = if (self.source) |src| leadingOwner(node_in, src) else node_in;
         // Position and current block, for the no-op check and the
         // tombstone below.
         const current: ?[]const u8 = blk: {
@@ -1205,14 +1717,56 @@ pub const Document = struct {
         // publish last — a failure before the publish leaves the node
         // untouched (the duplicate is pool garbage, freed with the pool).
         const stored: ?[]const u8 = if (t) |body| try self.pool.dupe(body) else "";
+        const src = self.source.?;
+        // The block replaces everything written above the line. An entry
+        // that became first after a sibling was deleted still carries its
+        // own written block, or its source block in its own gap; both
+        // would be written below the new one.
+        var c: ?*Node = nextOnLine(node, src);
+        while (c) |inner| : (c = nextOnLine(inner, src)) {
+            if (inner.pending_leading == null and !sameLeadingSource(self, inner, node)) {
+                if (self.leadingSourceSpan(inner) != null) try self.tombstoneLeadingBlock(inner);
+            }
+        }
         if (current != null and node.pending_leading == null) try self.tombstoneLeadingBlock(node);
+        c = nextOnLine(node, src);
+        while (c) |inner| : (c = nextOnLine(inner, src)) {
+            clearPendingLeading(inner);
+        }
         node.pending_leading = stored;
-        self.markModified(node);
+        try self.markModified(node);
+    }
+
+    /// Drop a written block from `node` (and from a key's inline value,
+    /// which `internal.pairLeadingOverride` also reads). Its source block
+    /// was tombstoned when it was written.
+    fn clearPendingLeading(node: *Node) void {
+        node.pending_leading = null;
+        if (node.parent) |p| if (p.pairs()) |ps| for (ps) |pair| {
+            if (pair.key == node) pair.value.pending_leading = null;
+        };
+    }
+
+    /// True when `inner` reads its source block from the same bytes as
+    /// `outer`: they shared the line in the source.
+    fn sameLeadingSource(self: *const Document, inner: *const Node, outer: *const Node) bool {
+        const a = self.leadingSourceSpan(inner) orelse return true;
+        const b = self.leadingSourceSpan(outer) orelse return false;
+        return a[0] == b[0] and a[1] == b[1];
     }
 
     /// True when `setTrailingComment` can act on this node.
     fn trailingWritablePosition(self: *const Document, node: *Node) bool {
-        _ = self;
+        // Below a node with no source bytes the emitter lays everything
+        // out afresh and writes no comments: the write was accepted and
+        // dropped.
+        if (!trailingPlaced(node)) return false;
+        // An empty node that reads no trailing comment (an empty item or
+        // document) must not take one: it was accepted and never written.
+        if (node.src) |s| if (s.synthetic) {
+            const src = self.source orelse return false;
+            if (trailingAnchor(node, src) == null) return false;
+        };
         switch (node.data) {
             .scalar => |s| switch (s.style) {
                 .literal, .folded => return false, // the value owns its lines
@@ -1236,6 +1790,13 @@ pub const Document = struct {
     /// has a gap of its own, and that gap is rewritable verbatim bytes.
     fn leadingPositionWritable(self: *const Document, node: *Node) bool {
         if (insideFlow(node)) return false;
+        // Inside a new or moved subtree, or under a replaced root: laid
+        // out afresh, and a written block was accepted and dropped.
+        if (!leadingPlaced(node)) return false;
+        // An empty node's span is a point borrowed from the next token:
+        // it has no line of its own to write a block above, and reads
+        // none. The write used to be accepted and then dropped.
+        if (node.src) |s| if (s.synthetic) return false;
         const src = self.source orelse return false;
         const owner = gapOwnerForLeading(node, src) orelse return false;
         return dropsOf(owner) != null;
@@ -1246,20 +1807,27 @@ pub const Document = struct {
     /// lines: the structural separator before the block (the previous
     /// line's terminator) survives, and so does the entry's own
     /// indentation after it.
+    /// The source span of the block above `owner`'s entry line (see
+    /// `leadingOwner`), or null.
+    fn leadingSourceSpan(self: *const Document, owner: *const Node) ?[2]usize {
+        const src = self.source orelse return null;
+        const s = owner.src orelse return null; // brand-new: no block in the source
+        if (s.synthetic) return null;
+        return markup.leadingCommentSpan(src, s.entry_start, leadingFloor(owner, self));
+    }
+
     fn tombstoneLeadingBlock(self: *Document, node: *Node) !void {
         const src = self.source orelse return;
-        const s = node.src orelse return; // brand-new: no block in the source
-        if (s.synthetic) return;
-        const span = markup.leadingCommentSpan(src, s.entry_start) orelse return;
+        const span = self.leadingSourceSpan(node) orelse return;
         // A root entry sharing its line with `---` reads backwards into
         // the previous document's region; those bytes are not ours.
         if (span[0] < self.region_start or span[1] > self.region_end) return error.InvalidSyntax;
         const owner = gapOwnerForLeading(node, src) orelse return error.InvalidSyntax;
-        const drops = dropsOf(owner) orelse return error.InvalidSyntax;
+        if (dropsOf(owner) == null) return error.InvalidSyntax;
         const from = markup.lineStart(src, span[0]);
         const to = markup.lineEnd(src, span[1]);
         if (to <= from) return;
-        try internal.dropRange(self, drops, from, to);
+        try internal.dropRange(self, owner, from, to);
     }
 
     /// Refuse comment bytes the scanner refuses on input: a write that
@@ -1318,6 +1886,15 @@ pub const Document = struct {
             if (i >= line.len or line[i] != '#') return error.InvalidSyntax;
         }
         return t;
+    }
+
+    fn isMappingValue(node: *const Node) bool {
+        const parent = node.parent orelse return false;
+        const ps = parent.pairs() orelse return false;
+        for (ps) |p| {
+            if (p.value == node) return true;
+        }
+        return false;
     }
 
     fn isMappingKey(node: *const Node) bool {
@@ -1396,7 +1973,7 @@ pub const Document = struct {
     /// mappings as needed; returns the container holding the final key.
     pub fn mappingWalkOrCreate(self: *Document, keys: []const []const u8) !*Node {
         if (self.root == null) {
-            self.root = try self.createMapping();
+            try internal.setRoot(self, try self.createMapping());
         }
         var cur = self.root.?;
         for (keys) |seg| {
@@ -1422,7 +1999,7 @@ pub const Document = struct {
             // `lookup` only matches values of the mapping `cur`, so the
             // in-place replace must succeed; falling through would
             // append a duplicate key.
-            if (!internal.mappingReplace(self, cur, existing, value)) return error.InvalidSyntax;
+            if (!try internal.mappingReplace(self, cur, existing, value)) return error.InvalidSyntax;
             return;
         }
         try self.mappingAppend(cur, try self.createScalar(last, .plain), value);
@@ -1446,8 +2023,7 @@ pub const Document = struct {
     /// re-emitted verbatim from its parent slot, and the parent's parent
     /// must not re-emit *it* verbatim, and so on. Unmodified siblings
     /// stay verbatim regardless (the emitter walks per slot).
-    pub fn markModified(self: *Document, node: *Node) void {
-        _ = self;
+    pub fn markModified(self: *Document, node: *Node) !void {
         var cur: ?*Node = node;
         // Bounded. `mappingAppend`/`sequenceAppend` refuse to build a
         // parent cycle, so the chain is acyclic and this never trips —
@@ -1461,28 +2037,12 @@ pub const Document = struct {
                 std.debug.assert(false); // parent cycle: attach guards were bypassed
                 return;
             }
-            n.modified = true;
+            if (!n.modified) {
+                try internal.recordModified(self, n);
+                n.modified = true;
+            }
             cur = n.parent;
         }
-    }
-
-    /// Why attaching `child` under `parent` must be refused, or null
-    /// when it is safe. `child` being `parent` itself or one of its
-    /// ancestors is a parent cycle. An ancestor chain longer than the
-    /// walk bound is reported as `NestingTooDeep` rather than a cycle:
-    /// `markModified` asserts past the same bound, so attaching there
-    /// would build a tree the rest of the module cannot maintain. The
-    /// chain is acyclic by induction — this is the check that keeps it so
-    /// — hence the plain walk.
-    fn attachRefusal(parent: *Node, child: *Node) ?error{ WouldCycle, NestingTooDeep } {
-        var cur: ?*Node = parent;
-        var guard: usize = 0;
-        while (cur) |n| : (guard += 1) {
-            if (n == child) return error.WouldCycle;
-            if (guard >= Node.max_parent_walk) return error.NestingTooDeep;
-            cur = n.parent;
-        }
-        return null;
     }
 
     /// The `dropped` tombstone list of a collection node (source ranges
@@ -1626,34 +2186,94 @@ pub fn writeAllOpts(allocator: std.mem.Allocator, docs: []const Document, option
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
+    // What the output so far ends with, kept as it is written. Asking the
+    // accumulated text instead cost O(output) per document (see `StreamEnd`).
+    var tail: StreamEnd = .{};
+
+    // Each document is emitted on its own, as if it started a line, and
+    // then joined on. Emitting straight onto the output let a document's
+    // emitter see the previous document's last line as its own, and
+    // measuring that line cost O(output) per document when the output had
+    // no line break.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+
     for (docs, 0..) |*doc, i| {
-        const body_start = out.items.len;
-        var em = emitter_mod.Emitter.init(allocator, &out);
+        body.clearRetainingCapacity();
+        var em = emitter_mod.Emitter.init(allocator, &body);
         defer em.deinit();
         em.configure(options);
         try em.emitDocument(doc);
 
-        if (i == 0) continue;
-        if (endsStream(out.items[0..body_start])) continue;
-        if (startsDocument(out.items[body_start..])) continue;
-
-        // No boundary either side: supply one. Nothing is inserted on
-        // the path above, which is what keeps a parsed stream byte-exact
-        // -- including the case that motivated this shape, where a
-        // document's region ends mid-line (`--- foo`) and its own
-        // trailing comment belongs to the *next* document's leading
-        // bytes. Inserting a newline there unconditionally would cut
-        // that line in half.
-        const sep = if (body_start > 0 and out.items[body_start - 1] != '\n') "\n---\n" else "---\n";
-        try out.insertSlice(allocator, body_start, sep);
+        // A document with nothing to write (built with no root) is still
+        // a document of the stream: an explicit empty one, or its
+        // neighbours read back as one.
+        if (body.items.len == 0 and docs.len > 1) try body.appendSlice(allocator, "---\n");
+        // A byte order mark opens a stream; before a later document the
+        // reader takes it for content (`\u{FEFF}b: 2` a key).
+        if (i > 0 and std.mem.startsWith(u8, body.items, "\u{FEFF}")) {
+            std.mem.copyForwards(u8, body.items, body.items[3..]);
+            body.shrinkRetainingCapacity(body.items.len - 3);
+        }
+        const join = if (i > 0) boundary(&tail, out.items, body.items) else "";
+        try out.ensureUnusedCapacity(allocator, join.len + body.items.len);
+        out.appendSliceAssumeCapacity(join);
+        out.appendSliceAssumeCapacity(body.items);
+        tail.feed(join);
+        tail.feed(body.items);
     }
 
     return try out.toOwnedSlice(allocator);
 }
 
-/// True when `text` opens a new document — its first line that is not
-/// blank, a comment or a directive is a `---` marker. Directives imply
-/// one, since a directive can only precede a document start.
+/// What `writeAllOpts` puts between the output so far (`before`, whose end
+/// `tail` describes) and the next document's bytes (`next`) so that the
+/// stream reads back as the same documents. Nothing is added where the
+/// boundary is already marked, which is what keeps a parsed stream
+/// byte-exact -- including a document whose region ends mid-line
+/// (`--- foo`) while its trailing comment is the *next* document's first
+/// bytes (` # c`): breaking that line would move the comment.
+///
+/// A marker counts only at the start of a line. After a document that
+/// ends mid-line, `--- y` or `%YAML` would be read as content of that
+/// line, so the line is ended first unless `next` merely finishes it with
+/// blanks or a comment. A directive also needs the previous document
+/// closed with `...`: after a bare or open document it is read as part of
+/// its last scalar.
+fn boundary(tail: *const StreamEnd, before: []const u8, next: []const u8) []const u8 {
+    const mid_line = before.len > 0 and before[before.len - 1] != '\n' and before[before.len - 1] != '\r';
+    const cut = mid_line and !finishesLine(next);
+    if (tail.endsStream()) return if (cut) "\n" else "";
+    const first = firstContentLine(next) orelse return if (mid_line) "\n---\n" else "---\n";
+    if (first[0] == '%') return if (mid_line) "\n...\n" else "...\n";
+    if (first[0] == '-' and Document.isMarkerLine(first, 0)) return if (cut) "\n" else "";
+    return if (mid_line) "\n---\n" else "---\n";
+}
+
+/// True when `text` can follow a line that already has content on it
+/// without changing that line: its first line is empty, blank, or blanks
+/// then a comment (a `#` needs a blank before it to open one).
+fn finishesLine(text: []const u8) bool {
+    var it: LineIter = .{ .src = text };
+    const line = it.next() orelse return true;
+    if (line.len == 0) return true;
+    if (line[0] != ' ' and line[0] != '\t') return false;
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    return trimmed.len == 0 or trimmed[0] == '#';
+}
+
+/// The first line of `text` that is neither blank nor a comment, as
+/// written (leading blanks kept), or null when there is none.
+fn firstContentLine(text: []const u8) ?[]const u8 {
+    var it: LineIter = .{ .src = text };
+    while (it.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        return line;
+    }
+    return null;
+}
+
 /// Iterate lines on any YAML line break — `\n`, `\r\n`, or a lone `\r`
 /// (§5.4 `b-break ::= CRLF | CR | LF`) — yielding each line without its
 /// terminator. Splitting on `\n` alone left a wholly CR-terminated
@@ -1685,19 +2305,6 @@ const LineIter = struct {
     }
 };
 
-fn startsDocument(text: []const u8) bool {
-    var it: LineIter = .{ .src = text };
-    while (it.next()) |line| {
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-        if (trimmed.len == 0) continue;
-        if (trimmed[0] == '#') continue;
-        if (trimmed[0] == '%') return true;
-        return std.mem.startsWith(u8, line, "---") and
-            (line.len == 3 or line[3] == ' ' or line[3] == '\t');
-    }
-    return false;
-}
-
 /// True when `text` is nothing but blank and comment lines: the tail a
 /// document may own after its content. A directive line is not one; it
 /// opens the next document.
@@ -1711,24 +2318,64 @@ fn isTrailer(text: []const u8) bool {
     return true;
 }
 
-/// True when `text` ends with an explicit `...` end-of-document marker,
-/// which is itself a boundary: the next document needs no `---`.
-fn endsStream(text: []const u8) bool {
-    var it: LineIter = .{ .src = text };
-    var last: []const u8 = "";
-    while (it.next()) |line| {
-        if (std.mem.trim(u8, line, " \t").len == 0) continue;
-        last = line;
+/// What `writeAll` needs to know about the output written so far: whether
+/// its last non-blank line is an explicit `...` end-of-document marker
+/// (`...` followed by the end of the line or a blank), which is itself a
+/// boundary, so the next document needs no `---`.
+///
+/// It is fed every byte exactly once, in output order, and remembers only
+/// the line in progress and the last finished non-blank line, so a whole
+/// stream costs O(output). Asking the accumulated text instead was
+/// quadratic in the number of documents however the answer was found:
+/// walking every line to reach the last one, or scanning back to where the
+/// last one starts, which for output with no line break at all (separately
+/// parsed strings that end without a newline and each open a document) is
+/// the start of the buffer.
+const StreamEnd = struct {
+    /// The first bytes of the line in progress and how many it has so far,
+    /// counted up to four: `...` alone, and `...` plus one more byte, are
+    /// all the marker test can tell apart.
+    head: [4]u8 = undefined,
+    head_len: usize = 0,
+    /// The line in progress has something on it besides blanks.
+    has_content: bool = false,
+    /// Whether the last non-blank line that already ended is a marker.
+    finished_is_marker: bool = false,
+
+    fn feed(self: *StreamEnd, bytes: []const u8) void {
+        for (bytes) |byte| {
+            if (ctype.isBreak(byte)) {
+                if (self.has_content) self.finished_is_marker = self.lineIsMarker();
+                self.head_len = 0;
+                self.has_content = false;
+                continue;
+            }
+            if (self.head_len < self.head.len) {
+                self.head[self.head_len] = byte;
+                self.head_len += 1;
+            }
+            if (!ctype.isBlank(byte)) self.has_content = true;
+        }
     }
-    return std.mem.startsWith(u8, last, "...") and
-        (last.len == 3 or last[3] == ' ' or last[3] == '\t');
-}
+
+    /// True when the last line that has anything on it is a `...` marker.
+    fn endsStream(self: *const StreamEnd) bool {
+        return if (self.has_content) self.lineIsMarker() else self.finished_is_marker;
+    }
+
+    fn lineIsMarker(self: *const StreamEnd) bool {
+        return self.head_len >= 3 and std.mem.eql(u8, self.head[0..3], "...") and
+            (self.head_len == 3 or self.head[3] == ' ' or self.head[3] == '\t');
+    }
+};
 
 /// Builds a node tree out of parser events (fy_docbuilder). While
 /// building, every node records its source span (see `markup.Src`) so
 /// untouched regions re-emit byte-identically.
 const Builder = struct {
     doc: *Document,
+    /// Where a problem found while building is reported (the parser's).
+    d: ?*diag.Diag = null,
     source: []const u8,
     stack: std.ArrayList(Frame),
     anchors: std.StringHashMap(*Node),
@@ -1774,6 +2421,14 @@ const Builder = struct {
             while (end > ev.start.offset and end <= src.len and
                 (src[end - 1] == ' ' or src[end - 1] == '\t' or
                     src[end - 1] == '\r' or src[end - 1] == '\n')) end -= 1;
+            // A scalar that is only properties (`a: &anchor`, `- !!str`)
+            // ends at the next token, so trimming blanks stops inside
+            // any comment in between: `&anchor\n# c` took the next
+            // entry's comment, and a trailing `# t` was not read as one.
+            const sc = ev.data.scalar;
+            if (sc.value.len == 0 and sc.style == .plain) {
+                end = @min(end, markup.propertiesEnd(src, ev.start.offset));
+            }
         }
         return .{
             .entry_start = if (synthetic)
@@ -1804,8 +2459,10 @@ const Builder = struct {
                 try self.attach(n);
             },
             .alias => {
-                const target = self.anchors.get(ev.data.alias) orelse
+                const target = self.anchors.get(ev.data.alias) orelse {
+                    diag.emitBestEffort(self.d, .err, ev.start, "found undefined alias '{s}'", .{ev.data.alias});
                     return error.UnknownAlias;
+                };
                 const n = try self.doc.pool.create(Node);
                 n.* = .{
                     .mark = ev.start,
@@ -1851,9 +2508,17 @@ const Builder = struct {
         switch (parent.data) {
             .sequence => self.growSpan(parent, cs),
             .mapping => {
-                for (parent.data.mapping.pairs.items) |*p| {
-                    if (p.value == coll) {
-                        p.src_end = cs.end;
+                // The collection that just closed belongs to the pair
+                // being built, the last one: searched from the front,
+                // every collection value cost the pairs before it, which
+                // made a mapping of mappings quadratic to parse (80,000
+                // `kN:\n  x: 1` entries took a second).
+                const pairs = parent.data.mapping.pairs.items;
+                var i = pairs.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (pairs[i].value == coll) {
+                        pairs[i].src_end = cs.end;
                         self.growSpan(parent, cs);
                         return;
                     }
@@ -1918,7 +2583,7 @@ const Builder = struct {
                     // and must not be trusted.
                     const key_end: usize = if (key.src) |ks| ks.end else key.mark.offset;
                     const pair_end: usize = if (n.src) |vs|
-                        (if (vs.synthetic) markup.colonEnd(self.source, key_end) else vs.end)
+                        (if (vs.synthetic) markup.valueIndicatorEnd(self.source, key_end, vs.start) else vs.end)
                     else
                         key_end;
                     if (frame.node.data == .mapping) {
@@ -2378,6 +3043,64 @@ test "writeAll reproduces a parsed stream byte for byte" {
     }
 }
 
+test "parseAll holds one copy of the stream, however many documents it has" {
+    // Every document used to duplicate the WHOLE stream into its own
+    // arena, so memory was documents x stream: doubling the input
+    // quadrupled it, and 1 MiB of nine-byte documents wanted ~114 GiB
+    // (a 32 KiB stream measured 180 MB). Growth is linear in the input
+    // now. Measured as live bytes with a counting allocator, so the test
+    // needs no large allocation of its own and catches the regression at
+    // a size where the old code was already 16x apart.
+    const allocator = std.testing.allocator;
+    var live: [2]usize = undefined;
+    const doc_counts = [_]usize{ 400, 1600 };
+    for (doc_counts, 0..) |count, i| {
+        var stream: std.ArrayList(u8) = .empty;
+        defer stream.deinit(allocator);
+        for (0..count) |_| try stream.appendSlice(allocator, "---\na: 1\n");
+
+        var counting = std.testing.FailingAllocator.init(allocator, .{});
+        const counted = counting.allocator();
+        var docs = try Document.parseAll(counted, stream.items);
+        defer docs.deinit(counted);
+        try testing.expectEqual(count, docs.items.len);
+        live[i] = counting.allocated_bytes - counting.freed_bytes;
+        for (docs.items) |*d| d.deinit();
+    }
+    // 4x the documents: linear growth is ~4x, the per-document copy was
+    // ~16x. The slack absorbs allocator and arena rounding.
+    try testing.expect(live[1] < live[0] * 6);
+}
+
+test "documents of one stream stay valid in any order of release" {
+    // The shared copy of the stream is reference-counted, so a document
+    // must keep working after any of its siblings is gone, and the copy
+    // must be freed exactly once (the testing allocator reports both a
+    // leak and a double free).
+    const allocator = std.testing.allocator;
+    const input = "---\na: 1 # one\n---\nb: 2 # two\n---\nc: 3 # three\n";
+    var docs = try Document.parseAll(allocator, input);
+    defer docs.deinit(allocator);
+    try testing.expectEqual(@as(usize, 3), docs.items.len);
+
+    // Release the first and last; the middle one is the survivor.
+    docs.items[0].deinit();
+    docs.items[2].deinit();
+    const out = try docs.items[1].write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("---\nb: 2 # two\n", out);
+    try testing.expectEqualStrings("2", docs.items[1].pathGet(&.{"b"}).?.scalarValue().?);
+    docs.items[1].deinit();
+}
+
+test "a stream that fails after its first document releases the shared copy" {
+    // The failure path frees the finished documents and the one in
+    // flight; the copy they share must go with the last of them.
+    const allocator = std.testing.allocator;
+    try testing.expectError(error.InvalidSyntax, Document.parseAll(allocator, "a: 1\n---\nb: [\n"));
+    try testing.expectError(error.InvalidSyntax, Document.parseAll(allocator, "---\na: 1\n---\nb: 2\n---\nc: {\n"));
+}
+
 test "writeAll separates documents that would otherwise merge" {
     const allocator = std.testing.allocator;
 
@@ -2420,6 +3143,85 @@ test "writeAll separates documents that would otherwise merge" {
     try testing.expectEqual(@as(usize, 2), back.items.len);
     try testing.expectEqualStrings("1", back.items[0].pathGet(&.{"a"}).?.scalarValue().?);
     try testing.expectEqualStrings("2", back.items[1].pathGet(&.{"b"}).?.scalarValue().?);
+}
+
+test "writeAll keeps documents apart when one ends mid-line" {
+    const allocator = std.testing.allocator;
+
+    // A document parsed from text with no final line break is written
+    // back without one, so the next document's bytes land on its last
+    // line. A `---` or `%` there is not at the start of a line, so it is
+    // content, not a marker: `--- x` then `--- y` was written
+    // `--- x--- y`, ONE document holding `x--- y`. A directive after a
+    // document that did not end with `...` was read as part of it
+    // (`x\n%YAML 1.2` is the scalar `x %YAML 1.2`), and `y` after a `...`
+    // with no line break was glued to the marker.
+    const Case = struct { docs: []const []const u8, roots: []const []const u8 };
+    const cases = [_]Case{
+        .{ .docs = &.{ "--- x", "--- y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x", "--- y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x # c", "--- y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "--- x", "# c\n--- y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x\n...", "y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x\n... ", "y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x", "%YAML 1.2\n--- y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x\n", "%YAML 1.2\n--- y\n" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x\n", "%TAG !e! tag:e,2000:\n--- !e!t y\n" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x\r", "--- y" }, .roots = &.{ "x", "y" } },
+        .{ .docs = &.{ "x", "y", "--- z" }, .roots = &.{ "x", "y", "z" } },
+    };
+    for (cases) |case| {
+        var docs: std.ArrayList(Document) = .empty;
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        for (case.docs) |text| try docs.append(allocator, try Document.parse(allocator, text));
+
+        const out = try writeAll(allocator, docs.items);
+        defer allocator.free(out);
+        var back = try Document.parseAll(allocator, out);
+        defer {
+            for (back.items) |*d| d.deinit();
+            back.deinit(allocator);
+        }
+        errdefer std.debug.print("writeAll gave {f}\n", .{std.zig.fmtString(out)});
+        try testing.expectEqual(case.roots.len, back.items.len);
+        for (case.roots, back.items) |want, *d| try testing.expectEqualStrings(want, d.root.?.scalarValue().?);
+    }
+
+    // A document built with no root, and a later one opening with a byte
+    // order mark: neither may merge into, or change, its neighbours.
+    {
+        var empty = Document.init(allocator);
+        defer empty.deinit();
+        var y = try Document.parse(allocator, "y\n");
+        defer y.deinit();
+        var b = try Document.parse(allocator, "\u{FEFF}b: 2\n");
+        defer b.deinit();
+        const out = try writeAll(allocator, &.{ empty, y, b, empty });
+        defer allocator.free(out);
+        var back = try Document.parseAll(allocator, out);
+        defer {
+            for (back.items) |*d| d.deinit();
+            back.deinit(allocator);
+        }
+        try testing.expectEqual(@as(usize, 4), back.items.len);
+        try testing.expect(back.items[0].root == null or back.items[0].root.?.scalarValue().?.len == 0);
+        try testing.expectEqualStrings("y", back.items[1].root.?.scalarValue().?);
+        try testing.expectEqualStrings("2", back.items[2].pathGet(&.{"b"}).?.scalarValue().?);
+    }
+
+    // A comment that belongs to the line the previous document ended on
+    // (how a parsed stream splits `--- x # c`) stays on that line.
+    var parsed = try Document.parseAll(allocator, "--- x # c\n--- y\n");
+    defer {
+        for (parsed.items) |*d| d.deinit();
+        parsed.deinit(allocator);
+    }
+    const same = try writeAll(allocator, parsed.items);
+    defer allocator.free(same);
+    try testing.expectEqualStrings("--- x # c\n--- y\n", same);
 }
 
 test "writeAll separates hand-built documents" {
@@ -2500,6 +3302,116 @@ test "emit options cannot disturb bytes that re-emit verbatim" {
     try testing.expect(std.mem.indexOf(u8, with_new, "fresh:\n   n: 1") != null);
     // ... and the original lines are still exactly as they were.
     try testing.expect(std.mem.indexOf(u8, with_new, "outer:\n      key: v\n      other: w\n") != null);
+}
+
+/// The definition `endsStream` replaced: walk every line, keep the last
+/// one that is not blank. Kept as the oracle for the test below.
+fn endsStreamByLines(text: []const u8) bool {
+    var it: LineIter = .{ .src = text };
+    var last: []const u8 = "";
+    while (it.next()) |line| {
+        if (std.mem.trim(u8, line, " \t").len == 0) continue;
+        last = line;
+    }
+    return std.mem.startsWith(u8, last, "...") and
+        (last.len == 3 or last[3] == ' ' or last[3] == '\t');
+}
+
+fn streamEndAfter(chunks: []const []const u8) bool {
+    var tail: StreamEnd = .{};
+    for (chunks) |chunk| tail.feed(chunk);
+    return tail.endsStream();
+}
+
+test "the stream-end tracker agrees with the line-by-line definition on every short input" {
+    // Every string up to length 7 over the bytes that decide the answer:
+    // the marker's dot, both blanks, all three line breaks (`\n`, `\r`, and
+    // `\r\n` by adjacency) and one byte of ordinary content. 335,923
+    // inputs, so a boundary case (CR/LF pairs, blanks around the marker, a
+    // marker not on the last line) cannot slip past a hand-picked list.
+    // Each is fed whole, one byte at a time, and (up to length 6) split in
+    // two at every position, because the tracker's whole point is that the
+    // answer must not depend on how the output arrived.
+    const alphabet = [_]u8{ '.', ' ', '\t', '\n', '\r', 'x' };
+    var buf: [7]u8 = undefined;
+    var checked: usize = 0;
+    var yes: usize = 0;
+    for (0..buf.len + 1) |len| {
+        var total: usize = 1;
+        for (0..len) |_| total *= alphabet.len;
+        for (0..total) |n| {
+            var rest = n;
+            for (buf[0..len]) |*b| {
+                b.* = alphabet[rest % alphabet.len];
+                rest /= alphabet.len;
+            }
+            const text = buf[0..len];
+            const expected = endsStreamByLines(text);
+            try testing.expectEqual(expected, streamEndAfter(&.{text}));
+
+            var bytewise: StreamEnd = .{};
+            for (text) |byte| bytewise.feed(&.{byte});
+            try testing.expectEqual(expected, bytewise.endsStream());
+
+            if (len <= 6) {
+                for (0..len + 1) |cut| {
+                    try testing.expectEqual(expected, streamEndAfter(&.{ text[0..cut], text[cut..] }));
+                }
+            }
+            checked += 1;
+            if (expected) yes += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 335_923), checked);
+    // Not vacuous: plenty of inputs do end a stream, and plenty do not.
+    try testing.expect(yes > 1000 and yes < checked / 2);
+}
+
+test "writeAll stays linear over documents that end mid-line" {
+    // Separately parsed strings that end without a newline and each open a
+    // document. Nothing was once inserted between them, so the output was
+    // ONE line (and one document: see "writeAll keeps documents apart when
+    // one ends mid-line"), and anything that measured the last line --
+    // walking the lines, scanning back to where the last one starts, or
+    // the next document's emitter measuring the line it starts on --
+    // cost O(output) per document: 8,000 documents (1.6 MB) took ~3.5 s
+    // in ReleaseSafe and far longer in Debug, against milliseconds now.
+    // The bound is far from both, so a slow CI machine cannot flake it
+    // and the regression cannot hide inside it; the fastest of three runs
+    // is judged.
+    //
+    // Leak-checked, but without `testing.allocator`'s per-allocation stack
+    // traces, which make thousands of parses slow.
+    var leak_check: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer testing.expect(leak_check.deinit() == .ok) catch @panic("leaked memory");
+    const allocator = leak_check.allocator();
+    const io = testing.io;
+
+    var source: [200]u8 = undefined;
+    @memcpy(source[0..4], "--- ");
+    @memset(source[4..], 'x');
+
+    var docs: std.ArrayList(Document) = .empty;
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(allocator);
+    }
+    for (0..8000) |_| try docs.append(allocator, try Document.parse(allocator, &source));
+
+    var fastest_ns: i96 = std.math.maxInt(i96);
+    for (0..3) |_| {
+        const start = std.Io.Timestamp.now(io, .awake);
+        const out = try writeAll(allocator, docs.items);
+        const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
+        defer allocator.free(out);
+        // The scenario is what it claims to be: every document written
+        // back as it was parsed, with only the line break each needs to
+        // start a line of its own.
+        try testing.expectEqual(docs.items.len * (source.len + 1) - 1, out.len);
+        try testing.expectEqual(docs.items.len - 1, std.mem.count(u8, out, "\n"));
+        fastest_ns = @min(fastest_ns, elapsed);
+    }
+    try testing.expect(fastest_ns < 1_000_000_000);
 }
 
 test "emit options carry the depth bound" {
@@ -2805,6 +3717,179 @@ test "comment write: leading blocks set, change and delete whole lines" {
     }
 }
 
+test "comment write: a leading comment on a framed key keeps one `- ` or `? `" {
+    // The first key of a sequence item and an explicit key start their
+    // entry with framing -- a `- ` or `? ` in [entry_start, start). The
+    // written block re-assembled the entry's line with that framing, and
+    // the key then re-emitted it from entry_start: `- k: v` came out as
+    // `# lead\n- - k: v`, a nested sequence, and `? k` as `? ? k`.
+    const cases = [_]struct { in: []const u8, at: []const []const u8, anchor: bool = false, out: []const u8 }{
+        .{ .in = "- k: v\n  j: w\n", .at = &.{"0"}, .out = "# lead\n- k: v\n  j: w\n" },
+        .{ .in = "items:\n  - k: v\n    j: w\n", .at = &.{ "items", "0" }, .out = "items:\n  # lead\n  - k: v\n    j: w\n" },
+        .{ .in = "? k\n: v\n", .at = &.{}, .out = "# lead\n? k\n: v\n" },
+        .{ .in = "- ? k\n  : v\n", .at = &.{"0"}, .out = "# lead\n- ? k\n  : v\n" },
+        // A modified key takes the same path.
+        .{ .in = "- k: v\n  j: w\n", .at = &.{"0"}, .anchor = true, .out = "# lead\n- &x k: v\n  j: w\n" },
+        // Control: an unframed key.
+        .{ .in = "a: 1\nk: v\n", .at = &.{}, .out = "a: 1\n# lead\nk: v\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        const key = for (doc.root.?.byPath(c.at).?.pairs().?) |p| {
+            if (std.mem.eql(u8, p.key.scalarValue().?, "k")) break p.key;
+        } else unreachable;
+        if (c.anchor) try doc.setAnchor(key, "x");
+        try doc.setLeadingComments(key, "# lead");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+
+        // Read back: the same comment above the same key, value intact.
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        const pair = for (again.root.?.byPath(c.at).?.pairs().?) |p| {
+            if (std.mem.eql(u8, p.key.scalarValue().?, "k")) break p;
+        } else unreachable;
+        try testing.expectEqualStrings("# lead", pair.key.leadingComments(&again).?);
+        try testing.expectEqualStrings("v", pair.value.scalarValue().?);
+    }
+}
+
+test "comment write: every node on an entry line shares one block" {
+    // Written blocks used to go wrong wherever several nodes start on one
+    // line. Each case writes `# new` through one node and checks the
+    // output and that every node on the line reads it back.
+    const cases = [_]struct { in: []const u8, at: []const []const u8, out: []const u8 }{
+        // The root: the block was tombstoned out of the head and never
+        // written, so the old comment was lost and the new one too.
+        .{ .in = "# old\na: 1\nb: 2\n", .at = &.{}, .out = "# new\na: 1\nb: 2\n" },
+        .{ .in = "- a\n- b\n", .at = &.{}, .out = "# new\n- a\n- b\n" },
+        // A sequence item holding a mapping: the item's `- ` was written
+        // twice (`- - name: x`), a nested sequence.
+        .{ .in = "items:\n  - name: x\n  - name: y\n", .at = &.{ "items", "1" }, .out = "items:\n  - name: x\n  # new\n  - name: y\n" },
+        // The first key of an item: its old block sat in the sequence's
+        // gap but was tombstoned in the item's list, and survived.
+        .{ .in = "- a: 1\n# old\n- b: 2\n", .at = &.{ "1", "b" }, .out = "- a: 1\n# new\n- b: 2\n" },
+        // An inline value writes the block above its pair.
+        .{ .in = "a: 1\nb: 2\n", .at = &.{"b"}, .out = "a: 1\n# new\nb: 2\n" },
+        // An item whose content starts on the line after its `-`.
+        .{ .in = "- x\n-\n  name: y\n", .at = &.{ "1", "name" }, .out = "- x\n# new\n-\n  name: y\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        try doc.setLeadingComments(doc.root.?.byPath(c.at).?, "# new");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        try testing.expectEqualStrings("# new", again.root.?.byPath(c.at).?.leadingComments(&again).?);
+    }
+}
+
+test "comment reads: block scalar content and property-only nodes" {
+    // A `# ...` line inside a block scalar is content, not the next
+    // item's comment; reading it as one also tombstoned it on a write.
+    {
+        var doc = try Document.parse(testing.allocator, "- >\n  text\n  # not a comment\n- b\n");
+        defer doc.deinit();
+        try testing.expect(doc.root.?.items().?[1].leadingComments(&doc) == null);
+    }
+    // A node that is only properties ended at the next token, so its
+    // span took the comment lines in between: the next key read no
+    // block, and a trailing comment was not read at all.
+    {
+        var doc = try Document.parse(testing.allocator, "a: &anchor\n# about b\nb: *anchor\nc: &x !!str # t\n");
+        defer doc.deinit();
+        try testing.expectEqualStrings("# about b", doc.pathGet(&.{"b"}).?.leadingComments(&doc).?);
+        try testing.expectEqualStrings("# t", doc.pathGet(&.{"c"}).?.trailingComment(&doc).?);
+    }
+}
+
+test "comment write: an empty node has no line of its own and is refused" {
+    // Its span is a point borrowed from the next token; the write was
+    // accepted and then silently dropped.
+    var doc = try Document.parse(testing.allocator, "- a\n- \n- b\n");
+    defer doc.deinit();
+    try testing.expectError(error.InvalidSyntax, doc.setLeadingComments(doc.root.?.items().?[1], "# c"));
+
+    // Unless it is first: then it shares the line of the collection it
+    // opens, and the block is the collection's, above that line.
+    var first = try Document.parse(testing.allocator, "- \n- b\n");
+    defer first.deinit();
+    try first.setLeadingComments(first.root.?.items().?[0], "# c");
+    const out = try first.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# c\n- \n- b\n", out);
+    var again = try Document.parse(testing.allocator, out);
+    defer again.deinit();
+    try testing.expectEqualStrings("# c", again.root.?.items().?[0].leadingComments(&again).?);
+}
+
+test "comment write: a multi-line key stays a key" {
+    // A modified key re-emitted through `emitContent` came out as a
+    // literal block (`|-` then its lines), which reads back as another
+    // mapping.
+    var doc = try Document.parse(testing.allocator, "\"a\\nb\": 1\nc: 2\n");
+    defer doc.deinit();
+    try doc.setLeadingComments(doc.root.?.pairs().?[0].key, "# k");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# k\n\"a\\nb\": 1\nc: 2\n", out);
+}
+
+test "comment reads and writes: a trailing comment on an empty value" {
+    // An empty value's span is a point borrowed from the next token, so
+    // `push: # c` read no comment although the write put it there; an
+    // empty item or document took the write and never emitted it.
+    {
+        var doc = try Document.parse(testing.allocator, "on:\n  push: # c\n  pull_request:\n");
+        defer doc.deinit();
+        try testing.expectEqualStrings("# c", doc.pathGet(&.{ "on", "push" }).?.trailingComment(&doc).?);
+        const pr = doc.pathGet(&.{ "on", "pull_request" }).?;
+        try doc.setTrailingComment(pr, "# new");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("on:\n  push: # c\n  pull_request: # new\n", out);
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        try testing.expectEqualStrings("# new", again.pathGet(&.{ "on", "pull_request" }).?.trailingComment(&again).?);
+    }
+    {
+        // An explicit key with no value: the comment follows the key.
+        var doc = try Document.parse(testing.allocator, "? a # c\n? b\n");
+        defer doc.deinit();
+        try testing.expectEqualStrings("# c", doc.root.?.pairs().?[0].value.trailingComment(&doc).?);
+    }
+    // No bytes to hang it on: refused.
+    {
+        var doc = try Document.parse(testing.allocator, "- \n- b\n");
+        defer doc.deinit();
+        try testing.expectError(error.InvalidSyntax, doc.setTrailingComment(doc.root.?.items().?[0], "# c"));
+    }
+    {
+        // After a block scalar key with no `:` is inside its content.
+        var doc = try Document.parse(testing.allocator, "? >\n  a\n? b\n");
+        defer doc.deinit();
+        try testing.expectError(error.InvalidSyntax, doc.setTrailingComment(doc.root.?.pairs().?[0].value, "# c"));
+    }
+    {
+        // Its `:` on a line of its own is the value's position.
+        var doc = try Document.parse(testing.allocator, "? >\n  a\n:\n");
+        defer doc.deinit();
+        try doc.setTrailingComment(doc.root.?.pairs().?[0].value, "# c");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("? >\n  a\n: # c\n", out);
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        try testing.expectEqualStrings("# c", again.root.?.pairs().?[0].value.trailingComment(&again).?);
+    }
+}
+
 test "comment write: a comment on a brand-new entry, the motivating case" {
     var doc = try Document.parse(testing.allocator, "name: api\n");
     defer doc.deinit();
@@ -2885,6 +3970,217 @@ test "comment round trip: every written comment survives write and re-parse" {
     try testing.expectEqualStrings("# doc head", again.pathGet(&.{"a"}).?.leadingComments(&again).?);
     const items = again.pathGet(&.{"b"}).?.items().?;
     try testing.expectEqualStrings("# tail of y", items[1].trailingComment(&again).?);
+}
+
+test "comment write then edit: the block stays where it reads back" {
+    // A written leading block followed by a structural edit near it: the
+    // comment sweep only ever wrote, so none of these was seen. Each
+    // result must parse, keep the tree, and put the block where the
+    // in-memory reads said it was.
+    const edit_mod = @import("edit.zig");
+    const Case = struct { in: []const u8, lead: []const u8, edit: edit_mod.Edit, out: []const u8 };
+    const cases = [_]Case{
+        // The first entry deleted: its block belongs to the container's
+        // line and stays above the new first entry. The block writer
+        // put that entry's indentation back on top of the successor's
+        // own, two levels deep: a different tree, or none.
+        .{ .in = "items:\n  - name: x\n  - name: y\n    port: 1\n", .lead = "$.items[0]", .edit = .{ .delete = "$.items[0]" }, .out = "items:\n  # new\n  - name: y\n    port: 1\n" },
+        .{ .in = "a:\n  b: 1\n  c:\n    d: 2\n", .lead = "$.a.b", .edit = .{ .delete = "$.a.b" }, .out = "a:\n  # new\n  c:\n    d: 2\n" },
+        .{ .in = "k:\n  - a\n  - b\n", .lead = "$.k[0]", .edit = .{ .delete = "$.k[0]" }, .out = "k:\n  # new\n  - b\n" },
+        .{ .in = "  a: 1\n  b: 2\n", .lead = "$", .edit = .{ .delete = "$.a" }, .out = "  # new\n  b: 2\n" },
+        .{ .in = "a:\n  b: 1\n  c: 2\n", .lead = "$.a.b", .edit = .{ .move = .{ .from = "$.a.b", .to = "$", .key = "z" } }, .out = "a:\n  # new\n  c: 2\nz: 1\n" },
+        // A later entry owns its line: deleted with it.
+        .{ .in = "a:\n  x: 1\n  y: 2\n  z: 3\n", .lead = "$.a.y", .edit = .{ .delete = "$.a.y" }, .out = "a:\n  x: 1\n  z: 3\n" },
+        // Emptied by the delete, the block value keeps its own line and
+        // its block above `{}`.
+        .{ .in = "a: 1\nv:\n  k: x\nb: 2\n", .lead = "$.v", .edit = .{ .delete = "$.v.k" }, .out = "a: 1\nv:\n  # new\n  {}\nb: 2\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(testing.allocator, c.in);
+        defer doc.deinit();
+        var ed = edit_mod.Editor.init(&doc);
+        try doc.setLeadingComments(try ed.one(c.lead), "# new");
+        try ed.apply(&.{c.edit});
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+}
+
+test "comment write after an edit: a block goes where the tree is now" {
+    const edit_mod = @import("edit.zig");
+    {
+        // An insert ahead of `x` gives it a line of its own again: its
+        // block goes above it, not above the new first item (which the
+        // source lines still said shared the sequence's line).
+        var doc = try Document.parse(testing.allocator, "a: 1\nb:\n  - x\n");
+        defer doc.deinit();
+        var ed = edit_mod.Editor.init(&doc);
+        try ed.apply(&.{.{ .insert = .{ .sequence = "$.b", .position = "$.b[0]", .value = try doc.createScalar("z", .plain), .before = true } }});
+        try doc.setLeadingComments(try ed.one("$.b[1]"), "# other");
+        try testing.expectEqualStrings("# other", (try ed.one("$.b[1]")).leadingComments(&doc).?);
+        try testing.expect((try ed.one("$.b[0]")).leadingComments(&doc) == null);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("a: 1\nb:\n  - z\n  # other\n  - x\n", out);
+    }
+    {
+        // A block on a new first item: the original item after it kept
+        // its indentation (it was written at column 0, and did not parse).
+        var doc = try Document.parse(testing.allocator, "a: 1\nb:\n  - x\n");
+        defer doc.deinit();
+        var ed = edit_mod.Editor.init(&doc);
+        try ed.apply(&.{.{ .insert = .{ .sequence = "$.b", .position = "$.b[0]", .value = try doc.createScalar("z", .plain), .before = true } }});
+        try doc.setLeadingComments(try ed.one("$.b[0]"), "# new");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("a: 1\nb:\n  # new\n  - z\n  - x\n", out);
+    }
+    {
+        // A block on a new item between two original ones, nested: the
+        // original after it keeps its indentation.
+        var doc = try Document.parse(testing.allocator, "k:\n  - a\n  - b\n");
+        defer doc.deinit();
+        var ed = edit_mod.Editor.init(&doc);
+        try ed.apply(&.{.{ .insert = .{ .sequence = "$.k", .position = "$.k[1]", .value = try doc.createScalar("z", .plain), .before = true } }});
+        try doc.setLeadingComments(try ed.one("$.k[1]"), "# new");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("k:\n  - a\n  # new\n  - z\n  - b\n", out);
+    }
+    {
+        // The in-memory reads follow the tree too: after the insert the
+        // block on the sequence's first line is the new item's to read.
+        var doc = try Document.parse(testing.allocator, "- a\n- b\n");
+        defer doc.deinit();
+        var ed = edit_mod.Editor.init(&doc);
+        try doc.setLeadingComments(try ed.one("$[0]"), "# new");
+        try ed.apply(&.{.{ .insert = .{ .sequence = "$", .position = "$[0]", .value = try doc.createScalar("z", .plain), .before = true } }});
+        try testing.expectEqualStrings("# new", (try ed.one("$[0]")).leadingComments(&doc).?);
+        try testing.expect((try ed.one("$[1]")).leadingComments(&doc) == null);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("# new\n- z\n- a\n- b\n", out);
+    }
+    {
+        // A block written on an entry that later becomes first is still
+        // its own, and still read.
+        var doc = try Document.parse(testing.allocator, "a:\n  x: 1\n  y: 2\n");
+        defer doc.deinit();
+        var ed = edit_mod.Editor.init(&doc);
+        try doc.setLeadingComments(try ed.one("$.a.y"), "# new");
+        try ed.delete("$.a.x");
+        try testing.expectEqualStrings("# new", (try ed.one("$.a.y")).leadingComments(&doc).?);
+        try testing.expectEqualStrings("# new", (try ed.one("$.a")).leadingComments(&doc).?);
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("a:\n  # new\n  y: 2\n", out);
+    }
+}
+
+test "comment write: nothing inside a new subtree is accepted and dropped" {
+    // The emitter lays a new subtree out afresh and writes no comments
+    // inside it; the write used to be accepted, read back in memory and
+    // silently lost.
+    const edit_mod = @import("edit.zig");
+    var doc = try Document.parse(testing.allocator, "a: 1\nb: 2\n");
+    defer doc.deinit();
+    var ed = edit_mod.Editor.init(&doc);
+    const m = try doc.createMapping();
+    try doc.mappingAppend(m, try doc.createScalar("x", .plain), try doc.createScalar("1", .plain));
+    try ed.set("$.c", m);
+    const x = try ed.one("$.c.x");
+    try testing.expectError(error.InvalidSyntax, doc.setLeadingComments(x, "# new"));
+    try testing.expectError(error.InvalidSyntax, doc.setTrailingComment(x, "# t"));
+    // So is one on the new block value itself: nothing writes a block
+    // between `c:` and its first line. The entry's line is its key's.
+    try testing.expectError(error.InvalidSyntax, doc.setLeadingComments(try ed.one("$.c"), "# new"));
+    const pairs = doc.root.?.pairs().?;
+    try doc.setLeadingComments(pairs[pairs.len - 1].key, "# new");
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a: 1\nb: 2\n# new\nc:\n  x: 1\n", out);
+}
+
+test "comment reads: a collection's trailing comment is its last entry's now" {
+    const edit_mod = @import("edit.zig");
+    var doc = try Document.parse(testing.allocator, "a:\n  x: 1\n  y: 2 # c\nb: 3\n");
+    defer doc.deinit();
+    var ed = edit_mod.Editor.init(&doc);
+    try testing.expectEqualStrings("# c", (try ed.one("$.a")).trailingComment(&doc).?);
+    try doc.setTrailingComment(try ed.one("$.a.x"), "# x");
+    try ed.delete("$.a.y");
+    try testing.expectEqualStrings("# x", (try ed.one("$.a")).trailingComment(&doc).?);
+    // `? key` with no value: the key reads what is written on its value.
+    var set = try Document.parse(testing.allocator, "? a\n? b\n");
+    defer set.deinit();
+    try set.setTrailingComment(set.root.?.pairs().?[0].value, "# t");
+    try testing.expectEqualStrings("# t", set.root.?.pairs().?[0].key.trailingComment(&set).?);
+}
+
+test "comment write: a value after a synthetic key reads its entry's line" {
+    // `: a` has no key bytes: the value is the entry's first byte, and
+    // for the first pair it shares the mapping's line. Written there, the
+    // block read back from nobody.
+    // Not first, the value holds its own line's block.
+    {
+        var doc = try Document.parse(testing.allocator, ": a\n: b\n");
+        defer doc.deinit();
+        try doc.setLeadingComments(doc.root.?.pairs().?[1].value, "# probe");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(": a\n# probe\n: b\n", out);
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        try testing.expectEqualStrings("# probe", again.root.?.pairs().?[1].value.leadingComments(&again).?);
+    }
+    for ([_][]const u8{ ": a\n: b\n", "- ? : x\n" }) |in| {
+        var doc = try Document.parse(testing.allocator, in);
+        defer doc.deinit();
+        var node = doc.root.?;
+        while (true) {
+            if (node.items()) |its| node = its[0] else if (node.pairs()) |ps| node = if (ps[0].key.pairs() != null) ps[0].key else ps[0].value else break;
+        }
+        try doc.setLeadingComments(node, "# probe");
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        var again = try Document.parse(testing.allocator, out);
+        defer again.deinit();
+        var back = again.root.?;
+        while (true) {
+            if (back.items()) |its| back = its[0] else if (back.pairs()) |ps| back = if (ps[0].key.pairs() != null) ps[0].key else ps[0].value else break;
+        }
+        try testing.expectEqualStrings("# probe", back.leadingComments(&again).?);
+    }
+}
+
+test "comment write: a root on the `---` line moves below its block" {
+    // It was written `--- \n    # new\n    {a: 1}`: a trailing blank
+    // after the marker and the root four columns in.
+    const parseAll = @import("yaml.zig").parseAll;
+    for ([_][2][]const u8{
+        .{ "--- {a: 1}\n", "---\n# new\n{a: 1}\n" },
+        .{ "--- !!map {a: 1}\n", "---\n# new\n!!map {a: 1}\n" },
+        .{ "x: 1\n--- [1, 2]\n", "x: 1\n---\n# new\n[1, 2]\n" },
+    }) |c| {
+        var docs = try parseAll(testing.allocator, c[0]);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(testing.allocator);
+        }
+        const doc = &docs.items[docs.items.len - 1];
+        try doc.setLeadingComments(doc.root.?, "# new");
+        const out = try writeAll(testing.allocator, docs.items);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(c[1], out);
+        var again = try parseAll(testing.allocator, out);
+        defer {
+            for (again.items) |*d| d.deinit();
+            again.deinit(testing.allocator);
+        }
+        const last = &again.items[again.items.len - 1];
+        try testing.expectEqualStrings("# new", last.root.?.leadingComments(last).?);
+    }
 }
 
 test "comment write in a CRLF document keeps the convention" {
@@ -3052,6 +4348,34 @@ test "merge keys: a source that itself merges is expanded first" {
     try testing.expectEqualStrings("2", use.lookup("u").?.scalarValue().?);
     const mid = doc.pathGet(&.{"mid"}).?;
     try testing.expectEqualStrings("0", mid.lookup("r").?.scalarValue().?);
+}
+
+test "merge keys: resolution is bounded in the nodes it copies" {
+    // Every `<<: *base` copies the base's pairs into its mapping, and
+    // resolution had no bound but depth: 72 KB of merges of a 1000-key
+    // base built a 2.4 GB arena over two minutes (each copied key was
+    // also checked against every key already there, quadratic per merge).
+    const allocator = testing.allocator;
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, "base: &b\n");
+    for (0..50) |i| try input.print(allocator, "  k{d}: v\n", .{i});
+    for (0..100) |i| try input.print(allocator, "m{d}: {{<<: *b, own: 1}}\n", .{i});
+
+    // 100 merges x 50 pairs x 2 nodes = 10,000 copies.
+    try testing.expectError(error.LimitExceeded, Document.parseOpts(allocator, input.items, null, .{ .resolve_merge_keys = true, .max_merge_nodes = 5_000 }));
+    var doc = try Document.parseOpts(allocator, input.items, null, .{ .resolve_merge_keys = true, .max_merge_nodes = 10_000 });
+    defer doc.deinit();
+    try testing.expectEqual(@as(usize, 51), doc.pathGet(&.{"m99"}).?.pairs().?.len);
+    try testing.expectEqual(@as(usize, 1 << 18), (ParseOptions{}).max_merge_nodes);
+
+    // A refused resolution leaves the document as it was.
+    var raw = try Document.parse(allocator, input.items);
+    defer raw.deinit();
+    try testing.expectError(error.LimitExceeded, raw.resolveMergeKeysLimited(5_000));
+    const out = try raw.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings(input.items, out);
 }
 
 test "merge keys: a quoted << is an ordinary key" {
@@ -3497,6 +4821,17 @@ test "sequenceInsert refuses an ancestor instead of building a cycle" {
     try std.testing.expectEqual(@as(usize, 1), re.pathGet(&.{"list"}).?.items().?.len);
 }
 
+test "a read path indexes a sequence only with plain decimal digits" {
+    // `std.fmt.parseInt(usize, seg, 10)` also takes `+1` and `1_0`, so
+    // `byPath(&.{"items", "1_0"})` answered item 10.
+    var doc = try Document.parse(testing.allocator, "items: [a, b, c]\n");
+    defer doc.deinit();
+    try testing.expectEqualStrings("b", doc.pathGet(&.{ "items", "1" }).?.scalarValue().?);
+    for ([_][]const u8{ "+1", "1_0", "-0", " 1", "" }) |seg| {
+        try testing.expect(doc.pathGet(&.{ "items", seg }) == null);
+    }
+}
+
 test "parseCoreInt and parseCoreFloat are the one shared scalar rule" {
     // `value` and `schema` both call these, so they cannot disagree about
     // which scalars are bigints or float specials.
@@ -3516,4 +4851,137 @@ test "rootlessDocument carries bytes with no node" {
     const out = try d.write(allocator);
     defer allocator.free(out);
     try std.testing.expectEqualStrings("# c\n", out);
+}
+
+/// Parse time of `input` in milliseconds, fastest of three, under a
+/// leak-checked allocator without per-allocation stack traces (which
+/// would dominate a timing).
+fn parseMillis(input: []const u8) !i96 {
+    var leak_check: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer testing.expect(leak_check.deinit() == .ok) catch @panic("leaked memory");
+    const allocator = leak_check.allocator();
+    var fastest: i96 = std.math.maxInt(i96);
+    for (0..3) |_| {
+        const start = std.Io.Timestamp.now(testing.io, .awake);
+        var doc = try Document.parse(allocator, input);
+        doc.deinit();
+        fastest = @min(fastest, std.Io.Timestamp.now(testing.io, .awake).nanoseconds - start.nanoseconds);
+    }
+    return @divTrunc(fastest, std.time.ns_per_ms);
+}
+
+test "parsing stays linear on shapes that were quadratic" {
+    const allocator = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    // Every open simple key had its span recounted in codepoints on every
+    // token once it passed 1024 bytes: nested flow collections of
+    // multibyte text took 15.7 s for these 10 KB in Debug (70 ms now).
+    try buf.append(allocator, '[');
+    for (0..4) |b| {
+        if (b > 0) try buf.append(allocator, ',');
+        try buf.appendNTimes(allocator, '[', 190);
+        for (0..520) |i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "\u{4E2D}");
+        }
+        try buf.appendNTimes(allocator, ']', 190);
+    }
+    try buf.append(allocator, ']');
+    try testing.expect(try parseMillis(buf.items) < 1000);
+
+    // Each collection value searched its mapping's pairs from the front
+    // for itself: a mapping of mappings, the commonest shape there is,
+    // was quadratic. Judged by growth, which does not depend on the
+    // machine: four times the entries took about 16 times as long, and
+    // take about 4 times as long now.
+    buf.clearRetainingCapacity();
+    for (0..10_000) |i| try buf.print(allocator, "k{d}:\n  x: 1\n", .{i});
+    const small = @max(1, try parseMillis(buf.items));
+    for (10_000..40_000) |i| try buf.print(allocator, "k{d}:\n  x: 1\n", .{i});
+    const large = try parseMillis(buf.items);
+    try testing.expect(large < small * 8);
+
+    // `%TAG` handles were found by a linear search, for the duplicate
+    // check and for every tag: 16,000 of each took 5.5 s in Debug under
+    // the test allocator, and take 0.3 s.
+    buf.clearRetainingCapacity();
+    for (0..16_000) |i| try buf.print(allocator, "%TAG !t{d}! tag:e.com,2000:{d}:\n", .{ i, i });
+    try buf.appendSlice(allocator, "---\n");
+    for (0..16_000) |i| try buf.print(allocator, "- !t{d}!x 1\n", .{i});
+    try testing.expect(try parseMillis(buf.items) < 2000);
+}
+
+test "a truncated input's discarded bytes stay discarded" {
+    const allocator = testing.allocator;
+    // `.truncate` cut the scanner's input at the NUL, but the documents
+    // kept the whole input as their source, so a write emitted the NUL and
+    // everything after it -- bytes no validation had seen, and output a
+    // default parse refuses.
+    const input = "a: 1\n\x00b: 2\n";
+    var doc = try Document.parseOpts(allocator, input, null, .{ .embedded_nul = .truncate });
+    defer doc.deinit();
+    try doc.pathSet(&.{"a"}, try doc.createScalar("9", .plain));
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("a: 9\n", out);
+
+    var docs = try Document.parseAllOpts(allocator, input, null, .{ .embedded_nul = .truncate });
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(allocator);
+    }
+    const all = try writeAll(allocator, docs.items);
+    defer allocator.free(all);
+    try testing.expectEqualStrings("a: 1\n", all);
+}
+
+test "every parse failure leaves a positioned diagnostic" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { in: []const u8, merge: bool = false, err: anyerror, line: usize }{
+        .{ .in = "a: 1\nb: *nope\n", .err = error.UnknownAlias, .line = 2 },
+        .{ .in = "a: 1\nb:\n  <<: 1\n", .merge = true, .err = error.InvalidMergeKey, .line = 3 },
+        .{ .in = "a: 1\nb:\n  <<: [1]\n", .merge = true, .err = error.InvalidMergeKey, .line = 3 },
+        .{ .in = "a: 1\nb: &b\n  <<: *b\n", .merge = true, .err = error.MergeKeyRecursive, .line = 2 },
+        // Invalid UTF-8 was always reported at 1:1.
+        .{ .in = "a: 1\nb: 2\nc: \xff\n", .err = error.InvalidUtf8, .line = 3 },
+    };
+    for (cases) |c| {
+        var d: diag.Diag = .{ .allocator = allocator };
+        defer d.deinit();
+        try testing.expectError(c.err, Document.parseOpts(allocator, c.in, &d, .{ .resolve_merge_keys = c.merge }));
+        errdefer std.debug.print("{s}: {any}\n", .{ c.in, d.list.items });
+        try testing.expectEqual(@as(usize, 1), d.list.items.len);
+        try testing.expectEqual(c.line, d.list.items[0].mark.line);
+    }
+}
+
+test "parse refuses a first document that does not end" {
+    const allocator = testing.allocator;
+    // `parse` stopped at the first document's end event, so a stream that
+    // could not even start another document came back as if whole: the
+    // trailing content was dropped without a word.
+    for ([_][]const u8{ "[1, 2] garbage\n", "\"a\"\nb: 1\n", "!a !b x\n", "&a *b\n" }) |in| {
+        var doc = Document.parse(allocator, in) catch continue;
+        doc.deinit();
+        std.debug.print("accepted {s}\n", .{in});
+        return error.TestUnexpectedResult;
+    }
+    // A malformed LATER document still does not fail a single-document
+    // parse.
+    for ([_][]const u8{ "a: 1\n---\n[unclosed\n", "a: 1\n...\n@b\n", "a: 1\n...\n\"unterminated\n" }) |in| {
+        var doc = try Document.parse(allocator, in);
+        defer doc.deinit();
+        try testing.expectEqualStrings("1", doc.pathGet(&.{"a"}).?.scalarValue().?);
+    }
+}
+
+test "a tag escape that decodes to invalid UTF-8 is refused" {
+    // `!e!%ff` names no tag; libfyaml refuses it, and yayl kept the byte,
+    // which no writer could spell back.
+    try testing.expectError(error.InvalidSyntax, Document.parse(testing.allocator, "%TAG !e! tag:e.com:\n--- !e!%ff x\n"));
+    var ok = try Document.parse(testing.allocator, "%TAG !e! tag:e.com:\n--- !e!%C3%A9 x\n");
+    defer ok.deinit();
+    try testing.expectEqualStrings("tag:e.com:\u{00E9}", ok.root.?.tag.?);
 }

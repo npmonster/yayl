@@ -5,10 +5,16 @@
 //! every failure prints the seed and iteration index, and rerunning the
 //! same seed reproduces the same byte sequence exactly.
 //!
-//! Zig 0.16.0's std has no `std.testing.fuzz` entry point (verified
-//! against the installed toolchain), so this is the documented
-//! fallback from the card contract: a seeded PRNG mutating a seed
-//! corpus, with the contract
+//! A seeded PRNG mutating a seed corpus: deterministic, and reproducible
+//! from its seed. It runs as a bounded smoke in `zig build test` and at
+//! length in `zig build fuzz`. Zig 0.16.0 does have `std.testing.fuzz`,
+//! but its coverage-guided mode does not build on that toolchain: the
+//! test runner's own fuzz path passes a `*builtin.StackTrace` to
+//! `std.debug.writeStackTrace`, which takes a `*debug.StackTrace`, so
+//! `zig build test --fuzz` fails to compile whichever test calls it.
+//! When a toolchain builds it, `fuzzOnce` is the function to hand it.
+//! (An earlier note here said the entry point did not exist.) The
+//! contract:
 //!
 //!   1. `parseAll` returns a parsed document list or a typed error —
 //!      never a crash, hang, or leak (the leak-checking test allocator
@@ -151,12 +157,11 @@ fn fuzzOnce(allocator: std.mem.Allocator, input: []const u8) !void {
     // document MUST resolve back, so a failure is a real addressing
     // defect and not a miss.
     //
-    // Bounded to small inputs. Each re-parses and deep-clones the tree
-    // several times (an edit clones the whole root), and the corpus
-    // seeds run to 64 KiB, which put one iteration into the hundreds of
-    // milliseconds. Every defect these have found lived in a document
-    // under a hundred bytes; the large seeds still get the parse, emit,
-    // value and schema coverage above.
+    // Bounded to small inputs. Each re-parses and re-writes the
+    // document several times, and the corpus seeds run to 64 KiB. Every
+    // defect these have found lived in a document under a hundred bytes;
+    // the large seeds still get the parse, emit, value and schema
+    // coverage above.
     if (docs.items.len > 0 and input.len <= 2048) try fuzzPaths(allocator, input);
 }
 
@@ -524,14 +529,12 @@ fn fuzzEdit(allocator: std.mem.Allocator, doc: *yaml.Document) !void {
     }
 
     // A mutating batch, then prove the document still round-trips.
-    // `apply` clones the root, so a deep or cyclic tree drives the
-    // clone walk too.
     const scalar = doc.createScalar("fuzz", .plain) catch |err| {
         try expectTypedError(err);
         return;
     };
-    // `set` routes through `apply`, which deep-clones the root, so a
-    // deep or cyclic tree drives the clone walk as well as the edit.
+    // `set` routes through `apply`, so a failure here also drives the
+    // undo journal's rollback.
     ed.set("$.fuzzed", scalar) catch |err| {
         try expectTypedError(err);
         return;
@@ -569,32 +572,25 @@ fn writeAllDocs(allocator: std.mem.Allocator, docs: []const yaml.Document) ![]u8
     };
 }
 
-/// The declared error vocabulary plus OOM. Anything else escaping the
-/// scanner/parser/emitter is a bug dressed up as an error.
-fn expectTypedError(err: anyerror) !void {
-    const known = [_][]const u8{
-        // parse / emit
-        "InvalidSyntax",      "InvalidUtf8",
-        "InvalidEscape",      "InvalidIndentation",
-        "UnknownAlias",       "UnsupportedVersion",
-        "Unterminated",       "NestingTooDeep",
-        "InputTooLarge",      "AliasCycle",
-        "InvalidCodepoint",   "OutOfMemory",
-        // value / schema
-        "TypeMismatch",       "UnsupportedType",
-        "LimitExceeded",
-        // edit
-             "InvalidPath",
-        "UnknownPath",        "NotACollection",
-        "NotASequence",       "NotAMapping",
-        "AmbiguousOperation", "MoveIntoSubtree",
-        "WouldCycle",         "AnchorReferenced",
-    };
-    const name = @errorName(err);
-    for (known) |k| {
-        if (std.mem.eql(u8, k, name)) return;
+/// The library's declared error vocabulary: parse, emit and document
+/// (`YamlError`), value, schema and edit. Anything else escaping the
+/// scanner/parser/emitter is a bug dressed up as an error. Derived from
+/// the error sets themselves, so a new error cannot be missing here: the
+/// hand-kept list this replaced lacked `AliasPath`, and would have
+/// reported the edit API's correct refusal of a write through an alias
+/// as a harness failure.
+const Declared = yaml.YamlError || yaml.value.Error || yaml.schema.Error || yaml.edit.Error;
+
+fn isDeclared(err: anyerror) bool {
+    inline for (@typeInfo(Declared).error_set.?) |e| {
+        if (std.mem.eql(u8, e.name, @errorName(err))) return true;
     }
-    std.debug.print("fuzz: untyped error escaped: {s}\n", .{name});
+    return false;
+}
+
+fn expectTypedError(err: anyerror) !void {
+    if (isDeclared(err)) return;
+    std.debug.print("fuzz: untyped error escaped: {s}\n", .{@errorName(err)});
     return error.FuzzUntypedError;
 }
 
@@ -716,6 +712,14 @@ fn appendDirSeeds(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8
         const data = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 << 10));
         try seeds.append(allocator, data);
     }
+}
+
+test "the harness accepts the library's declared errors and nothing else" {
+    try std.testing.expect(isDeclared(error.AliasPath));
+    try std.testing.expect(isDeclared(error.TypeMismatch));
+    try std.testing.expect(isDeclared(error.InvalidSyntax));
+    try std.testing.expect(isDeclared(error.LimitExceeded));
+    try std.testing.expect(!isDeclared(error.EndOfStream));
 }
 
 test {

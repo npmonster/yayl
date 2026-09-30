@@ -48,15 +48,27 @@ fn lineOf(src: []const u8, off: usize) usize {
     return n;
 }
 
+/// The lines of `s`, compared without a leading byte order mark: the
+/// emitter keeps it at the start of the output, so deleting the first
+/// entry moves it onto the next line, which is no change to that line.
+/// `keepsBom` checks the mark itself survives.
 fn splitLines(allocator: std.mem.Allocator, s: []const u8) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer out.deinit(allocator);
-    var it = std.mem.splitScalar(u8, s, '\n');
+    const body = if (std.mem.startsWith(u8, s, bom)) s[bom.len..] else s;
+    var it = std.mem.splitScalar(u8, body, '\n');
     while (it.next()) |line| try out.append(allocator, line);
     // A trailing newline produces one empty final element; drop it so
     // both sides compare on content lines only.
     if (out.items.len > 0 and out.items[out.items.len - 1].len == 0) _ = out.pop();
     return try out.toOwnedSlice(allocator);
+}
+
+const bom = "\xEF\xBB\xBF";
+
+/// An edit keeps the byte order mark the input opened with.
+fn keepsBom(input: []const u8, out: []const u8) bool {
+    return !std.mem.startsWith(u8, input, bom) or std.mem.startsWith(u8, out, bom);
 }
 
 /// `input` with every occurrence of `byte` replaced by `with` — the
@@ -194,14 +206,8 @@ const Target = struct {
     /// Moving this subtree cannot be asserted independently: it is an
     /// alias, contains an alias that could become a forward reference,
     /// carries an anchor whose references depend on its source
-    /// position, or sits under a container whose leading bytes are
-    /// anchor/tag properties the edited walk does not re-emit.
+    /// position.
     move_unsafe: bool,
-    /// Some ancestor container (or the parent itself) opens its span
-    /// with anchor/tag property lines. An edit marks that container
-    /// modified, and the edited walk re-orders the property bytes
-    /// behind the entries — counted, never swept.
-    props_preamble: bool,
     /// The entry was written with an explicit key indicator (`? key`).
     /// Edits re-emit it as a two-line entry, so line-shape assertions do
     /// not apply; the WEAK invariants do (valid YAML, semantic value tree,
@@ -231,8 +237,6 @@ const Container = struct {
     is_mapping: bool,
     is_flow: bool,
     non_empty: bool,
-    /// See `Target.props_preamble`.
-    props_preamble: bool,
     /// The container's own bytes carry a hard tab.
     tab_span: bool,
     /// See `Target.unsupported`.
@@ -375,66 +379,10 @@ fn addContainer(
     try found.containers.append(allocator, c);
 }
 
-/// True when a block container's span opens with bytes that are neither
-/// entry framing nor blank: anchor and tag properties written on their
-/// own lines before the first entry (`&sequence\n- a`). The same
-/// hazard arises when the property bytes sit in the gap BETWEEN the
-/// owning key and the container (`sequence: !!seq\n- entry`) or before
-/// the root's span (`--- &anchor\n- a`) — `gap` checks those bytes.
-fn containerPropsPreamble(node: *const yaml.Node, src: []const u8) bool {
-    const cs = node.src orelse return false;
-    if (cs.synthetic or cs.start >= cs.entry_start) return false;
-    return gapHasProps(src, cs.start, cs.entry_start);
-}
-
-/// True when `src[from..to]` contains an anchor or tag indicator (`&`
-/// or `!`) among otherwise blank/framing bytes.
-fn gapHasProps(src: []const u8, from: usize, to: usize) bool {
-    if (to <= from) return false;
-    for (src[from..to]) |ch| switch (ch) {
-        ' ', '\t', '\n', '\r', '-', ':' => {},
-        '&', '!' => return true,
-        else => {},
-    };
-    return false;
-}
-
 /// True when the span [from, to) carries a hard tab.
 fn spanHasTab(src: []const u8, from: usize, to: usize) bool {
     if (to <= from or to > src.len or from > src.len) return false;
     return std.mem.indexOfScalar(u8, src[from..to], '\t') != null;
-}
-
-/// True when a container's own header — the bytes between its entry
-/// start and its first entry's start — carries an anchor or tag
-/// (`!!seq` on its own line before `- entry`). The edited walk treats
-/// those bytes as inter-entry gap, so a re-emitted first slot lands
-/// ahead of them and reorders the container: counted, never swept.
-fn containerHeaderProps(node: *const yaml.Node, src: []const u8) bool {
-    const cs = node.src orelse return false;
-    if (cs.synthetic) return false;
-    var first_entry: usize = cs.end;
-    switch (node.data) {
-        .mapping => |m| for (m.pairs.items) |p| {
-            if (p.key.src) |s| {
-                if (!s.synthetic) {
-                    first_entry = s.entry_start;
-                    break;
-                }
-            }
-        },
-        .sequence => |sq| for (sq.items.items) |it| {
-            if (it.src) |s| {
-                if (!s.synthetic) {
-                    first_entry = s.entry_start;
-                    break;
-                }
-            }
-        },
-        else => {},
-    }
-    return cs.entry_start < first_entry and first_entry <= src.len and
-        gapHasProps(src, cs.entry_start, first_entry);
 }
 
 /// True when the bytes between a key's entry start and its text are an
@@ -459,22 +407,14 @@ fn walkTargets(
     comps: *std.ArrayList(Comp),
     found: *Found,
     depth: usize,
-    preamble: bool,
-    preamble_unsupported: bool,
+    inherited_unsupported: bool,
 ) !void {
     if (depth > 24) return;
-    // An edit below this container marks it modified; if its span
-    // opens with property bytes — in its own header, in the gap its
-    // owning key left, or, at the root, before the root's span — every
-    // position inside inherits the re-ordering hazard.
-    const unsafe = preamble or containerPropsPreamble(node, input) or
-        containerHeaderProps(node, input) or
-        (depth == 0 and node.src != null and gapHasProps(input, 0, node.src.?.start));
     // A mapping whose KEYS use constructs the edit path does not model
     // (tagged, anchored, aliased, empty or multi-line keys) makes every
     // position inside it unsupported, this container's own adds
     // included.
-    var unsupported = preamble_unsupported;
+    var unsupported = inherited_unsupported;
     switch (node.data) {
         .mapping => |m| for (m.pairs.items) |p| {
             const kt = p.key.scalarValue() orelse {
@@ -497,7 +437,6 @@ fn walkTargets(
                 .is_mapping = true,
                 .is_flow = m.style == .flow,
                 .non_empty = m.pairs.items.len > 0,
-                .props_preamble = unsafe,
                 .tab_span = if (node.src) |cs| spanHasTab(input, cs.start, cs.end) else false,
                 .unsupported = unsupported,
             });
@@ -521,7 +460,7 @@ fn walkTargets(
                     // unaddressable; children are still validated.
                     allocator.free(path);
                     found.unaddressable += 1;
-                    try walkTargets(allocator, ed, input, referenced, pair.value, comps, found, depth + 1, unsafe, unsupported);
+                    try walkTargets(allocator, ed, input, referenced, pair.value, comps, found, depth + 1, unsupported);
                     continue;
                 }
                 const line = if (pair.key.src) |s| blk: {
@@ -540,8 +479,6 @@ fn walkTargets(
                     .anchored_referenced = subtreeDefinesReferencedAnchor(pair.value, referenced, 0),
                     .move_unsafe = subtreeContainsAlias(pair.value, 0) or
                         subtreeDefinesReferencedAnchor(pair.value, referenced, 0),
-                    .props_preamble = unsafe or
-                        (ks != null and vs != null and gapHasProps(input, ks.?.end, vs.?.entry_start)),
                     .explicit_key = ks != null and !ks.?.synthetic and
                         explicitKeyBytes(input, ks.?.entry_start, ks.?.start),
                     .in_flow = m.style == .flow,
@@ -549,7 +486,7 @@ fn walkTargets(
                     .unsupported = unsupported,
                     .key_text = try allocator.dupe(u8, key_text),
                 });
-                try walkTargets(allocator, ed, input, referenced, pair.value, comps, found, depth + 1, unsafe, unsupported);
+                try walkTargets(allocator, ed, input, referenced, pair.value, comps, found, depth + 1, unsupported);
             }
         },
         .sequence => |s| {
@@ -558,7 +495,6 @@ fn walkTargets(
                 .is_mapping = false,
                 .is_flow = s.style == .flow,
                 .non_empty = s.items.items.len > 0,
-                .props_preamble = unsafe,
                 .tab_span = if (node.src) |cs| spanHasTab(input, cs.start, cs.end) else false,
                 .unsupported = unsupported,
             });
@@ -570,7 +506,7 @@ fn walkTargets(
                 if (resolved == null or resolved.? != item) {
                     allocator.free(path);
                     found.unaddressable += 1;
-                    try walkTargets(allocator, ed, input, referenced, item, comps, found, depth + 1, unsafe, unsupported);
+                    try walkTargets(allocator, ed, input, referenced, item, comps, found, depth + 1, unsupported);
                     continue;
                 }
                 // A synthetic span borrows the next token's offsets, so
@@ -590,14 +526,13 @@ fn walkTargets(
                     .anchored_referenced = subtreeDefinesReferencedAnchor(item, referenced, 0),
                     .move_unsafe = subtreeContainsAlias(item, 0) or
                         subtreeDefinesReferencedAnchor(item, referenced, 0),
-                    .props_preamble = unsafe,
                     .explicit_key = false,
                     .in_flow = s.style == .flow,
                     .tab_span = if (item.src) |sp| spanHasTab(input, sp.entry_start, sp.end) else false,
                     .unsupported = unsupported or item.anchor != null or item.tag != null,
                     .key_text = "",
                 });
-                try walkTargets(allocator, ed, input, referenced, item, comps, found, depth + 1, unsafe, unsupported);
+                try walkTargets(allocator, ed, input, referenced, item, comps, found, depth + 1, unsupported);
             }
         },
         .scalar, .alias => {},
@@ -651,12 +586,10 @@ const Stats = struct {
     skipped_move_dest: usize = 0,
     skipped_no_root: usize = 0,
     skipped_roundtrip_unstable: usize = 0,
-    skipped_props_preamble: usize = 0,
     weak_explicit_key: usize = 0,
     skipped_tab_span: usize = 0,
     skipped_unsupported: usize = 0,
     skipped_no_final_newline: usize = 0,
-    skipped_bom: usize = 0,
     capped_targets: usize = 0,
     capped_containers: usize = 0,
     unaddressable: usize = 0,
@@ -891,8 +824,8 @@ fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats)
         },
     );
     std.debug.print(
-        "  skipped: {d} sole-child, {d} dangling anchor, {d} multi-line, {d} alias, {d} flow, {d} empty, {d} same non-scalar, {d} tab-span, {d} unsupported constructs, {d} no-final-newline, {d} bom\n" ++
-            "  skipped: {d} unaddressable paths, {d} round-trip-unstable, {d} property-preamble, {d} move/insert related, {d} unusable destinations; capped: {d} targets, {d} containers\n",
+        "  skipped: {d} sole-child, {d} dangling anchor, {d} multi-line, {d} alias, {d} flow, {d} empty, {d} same non-scalar, {d} tab-span, {d} unsupported constructs, {d} no-final-newline\n" ++
+            "  skipped: {d} unaddressable paths, {d} round-trip-unstable, {d} move/insert related, {d} unusable destinations; capped: {d} targets, {d} containers\n",
         .{
             stats.skipped_sole_child,
             stats.skipped_dangling_anchor,
@@ -904,10 +837,8 @@ fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats)
             stats.skipped_tab_span,
             stats.skipped_unsupported,
             stats.skipped_no_final_newline,
-            stats.skipped_bom,
             stats.unaddressable,
             stats.skipped_roundtrip_unstable,
-            stats.skipped_props_preamble,
             stats.skipped_move_related,
             stats.skipped_move_dest,
             stats.capped_targets,
@@ -964,14 +895,6 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             stats.skipped_roundtrip_unstable += 1;
             return;
         }
-        // A byte-order mark keeps the document's untouched bytes exact
-        // (the round-trip gate and the BOM unit test prove it), but the
-        // edited walk still misaligns its slots around the prefix.
-        // Counted, never swept.
-        if (std.mem.startsWith(u8, input, "\xEF\xBB\xBF")) {
-            stats.skipped_bom += 1;
-            return;
-        }
         stats.documents += 1;
         var referenced: std.StringHashMap(void) = .init(allocator);
         defer {
@@ -983,7 +906,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
         var ed = yaml.edit.Editor.init(&gen);
         var comps: std.ArrayList(Comp) = .empty;
         defer comps.deinit(allocator);
-        try walkTargets(allocator, &ed, input, &referenced, root, &comps, &found, 0, false, false);
+        try walkTargets(allocator, &ed, input, &referenced, root, &comps, &found, 0, false);
     }
     stats.unaddressable += found.unaddressable;
     var capped_targets: usize = 0;
@@ -1001,10 +924,6 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
     // DELETE sweep: input minus one contiguous run that contains the
     // deleted entry.
     for (targets) |t| {
-        if (t.props_preamble) {
-            stats.skipped_props_preamble += 1;
-            continue;
-        }
         if (t.unsupported) {
             stats.skipped_unsupported += 1;
             continue;
@@ -1095,6 +1014,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
         const out = try doc.write(allocator);
         defer allocator.free(out);
         const out_lines = try splitLines(allocator, out);
+        if (!keepsBom(input, out)) failures.add("{s}: an edit dropped the byte order mark", .{name});
         defer allocator.free(out_lines);
         // Whatever the shape, the result must still be YAML and must no
         // longer resolve the deleted path.
@@ -1151,10 +1071,6 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
     // SET sweep: exactly the target's line changes; the output
     // re-parses with the new value at the same path.
     for (targets) |t| {
-        if (t.props_preamble) {
-            stats.skipped_props_preamble += 1;
-            continue;
-        }
         if (t.anchored_referenced) {
             // Replacing an anchored node drops the anchor and leaves
             // every alias to it dangling — no valid edit exists, so
@@ -1257,6 +1173,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
         const out = try doc.write(allocator);
         defer allocator.free(out);
         const out_lines = try splitLines(allocator, out);
+        if (!keepsBom(input, out)) failures.add("{s}: an edit dropped the byte order mark", .{name});
         defer allocator.free(out_lines);
         const idx = oneLineChanged(orig_lines, out_lines) orelse {
             failures.add("{s}: set {s}: more than one line changed", .{ name, t.path });
@@ -1331,10 +1248,6 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             stats.skipped_empty += @intFromBool(!c.non_empty);
             continue;
         }
-        if (c.props_preamble) {
-            stats.skipped_props_preamble += 1;
-            continue;
-        }
         if (c.tab_span) {
             stats.skipped_tab_span += 1;
             continue;
@@ -1362,6 +1275,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             const out = try doc.write(allocator);
             defer allocator.free(out);
             const out_lines = try splitLines(allocator, out);
+            if (!keepsBom(input, out)) failures.add("{s}: an edit dropped the byte order mark", .{name});
             defer allocator.free(out_lines);
             const at = pureInsertion(orig_lines, out_lines) orelse {
                 failures.add("{s}: map add under {s}: not a pure line insertion", .{ name, c.path });
@@ -1423,6 +1337,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             const out = try doc.write(allocator);
             defer allocator.free(out);
             const out_lines = try splitLines(allocator, out);
+            if (!keepsBom(input, out)) failures.add("{s}: an edit dropped the byte order mark", .{name});
             defer allocator.free(out_lines);
             if (pureInsertion(orig_lines, out_lines) == null) {
                 failures.add("{s}: seq append to {s}: not a pure line insertion", .{ name, c.path });
@@ -1437,10 +1352,6 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
     // sweep the re-parsed output must equal the edited document, with
     // the new item resolvable at the exact position it was given.
     for (targets) |t| {
-        if (t.props_preamble) {
-            stats.skipped_props_preamble += 1;
-            continue;
-        }
         if (t.tab_span) {
             stats.skipped_tab_span += 1;
             continue;
@@ -1485,6 +1396,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
         const out = try doc.write(allocator);
         defer allocator.free(out);
         const out_lines = try splitLines(allocator, out);
+        if (!keepsBom(input, out)) failures.add("{s}: an edit dropped the byte order mark", .{name});
         defer allocator.free(out_lines);
         const at = pureInsertionReframed(orig_lines, out_lines) orelse {
             failures.add("{s}: insert before {s}: not a pure line insertion", .{ name, t.path });
@@ -1542,10 +1454,6 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
                 }
                 if (pathRelated(c.path, t.path)) {
                     stats.skipped_move_related += 1;
-                    continue;
-                }
-                if (t.props_preamble or c.props_preamble) {
-                    stats.skipped_props_preamble += 1;
                     continue;
                 }
                 if (t.tab_span or c.tab_span) {
@@ -2096,7 +2004,7 @@ test "preservation sweep: every edit position in every single-document fixture" 
     try std.testing.expect(stats.same_sets > 0);
     try std.testing.expect(stats.inserts > 0);
     try std.testing.expect(stats.moves > 0);
-    try std.testing.expectEqual(names.items.len, stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable + stats.skipped_bom);
+    try std.testing.expectEqual(names.items.len, stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable);
     if (failures.list.items.len > 0) {
         for (failures.list.items) |f| std.debug.print("  PRESERVATION-FAIL {s}\n", .{f});
         return error.TestUnexpectedResult;
@@ -2266,6 +2174,91 @@ test "flow-sequence replacements preserve exact slots and surrounding bytes" {
     }
 }
 
+test "preservation sweep: a root on its `---` line keeps the marker through every scalar edit" {
+    // A root that starts on its own `---` line (`--- {a: 1}`, the usual
+    // shape of a flow root or minified JSON) lost the marker's last dash
+    // and the blank on ANY edit under it: `markup.entryStart` took that
+    // dash for a `- ` indicator, and the document was written back as
+    // `--{a: 2}`, a mapping keyed `--{a`. The fixture sweep skips every
+    // target inside a flow collection (flow collections reflow by
+    // design), which is where this class lives, so it is swept here with
+    // the strongest assertion there is: setting any scalar changes
+    // exactly that scalar's bytes, in every document of the stream.
+    const allocator = std.testing.allocator;
+    const streams = [_][]const u8{
+        "--- {a: 1, b: [x, 'y'], c: {d: \"e\"}}\n",
+        "--- [1, {k: v}, [2, 3]]\n",
+        "--- !!map {a: 1, b: 2}\n",
+        "--- &r {a: 1, b: 2}\n",
+        "--- !!seq [x, y]\n",
+        "--- {a: 1} # trailing\n",
+        "# head\n--- {a: 1, b: 2}\n...\n",
+        "%YAML 1.2\n--- {a: 1}\n",
+        "--- {a: 1,\n  b: 2}\n",
+        "--- {a: 1}\r\n",
+        "\xEF\xBB\xBF--- {a: 1}\n",
+        "---\t{a: 1}\n",
+        "--- foo\n",
+        "--- 'quoted' # c\n",
+        "--- |\n  text\n",
+        "--- {a: 1}\n--- [x, y]\n--- z\n",
+        "a: 1\n--- {b: 2}\n",
+    };
+    var swept: usize = 0;
+    for (streams) |input| {
+        // Every scalar of every document, with its path and its bytes.
+        var docs = try yaml.parseAll(allocator, input);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        for (docs.items, 0..) |*doc, di| {
+            const root = doc.root orelse continue;
+            var ed = yaml.edit.Editor.init(doc);
+            var referenced = std.StringHashMap(void).init(allocator);
+            defer referenced.deinit();
+            var comps: std.ArrayList(Comp) = .empty;
+            defer comps.deinit(allocator);
+            var found: Found = .{};
+            defer found.deinit(allocator);
+            try walkTargets(allocator, &ed, input, &referenced, root, &comps, &found, 0, false);
+
+            var paths: std.ArrayList([]const u8) = .empty;
+            defer paths.deinit(allocator);
+            try paths.append(allocator, "$");
+            for (found.targets.items) |t| try paths.append(allocator, t.path);
+            for (paths.items) |path| {
+                const node = try ed.one(path);
+                if (node.kind() != .scalar) continue;
+                const span = node.src.?;
+
+                var edited = try yaml.parseAll(allocator, input);
+                defer {
+                    for (edited.items) |*d| d.deinit();
+                    edited.deinit(allocator);
+                }
+                var eed = yaml.edit.Editor.init(&edited.items[di]);
+                try eed.set(path, try edited.items[di].createScalar("SENTINEL", .plain));
+                const out = try yaml.writeAll(allocator, edited.items);
+                defer allocator.free(out);
+
+                const want = try std.mem.concat(allocator, u8, &.{ input[0..span.start], "SENTINEL", input[span.end..] });
+                defer allocator.free(want);
+                if (!std.mem.eql(u8, want, out)) {
+                    std.debug.print("  PRESERVATION-FAIL \"{f}\" doc {d} set {s}:\n    want \"{f}\"\n    got  \"{f}\"\n", .{
+                        std.zig.fmtString(input), di, path, std.zig.fmtString(want), std.zig.fmtString(out),
+                    });
+                    return error.TestUnexpectedResult;
+                }
+                swept += 1;
+            }
+        }
+    }
+    // Every scalar value above: 4 + 4 + 2 + 2 + 2 + 1 + 2 + 1 + 2 + 1 +
+    // 1 + 1 + 1 + 1 + 1 + (1 + 2 + 1) + (1 + 1).
+    try std.testing.expectEqual(@as(usize, 32), swept);
+}
+
 test "preservation sweep: bounded edits over every valid corpus document" {
     // Leak-checking allocator WITHOUT per-allocation stack traces (see
     // the fixture sweep above for the cost arithmetic).
@@ -2320,7 +2313,7 @@ test "preservation sweep: bounded edits over every valid corpus document" {
 
     // Every valid document accounted for: edited, root-less, or one of
     // the documented round-trip-unstable shapes.
-    try std.testing.expectEqual(@as(usize, 296), stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable + stats.skipped_bom);
+    try std.testing.expectEqual(@as(usize, 296), stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable);
     // The bounded sweep must still exercise every operation kind.
     try std.testing.expect(stats.deletes > 0);
     try std.testing.expect(stats.sets > 0);
@@ -2390,8 +2383,8 @@ test "preservation sweep: CRLF, BOM and no-final-newline fixture variants" {
         // Three variants derived in memory — no new fixture files.
         const crlf = try replaceByte(allocator, input, '\n', "\r\n");
         defer allocator.free(crlf);
-        const bom = try std.fmt.allocPrint(allocator, "\xEF\xBB\xBF{s}", .{input});
-        defer allocator.free(bom);
+        const with_bom = try std.fmt.allocPrint(allocator, bom ++ "{s}", .{input});
+        defer allocator.free(with_bom);
         const nofinal = if (std.mem.endsWith(u8, input, "\n"))
             try allocator.dupe(u8, input[0 .. input.len - 1])
         else
@@ -2399,7 +2392,7 @@ test "preservation sweep: CRLF, BOM and no-final-newline fixture variants" {
         defer allocator.free(nofinal);
         const variants = [_]struct { label: []const u8, bytes: []const u8 }{
             .{ .label = "crlf", .bytes = crlf },
-            .{ .label = "bom", .bytes = bom },
+            .{ .label = "bom", .bytes = with_bom },
             .{ .label = "no-final-newline", .bytes = nofinal },
         };
         for (variants) |v| {
@@ -2415,7 +2408,7 @@ test "preservation sweep: CRLF, BOM and no-final-newline fixture variants" {
     // the bounded sweeps still exercised the no-op, insert and move
     // paths.
     try std.testing.expectEqual(names.items.len * 3, attempted);
-    try std.testing.expectEqual(attempted, stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable + stats.skipped_bom);
+    try std.testing.expectEqual(attempted, stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable);
     try std.testing.expect(stats.same_sets > 0);
     try std.testing.expect(stats.inserts > 0);
     try std.testing.expect(stats.moves > 0);
@@ -2617,6 +2610,347 @@ test "preservation sweep: comment positions — set-to-same is byte-identical" {
     // The sweep must actually run: the fixtures carry plenty of comments.
     if (fixtures < 10) return error.TestUnexpectedResult;
     if (checked_trailing < 5 or checked_leading < 5) return error.TestUnexpectedResult;
+}
+
+const CommentKind = enum { leading, trailing };
+
+/// Write `# probe` as the `kind` comment of the `index`-th node (in
+/// `collectNodes` order) of the first document of `text`. Returns
+/// false when the position is not writable; otherwise records a failure
+/// unless the output re-parses to the same tree and the same node reads
+/// the probe back.
+fn probeComment(allocator: std.mem.Allocator, label: []const u8, text: []const u8, index: usize, kind: CommentKind, failures: *Failures) !bool {
+    var orig = try yaml.parse(allocator, text);
+    defer orig.deinit();
+    var doc = try yaml.parse(allocator, text);
+    defer doc.deinit();
+    var nodes: std.ArrayList(*yaml.Node) = .empty;
+    defer nodes.deinit(allocator);
+    try collectNodes(allocator, doc.root.?, &nodes);
+    const set = switch (kind) {
+        .leading => doc.setLeadingComments(nodes.items[index], "# probe"),
+        .trailing => doc.setTrailingComment(nodes.items[index], "# probe"),
+    };
+    set catch |err| switch (err) {
+        error.InvalidSyntax => return false,
+        else => return err,
+    };
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    // Which node, for the report: its role in its parent and its kind.
+    const n = nodes.items[index];
+    const role: []const u8 = if (n.parent) |p| switch (p.data) {
+        .sequence => "item",
+        .mapping => |m| for (m.pairs.items) |pair| {
+            if (pair.key == n) break "key";
+        } else "value",
+        else => "?",
+    } else "root";
+    var re = yaml.parse(allocator, out) catch {
+        failures.add("{s}: node {d} ({s} {t}): a written {t} comment does not re-parse:\n{s}", .{ label, index, role, n.kind(), kind, out });
+        return true;
+    };
+    defer re.deinit();
+    if (re.root == null or !structuralEql(orig.root.?, re.root.?, 0)) {
+        failures.add("{s}: node {d} ({s} {t}): a written {t} comment changed the tree:\n{s}", .{ label, index, role, n.kind(), kind, out });
+        return true;
+    }
+    var back: std.ArrayList(*yaml.Node) = .empty;
+    defer back.deinit(allocator);
+    try collectNodes(allocator, re.root.?, &back);
+    const got = switch (kind) {
+        .leading => back.items[index].leadingComments(&re),
+        .trailing => back.items[index].trailingComment(&re),
+    } orelse "";
+    if (!std.mem.eql(u8, got, "# probe")) {
+        failures.add("{s}: node {d} ({s} {t}): a written {t} comment reads back as \"{s}\"{s}:\n{s}", .{
+            label, index, role, n.kind(), kind, got, if (std.mem.indexOf(u8, out, "# probe") == null) " (never written)" else "", out,
+        });
+    }
+    return true;
+}
+
+/// A structural edit next to the entry holding a written comment.
+const NearEdit = enum { delete_prev, delete_next, delete_self, delete_first, insert_before };
+
+/// The path of `node`, or null when the grammar cannot address it (a
+/// key that is not a scalar, or the node sits in a key).
+fn pathTo(allocator: std.mem.Allocator, node: *const yaml.Node) !?[]const u8 {
+    var comps: std.ArrayList(Comp) = .empty;
+    defer comps.deinit(allocator);
+    var cur = node;
+    while (cur.parent) |p| : (cur = p) {
+        switch (p.data) {
+            .sequence => |sq| for (sq.items.items, 0..) |it, i| {
+                if (it == cur) break try comps.append(allocator, .{ .index = i });
+            } else return null,
+            .mapping => |m| for (m.pairs.items) |pair| {
+                if (pair.value == cur) {
+                    const k = pair.key.scalarValue() orelse return null;
+                    break try comps.append(allocator, .{ .key = k });
+                }
+            } else return null,
+            else => return null,
+        }
+    }
+    std.mem.reverse(Comp, comps.items);
+    return try formatPath(allocator, comps.items);
+}
+
+/// The entry `edit` acts on, next to entry `index` of `container`, or
+/// null when it does not apply there.
+fn nearEditTarget(container: *const yaml.Node, index: usize, edit: NearEdit) ?usize {
+    const len = if (container.items()) |its| its.len else container.pairs().?.len;
+    const target: usize = switch (edit) {
+        .delete_prev => if (index == 0) return null else index - 1,
+        .delete_next => if (index + 1 >= len) return null else index + 1,
+        .delete_self => index,
+        .insert_before => if (container.items() == null) return null else index,
+        .delete_first => if (index == 0) return null else 0,
+    };
+    if (container.pairs()) |ps| if (ps[target].key.scalarValue() == null) return null;
+    return target;
+}
+
+/// Apply `edit` to the entry `target` of `container` (at `cpath`).
+fn applyNearEdit(allocator: std.mem.Allocator, doc: *yaml.Document, cpath: []const u8, container: *const yaml.Node, target: usize, edit: NearEdit) !bool {
+    const entry = blk: {
+        if (container.items() != null) break :blk try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ cpath, target });
+        const kp = try formatPath(allocator, &.{.{ .key = container.pairs().?[target].key.scalarValue().? }});
+        defer allocator.free(kp);
+        break :blk try std.fmt.allocPrint(allocator, "{s}{s}", .{ cpath, kp[1..] });
+    };
+    defer allocator.free(entry);
+    var ed = yaml.edit.Editor.init(doc);
+    if (edit == .insert_before) {
+        const v = try doc.createScalar("zz", .plain);
+        try ed.apply(&.{.{ .insert = .{ .sequence = cpath, .position = entry, .value = v, .before = true } }});
+    } else {
+        // A path of keys and indices names one node; if it named more
+        // (a duplicate key) the delete would too, so skip it.
+        _ = ed.one(entry) catch return false;
+        try ed.delete(entry);
+    }
+    return true;
+}
+
+/// Write `# probe` on node `index`, then make `edit` next to the entry
+/// holding it (and the same edit on an unwritten copy). The output must
+/// re-parse to the tree the unwritten copy gives, write the probe at
+/// most once, and put it where memory says it is (see below). Returns
+/// false when the edit does not apply there.
+fn probeCommentEdit(allocator: std.mem.Allocator, label: []const u8, text: []const u8, index: usize, kind: CommentKind, edit: NearEdit, failures: *Failures) !bool {
+    var docs: [2]yaml.Document = undefined;
+    var parsed: usize = 0;
+    defer for (docs[0..parsed]) |*doc| doc.deinit();
+    var outs: [2]?[]const u8 = .{ null, null };
+    defer for (outs) |o| if (o) |b| allocator.free(b);
+    for (0..2) |d| {
+        docs[d] = try yaml.parse(allocator, text);
+        parsed += 1;
+        const doc = &docs[d];
+        var nodes: std.ArrayList(*yaml.Node) = .empty;
+        defer nodes.deinit(allocator);
+        try collectNodes(allocator, doc.root.?, &nodes);
+        const n = nodes.items[index];
+        // The entry: the node, or for a mapping value its pair.
+        const container = n.parent orelse return false;
+        switch (container.data) {
+            .mapping => |m| if (m.style == .flow) return false,
+            .sequence => |sq| if (sq.style == .flow) return false,
+            else => return false,
+        }
+        const at = if (container.items()) |its| std.mem.indexOfScalar(*yaml.Node, its, n) orelse return false else for (container.pairs().?, 0..) |pair, i| {
+            if (pair.value == n or pair.key == n) break i;
+        } else return false;
+        const target = nearEditTarget(container, at, edit) orelse return false;
+        const cpath = try pathTo(allocator, container) orelse return false;
+        defer allocator.free(cpath);
+        if (d == 0) {
+            const set = switch (kind) {
+                .leading => doc.setLeadingComments(n, "# probe"),
+                .trailing => doc.setTrailingComment(n, "# probe"),
+            };
+            set catch |err| switch (err) {
+                error.InvalidSyntax => return false,
+                else => return err,
+            };
+        }
+        const applied = applyNearEdit(allocator, doc, cpath, container, target, edit) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return false, // refused (a stranded alias, say)
+        };
+        if (!applied) return false;
+        outs[d] = try doc.write(allocator);
+    }
+
+    var plain = yaml.parse(allocator, outs[1].?) catch {
+        failures.add("{s}: node {d}: {t} does not re-parse, even without a comment:\n{s}", .{ label, index, edit, outs[1].? });
+        return true;
+    };
+    defer plain.deinit();
+    var back = yaml.parse(allocator, outs[0].?) catch {
+        failures.add("{s}: node {d}: a {t} comment then {t} does not re-parse:\n{s}", .{ label, index, kind, edit, outs[0].? });
+        return true;
+    };
+    defer back.deinit();
+    if (back.root == null or plain.root == null or !structuralEql(plain.root.?, back.root.?, 0)) {
+        failures.add("{s}: node {d}: a {t} comment then {t} changed the tree:\n{s}", .{ label, index, kind, edit, outs[0].? });
+        return true;
+    }
+    const copies = std.mem.count(u8, outs[0].?, "# probe");
+    if (copies > 1) {
+        failures.add("{s}: node {d}: a {t} comment then {t} is written {d} times:\n{s}", .{ label, index, kind, edit, copies, outs[0].? });
+        return true;
+    }
+    // Node for node, the probe is read back only where memory holds it,
+    // and memory holds it only where it is read back -- or, like a
+    // source comment above a deleted first entry, where it is written
+    // but free-floating. Stale reads of SOURCE comments after an edit are
+    // not this check's business: it asks only about the written one.
+    var mem: std.ArrayList(*yaml.Node) = .empty;
+    defer mem.deinit(allocator);
+    try collectNodes(allocator, docs[0].root.?, &mem);
+    var got: std.ArrayList(*yaml.Node) = .empty;
+    defer got.deinit(allocator);
+    try collectNodes(allocator, back.root.?, &got);
+    if (mem.items.len != got.items.len) return true; // structuralEql covered the shape
+    var held = false;
+    var read_back = false;
+    for (mem.items, got.items) |m, g| {
+        const hm = holdsProbe(m.leadingComments(&docs[0])) or holdsProbe(m.trailingComment(&docs[0]));
+        const hg = holdsProbe(g.leadingComments(&back)) or holdsProbe(g.trailingComment(&back));
+        held = held or hm;
+        read_back = read_back or hg;
+        if (hm != hg and (hg or copies == 0 or readBackAnywhere(got.items, &back))) {
+            failures.add("{s}: node {d}: a {t} comment then {t}: {s}:\n{s}", .{
+                label, index, kind, edit, if (hg) "read back from a node that does not hold it in memory" else "held in memory by a node that does not read it back", outs[0].?,
+            });
+            return true;
+        }
+    }
+    if (held and copies == 0) {
+        failures.add("{s}: node {d}: a {t} comment then {t} is held in memory and not written:\n{s}", .{ label, index, kind, edit, outs[0].? });
+    }
+    return true;
+}
+
+fn holdsProbe(read: ?[]const u8) bool {
+    return std.mem.indexOf(u8, read orelse return false, "# probe") != null;
+}
+
+/// True when some node of `doc` reads the probe back.
+fn readBackAnywhere(nodes: []const *yaml.Node, doc: *const yaml.Document) bool {
+    for (nodes) |n| {
+        if (holdsProbe(n.leadingComments(doc)) or holdsProbe(n.trailingComment(doc))) return true;
+    }
+    return false;
+}
+
+test "preservation sweep: a new comment on any node reads back from it" {
+    // The set-to-same sweep above cannot see a comment written where
+    // there was none: that path re-assembles the entry's line, and it
+    // doubled a key's `- `/`? ` framing (`- - k: v`) or cut an item's
+    // `- ` off an explicit key. Every writable position of every
+    // fixture and corpus document now takes a new leading and a new
+    // trailing comment, one at a time, and the result must re-parse to
+    // the same tree with the comment on the same node.
+    var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer std.debug.assert(da.deinit() == .ok);
+    const allocator = da.allocator();
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var failures: Failures = .{ .allocator = allocator };
+    defer {
+        for (failures.list.items) |f| allocator.free(f);
+        failures.list.deinit(allocator);
+    }
+    var written = [_]usize{ 0, 0 };
+    var skipped = [_]usize{ 0, 0 };
+    var edited: usize = 0;
+
+    // Inputs: the first document of every fixture and valid corpus case.
+    var texts: std.ArrayList(struct { label: []const u8, text: []const u8 }) = .empty;
+    defer {
+        for (texts.items) |t| {
+            allocator.free(t.label);
+            allocator.free(t.text);
+        }
+        texts.deinit(allocator);
+    }
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, fixtures_dir, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".yaml") and !std.mem.endsWith(u8, entry.name, ".yml")) continue;
+            const input = try dir.readFileAlloc(io, entry.name, allocator, .limited(4 << 20));
+            defer allocator.free(input);
+            const text = try firstDocument(allocator, input) orelse continue;
+            errdefer allocator.free(text);
+            try texts.append(allocator, .{ .label = try allocator.dupe(u8, entry.name), .text = text });
+        }
+        var cases: std.ArrayList(corpus.Case) = .empty;
+        defer {
+            for (cases.items) |*c| corpus.freeCase(allocator, c);
+            cases.deinit(allocator);
+        }
+        try corpus.loadCases(allocator, io, &cases);
+        for (cases.items) |*c| {
+            if (c.fail or corpus.skipPreservation(c.id)) continue;
+            const text = try firstDocument(allocator, c.input) orelse continue;
+            errdefer allocator.free(text);
+            try texts.append(allocator, .{ .label = try allocator.dupe(u8, c.id), .text = text });
+        }
+    }
+
+    for (texts.items) |t| {
+        var doc = try yaml.parse(allocator, t.text);
+        defer doc.deinit();
+        const root = doc.root orelse continue;
+        var nodes: std.ArrayList(*yaml.Node) = .empty;
+        defer nodes.deinit(allocator);
+        try collectNodes(allocator, root, &nodes);
+        for (0..nodes.items.len) |i| {
+            for (std.enums.values(CommentKind)) |kind| {
+                const k = @intFromEnum(kind);
+                if (!try probeComment(allocator, t.label, t.text, i, kind, &failures)) {
+                    skipped[k] += 1;
+                    continue;
+                }
+                written[k] += 1;
+                for (std.enums.values(NearEdit)) |edit| {
+                    if (try probeCommentEdit(allocator, t.label, t.text, i, kind, edit, &failures)) edited += 1;
+                }
+            }
+        }
+    }
+    std.debug.print("preservation[new comments]: leading {d} written, {d} positions not writable; trailing {d} written, {d} not writable; {d} followed by an edit; over {d} documents\n", .{ written[0], skipped[0], written[1], skipped[1], edited, texts.items.len });
+    if (failures.list.items.len > 0) {
+        for (failures.list.items) |f| std.debug.print("  PRESERVATION-FAIL {s}\n", .{f});
+        return error.TestUnexpectedResult;
+    }
+    if (written[0] < 100 or written[1] < 100 or edited < 1000) return error.TestUnexpectedResult;
+}
+
+/// The bytes of the first document of `input`, owned, or null when it
+/// has none (or does not parse).
+fn firstDocument(allocator: std.mem.Allocator, input: []const u8) !?[]const u8 {
+    var docs = yaml.parseAll(allocator, input) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(allocator);
+    }
+    if (docs.items.len == 0 or docs.items[0].root == null) return null;
+    const d = docs.items[0];
+    const text = if (docs.items.len > 1) input[d.region_start..d.region_end] else input;
+    return try allocator.dupe(u8, text);
 }
 
 test "preservation sweep: every comment in every fixture is reachable" {
