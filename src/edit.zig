@@ -4167,6 +4167,397 @@ test "an alias placed ahead of its anchor, or over it, is refused" {
     try testing.expectError(error.InvalidSyntax, doc.createAlias(try ed.one("$.a")));
 }
 
+/// Write `doc`, read the result back, and require the tree in memory: what
+/// an edit means is what its output reads back as, whatever bytes carry it.
+fn expectReadsBack(allocator: std.mem.Allocator, doc: *const Document, label: []const u8) !void {
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    var back = Document.parse(allocator, out) catch |err| {
+        std.debug.print("{s}: wrote {f}, which does not parse\n", .{ label, std.zig.fmtString(out) });
+        return err;
+    };
+    defer back.deinit();
+    if (!readsBackAs(doc.root, back.root, 0)) {
+        std.debug.print("{s}: wrote {f}, which reads back as another tree\n", .{ label, std.zig.fmtString(out) });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "a property on a block collection under a key, then another edit inside it, reads back" {
+    // The properties of a collection whose parent's line ends in a comment
+    // (or has comment lines below it) go on a line of their own, and were
+    // written at column 0 -- the key's, where they read as its sibling --
+    // whenever the first entry was replaced, moved or deleted (the gap
+    // that carries its indentation is skipped) or, for a sequence at its
+    // key's column, given a comment: `k: # note` / `&x` / `  - b` did not
+    // parse. 36 of these 168 combinations did not.
+    const allocator = testing.allocator;
+    const shapes = [_]struct { text: []const u8, seq: bool }{
+        .{ .text = "k:\n  - a\n  - b\nz: 1\n", .seq = true },
+        .{ .text = "k:\n- a\n- b\nz: 1\n", .seq = true },
+        .{ .text = "k: # note\n  - a\n  - b\nz: 1\n", .seq = true },
+        .{ .text = "k:\n  # note\n  - a\n  - b\nz: 1\n", .seq = true },
+        .{ .text = "k:\n  a: 1\n  b: 2\nz: 1\n", .seq = false },
+        .{ .text = "k: # note\n  a: 1\n  b: 2\nz: 1\n", .seq = false },
+        .{ .text = "k:\n  # note\n  a: 1\n  b: 2\nz: 1\n", .seq = false },
+        .{ .text = "k:\n- a\n- b\n", .seq = true },
+    };
+    const Second = enum { none, replace_first, delete_first, append, lead_first, trail_first, move_first };
+    for (shapes) |shape| {
+        for ([_]enum { anchor, tag, both }{ .anchor, .tag, .both }) |props| {
+            for (std.enums.values(Second)) |second| {
+                var doc = try Document.parse(allocator, shape.text);
+                defer doc.deinit();
+                var ed = Editor.init(&doc);
+                const k = doc.root.?.lookup("k").?;
+                if (props != .tag) try doc.setAnchor(k, "x");
+                if (props != .anchor) try doc.setTag(k, "!t");
+                const first: []const u8 = if (shape.seq) "$.k[0]" else "$.k.a";
+                switch (second) {
+                    .none => {},
+                    .replace_first => try ed.apply(&.{.{ .set = .{ .path = first, .value = try doc.createScalar("new", .plain) } }}),
+                    .delete_first => try ed.apply(&.{.{ .delete = first }}),
+                    .append => if (shape.seq)
+                        try ed.apply(&.{.{ .append = .{ .sequence = "$.k", .value = try doc.createScalar("new", .plain) } }})
+                    else
+                        try ed.apply(&.{.{ .set = .{ .path = "$.k.n", .value = try doc.createScalar("new", .plain) } }}),
+                    .lead_first => try doc.setLeadingComments(try ed.one(first), "# c"),
+                    .trail_first => try doc.setTrailingComment(try ed.one(first), "# c"),
+                    .move_first => if (shape.seq)
+                        try ed.apply(&.{.{ .move = .{ .from = "$.k[0]", .to = "$.k", .key = null } }})
+                    else
+                        try ed.apply(&.{.{ .move = .{ .from = "$.k.a", .to = "$.k", .key = "moved" } }}),
+                }
+                errdefer std.debug.print("{f}: {s} then {s}\n", .{ std.zig.fmtString(shape.text), @tagName(props), @tagName(second) });
+                try expectReadsBack(allocator, &doc, "property on a block collection");
+            }
+        }
+    }
+    // The property line sits at the entries' column, the collection's
+    // own, or one step in from its key when it sat at the key's column.
+    var doc = try Document.parse(allocator, "k: # note\n  - a\n  - b\nz: 1\n");
+    defer doc.deinit();
+    try doc.setAnchor(doc.root.?.lookup("k").?, "x");
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{.{ .delete = "$.k[0]" }});
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("k: # note\n  &x\n  - b\nz: 1\n", out);
+}
+
+test "a property on an indented root collection keeps its first entry in line" {
+    // The root's properties take a line of their own, and the walk resumed
+    // at the first entry's content: the blanks before it had gone out ahead
+    // of the properties, so that entry sat at column 0 over its siblings
+    // (` &x` / `- a` / ` - b`), and a mapping root did not parse.
+    const allocator = testing.allocator;
+    const texts = [_][]const u8{
+        "- a\n- b\n- c\n",
+        " - a\n - b\n - c\n",
+        "  - a\n  - b\n  - c\n",
+        "a: 1\nb: 2\nc: 3\n",
+        " a: 1\n b: 2\n c: 3\n",
+        "  a: 1\n  b: 2\n  c: 3\n",
+        "---\n - a\n - b\n - c\n",
+        "---\n a: 1\n b: 2\n c: 3\n",
+        " - a\r\n - b\r\n - c\r\n",
+        " a: 1\r\n b: 2\r\n c: 3\r\n",
+    };
+    for (texts) |text| {
+        for ([_]bool{ false, true }) |anchored| {
+            for ([_]enum { none, delete_first, delete_last, replace_first, append }{ .none, .delete_first, .delete_last, .replace_first, .append }) |second| {
+                var doc = try Document.parse(allocator, text);
+                defer doc.deinit();
+                var ed = Editor.init(&doc);
+                if (anchored) try doc.setAnchor(doc.root.?, "x");
+                const seq = doc.root.?.kind() == .sequence;
+                const first: []const u8 = if (seq) "$[0]" else "$.a";
+                switch (second) {
+                    .none => {},
+                    .delete_first => try ed.apply(&.{.{ .delete = first }}),
+                    .delete_last => try ed.apply(&.{.{ .delete = if (seq) "$[2]" else "$.c" }}),
+                    .replace_first => try ed.apply(&.{.{ .set = .{ .path = first, .value = try doc.createScalar("new", .plain) } }}),
+                    .append => if (seq)
+                        try ed.apply(&.{.{ .append = .{ .sequence = "$", .value = try doc.createScalar("new", .plain) } }})
+                    else
+                        try ed.apply(&.{.{ .set = .{ .path = "$.n", .value = try doc.createScalar("new", .plain) } }}),
+                }
+                errdefer std.debug.print("{f}: anchored={any}, {s}\n", .{ std.zig.fmtString(text), anchored, @tagName(second) });
+                try expectReadsBack(allocator, &doc, "property on an indented root");
+            }
+        }
+    }
+    var doc = try Document.parse(allocator, " - a\n - b\n");
+    defer doc.deinit();
+    try doc.setAnchor(doc.root.?, "x");
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings(" &x\n - a\n - b\n", out);
+}
+
+test "a property written above the first line breaks it as the document does" {
+    // `terminatorAt(0)` answered `\n` for the first line of the source, so a
+    // root collection there (no indentation, no marker) got a line feed
+    // after its properties in a CRLF or CR document.
+    const allocator = testing.allocator;
+    for ([_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "- a\r\n- b\r\n", .out = "&x\r\n- a\r\n- b\r\n" },
+        .{ .in = "- a\r- b\r", .out = "&x\r- a\r- b\r" },
+        .{ .in = "k: 1\r\nz: 2\r\n", .out = "&x\r\nk: 1\r\nz: 2\r\n" },
+    }) |c| {
+        var doc = try Document.parse(allocator, c.in);
+        defer doc.deinit();
+        try doc.setAnchor(doc.root.?, "x");
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings(c.out, out);
+    }
+}
+
+test "a block scalar written beside the lines of a deleted entry keeps its value" {
+    // The indentation a new block scalar needs is measured from the lines
+    // that will follow it -- comments and blanks up to the next content
+    // line, a whitespace-only line being content when it is deeper than the
+    // block. The scan stopped at the first content line even when that
+    // line was a deleted entry, and the blanks behind it, which are written,
+    // became the block's value (`bar: 2` / `    ` deleted from ahead of a
+    // new `text: |`). The same for the blanks a keep-chomped block takes.
+    const allocator = testing.allocator;
+    const inputs = [_][]const u8{
+        "a: 1\nb: |\n  clip\n \n\n",
+        "a: 1\nb: 2\n\n\n",
+        "a: 1\nb: 2\n  \n\nc: 3\n",
+        "a: 1\n\nb: |\n  clip\n\n\nc: 3\n",
+        "a: 1\nb: |+\n  keep\n\n\n",
+        "a:\n  \"Empty line\n\n  as a line feed\"\nb: |\n  Clipped empty lines\n \n\n",
+        "a: 1\n    \nb: 2\n    \n",
+        "a: 1\n\nb: 2\n    \ntext: |\n  x\n\n  y\n \n  z\n",
+    };
+    const Op = enum { set_keep, set_literal, append_keep, move_keep };
+    for (inputs) |input| {
+        for (std.enums.values(Op)) |op| {
+            var doc = try Document.parse(allocator, input);
+            defer doc.deinit();
+            var ed = Editor.init(&doc);
+            switch (op) {
+                .set_keep => try ed.apply(&.{ .{ .delete = "$.b" }, .{ .set = .{ .path = "$.a", .value = try doc.createScalar("x\n\n", .literal) } } }),
+                .set_literal => try ed.apply(&.{ .{ .delete = "$.b" }, .{ .set = .{ .path = "$.a", .value = try doc.createScalar("x\ny\n", .literal) } } }),
+                .append_keep => try ed.apply(&.{ .{ .delete = "$.b" }, .{ .set = .{ .path = "$.new", .value = try doc.createScalar("x\n\n\n", .literal) } } }),
+                .move_keep => try ed.apply(&.{ .{ .set = .{ .path = "$.a", .value = try doc.createScalar("x\n\n", .literal) } }, .{ .move = .{ .from = "$.a", .to = "$", .key = "mv" } }, .{ .delete = "$.b" } }),
+            }
+            errdefer std.debug.print("{f}: {s}\n", .{ std.zig.fmtString(input), @tagName(op) });
+            try expectReadsBack(allocator, &doc, "block scalar beside a deleted entry");
+        }
+    }
+    // The whole example, written back with its block scalar re-set.
+    var doc = try Document.parse(allocator, "foo: 1\n\nbar: 2\n    \ntext: |\n  a\n\n  c\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{ .{ .delete = "$.bar" }, .{ .delete = "$.foo" }, .{ .delete = "$.text" }, .{ .set = .{ .path = "$.text", .value = try doc.createScalar("a\n\nc\n", .literal) } } });
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("text: |\n    a\n\n    c\n\n    \n", out);
+}
+
+test "a moved item's trailing comment goes on its block scalar's header" {
+    // A trailing comment travels with the item. Written after a block
+    // scalar's last line it is a line of the block (` # two` under `|+`
+    // read back as content); for an item in a sequence it went on the
+    // header, for the value of a mapping entry it did not.
+    const allocator = testing.allocator;
+    var doc = try Document.parse(allocator, "z:\n  - x  # one\n  - y  # two\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{.{ .set = .{ .path = "$.z[1]", .value = try doc.createScalar("v\n\n", .literal) } }});
+    {
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings("z:\n  - x  # one\n  - |+ # two\n    v\n\n", out);
+    }
+    try ed.apply(&.{.{ .move = .{ .from = "$.z[1]", .to = "$", .key = "mv" } }});
+    try expectReadsBack(allocator, &doc, "moved block scalar");
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("z:\n  - x  # one\nmv: |+ # two\n  v\n\n", out);
+}
+
+test "an entry with no key text is written apart from an explicit key that has no value" {
+    // `? e` and nothing after it, then `: v`, is ONE entry: the value of
+    // `e`. A null key written bare after it lost its entry, silently
+    // changing the value of the key before it.
+    const allocator = testing.allocator;
+    for ([_][]const u8{
+        "? a\n: 1\n? e\n",
+        "? e\n",
+        "a: 1\n? e\n",
+        "? a\n  true\n: null\n? e\n  42\n",
+    }) |input| {
+        var doc = try Document.parse(allocator, input);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .set = .{ .path = "$[\"\"]", .value = try doc.createScalar("v", .plain) } }});
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(input)});
+        try expectReadsBack(allocator, &doc, "null key after an explicit key");
+    }
+    var doc = try Document.parse(allocator, "? e\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{.{ .set = .{ .path = "$[\"\"]", .value = try doc.createScalar("v", .plain) } }});
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("? e\n?\n: v\n", out);
+    // Where the entry before it has a value, the bare form stays.
+    var plain = try Document.parse(allocator, "a: 1\n");
+    defer plain.deinit();
+    var ed2 = Editor.init(&plain);
+    try ed2.apply(&.{.{ .set = .{ .path = "$[\"\"]", .value = try plain.createScalar("v", .plain) } }});
+    const out2 = try plain.write(allocator);
+    defer allocator.free(out2);
+    try testing.expectEqualStrings("a: 1\n: v\n", out2);
+}
+
+test "new entries sit where the properties of an empty key do" {
+    // `!!str : a` has its span at the `:` after the tag, and a new entry
+    // measured from there sat as far right as the colon: `- !!str : a` /
+    // `        q: x` did not parse.
+    const allocator = testing.allocator;
+    for ([_][]const u8{
+        "- !!str : !!null\n",
+        "- !!str : a\n",
+        "- &k : a\n",
+        "-  !!str : a\n",
+        "- !!str : a\n  b: 2\n",
+    }) |input| {
+        var doc = try Document.parse(allocator, input);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .move = .{ .from = "$[0][\"\"]", .to = "$[0]", .key = "s" } }});
+        try ed.apply(&.{.{ .set = .{ .path = "$[0][\"q\"]", .value = try doc.createScalar("x", .plain) } }});
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(input)});
+        try expectReadsBack(allocator, &doc, "new entry beside an empty key with properties");
+    }
+    var doc = try Document.parse(allocator, "- !!str : a\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{.{ .move = .{ .from = "$[0][\"\"]", .to = "$[0]", .key = "s" } }});
+    try ed.apply(&.{.{ .set = .{ .path = "$[0][\"q\"]", .value = try doc.createScalar("x", .plain) } }});
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("- s: a\n  q: x\n", out);
+}
+
+test "the entries removed from ahead of a compact item's survivor, in any order, leave it in line" {
+    // A removed first entry passes the `- ` line on: its tombstone takes the
+    // successor's indentation, so the successor moves up onto that line,
+    // but only when nothing but blanks lies between them. An entry deleted
+    // earlier from after it lay between, and text a deletion owns is gone:
+    // the survivor kept its indentation behind the dash (`-   ports: [80]`).
+    const allocator = testing.allocator;
+    const bases = [_][]const u8{
+        "- name: nginx\n  image: nginx\n  res: 1\n  ports: [80]\n",
+        "- name: nginx\n  image: nginx\n  res: 1\n  ports: [80]\n- z: 9\n",
+        "k:\n  - name: nginx\n    image: nginx\n    res: 1\n    ports:\n    - 80\n",
+    };
+    const names = [_][]const u8{ "name", "image", "res" };
+    const orders = [_][3]u8{ .{ 0, 1, 2 }, .{ 0, 2, 1 }, .{ 1, 0, 2 }, .{ 1, 2, 0 }, .{ 2, 0, 1 }, .{ 2, 1, 0 } };
+    for (bases) |base| {
+        const prefix: []const u8 = if (std.mem.startsWith(u8, base, "k:")) "$.k[0]" else "$[0]";
+        for (orders) |order| {
+            for (0..8) |moved| {
+                var doc = try Document.parse(allocator, base);
+                defer doc.deinit();
+                var ed = Editor.init(&doc);
+                var edits: [3]Edit = undefined;
+                var paths: [3][40]u8 = undefined;
+                var keys: [3][40]u8 = undefined;
+                for (order, 0..) |which, n| {
+                    const path = try std.fmt.bufPrint(&paths[n], "{s}.{s}", .{ prefix, names[which] });
+                    if ((moved >> @intCast(which)) & 1 == 1) {
+                        const key = try std.fmt.bufPrint(&keys[n], "m_{s}", .{names[which]});
+                        edits[n] = .{ .move = .{ .from = path, .to = prefix, .key = key } };
+                    } else edits[n] = .{ .delete = path };
+                }
+                errdefer std.debug.print("{f}: order {any}, moved bits {b}\n", .{ std.zig.fmtString(base), order, moved });
+                try ed.apply(&edits);
+                try expectReadsBack(allocator, &doc, "removals ahead of a compact item's survivor");
+            }
+        }
+    }
+    // The example written: `res`, then `name`, then `image` moved out.
+    var doc = try Document.parse(allocator, "- name: nginx\n  image: nginx\n  res: 1\n  ports: [80]\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{ .{ .delete = "$[0].res" }, .{ .delete = "$[0].name" }, .{ .move = .{ .from = "$[0].image", .to = "$[0]", .key = "moved" } } });
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("- ports: [80]\n  moved: nginx\n", out);
+}
+
+test "a new entry after a finished empty item, or an emptied value, starts a line of its own" {
+    // `- ` at the end of what was written is framing to the entry opening
+    // next -- the `- ` a deleted first entry left, or an explicit key's `: `
+    // -- and it continued on that line. Framing carries an entry only where
+    // the entry begins right after it; an empty item's `- ` and an emptied
+    // value's `: ` are finished lines.
+    const allocator = testing.allocator;
+    // A new sequence whose last item is empty, then a new key beside it.
+    for ([_][]const u8{ "m:\n  a: 1\n  b: 2\n", "m:\n  a: 1\nz: 2\n", "a: 1\n" }) |base| {
+        const under_m = std.mem.startsWith(u8, base, "m:");
+        var doc = try Document.parse(allocator, base);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const seq = try doc.createSequence();
+        try doc.sequenceAppend(seq, try doc.createScalar("", .plain));
+        try ed.apply(&.{.{ .set = .{ .path = if (under_m) "$.m.s" else "$.s", .value = seq } }});
+        try ed.apply(&.{.{ .set = .{ .path = if (under_m) "$.m.t" else "$.t", .value = try doc.createScalar("x", .plain) } }});
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(base)});
+        try expectReadsBack(allocator, &doc, "new key after an empty item");
+    }
+    var doc = try Document.parse(allocator, "a: 1\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    const seq = try doc.createSequence();
+    try doc.sequenceAppend(seq, try doc.createScalar("", .plain));
+    try ed.apply(&.{ .{ .set = .{ .path = "$.s", .value = seq } }, .{ .set = .{ .path = "$.t", .value = try doc.createScalar("x", .plain) } } });
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("a: 1\ns:\n  - \nt: x\n", out);
+    // A value emptied on the last line of a source with no final break.
+    for ([_]struct { base: []const u8, set: []const u8 }{
+        .{ .base = "? d\n: 23", .set = "$.d" },
+        .{ .base = "a: 4.2\n? d\n: 23", .set = "$.d" },
+        .{ .base = "a: 1\nb: 23", .set = "$.b" },
+        .{ .base = "? d\n: 23\n", .set = "$.d" },
+    }) |c| {
+        var d2 = try Document.parse(allocator, c.base);
+        defer d2.deinit();
+        var e2 = Editor.init(&d2);
+        try e2.apply(&.{.{ .set = .{ .path = c.set, .value = try d2.createScalar("", .plain) } }});
+        try e2.apply(&.{.{ .set = .{ .path = "$.n", .value = try d2.createScalar("x", .plain) } }});
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(c.base)});
+        try expectReadsBack(allocator, &d2, "new key after an emptied value");
+    }
+}
+
+test "an entry with no key text is written apart from a compact explicit key that has no value" {
+    // The compact form of the null-key rule: `- ? e` puts the entry's own
+    // text past the sequence's `- `.
+    const allocator = testing.allocator;
+    for ([_]struct { in: []const u8, path: []const u8 }{
+        .{ .in = "- ? : x\n", .path = "$[0][\"\"]" },
+        .{ .in = "- ? e\n", .path = "$[0][\"\"]" },
+        .{ .in = "- - ? e\n", .path = "$[0][0][\"\"]" },
+        .{ .in = "- ? e\n- z: 1\n", .path = "$[0][\"\"]" },
+    }) |c| {
+        var doc = try Document.parse(allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .set = .{ .path = c.path, .value = try doc.createScalar("v", .plain) } }});
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(c.in)});
+        try expectReadsBack(allocator, &doc, "null key after a compact explicit key");
+    }
+}
+
 test "an edit that would rebind an alias, or build a cycle, is refused" {
     const allocator = testing.allocator;
     // A later `&x` shadows an earlier one for the aliases after it, once

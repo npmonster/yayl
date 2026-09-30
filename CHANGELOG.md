@@ -580,6 +580,57 @@ fixed and pinned by regression tests:
   original block scalar re-emitted in place was indented at its `|`
   column rather than its content's.
 
+**A second, independent randomized edit differential found more edits that
+wrote another document, or none.** It runs the same check as the one
+above, written again from scratch so that what one misses the other may
+not (the corpus and fixtures in plain, CRLF, CR, byte-order-mark and
+no-final-newline variants; random edits through the Editor API, each
+written, read back and compared with the tree in memory), and it also
+requires a batch that fails to leave the output byte-identical and a set to
+an identical scalar to change no byte. On ten seeds (about 950,000
+documents and 2.1 million edit batches) it reported 679 failures on the
+release candidate (430 documents that read back as another tree, 234 that
+did not parse, 15 that lost or gained a document), and 733 on ten fresh
+seeds; it reports none on either set now, and every one of the 2.1 million
+failed batches left the output byte-identical. What it found, now fixed
+and pinned by tests that fail without the fix:
+
+- A tag or anchor on a block collection under a key whose line ends in a
+  comment, or with comment lines below it, was written at column 0, the
+  key's own, where it reads as the key's sibling (`k: # note` / `&x` /
+  `  - b` did not parse). It went there whenever the collection's first
+  entry had been replaced, moved or deleted, and, for a sequence at its
+  key's column, whenever that entry was given a comment. It is now on a
+  line of its own at the entries' column, or one step in from the key when
+  they sat at the key's.
+- A tag or anchor on a root collection indented by a blank or more left
+  its first entry at column 0 over its siblings (` &x` / `- a` /
+  ` - b`), and a mapping root did not parse. The line after a root's
+  properties was broken with a line feed in a CRLF or CR document.
+- A block scalar written beside lines a deleted entry owned took a
+  whitespace-only line, or a comment, from behind it into its value:
+  the indentation it needs is measured from what will follow it, and the
+  measurement stopped at the deleted entry. The blank lines a keep-chomped
+  block takes were missed the same way when the entry behind it had been
+  deleted.
+- A trailing comment travelling with an item that became a block scalar's
+  value was written after the block, as a line of it (` # c` under `|+`);
+  it goes on the header line, as it does for an item of a sequence.
+- A first document with no content (its root set to null, or left empty)
+  was written as nothing, and `\n---\nb: 2` reads back as one document. It
+  gets a `---` of its own, after the byte order mark if there is one.
+- `? e` with no value, followed by a new entry with no key text, was
+  written `: v`, the value of `e`; the new entry is written `?` over `: v`,
+  in a sequence item's compact form (`- ? e`) too.
+- A new entry beside an empty key that has properties (`- !!str : a`)
+  was measured from the `:` after them, as far right as that column.
+- Removing the entries ahead of a compact item's survivor left the
+  survivor's own indentation behind the dash (`-   ports: [80]`) when a
+  later entry had been deleted first.
+- A new entry written straight after an empty item's `- ` or an emptied
+  explicit key's `: ` continued that line (`s:` / `- t: x`, `? d` /
+  `: n: x`), making it the item's or the value's own.
+
 ### Changed
 
 - `edit.cloneTreeWhole` is removed. It existed for the clone the undo

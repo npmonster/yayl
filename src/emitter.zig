@@ -185,6 +185,33 @@ pub const Emitter = struct {
         try self.write(indicator);
     }
 
+    /// Whether the entry written last at column `col` is an explicit key
+    /// with no value: `? e` and nothing after it. Read from what was
+    /// written, past comments and the deeper lines of the key's own text.
+    fn endsOpenExplicitKey(self: *const Emitter, col: usize) bool {
+        const out = self.out.items;
+        var pos = out.len - self.pendingLine().len;
+        while (pos > 0) {
+            const ls = markup.lineStart(out, pos - 1);
+            const line = out[ls..markup.newlineAt(out, ls)];
+            pos = ls;
+            // The entry's own text starts past any `- ` framing (a compact
+            // sequence item: `- ? e` puts the entry at column 2).
+            var at: usize = 0;
+            while (at < line.len and line[at] == ' ') at += 1;
+            while (at + 1 < line.len and line[at] == '-' and ctype.isBlank(line[at + 1])) {
+                at += 2;
+                while (at < line.len and ctype.isBlank(line[at])) at += 1;
+            }
+            const body = line[at..];
+            if (body.len == 0 or body[0] == '#') continue;
+            if (at > col) continue;
+            if (at < col) return false;
+            return body[0] == '?' and (body.len == 1 or ctype.isBlank(body[1]));
+        }
+        return false;
+    }
+
     /// Make the key written since `key_start` an explicit one (`? key`)
     /// when it is too long to be implicit, and say whether it did. An
     /// implicit key spans at most 1024 characters up to its `:` (spec
@@ -389,7 +416,14 @@ pub const Emitter = struct {
         // break after it) cannot stay under the entry: they would put it
         // inside a block scalar above. (Blanks that are such a block's
         // content never get here: see `keepBlockBeforeNew`.)
-        if (isEntryFraming(pending)) {
+        // Framing carries the entry only where the entry begins right after
+        // it: a deleted first entry's `- ` for the next one, at the column
+        // that follows. `: ` left as an emptied value's indicator, or a
+        // finished empty item's `- `, is not the start of a line for an
+        // entry of the collection around it (`? d` / `: n: x` made the new
+        // key a compact mapping inside `d`'s value).
+        const framed = isEntryFraming(pending) and (ctype.isBlankRun(pending) or pending.len == col);
+        if (framed) {
             if (pending.len != col and ctype.isBlankRun(pending)) {
                 self.out.shrinkRetainingCapacity(self.out.items.len - pending.len);
                 try self.writeIndent(col);
@@ -854,13 +888,12 @@ pub const Emitter = struct {
             }
             self.placeNewBlock(container, value, gap);
             defer self.endBlockPlacement();
+            // A key of several lines is written `? |...`, whose header
+            // would take the value's comment.
+            const offered = key.data == .scalar and std.mem.indexOfScalar(u8, key.data.scalar.value, '\n') == null and
+                self.offerHeaderComment(value);
             try self.emitEntry(key, value, entry_col);
-            if (value.pending_trailing) |tt| {
-                if (tt.len > 0) {
-                    try self.writeByte(' ');
-                    try self.write(tt);
-                }
-            }
+            try self.writeOwedTrailing(value, offered);
             if (owed_terminator and !self.endsWithNewline()) try self.write(self.defaultTerminator());
             if (self.endsWithNewline()) return self.pastKeptBlanksIn(container, value, self.pastTakenBreak(container, gap));
             return gap;
@@ -1087,24 +1120,9 @@ pub const Emitter = struct {
             try self.write("- ");
             self.placeNewBlock(container, item, gap);
             defer self.endBlockPlacement();
-            // A block scalar's line ends with its header: a trailing
-            // comment goes there (see `placeBlock`).
-            var offered = false;
-            if (item.data == .scalar) if (item.pending_trailing) |tt| {
-                if (tt.len > 0) {
-                    self.header_comment = tt;
-                    offered = true;
-                }
-            };
+            const offered = self.offerHeaderComment(item);
             _ = try self.emitContent(item, entry_col + 2);
-            const on_header = offered and self.header_comment == null;
-            self.header_comment = null;
-            if (item.pending_trailing) |tt| {
-                if (tt.len > 0 and !on_header) {
-                    try self.writeByte(' ');
-                    try self.write(tt);
-                }
-            }
+            try self.writeOwedTrailing(item, offered);
             if (owed_terminator and !self.endsWithNewline()) try self.write(self.defaultTerminator());
             // An item with no content left only its `- ` on the line,
             // which the next item takes for its own framing (`- - x`, a
@@ -1268,26 +1286,27 @@ pub const Emitter = struct {
     fn pastKeptBlanksIn(self: *const Emitter, container: *const Node, node: *const Node, from: usize) usize {
         _ = node;
         if (self.kept_end != self.out.items.len) return from;
-        var i = from;
-        outer: while (i < self.src.len) {
-            for (Document.droppedOf(container)) |d| {
-                if (i >= d[0] and i < d[1]) {
-                    i = d[1];
-                    continue :outer;
-                }
-            }
-            const next = markup.lineEnd(self.src, i);
-            if (next == i or !ctype.isBlankRun(self.src[i..next])) break;
-            i = next;
-        }
-        return i;
+        return self.skipBlankLines(container, from);
     }
 
     fn pastKeptBlanks(self: *const Emitter, node: *const Node, le: usize) usize {
-        _ = node;
         if (self.kept_end != self.out.items.len) return le;
-        var i = le;
+        return self.skipBlankLines(node.parent, le);
+    }
+
+    /// The offset of the first line at or after `from` that is not blank,
+    /// running through the lines of entries deleted from `holder` (or from
+    /// what holds it): they are not written, so the blanks behind them are
+    /// what would follow. A keep-chomped block takes those into its value,
+    /// and behind a deleted entry they were missed (`pastKeptBlanks` looked
+    /// only at the line after the block, and `Chomping:` stood there).
+    fn skipBlankLines(self: *const Emitter, holder: ?*const Node, from: usize) usize {
+        var i = from;
         while (i < self.src.len) {
+            if (droppedEnd(holder, i)) |end| {
+                i = end;
+                continue;
+            }
             const next = markup.lineEnd(self.src, i);
             if (next == i or !ctype.isBlankRun(self.src[i..next])) break;
             i = next;
@@ -1366,7 +1385,7 @@ pub const Emitter = struct {
                         // would have written with the first entry.
                         const s = node.src.?;
                         if (s.entry_start < s.start) try self.write(self.src[s.entry_start..s.start]);
-                        try self.emitNode(node, indent);
+                        try self.emitNode(node, try self.openNormalizedBlock(node, indent));
                         return s.end;
                     };
                 }
@@ -1409,7 +1428,7 @@ pub const Emitter = struct {
                         // would have written with the first entry.
                         const s = node.src.?;
                         if (s.entry_start < s.start) try self.write(self.src[s.entry_start..s.start]);
-                        try self.emitNode(node, indent);
+                        try self.emitNode(node, try self.openNormalizedBlock(node, indent));
                         return s.end;
                     };
                 }
@@ -1423,6 +1442,34 @@ pub const Emitter = struct {
                 return gap;
             },
         }
+    }
+
+    /// A block collection re-emitted normalized where it begins a line of
+    /// its own: its parent's key line ended in a comment (or comment lines
+    /// followed it), so there is no `key: ` for its properties to follow.
+    /// The properties open the line, and at column 0 -- the key's own
+    /// column -- they read as the key's sibling, not its value:
+    /// `k: # note` / `&x` / `  - b` does not parse. Returns the column to
+    /// emit at: the collection's own, or one step in from its key when it
+    /// sat at the key's column (an indentless sequence, whose entries can
+    /// be there but whose properties cannot).
+    fn openNormalizedBlock(self: *Emitter, node: *const Node, indent: usize) Error!usize {
+        var col = indent;
+        if (node.parent) |parent| {
+            if (parent.data == .mapping) {
+                for (parent.data.mapping.pairs.items) |pair| {
+                    if (pair.value != node) continue;
+                    if (pair.key.src) |ks| {
+                        const key_col = markup.columnOf(self.src, ks.start);
+                        if (col <= key_col) col = key_col + self.indent_step;
+                    }
+                    break;
+                }
+            }
+        }
+        const pending = self.pendingLine();
+        if (ctype.isBlankRun(pending) and pending.len < col) try self.writeIndent(col - pending.len);
+        return col;
     }
 
     /// The properties a parsed block collection's source gives it: its
@@ -1552,6 +1599,16 @@ pub const Emitter = struct {
             try self.writeGap(node, s.entry_start, s.start);
             _ = try self.writeProperties(node);
             try self.write(self.terminatorAt(s.start));
+            // The walk resumes at the first entry's content. The blanks
+            // before it went out ahead of the properties, so the entry
+            // needs them again: without, an indented root's first entry
+            // sat at column 0 over its siblings (` &x` / `- a` / ` - b`).
+            // A deleted first entry leaves them to the next one, which
+            // carries its own indentation (see `emitPairEdited`).
+            const line = markup.lineStart(self.src, s.start);
+            if (!dropCovers(node, s.start) and ctype.isBlankRun(self.src[line..s.start])) {
+                try self.writeIndent(s.start - line);
+            }
             return s.start;
         }
         const parent = node.parent.?;
@@ -1760,7 +1817,7 @@ pub const Emitter = struct {
                             if (explicitKeySpan(src, s.entry_start, s.start)) {
                                 return markup.columnOf(src, s.entry_start);
                             }
-                            const col = markup.columnOf(src, s.start);
+                            const col = textColumn(src, s.entry_start, s.start);
                             // ... also when the `?` has a line of its own
                             // (`? # c` over `  - seq`): the key's text is
                             // deeper than the entry, and a new key written
@@ -1791,9 +1848,38 @@ pub const Emitter = struct {
         // column 0) -- and `fallback` is the container's own column, so
         // stepping in from it would indent one level too deep.
         if (node.src) |s| {
-            if (!s.synthetic) return markup.columnOf(src, firstContent(src, s.start));
+            if (!s.synthetic) return textColumn(src, s.entry_start, firstContent(src, s.start));
         }
         return fallback + self.indent_step;
+    }
+
+    /// The column a mapping's entries sit at, given where its first key's
+    /// span starts (`start`) and the framing before it (`entry_start`, a
+    /// sequence item's `- `). An empty scalar key that has properties
+    /// (`!!str : v`, `&k : v`) has its span at the `:` that follows them,
+    /// and a new entry measured from there sat as far right as the colon
+    /// (`- !!str : v` / `        k: x`, which does not read as an entry).
+    /// The entries sit where the text on that line begins: past the
+    /// framing, at the properties.
+    fn textColumn(src: []const u8, entry_start: usize, start: usize) usize {
+        var i = entry_start;
+        while (i + 1 < start and (src[i] == '-' or src[i] == '?') and ctype.isBlank(src[i + 1])) {
+            i += 2;
+            while (i < start and ctype.isBlank(src[i])) i += 1;
+        }
+        var j = i;
+        while (j < start) {
+            switch (src[j]) {
+                ' ', '\t' => j += 1,
+                '&', '!' => {
+                    const end = markup.propertiesEnd(src, j);
+                    if (end == j) return markup.columnOf(src, start);
+                    j = end;
+                },
+                else => return markup.columnOf(src, start),
+            }
+        }
+        return markup.columnOf(src, @min(i, start));
     }
 
     /// The first byte at or after `start` that is not a node property,
@@ -1940,6 +2026,19 @@ pub const Emitter = struct {
         return null;
     }
 
+    /// Where the range that covers `offset` ends, when `offset` points at
+    /// bytes an entry deleted from `holder`, or from a collection that
+    /// holds it, used to own.
+    fn droppedEnd(holder: ?*const Node, offset: usize) ?usize {
+        var at = holder;
+        while (at) |n| : (at = n.parent) {
+            for (Document.droppedOf(n)) |d| {
+                if (offset >= d[0] and offset < d[1]) return d[1];
+            }
+        }
+        return null;
+    }
+
     /// True when `offset` falls inside one of `container`'s tombstoned
     /// ranges, i.e. points at bytes a deleted entry used to own.
     fn dropCovers(container: *const Node, offset: usize) bool {
@@ -1963,7 +2062,10 @@ pub const Emitter = struct {
     /// source behind them default to `\n`.
     fn terminatorAt(self: *const Emitter, offset: usize) []const u8 {
         const src = self.src;
-        if (offset == 0 or offset > src.len) return "\n";
+        // Offset 0 is the first line, which has a terminator of its own
+        // like any other: answering `\n` for it wrote a line feed into a
+        // CRLF or CR document wherever the first line was broken.
+        if (offset > src.len) return "\n";
         // `newlineAt` returns the first byte of the terminator, which
         // for CRLF is the CR (it treats a lone CR as a break, as the
         // scanner does). So the CRLF test is on that byte and its
@@ -2147,10 +2249,19 @@ pub const Emitter = struct {
                 // keys (through `emitFlowNode`) kept theirs, so an alias
                 // to an anchored scalar key emitted `*k` with no `&k`.
                 if (key.anchor) |a| try self.seen.put(key, a);
-                const key_start = self.out.items.len;
-                _ = try self.emitKeyContent(key, indent, false);
-                if (try self.explicitIfLong(key_start)) try self.newlineAt(indent);
-                try self.writeValueIndicator(":");
+                if (isNullScalar(key) and self.endsOpenExplicitKey(indent)) {
+                    // A null key written bare, `: v`, after `? e` and
+                    // nothing else, is that key's value: `? e` / `: v` is
+                    // one entry, and the new one is lost. Explicit too.
+                    try self.writeByte('?');
+                    try self.newlineAt(indent);
+                    try self.writeByte(':');
+                } else {
+                    const key_start = self.out.items.len;
+                    _ = try self.emitKeyContent(key, indent, false);
+                    if (try self.explicitIfLong(key_start)) try self.newlineAt(indent);
+                    try self.writeValueIndicator(":");
+                }
             },
             else => {
                 // Explicit key (spec 7.4.2). The key itself is written in
@@ -2650,6 +2761,32 @@ pub const Emitter = struct {
         return .{ .core = core, .trailing = trailing };
     }
 
+    /// A block scalar's line ends with its header, so the trailing comment
+    /// written for a scalar goes there (see `placeBlock`): offered to
+    /// `writeBlockHeader` before the value is written. Whether one was.
+    fn offerHeaderComment(self: *Emitter, node: *const Node) bool {
+        if (node.data != .scalar) return false;
+        const tt = node.pending_trailing orelse return false;
+        if (tt.len == 0) return false;
+        self.header_comment = tt;
+        return true;
+    }
+
+    /// The trailing comment owed after `node`'s value, unless a block
+    /// header took it (`offered`, and no longer pending). Written after a
+    /// block's last line it would be a line of the block: a moved item's
+    /// ` # c` read back as content of the `|+` block it followed.
+    fn writeOwedTrailing(self: *Emitter, node: *const Node, offered: bool) Error!void {
+        const on_header = offered and self.header_comment == null;
+        self.header_comment = null;
+        if (node.pending_trailing) |tt| {
+            if (tt.len > 0 and !on_header) {
+                try self.writeByte(' ');
+                try self.write(tt);
+            }
+        }
+    }
+
     /// Block scalars break their lines with the document's own line
     /// terminator (`defaultTerminator`): a new block in a CRLF file wrote
     /// `\n`, mixing the two.
@@ -2689,7 +2826,7 @@ pub const Emitter = struct {
         // A collection's block scalars sit inside it: only a scalar's
         // header is on the line the old value's comment was.
         if (node.data == .scalar and rest.len > 0 and rest[0] == '#') self.header_comment = rest;
-        self.setBlockFloor(markup.lineEnd(src, old_end));
+        self.setBlockFloor(node.parent, markup.lineEnd(src, old_end));
     }
 
     /// `placeBlock` for a brand-new entry, whose next source line (the
@@ -2710,7 +2847,7 @@ pub const Emitter = struct {
             }
             break;
         }
-        self.setBlockFloor(from);
+        self.setBlockFloor(container, from);
     }
 
     /// Set `block_floor` to one past the deepest comment line from
@@ -2719,11 +2856,25 @@ pub const Emitter = struct {
     /// One of those lines opening with a tab bars block scalars: the tab
     /// sits where the block's indentation is read, which no reader
     /// accepts, however deep the content (libfyaml agrees).
-    fn setBlockFloor(self: *Emitter, start: usize) void {
+    ///
+    /// The scan runs through the lines of entries deleted from `holder`
+    /// (or from what holds it): they are not written, so what follows
+    /// them follows the block. Stopped at the first content line, deleted
+    /// or not, the blanks left after a deleted entry went unseen, and a
+    /// line of them deeper than the block became its content
+    /// (`bar: 2` / `    ` deleted from ahead of a new `text: |`).
+    fn setBlockFloor(self: *Emitter, holder: ?*const Node, start: usize) void {
         const src = self.src;
         var i = start;
         var floor: usize = 0;
         while (i < src.len) {
+            if (droppedEnd(holder, i)) |end| {
+                const past = if (markup.lineStart(src, end) == end) end else markup.lineEnd(src, end);
+                if (past > i) {
+                    i = past;
+                    continue;
+                }
+            }
             const next = markup.lineEnd(src, i);
             const line = src[i..markup.newlineAt(src, i)];
             const body = std.mem.trimStart(u8, line, " \t");

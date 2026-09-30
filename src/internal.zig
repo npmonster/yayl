@@ -434,6 +434,28 @@ fn outerFraming(src: []const u8, container: *const Node, line: usize) ?struct { 
     return .{ .own = cs.start, .after = after };
 }
 
+/// Whether `[from, to)` holds nothing but blanks, line breaks and bytes in
+/// one of `node`'s tombstones: text a deleted entry owned is gone, so it
+/// separates nothing. A successor moves up onto a removed first entry's
+/// line only when nothing but that lies between them; an entry deleted
+/// earlier, from after it, sat between and left the successor where it
+/// was (`- name` / `  image` / `  res` / `  ports` with `res`, `name` and
+/// then `image` removed wrote `-   ports`).
+fn blankOrDropped(node: *const Node, src: []const u8, from: usize, to: usize) bool {
+    var i = from;
+    outer: while (i < to) {
+        for (Document.droppedOf(node)) |d| {
+            if (i >= d[0] and i < d[1]) {
+                i = d[1];
+                continue :outer;
+            }
+        }
+        if (!ctype.isBlankRun(src[i .. i + 1])) return false;
+        i += 1;
+    }
+    return true;
+}
+
 /// Whether every byte of `[from, to)` lies in one of `node`'s tombstones.
 fn coveredByDrops(node: *const Node, from: usize, to: usize) bool {
     var i = from;
@@ -540,7 +562,7 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
             // different tree) and left a bare `- ` or `? ` behind.
             if (outerFraming(src, map, markup.lineStart(src, entry_start))) |fr| {
                 if (nextEntryStart(m, p)) |nx| {
-                    if (nx >= to and ctype.isBlankRun(src[to..nx])) {
+                    if (nx >= to and blankOrDropped(map, src, to, nx)) {
                         from = fr.own;
                         to = nx;
                     } else {
@@ -572,7 +594,7 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
                 // whole line left the earlier line's indentation in front
                 // of the successor's own (`-\n    avg`).
                 if (nextEntryStart(m, p)) |nx| {
-                    if (nx >= to and ctype.isBlankRun(src[to..nx])) {
+                    if (nx >= to and blankOrDropped(map, src, to, nx)) {
                         from = entry_start;
                         to = nx;
                     }
@@ -637,7 +659,7 @@ pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
             // dropPairSpan for the mapping equivalent).
             if (outerFraming(src, seq, from)) |fr| {
                 if (nextItemStart(s, item)) |nx| {
-                    if (nx >= to and ctype.isBlankRun(src[to..nx])) {
+                    if (nx >= to and blankOrDropped(seq, src, to, nx)) {
                         from = fr.own;
                         to = nx;
                     } else {
@@ -662,7 +684,7 @@ pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
             } else if (from < is.entry_start and coveredByDrops(seq, from, is.entry_start)) {
                 // Moved up onto an earlier item's line (see dropPairSpan).
                 if (nextItemStart(s, item)) |nx| {
-                    if (nx >= to and ctype.isBlankRun(src[to..nx])) {
+                    if (nx >= to and blankOrDropped(seq, src, to, nx)) {
                         from = is.entry_start;
                         to = nx;
                     }

@@ -2261,10 +2261,29 @@ pub fn writeAllOpts(allocator: std.mem.Allocator, docs: []const Document, option
         }
         after_keep = ends_keep;
 
-        // A document with nothing to write (built with no root) is still
-        // a document of the stream: an explicit empty one, or its
-        // neighbours read back as one.
-        if (body.items.len == 0 and docs.len > 1) try body.appendSlice(allocator, "---\n");
+        // A document with nothing to write (built with no root, or a root
+        // set to null) is still a document of the stream: an explicit empty
+        // one, or its neighbours read back as one. Nothing to write is no
+        // content line -- a null root leaves a blank line, or a comment and
+        // a `...` -- and no marker of its own. After another document
+        // `boundary` supplies the `---`; a first one has nothing before it
+        // to mark it, and `\n---\nb: 2` reads back as one document.
+        const mark = if (std.mem.startsWith(u8, body.items, "\u{FEFF}")) "\u{FEFF}".len else 0;
+        if (docs.len > 1 and hasNoContent(body.items[mark..])) {
+            // The marker breaks its line as the document does; the bytes
+            // are copied out first, for the insert moves what they point at.
+            // A byte order mark stays first: it opens the stream.
+            var marker: [5]u8 = .{ '-', '-', '-', '\n', 0 };
+            var len: usize = 4;
+            if (std.mem.indexOfAny(u8, body.items, "\r\n")) |k| {
+                marker[3] = body.items[k];
+                if (body.items[k] == '\r' and k + 1 < body.items.len and body.items[k + 1] == '\n') {
+                    marker[4] = '\n';
+                    len = 5;
+                }
+            }
+            try body.insertSlice(allocator, mark, marker[0..len]);
+        }
         // A byte order mark opens a stream; before a later document the
         // reader takes it for content (`\u{FEFF}b: 2` a key).
         if (i > 0 and std.mem.startsWith(u8, body.items, "\u{FEFF}")) {
@@ -2316,6 +2335,23 @@ fn finishesLine(text: []const u8) bool {
     if (line[0] != ' ' and line[0] != '\t') return false;
     const trimmed = std.mem.trimStart(u8, line, " \t");
     return trimmed.len == 0 or trimmed[0] == '#';
+}
+
+/// Whether `text`, a document as written, has no content and no marker of
+/// its own: nothing but blank and comment lines and bare `...` end markers
+/// (an end marker with no start before it starts nothing). One line of
+/// anything else -- content, a `---`, a directive -- and it has some: a
+/// document may open with a comment and a `...` that end nothing, and then
+/// go on (spec example 9.3).
+fn hasNoContent(text: []const u8) bool {
+    var it: LineIter = .{ .src = text };
+    while (it.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        if (std.mem.startsWith(u8, line, "...") and (line.len == 3 or line[3] == ' ' or line[3] == '\t')) continue;
+        return false;
+    }
+    return true;
 }
 
 /// The first line of `text` that is neither blank nor a comment, as
@@ -3460,6 +3496,68 @@ test "the stream-end tracker agrees with the line-by-line definition on every sh
     try testing.expectEqual(@as(usize, 335_923), checked);
     // Not vacuous: plenty of inputs do end a stream, and plenty do not.
     try testing.expect(yes > 1000 and yes < checked / 2);
+}
+
+test "a first document with no content is still a document of the stream" {
+    // After another document the `---` between them marks the next one,
+    // but a first document has nothing before it: with its root set to
+    // null (or left empty), `\n---\nb: 2` read back as ONE document, and
+    // `# c` / `...` as none of its own.
+    const allocator = testing.allocator;
+    const cases = [_]struct { in: []const u8, out: []const u8, second: []const u8 }{
+        .{ .in = "a: 1\n---\nb: 2\n", .out = "---\n\n---\nb: 2\n", .second = "2" },
+        .{ .in = "a: 1\n...\n---\nb: 2\n", .out = "---\n\n...\n---\nb: 2\n", .second = "2" },
+        .{ .in = "# c\na: 1\n...\n---\nb: 2\n", .out = "---\n# c\n...\n---\nb: 2\n", .second = "2" },
+        .{ .in = "a: 1\r\n---\r\nb: 2\r\n", .out = "---\r\n\r\n---\r\nb: 2\r\n", .second = "2" },
+        // Already marked: nothing is added.
+        .{ .in = "---\na: 1\n---\nb: 2\n", .out = "---\n---\nb: 2\n", .second = "2" },
+        .{ .in = "--- x\n...\n--- y\n", .out = "--- \n...\n--- y\n", .second = "y" },
+    };
+    for (cases) |c| {
+        var docs = try Document.parseAll(allocator, c.in);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        try testing.expectEqual(@as(usize, 2), docs.items.len);
+        docs.items[0].root = try docs.items[0].createScalar("", .plain);
+        const out = try writeAll(allocator, docs.items);
+        defer allocator.free(out);
+        errdefer std.debug.print("{f}: wrote {f}\n", .{ std.zig.fmtString(c.in), std.zig.fmtString(out) });
+        try testing.expectEqualStrings(c.out, out);
+        var back = try Document.parseAll(allocator, out);
+        defer {
+            for (back.items) |*d| d.deinit();
+            back.deinit(allocator);
+        }
+        try testing.expectEqual(@as(usize, 2), back.items.len);
+        const second = back.items[1].root.?;
+        try testing.expectEqualStrings(c.second, if (second.scalarValue()) |v| v else second.lookup("b").?.scalarValue().?);
+    }
+    // A document may open with a comment and a `...` that end nothing and
+    // then go on (spec example 9.3): it has content, and a stream read and
+    // written unchanged gains no marker.
+    const bare = "Bare\ndocument\n...\n# No document\n...\n|\n%!PS-Adobe-2.0 # Not the first line\n";
+    {
+        var parsed = try Document.parseAll(allocator, bare);
+        defer {
+            for (parsed.items) |*d| d.deinit();
+            parsed.deinit(allocator);
+        }
+        const same = try writeAll(allocator, parsed.items);
+        defer allocator.free(same);
+        try testing.expectEqualStrings(bare, same);
+    }
+    // A byte order mark opens the stream, ahead of the marker.
+    var docs = try Document.parseAll(allocator, "\u{FEFF}a: 1\n---\nb: 2\n");
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(allocator);
+    }
+    docs.items[0].root = try docs.items[0].createScalar("", .plain);
+    const out = try writeAll(allocator, docs.items);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("\u{FEFF}---\n\n---\nb: 2\n", out);
 }
 
 test "writeAll stays linear over documents that end mid-line" {
