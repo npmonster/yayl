@@ -1178,6 +1178,68 @@ test "float Values emit a form that reparses to the same float" {
     }
 }
 
+test "non-finite floats are written as YAML spells them and read back as floats" {
+    // `{d}` writes them `nan`, `inf`, `-inf`: plain strings to the core
+    // schema. YAML's spellings are `.nan`, `.inf` and `-.inf`.
+    const allocator = testing.allocator;
+    const cases = [_]struct { f: f64, text: []const u8 }{
+        .{ .f = std.math.nan(f64), .text = ".nan" },
+        .{ .f = std.math.inf(f64), .text = ".inf" },
+        .{ .f = -std.math.inf(f64), .text = "-.inf" },
+    };
+    for (cases) |c| {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        const node = try toNode(&doc, .{ .float = c.f });
+        try testing.expectEqualStrings(c.text, node.scalarValue().?);
+        const back = try nodeToValue(allocator, node);
+        defer freeValue(allocator, back);
+        try testing.expect(back == .float);
+        if (std.math.isNan(c.f)) {
+            try testing.expect(std.math.isNan(back.float));
+        } else {
+            try testing.expectEqual(c.f, back.float);
+        }
+    }
+}
+
+test "allocation failures in map, union and pointer conversions leak nothing" {
+    try std.testing.checkAllAllocationFailures(testing.allocator, mapUnionPointerConversions, .{});
+}
+
+fn mapUnionPointerConversions(allocator: std.mem.Allocator) !void {
+    const Map = std.StringArrayHashMapUnmanaged([]const u8);
+    const Choice = union(enum) { path: []const u8, port: u16, inherit: void };
+    const Rich = struct {
+        labels: Map,
+        choice: Choice,
+        boxed: *const []const u8,
+        // A default is cloned, not handed out: a pointer to a slice makes
+        // the clone allocate the box and then the slice.
+        spare: *const []const u8 = &@as([]const u8, "spare"),
+    };
+    const source = try parseToValue(allocator,
+        \\labels: {a: one, b: two}
+        \\choice: {path: /etc/app}
+        \\boxed: hello
+        \\
+    );
+    defer freeValue(allocator, source);
+
+    // Value to Zig: each map key and value, the union's payload, the box
+    // and its slice, and the cloned default are allocated in an order
+    // whose failure leaves the earlier ones for an `errdefer` to free.
+    const rich = try toZig(Rich, allocator, source);
+    defer deinitZig(Rich, allocator, rich);
+    try testing.expectEqualStrings("hello", rich.boxed.*);
+    try testing.expectEqualStrings("spare", rich.spare.*);
+
+    // Zig to Value, the same shapes out again.
+    const back = try fromZig(allocator, rich);
+    defer freeValue(allocator, back);
+    try testing.expectEqual(@as(usize, 4), back.mapping.len);
+}
+
 test "parseToValueResolved can be bounded" {
     const allocator = testing.allocator;
     // Merge resolution amplifies: the source is tiny, the resolved tree is

@@ -1944,6 +1944,18 @@ test "a final whitespace-only line of a block scalar is content (corpus L24T)" {
     try testing.expectEqualStrings("x\n \n", v.items[1]);
 }
 
+test "an escape must name a Unicode scalar value" {
+    // Past U+10FFFF, or half of a surrogate pair, it names no character;
+    // the bounds themselves are characters.
+    for ([_][]const u8{ "\"\\uD800\"\n", "\"\\uDBFF\"\n", "\"\\uDFFF\"\n", "\"\\U00110000\"\n", "\"\\UFFFFFFFF\"\n" }) |in| {
+        try testing.expectError(error.InvalidEscape, scanAll(testing.allocator, in));
+    }
+    for ([_][]const u8{ "\"\\uD7FF\"\n", "\"\\uE000\"\n", "\"\\U0010FFFF\"\n", "\"\\u0000\"\n" }) |in| {
+        var r = try scanAll(testing.allocator, in);
+        r.deinit(testing.allocator);
+    }
+}
+
 test "rejections required by the corpus" {
     // '#' needs preceding whitespace to start a comment (9JBA/SU5Z).
     try testing.expectError(error.InvalidSyntax, scanAll(testing.allocator, "key: \"value\"# c\n"));
