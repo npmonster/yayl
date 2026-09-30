@@ -22,19 +22,7 @@ const Skip = struct {
 
 /// Known round-trip gaps. A skipped case that starts passing fails the
 /// gate (stale skip), so this table cannot outlive a fix.
-const skips = [_]Skip{
-    // The 46 unnamed suite sub-cases are now loaded (they were silently
-    // dropped before). Six of them are valid cases yayl cannot parse yet
-    // -- the same six the conformance gate tracks -- so there is no round
-    // trip to assert. The stale-skip guard fails the gate if any starts
-    // parsing.
-    .{ .id = "3RLN-2", .reason = "yayl cannot parse this unnamed sub-case yet" },
-    .{ .id = "3RLN-5", .reason = "yayl cannot parse this unnamed sub-case yet" },
-    .{ .id = "DE56-3", .reason = "yayl cannot parse this unnamed sub-case yet" },
-    .{ .id = "DE56-4", .reason = "yayl cannot parse this unnamed sub-case yet" },
-    .{ .id = "DK95-5", .reason = "yayl cannot parse this unnamed sub-case yet" },
-    .{ .id = "KH5V-2", .reason = "yayl cannot parse this unnamed sub-case yet" },
-};
+const skips = [_]Skip{};
 
 fn findSkip(id: []const u8) ?Skip {
     for (skips) |s| if (std.mem.eql(u8, s.id, id)) return s;

@@ -193,7 +193,9 @@ pub const Node = struct {
     }
 
     /// Look up a mapping entry by scalar key text. Alias nodes forward
-    /// to their target.
+    /// to their target. The first entry with the key wins; the scan is
+    /// linear in the mapping's size (see docs/USAGE.md on reading many
+    /// keys of a large mapping).
     pub fn lookup(self: *const Node, key: []const u8) ?*Node {
         const ps = self.resolveAlias().pairs() orelse return null;
         for (ps) |p| {
@@ -1143,6 +1145,19 @@ pub const Document = struct {
         return n;
     }
 
+    /// Create an alias (`*name`) to `target`, a node of this document,
+    /// named by the anchor it carries: give it one with `setAnchor`
+    /// first. A target without an anchor is `error.InvalidSyntax`. The
+    /// alias is placed like any node (`set`, `append`, ...), and an edit
+    /// that would put it ahead of its anchor, where it could not be read
+    /// back, is refused.
+    pub fn createAlias(self: *Document, target: *Node) !*Node {
+        const name = target.anchor orelse return error.InvalidSyntax;
+        const n = try self.pool.create(Node);
+        n.* = .{ .data = .{ .alias = .{ .name = try self.pool.dupe(name), .target = target } } };
+        return n;
+    }
+
     /// Define or clear the anchor on `node`. `name` null clears it.
     ///
     /// Clearing (or renaming) an anchor that an alias in this document
@@ -1173,7 +1188,7 @@ pub const Document = struct {
             // aliases after it, once written and read back; refused while
             // any of them still names the earlier node.
             if (self.root) |root| {
-                if (!try internal.aliasesBindInOrder(self.allocator, root, node, n)) return error.AnchorShadowed;
+                if (try internal.aliasBinding(self.allocator, root, node, n) == .shadowed) return error.AnchorShadowed;
             }
         } else if (node.anchor == null) return;
         if (node.anchor) |cur| {
@@ -1182,6 +1197,26 @@ pub const Document = struct {
             }
         }
         node.anchor = if (name) |n| try self.pool.dupe(n) else null;
+        try self.markModified(node);
+    }
+
+    /// Set (or, with null, clear) `node`'s tag: the resolved form, as
+    /// the parser reports it (`tag:yaml.org,2002:str`, `!local`, `!`).
+    /// Assigning `node.tag` directly works too, but a tag with no
+    /// spelling in this document -- left to the verbatim form `!<...>`
+    /// and holding a blank, a `>`, a line break or invalid UTF-8 -- then
+    /// fails only when the document is written. Here it is
+    /// `error.InvalidSyntax` at once, as is a tag on an alias, which YAML
+    /// gives no properties.
+    pub fn setTag(self: *Document, node: *Node, tag: ?[]const u8) !void {
+        if (node.data == .alias and tag != null) return error.InvalidSyntax;
+        if (tag) |t| {
+            if (!internal.tagSpellable(self.tag_directives.items, t)) return error.InvalidSyntax;
+            if (node.tag) |cur| {
+                if (std.mem.eql(u8, cur, t)) return;
+            }
+        } else if (node.tag == null) return;
+        node.tag = if (tag) |t| try self.pool.dupe(t) else null;
         try self.markModified(node);
     }
 
@@ -2197,6 +2232,9 @@ pub fn writeAllOpts(allocator: std.mem.Allocator, docs: []const Document, option
     // no line break.
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
+    // The previous document ended with a keep-chomped block scalar, which
+    // takes any blank lines after it into its value.
+    var after_keep = false;
 
     for (docs, 0..) |*doc, i| {
         body.clearRetainingCapacity();
@@ -2204,6 +2242,24 @@ pub fn writeAllOpts(allocator: std.mem.Allocator, docs: []const Document, option
         defer em.deinit();
         em.configure(options);
         try em.emitDocument(doc);
+        const ends_keep = em.kept_end == body.items.len;
+        // The blank lines a document opens with (after a previous one it
+        // follows without a marker line) join that block: dropped, the
+        // block keeps its value (`|+\n  x\n\n` + `\n# c` read back three
+        // breaks).
+        if (after_keep) {
+            var cut: usize = 0;
+            while (cut < body.items.len) {
+                const nl = std.mem.indexOfAnyPos(u8, body.items, cut, "\r\n") orelse break;
+                if (!ctype.isBlankRun(body.items[cut..nl])) break;
+                cut = markup.lineEnd(body.items, nl);
+            }
+            if (cut > 0) {
+                std.mem.copyForwards(u8, body.items, body.items[cut..]);
+                body.shrinkRetainingCapacity(body.items.len - cut);
+            }
+        }
+        after_keep = ends_keep;
 
         // A document with nothing to write (built with no root) is still
         // a document of the stream: an explicit empty one, or its
@@ -2429,6 +2485,12 @@ const Builder = struct {
             if (sc.value.len == 0 and sc.style == .plain) {
                 end = @min(end, markup.propertiesEnd(src, ev.start.offset));
             }
+            // A block scalar's blanks are content up to where the
+            // scanner says content ends: a whitespace-only last line
+            // deeper than the block, or a content line's trailing
+            // spaces. Trimmed, they went to the gap, and an edit that
+            // rewrote the gap dropped them from the value.
+            if (sc.content_end) |ce| end = @max(end, ce);
         }
         return .{
             .entry_start = if (synthetic)
@@ -2573,7 +2635,14 @@ const Builder = struct {
         switch (frame.node.data) {
             .sequence => {
                 try internal.attachItem(self.doc, frame.node, n);
-                self.growSpan(frame.node, n.src orelse return);
+                var is = n.src orelse return;
+                // A synthesized empty item's span points at the next
+                // token, which can be the enclosing sequence's next item:
+                // grown to it, `- -` over `- y` held that item, and an
+                // edit writing the rest of the inner sequence's line wrote
+                // it twice. It ends at its own `-`.
+                if (is.synthetic) is.end = if (markup.emptyItemDash(self.source, is.end)) |d| d + 1 else return;
+                self.growSpan(frame.node, is);
             },
             .mapping => {
                 if (frame.pending_key) |key| {
@@ -2971,8 +3040,34 @@ fn editWrite(allocator: std.mem.Allocator) !void {
     try doc.pathSet(&.{"a"}, try doc.createScalar("2", .plain));
     const items = doc.pathGet(&.{"b"}).?;
     try doc.sequenceAppend(items, try doc.createScalar("z", .plain));
+    try doc.setTag(items, "!list");
     const out = try doc.write(allocator);
     defer allocator.free(out);
+}
+
+test "setTag writes a tag, clears one, and refuses one with no spelling" {
+    var doc = try Document.parse(testing.allocator, "%TAG !e! tag:example.com,2000:\n---\na: 1\nb: &x 2\nc: *x\n");
+    defer doc.deinit();
+    const a = doc.pathGet(&.{"a"}).?;
+    try doc.setTag(a, "tag:yaml.org,2002:str");
+    try doc.setTag(doc.pathGet(&.{"b"}).?, "tag:example.com,2000:app/x y");
+    {
+        const out = try doc.write(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("%TAG !e! tag:example.com,2000:\n---\na: !!str 1\nb: &x !e!app/x%20y 2\nc: *x\n", out);
+    }
+    try doc.setTag(a, null);
+    try testing.expect(a.tag == null);
+    // Unspellable: left to the verbatim form, with a blank or a `>`.
+    try testing.expectError(error.InvalidSyntax, doc.setTag(a, "tag:other.org,2000:a b"));
+    try testing.expectError(error.InvalidSyntax, doc.setTag(a, "a>b"));
+    try testing.expectError(error.InvalidSyntax, doc.setTag(a, ""));
+    try testing.expect(a.tag == null);
+    // An alias takes no properties.
+    try testing.expectError(error.InvalidSyntax, doc.setTag(doc.pathGet(&.{"c"}).?, "!t"));
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("%TAG !e! tag:example.com,2000:\n---\na: 1\nb: &x !e!app/x%20y 2\nc: *x\n", out);
 }
 
 test "parse keeps the document's tail: trailing comments and blank lines round-trip" {
@@ -4878,18 +4973,12 @@ test "parsing stays linear on shapes that were quadratic" {
     // Every open simple key had its span recounted in codepoints on every
     // token once it passed 1024 bytes: nested flow collections of
     // multibyte text took 15.7 s for these 10 KB in Debug (70 ms now).
-    try buf.append(allocator, '[');
-    for (0..4) |b| {
-        if (b > 0) try buf.append(allocator, ',');
-        try buf.appendNTimes(allocator, '[', 190);
-        for (0..520) |i| {
-            if (i > 0) try buf.append(allocator, ',');
-            try buf.appendSlice(allocator, "\u{4E2D}");
-        }
-        try buf.appendNTimes(allocator, ']', 190);
-    }
-    try buf.append(allocator, ']');
-    try testing.expect(try parseMillis(buf.items) < 1000);
+    // Judged against the same shape in ASCII, which no load on the
+    // machine changes: ASCII keys pass the bound at once and were never
+    // recounted, so the multibyte parse was about 1000 times slower.
+    const cjk = try flowOfNested(allocator, &buf, "\u{4E2D}");
+    const ascii = try flowOfNested(allocator, &buf, "x");
+    try testing.expect(cjk < @max(ascii, 1) * 20);
 
     // Each collection value searched its mapping's pairs from the front
     // for itself: a mapping of mappings, the commonest shape there is,
@@ -4905,12 +4994,37 @@ test "parsing stays linear on shapes that were quadratic" {
 
     // `%TAG` handles were found by a linear search, for the duplicate
     // check and for every tag: 16,000 of each took 5.5 s in Debug under
-    // the test allocator, and take 0.3 s.
+    // the test allocator, and take 0.3 s. By growth again: four times
+    // the directives and tags took 16 times as long.
+    const tags_small = @max(1, try tagsMillis(allocator, &buf, 4_000));
+    const tags_large = try tagsMillis(allocator, &buf, 16_000);
+    try testing.expect(tags_large < tags_small * 8);
+}
+
+/// Parse time of four nested flow collections of 520 `item` entries each.
+fn flowOfNested(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), item: []const u8) !i96 {
     buf.clearRetainingCapacity();
-    for (0..16_000) |i| try buf.print(allocator, "%TAG !t{d}! tag:e.com,2000:{d}:\n", .{ i, i });
+    try buf.append(allocator, '[');
+    for (0..4) |b| {
+        if (b > 0) try buf.append(allocator, ',');
+        try buf.appendNTimes(allocator, '[', 190);
+        for (0..520) |i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, item);
+        }
+        try buf.appendNTimes(allocator, ']', 190);
+    }
+    try buf.append(allocator, ']');
+    return parseMillis(buf.items);
+}
+
+/// Parse time of `n` `%TAG` directives and `n` tags using them.
+fn tagsMillis(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), n: usize) !i96 {
+    buf.clearRetainingCapacity();
+    for (0..n) |i| try buf.print(allocator, "%TAG !t{d}! tag:e.com,2000:{d}:\n", .{ i, i });
     try buf.appendSlice(allocator, "---\n");
-    for (0..16_000) |i| try buf.print(allocator, "- !t{d}!x 1\n", .{i});
-    try testing.expect(try parseMillis(buf.items) < 2000);
+    for (0..n) |i| try buf.print(allocator, "- !t{d}!x 1\n", .{i});
+    return parseMillis(buf.items);
 }
 
 test "a truncated input's discarded bytes stay discarded" {
@@ -4984,4 +5098,32 @@ test "a tag escape that decodes to invalid UTF-8 is refused" {
     var ok = try Document.parse(testing.allocator, "%TAG !e! tag:e.com:\n--- !e!%C3%A9 x\n");
     defer ok.deinit();
     try testing.expectEqualStrings("tag:e.com:\u{00E9}", ok.root.?.tag.?);
+}
+
+test "a byte order mark that is content stays content when it opens the output" {
+    const allocator = testing.allocator;
+    // The parser keeps a mark inside a document as content, as libfyaml
+    // does; deleting what stood before it put it first in the output,
+    // where it read back as the stream's encoding mark (`\u{FEFF}b`, a key,
+    // became `b`).
+    var doc = try Document.parse(allocator, "a: 1\n\u{FEFF}b: 2\n");
+    defer doc.deinit();
+    try testing.expect(doc.root.?.lookup("\u{FEFF}b") != null);
+    _ = try doc.mappingRemove(doc.root.?, "a");
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    var back = try Document.parse(allocator, out);
+    defer back.deinit();
+    try testing.expectEqualStrings("2", back.root.?.lookup("\u{FEFF}b").?.scalarValue().?);
+    // In a stream, the added mark does not reach a later document.
+    var first = try Document.parse(allocator, "x\n");
+    defer first.deinit();
+    const all = try writeAll(allocator, &.{ first, doc });
+    defer allocator.free(all);
+    var docs = try Document.parseAll(allocator, all);
+    defer {
+        for (docs.items) |*d| d.deinit();
+        docs.deinit(allocator);
+    }
+    try testing.expectEqualStrings("2", docs.items[1].root.?.lookup("\u{FEFF}b").?.scalarValue().?);
 }

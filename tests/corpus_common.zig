@@ -24,41 +24,6 @@ pub fn freeCase(allocator: std.mem.Allocator, c: *const Case) void {
     if (c.tree) |t| allocator.free(t);
 }
 
-/// Unnamed suite sub-cases yayl cannot PARSE yet. They are the same six
-/// the conformance and round-trip gates track; sharing the list keeps the
-/// three gates from disagreeing about what a known parse gap is.
-pub const unparseable_subcases = [_][]const u8{
-    "3RLN-2", "3RLN-5", "DE56-3", "DE56-4", "DK95-5", "KH5V-2",
-};
-
-pub fn isUnparseableSubcase(id: []const u8) bool {
-    for (unparseable_subcases) |g| if (std.mem.eql(u8, g, id)) return true;
-    return false;
-}
-
-/// Valid sub-cases whose EDIT PRESERVATION is not asserted yet. They still
-/// parse and round-trip; only the line-level edit sweep is skipped, so a
-/// stale-skip here cannot hide a parse or round-trip regression.
-pub const preservation_gaps = [_][]const u8{"L24T-2"};
-
-pub fn isPreservationGap(id: []const u8) bool {
-    for (preservation_gaps) |g| if (std.mem.eql(u8, g, id)) return true;
-    return false;
-}
-
-/// The cases the preservation sweep must not edit-assert: unparseable
-/// ones, plus the preservation gaps above.
-pub fn skipPreservation(id: []const u8) bool {
-    return isUnparseableSubcase(id) or isPreservationGap(id);
-}
-
-test "unparseable sub-cases are a shared, explicit list" {
-    try std.testing.expect(isUnparseableSubcase("3RLN-2"));
-    try std.testing.expect(isUnparseableSubcase("KH5V-2"));
-    try std.testing.expect(!isUnparseableSubcase("3RLN-1"));
-    try std.testing.expect(!isUnparseableSubcase(""));
-}
-
 pub fn loadCases(allocator: std.mem.Allocator, io: std.Io, cases: *std.ArrayList(Case)) !void {
     var dir = try std.Io.Dir.cwd().openDir(io, corpus_dir, .{ .iterate = true });
     defer dir.close(io);

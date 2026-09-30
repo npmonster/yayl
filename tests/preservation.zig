@@ -156,6 +156,19 @@ fn soleChangedLine(orig: [][]const u8, out: [][]const u8) ?usize {
 
 /// `out` is `orig` with lines only inserted at one position; returns
 /// the insertion offset (the dual of `runRemoval`).
+/// A block scalar whose value ends in blank lines it kept (`|+`) owns
+/// those lines, though its span stops at its last content line: they
+/// go with it when it is replaced, so the edit changes several lines.
+fn keepsBlankLines(node: *const yaml.Node) bool {
+    const sc = switch (node.data) {
+        .scalar => |sc| sc,
+        else => return false,
+    };
+    if (sc.style != .literal and sc.style != .folded) return false;
+    const trimmed = std.mem.trimEnd(u8, sc.value, "\n");
+    return sc.value.len - trimmed.len > @intFromBool(trimmed.len > 0);
+}
+
 fn pureInsertion(orig: [][]const u8, out: [][]const u8) ?usize {
     if (out.len <= orig.len) return null;
     const added = out.len - orig.len;
@@ -473,7 +486,7 @@ fn walkTargets(
                 try found.targets.append(allocator, .{
                     .path = path,
                     .line = line,
-                    .multi_line = end_line != line,
+                    .multi_line = end_line != line or keepsBlankLines(pair.value),
                     .sole_child = m.pairs.items.len == 1,
                     .is_alias = pair.value.kind() == .alias,
                     .anchored_referenced = subtreeDefinesReferencedAnchor(pair.value, referenced, 0),
@@ -520,7 +533,7 @@ fn walkTargets(
                 try found.targets.append(allocator, .{
                     .path = path,
                     .line = line,
-                    .multi_line = end_line != line,
+                    .multi_line = end_line != line or keepsBlankLines(item),
                     .sole_child = s.items.items.len == 1,
                     .is_alias = item.kind() == .alias,
                     .anchored_referenced = subtreeDefinesReferencedAnchor(item, referenced, 0),
@@ -2279,13 +2292,11 @@ test "preservation sweep: bounded edits over every valid corpus document" {
     var valid: usize = 0;
     for (cases.items) |*c| {
         if (c.fail) continue;
-        if (corpus.skipPreservation(c.id)) continue;
         valid += 1;
     }
     // Every valid document the round-trip and conformance gates cover,
-    // minus the six unnamed sub-cases yayl cannot parse yet (the same
-    // list the other gates track) — here under edits.
-    try std.testing.expectEqual(@as(usize, 296), valid);
+    // here under edits.
+    try std.testing.expectEqual(@as(usize, 303), valid);
 
     var failures: Failures = .{ .allocator = allocator };
     defer {
@@ -2307,13 +2318,12 @@ test "preservation sweep: bounded edits over every valid corpus document" {
     };
     for (cases.items) |*c| {
         if (c.fail) continue;
-        if (corpus.skipPreservation(c.id)) continue;
         try sweepFixture(allocator, c.id, c.input, &failures, &stats, smoke);
     }
 
     // Every valid document accounted for: edited, root-less, or one of
     // the documented round-trip-unstable shapes.
-    try std.testing.expectEqual(@as(usize, 296), stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable);
+    try std.testing.expectEqual(@as(usize, 303), stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable);
     // The bounded sweep must still exercise every operation kind.
     try std.testing.expect(stats.deletes > 0);
     try std.testing.expect(stats.sets > 0);
@@ -2900,7 +2910,7 @@ test "preservation sweep: a new comment on any node reads back from it" {
         }
         try corpus.loadCases(allocator, io, &cases);
         for (cases.items) |*c| {
-            if (c.fail or corpus.skipPreservation(c.id)) continue;
+            if (c.fail) continue;
             const text = try firstDocument(allocator, c.input) orelse continue;
             errdefer allocator.free(text);
             try texts.append(allocator, .{ .label = try allocator.dupe(u8, c.id), .text = text });

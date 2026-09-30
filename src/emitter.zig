@@ -44,7 +44,7 @@ const Node = document_mod.Node;
 const Pair = document_mod.Pair;
 const ScalarStyle = token_mod.ScalarStyle;
 
-const yaml_tag_prefix = "tag:yaml.org,2002:";
+const yaml_tag_prefix = internal.yaml_tag_prefix;
 
 /// Serializes a document node tree to YAML text (fy-emit port).
 pub const Emitter = struct {
@@ -64,13 +64,19 @@ pub const Emitter = struct {
     /// True when the caller set `indent_step` explicitly, so faithful
     /// emission must not overwrite it with the source's own convention.
     forced_indent: bool = false,
-    /// The scalar last written by `emitScalarValue` was a block with keep
+    /// Output offset just past the last block scalar written with keep
     /// chomping (`|+`, `>+`), which absorbs any blank lines after it into
-    /// its value; see `pastKeptBlanks`.
-    kept_breaks: bool = false,
+    /// its value; see `pastKeptBlanks`. Only the output's end counts: a
+    /// keep block followed by other bytes has nothing to absorb.
+    kept_end: ?usize = null,
+    /// An original node the faithful walk must re-emit although clean: see
+    /// `keepBlockBeforeNew`.
+    force_dirty: ?*const Node = null,
     /// Least column a block scalar written next puts its content at, and
     /// a comment for its header line: see `placeBlock`.
     block_floor: usize = 0,
+    /// No block scalar may be written here: see `setBlockFloor`.
+    block_barred: bool = false,
     header_comment: ?[]const u8 = null,
     /// Output offset just past the last token a `:` written next would be
     /// read as part of -- an alias name, or an anchor or tag with nothing
@@ -245,11 +251,21 @@ pub const Emitter = struct {
     /// to continue from.
     fn writeContainerFraming(self: *Emitter, container: *const Node, gap_start: usize) Error!usize {
         const cs = container.src orelse return gap_start;
-        if (cs.synthetic or gap_start > cs.start) return gap_start;
+        if (cs.synthetic) return gap_start;
+        const header_end = markup.propertiesLineEnd(self.src, cs.start);
+        if (gap_start > cs.start) {
+            // Part of the header is written already (the rest of a key's
+            // line, `&a` of `&a` over `!!map`): the rest of it still is
+            // the container's, and was lost.
+            const he = header_end orelse return gap_start;
+            if (gap_start >= he) return gap_start;
+            try self.writeGap(container, gap_start, he);
+            return he;
+        }
         try self.writeGap(container, gap_start, cs.start);
-        const header_end = markup.propertiesLineEnd(self.src, cs.start) orelse return cs.start;
-        try self.writeGap(container, cs.start, header_end);
-        return header_end;
+        const he = header_end orelse return cs.start;
+        try self.writeGap(container, cs.start, he);
+        return he;
     }
 
     /// An emptied container re-emits as `{}` / `[]` straight from the
@@ -370,8 +386,9 @@ pub const Emitter = struct {
         // Indentation, or an indicator left by a deleted entry, already
         // in place: keep the original bytes. Blanks that are not this
         // entry's indentation (a whitespace-only last line with no line
-        // break after it) are replaced: kept, they put the entry inside a
-        // block scalar above.
+        // break after it) cannot stay under the entry: they would put it
+        // inside a block scalar above. (Blanks that are such a block's
+        // content never get here: see `keepBlockBeforeNew`.)
         if (isEntryFraming(pending)) {
             if (pending.len != col and ctype.isBlankRun(pending)) {
                 self.out.shrinkRetainingCapacity(self.out.items.len - pending.len);
@@ -484,6 +501,19 @@ pub const Emitter = struct {
         if (doc.explicit_end) try self.write("...\n");
     }
 
+    /// A byte order mark that is content -- the first bytes of a key or
+    /// value, which the parser keeps as libfyaml does -- can end up opening
+    /// the output when what stood before it is deleted, and the reader
+    /// then drops it as an encoding mark (`\u{FEFF}b: 2` read back as
+    /// `b`). A stream's own mark goes in front of it: that one is dropped,
+    /// and the content keeps its own.
+    fn guardContentBom(self: *Emitter, doc: *const Document, out_start: usize) Error!void {
+        if (out_start != 0) return;
+        if (!std.mem.startsWith(u8, self.out.items, "\u{FEFF}")) return;
+        if (doc.region_start == 0 and std.mem.startsWith(u8, self.src, "\u{FEFF}")) return;
+        try self.out.insertSlice(self.allocator, 0, "\u{FEFF}");
+    }
+
     /// A root scalar with an anchor or tag that will be written as a
     /// block scalar (see `emitDocument`).
     fn rootBlockWithProperties(root: *const Node) bool {
@@ -508,6 +538,12 @@ pub const Emitter = struct {
     // ------------------------------------------------------------------
 
     fn emitFaithful(self: *Emitter, doc: *const Document) Error!void {
+        const out_start = self.out.items.len;
+        try self.emitFaithfulBody(doc);
+        try self.guardContentBom(doc, out_start);
+    }
+
+    fn emitFaithfulBody(self: *Emitter, doc: *const Document) Error!void {
         const src = self.src;
         // Adopt the document's indentation convention before emitting
         // anything, so new subtrees match the file they land in. Bounded
@@ -587,6 +623,12 @@ pub const Emitter = struct {
             // Root replaced by a programmatic node: emit normalized and
             // keep the original tail.
             var at = indent;
+            // Blanks alone ahead of the root (`\t{}`) are no separator: a
+            // tab there is indentation, which a block cannot follow.
+            if (ctype.isBlankRun(self.pendingLine())) {
+                self.out.shrinkRetainingCapacity(self.out.items.len - self.pendingLine().len);
+                at = 0;
+            }
             const pending = self.pendingLine();
             if (pending.len > 0 and !internal.inlineValue(node)) {
                 // A block collection cannot open on the line of a `---`
@@ -605,7 +647,16 @@ pub const Emitter = struct {
             if (self.endsWithNewline()) return self.pastKeptBlanks(node, markup.lineEnd(self.src, orig_end));
             return orig_end;
         };
-        if (s.synthetic) return s.end; // empty document: head/tail only
+        if (s.synthetic) {
+            // An empty document: head and tail only, and the root's
+            // properties when it has some (`--- &x`), which were dropped.
+            if (node.anchor != null or node.tag != null) {
+                const pending = self.pendingLine();
+                if (pending.len > 0 and !ctype.isBlank(pending[pending.len - 1])) try self.writeByte(' ');
+                _ = try self.writeProperties(node);
+            }
+            return s.end;
+        }
         if (try self.writeCleanSlice(node, s.entry_start)) |end| return end;
         switch (node.data) {
             // Modified scalar/alias: re-emit content, then the original
@@ -651,7 +702,17 @@ pub const Emitter = struct {
             },
             else => {},
         }
-        const v = prev_value orelse return gap;
+        // The block can be the last entry of a collection that is the
+        // sibling: its breaks are just as much at the end of that sibling.
+        var v = prev_value orelse return gap;
+        var guard: usize = 0;
+        while (guard < self.max_depth) : (guard += 1) {
+            switch (v.data) {
+                .mapping => |m| v = if (m.pairs.items.len > 0) m.pairs.items[m.pairs.items.len - 1].value else return gap,
+                .sequence => |sq| v = if (sq.items.items.len > 0) sq.items.items[sq.items.items.len - 1] else return gap,
+                else => break,
+            }
+        }
         if (v.kind() != .scalar) return gap;
         if (v.data.scalar.style != .literal and v.data.scalar.style != .folded) return gap;
 
@@ -791,7 +852,7 @@ pub const Emitter = struct {
             if (try self.openEntryLine(entry_col, pending, self.terminatorAt(gap))) {
                 owed_terminator = true;
             }
-            self.placeNewBlock(value, gap);
+            self.placeNewBlock(container, value, gap);
             defer self.endBlockPlacement();
             try self.emitEntry(key, value, entry_col);
             if (value.pending_trailing) |tt| {
@@ -801,7 +862,7 @@ pub const Emitter = struct {
                 }
             }
             if (owed_terminator and !self.endsWithNewline()) try self.write(self.defaultTerminator());
-            if (self.endsWithNewline()) return self.pastKeptBlanksIn(container, value, gap);
+            if (self.endsWithNewline()) return self.pastKeptBlanksIn(container, value, self.pastTakenBreak(container, gap));
             return gap;
         }
 
@@ -884,7 +945,9 @@ pub const Emitter = struct {
                         } else {
                             try self.write(src[key_end..vs.entry_start]);
                         }
-                        try self.indentEmptied(markup.columnOf(src, s.entry_start));
+                        // The key's own column: a first key's
+                        // entry_start is the `- ` of the item it opens.
+                        try self.indentEmptied(markup.columnOf(src, s.start));
                     } else if (value.pending_leading != null and
                         markup.lineStart(src, vs.entry_start) != markup.lineStart(src, s.start))
                     {
@@ -910,7 +973,12 @@ pub const Emitter = struct {
                 }
                 self.placeBlock(value, pair_end orelse vs.end);
                 defer self.endBlockPlacement();
-                const stop = try self.emitContent(value, markup.columnOf(src, vs.start));
+                // An original block scalar re-emitted here keeps the
+                // column its content had; the value's own column (the
+                // `|` after `key: `) is no indentation the file uses.
+                const vcol = self.blockContentColumn(value) orelse
+                    if (value.data == .scalar) entry_col + self.indent_step else markup.columnOf(src, vs.start);
+                const stop = try self.emitContent(value, vcol);
                 // A container walk that reached the line end already
                 // consumed the terminator; deeper slots must not write
                 // it twice. A re-emitted block scalar closes its own
@@ -938,14 +1006,21 @@ pub const Emitter = struct {
             }
             // Replaced by an empty value node: normalized colon. An
             // explicit key needs none — `? key` is already the whole
-            // entry — and `? key: ` would not parse.
-            if (!expl) try self.writeValueIndicator(": ");
+            // entry — and `? key: ` would not parse; unless the value
+            // has properties to write, which go after a value indicator
+            // on a line of its own (`? a` over `: &x`), not on the key.
+            if (!expl) {
+                try self.writeValueIndicator(": ");
+            } else if (value.anchor != null or value.tag != null) {
+                try self.writeNewlineIndent(markup.columnOf(src, ks.?.entry_start));
+                try self.write(": ");
+            }
             _ = try self.emitContent(value, entry_col + self.indent_step);
             if (pair_end) |pe| return self.writeEntryTail(value, pe);
             return gap_start;
         }
         // Brand-new value: layout by its shape.
-        if (pair_end) |pe| self.placeBlock(value, pe) else self.placeNewBlock(value, gap_start);
+        if (pair_end) |pe| self.placeBlock(value, pe) else self.placeNewBlock(container, value, gap_start);
         defer self.endBlockPlacement();
         if (expl) {
             // `? key` gaining a value it did not have: the value
@@ -1010,7 +1085,7 @@ pub const Emitter = struct {
                 owed_terminator = true;
             }
             try self.write("- ");
-            self.placeNewBlock(item, gap);
+            self.placeNewBlock(container, item, gap);
             defer self.endBlockPlacement();
             // A block scalar's line ends with its header: a trailing
             // comment goes there (see `placeBlock`).
@@ -1051,7 +1126,7 @@ pub const Emitter = struct {
                 }
                 // A keep-chomped block takes the blank lines after it into
                 // its value; the next entry's gap must not write them again.
-                return self.pastKeptBlanksIn(container, item, gap);
+                return self.pastKeptBlanksIn(container, item, self.pastTakenBreak(container, gap));
             }
             return gap;
         };
@@ -1071,6 +1146,25 @@ pub const Emitter = struct {
         // by the rule below and nowhere else: re-assembling it here as
         // well doubled it for a block collection item, whose first entry
         // carries it (`- - name: x`).
+        if (s.synthetic) if (markup.emptyItemDash(src, s.entry_start)) |dash| if (gap_start <= dash) {
+            // An empty item's span is a point borrowed from the next
+            // token, past its own `-`, comment and line break: taken
+            // from there, a new item ahead of it had the dash glued on
+            // (`- - x-`), and its properties had nowhere to go.
+            try self.writeGap(container, gap_start, dash);
+            try self.breakBeforeEntry(entry_col);
+            // A line a block scalar written ahead of it just ended: its
+            // indentation went with the framing that item took.
+            if (self.pendingLine().len == 0) try self.writeIndent(entry_col);
+            try self.emitted.put(item, {});
+            try self.writeByte('-');
+            if (item.anchor != null or item.tag != null) {
+                try self.writeByte(' ');
+                _ = try self.writeProperties(item);
+            }
+            try self.writeGap(container, dash + 1, s.entry_start);
+            return s.end;
+        };
         try self.writeGap(container, gap_start, s.entry_start);
         if (item.pending_leading != null) {
             const col = markup.columnOf(src, s.entry_start);
@@ -1094,7 +1188,7 @@ pub const Emitter = struct {
             }
             self.placeBlock(item, s.end);
             defer self.endBlockPlacement();
-            const stop = try self.emitContent(item, markup.columnOf(src, s.start));
+            const stop = try self.emitContent(item, self.blockContentColumn(item) orelse markup.columnOf(src, s.start));
             // A container walk that re-emitted its last entry already
             // consumed the line terminator; writing the remainder on top
             // of that would append a blank line after the item.
@@ -1132,6 +1226,29 @@ pub const Emitter = struct {
         return true;
     }
 
+    /// Where the gap after a brand-new entry that ended its own line
+    /// resumes. The entry opened that line by breaking the one the gap
+    /// was on, so the source's break still ahead (past any tombstones)
+    /// is taken: written too, it left a blank line after a block scalar
+    /// (`b: 1` then a new `mv: |`), or after an empty item's `- -`.
+    fn pastTakenBreak(self: *const Emitter, container: *const Node, gap: usize) usize {
+        const src = self.src;
+        var next = gap;
+        outer: while (next < src.len) {
+            for (Document.droppedOf(container)) |d| {
+                if (next >= d[0] and next < d[1]) {
+                    next = d[1];
+                    continue :outer;
+                }
+            }
+            break;
+        }
+        if (next < src.len and markup.lineStart(src, next) != next and ctype.isBreak(src[next])) {
+            return markup.lineEnd(src, next);
+        }
+        return next;
+    }
+
     /// The first item after `item` in `container` that has source bytes.
     fn nextOriginalItem(container: *const Node, item: *const Node) ?*const Node {
         const items = switch (container.data) {
@@ -1149,7 +1266,8 @@ pub const Emitter = struct {
     /// `pastKeptBlanks` from a brand-new entry's gap in `container`,
     /// where the blank lines can sit behind a replaced entry's tombstone.
     fn pastKeptBlanksIn(self: *const Emitter, container: *const Node, node: *const Node, from: usize) usize {
-        if (node.data != .scalar or !self.kept_breaks) return from;
+        _ = node;
+        if (self.kept_end != self.out.items.len) return from;
         var i = from;
         outer: while (i < self.src.len) {
             for (Document.droppedOf(container)) |d| {
@@ -1166,7 +1284,8 @@ pub const Emitter = struct {
     }
 
     fn pastKeptBlanks(self: *const Emitter, node: *const Node, le: usize) usize {
-        if (node.data != .scalar or !self.kept_breaks) return le;
+        _ = node;
+        if (self.kept_end != self.out.items.len) return le;
         var i = le;
         while (i < self.src.len) {
             const next = markup.lineEnd(self.src, i);
@@ -1252,6 +1371,12 @@ pub const Emitter = struct {
                     };
                 }
                 const col = self.entryColumn(node, indent);
+                var values: std.ArrayList(*const Node) = .empty;
+                defer values.deinit(self.allocator);
+                for (m.pairs.items) |pair| try values.append(self.allocator, pair.value);
+                const saved = self.force_dirty;
+                defer self.force_dirty = saved;
+                if (self.keepBlockBeforeNew(values.items)) |n| self.force_dirty = n;
                 for (m.pairs.items) |pair| {
                     gap = try self.emitPair(node, pair, col, gap);
                 }
@@ -1289,6 +1414,9 @@ pub const Emitter = struct {
                     };
                 }
                 const col = self.entryColumn(node, indent);
+                const saved = self.force_dirty;
+                defer self.force_dirty = saved;
+                if (self.keepBlockBeforeNew(sq.items.items)) |n| self.force_dirty = n;
                 for (sq.items.items) |item| {
                     gap = try self.emitItem(node, item, col, gap);
                 }
@@ -1632,7 +1760,15 @@ pub const Emitter = struct {
                             if (explicitKeySpan(src, s.entry_start, s.start)) {
                                 return markup.columnOf(src, s.entry_start);
                             }
-                            return markup.columnOf(src, s.start);
+                            const col = markup.columnOf(src, s.start);
+                            // ... also when the `?` has a line of its own
+                            // (`? # c` over `  - seq`): the key's text is
+                            // deeper than the entry, and a new key written
+                            // there did not parse.
+                            if (internal.explicitIndicatorAbove(src, s.start)) |q| {
+                                return @min(col, markup.columnOf(src, markup.spaceEnd(src, q)));
+                            }
+                            return col;
                         }
                     }
                 }
@@ -1663,21 +1799,97 @@ pub const Emitter = struct {
     /// The first byte at or after `start` that is not a node property,
     /// a blank, a line break or a comment.
     fn firstContent(src: []const u8, start: usize) usize {
-        var i = markup.propertiesEnd(src, start);
+        var i = start;
         while (i < src.len) {
             switch (src[i]) {
                 ' ', '\t', '\n', '\r' => i += 1,
                 '#' => i = markup.newlineAt(src, i),
+                '&', '!' => {
+                    const end = markup.propertiesEnd(src, i);
+                    if (end == i) return i;
+                    i = end;
+                },
                 else => return i,
             }
         }
         return start;
     }
 
+    /// The column of an original block scalar's first content line, or
+    /// null for any other node (or a block scalar without content).
+    fn blockContentColumn(self: *const Emitter, node: *const Node) ?usize {
+        if (node.data != .scalar) return null;
+        const s = node.src orelse return null;
+        if (s.synthetic) return null;
+        const src = self.src;
+        var h = markup.propertiesLineEnd(src, s.start) orelse markup.propertiesEnd(src, s.start);
+        while (h < s.end and (src[h] == ' ' or src[h] == '\t')) h += 1;
+        if (h >= s.end or (src[h] != '|' and src[h] != '>')) return null;
+        var i = markup.lineEnd(src, h);
+        while (i < s.end) {
+            const line = src[i..markup.newlineAt(src, i)];
+            const body = std.mem.trimStart(u8, line, " ");
+            if (body.len > 0) return line.len - body.len;
+            const next = markup.lineEnd(src, i);
+            if (next == i) break;
+            i = next;
+        }
+        return null;
+    }
+
     /// True when a node can be emitted from its original bytes.
     fn nodeClean(self: *Emitter, node: *Node) bool {
         const s = node.src orelse return false;
+        // The forced node, and every node whose bytes hold it.
+        if (self.force_dirty) |f| if (f.src) |fs| {
+            if (fs.start >= s.start and fs.end <= s.end) return false;
+        };
         return !s.synthetic and !node.modified and !self.emitted.contains(node);
+    }
+
+    /// The block scalar that ends the source with no final line break,
+    /// when it is the last original entry of a collection, or the last
+    /// one inside that entry, and a new entry follows it. Copied as it
+    /// is, the line break the new entry needs joins the block (a
+    /// keep-chomped `|+` then holds one more): re-emitted, it is written
+    /// with the chomping its value needs.
+    fn keepBlockBeforeNew(self: *const Emitter, entries: anytype) ?*const Node {
+        const src = self.src;
+        if (src.len == 0 or ctype.isBreak(src[src.len - 1])) return null;
+        var last: ?*const Node = null;
+        var new_after = false;
+        for (entries) |n| {
+            if (n.src) |ns| if (!ns.synthetic) {
+                last = n;
+                new_after = false;
+                continue;
+            };
+            new_after = true;
+        }
+        if (!new_after) return null;
+        var n = last orelse return null;
+        // Down through the last original entry of each block collection:
+        // a new entry after the collection comes after its last leaf.
+        var depth: usize = 0;
+        while (depth < self.max_depth) : (depth += 1) {
+            const next: ?*const Node = switch (n.data) {
+                .mapping => |m| if (m.pairs.items.len == 0) null else blk: {
+                    const p = m.pairs.items[m.pairs.items.len - 1];
+                    const v = p.value.src orelse break :blk null;
+                    break :blk if (v.synthetic) p.key else p.value;
+                },
+                .sequence => |sq| if (sq.items.items.len == 0) null else sq.items.items[sq.items.items.len - 1],
+                else => null,
+            };
+            n = next orelse break;
+            const ns = n.src orelse return null;
+            if (ns.synthetic) return null;
+        }
+        if (n.data != .scalar) return null;
+        const style = n.data.scalar.style;
+        if (style != .literal and style != .folded) return null;
+        if (std.mem.trimEnd(u8, src[n.src.?.end..], " \t").len != 0) return null;
+        return n;
     }
 
     /// Write a node's original bytes when it is untouched; returns the
@@ -2142,7 +2354,11 @@ pub const Emitter = struct {
                                 if (endsOpen(pair.key)) self.open_end = self.out.items.len;
                                 try self.writeValueIndicator(": ");
                             } else {
-                                try self.write(src[ks.entry_start..markup.spaceEnd(src, colon)]);
+                                const vstart = markup.spaceEnd(src, colon);
+                                try self.write(src[ks.entry_start..vstart]);
+                                // Nothing after the `:` on its line: a
+                                // plain key's value needs a blank there.
+                                if (vstart == colon) try self.writeByte(' ');
                             }
                         }
                         try self.emitFlowBody(pair.value);
@@ -2313,11 +2529,7 @@ pub const Emitter = struct {
             try self.writeByte('!');
             return self.writeTagSuffix(tag[1..]);
         }
-        if (tag.len == 0 or !utf8.valid(tag)) return error.InvalidSyntax;
-        var i: usize = 0;
-        while (utf8.decode(tag, i) catch unreachable) |d| : (i += d.len) {
-            if (d.cp == ' ' or d.cp == '>' or !utf8.isPrintableCodepoint(d.cp) or ctype.isBreak(tag[i])) return error.InvalidSyntax;
-        }
+        if (!internal.verbatimSpellable(tag)) return error.InvalidSyntax;
         try self.write("!<");
         try self.write(tag);
         try self.writeByte('>');
@@ -2325,10 +2537,7 @@ pub const Emitter = struct {
 
     /// Does the document being written give `handle` a prefix of its own?
     fn redefined(self: *const Emitter, handle: []const u8) bool {
-        for (self.directives) |td| {
-            if (std.mem.eql(u8, td.handle, handle)) return true;
-        }
-        return false;
+        return internal.handleRedefined(self.directives, handle);
     }
 
     /// A shorthand tag's suffix: tag characters as they are, every other
@@ -2353,8 +2562,11 @@ pub const Emitter = struct {
         // A YAML stream is UTF-8, and no style can spell a byte sequence
         // that is not: written raw it is output that does not parse.
         if (!utf8.valid(value)) return error.InvalidUtf8;
-        const style = chooseScalarStyle(value, prefer, indent, block_ok, flow);
-        self.kept_breaks = (style == .literal or style == .folded) and stripTrailingNewlines(value).trailing > 1;
+        const style = chooseScalarStyle(value, prefer, indent, block_ok and !self.block_barred, flow);
+        const keep = (style == .literal or style == .folded) and stripTrailingNewlines(value).trailing > 1;
+        defer if (keep) {
+            self.kept_end = self.out.items.len;
+        };
         switch (style) {
             .plain => try self.write(value),
             .single_quoted => {
@@ -2470,27 +2682,44 @@ pub const Emitter = struct {
     /// (`a: |- # c`). Only a scalar can become a block at the top; the
     /// caller clears this with `endBlockPlacement`.
     fn placeBlock(self: *Emitter, node: *const Node, old_end: usize) void {
-        if (node.data != .scalar) return;
+        if (node.data == .alias) return;
         const src = self.src;
         const nl = markup.newlineAt(src, old_end);
         const rest = std.mem.trim(u8, src[@min(old_end, nl)..nl], " \t");
-        if (rest.len > 0 and rest[0] == '#') self.header_comment = rest;
-        self.block_floor = self.commentFloor(markup.lineEnd(src, old_end));
+        // A collection's block scalars sit inside it: only a scalar's
+        // header is on the line the old value's comment was.
+        if (node.data == .scalar and rest.len > 0 and rest[0] == '#') self.header_comment = rest;
+        self.setBlockFloor(markup.lineEnd(src, old_end));
     }
 
     /// `placeBlock` for a brand-new entry, whose next source line (the
     /// next original entry's gap) starts at `gap`, or after it when `gap`
     /// is mid-line.
-    fn placeNewBlock(self: *Emitter, node: *const Node, gap: usize) void {
-        if (node.data != .scalar) return;
+    fn placeNewBlock(self: *Emitter, container: *const Node, node: *const Node, gap: usize) void {
+        if (node.data == .alias) return;
         const src = self.src;
-        const from = if (markup.lineStart(src, gap) == gap) gap else markup.lineEnd(src, gap);
-        self.block_floor = self.commentFloor(from);
+        var from = if (markup.lineStart(src, gap) == gap) gap else markup.lineEnd(src, gap);
+        // Past the lines of entries deleted or replaced here: the new
+        // entry takes their place, and what follows them follows it.
+        outer: while (from < src.len) {
+            for (Document.droppedOf(container)) |d| {
+                if (from >= d[0] and from < d[1]) {
+                    from = if (markup.lineStart(src, d[1]) == d[1]) d[1] else markup.lineEnd(src, d[1]);
+                    continue :outer;
+                }
+            }
+            break;
+        }
+        self.setBlockFloor(from);
     }
 
-    /// One past the deepest comment line from `start` (a line start) up to
-    /// the next content line, or 0 when there is none.
-    fn commentFloor(self: *const Emitter, start: usize) usize {
+    /// Set `block_floor` to one past the deepest comment line from
+    /// `start` (a line start) up to the next content line, and at least
+    /// as deep as any line of blanks there, or 0 when there is none.
+    /// One of those lines opening with a tab bars block scalars: the tab
+    /// sits where the block's indentation is read, which no reader
+    /// accepts, however deep the content (libfyaml agrees).
+    fn setBlockFloor(self: *Emitter, start: usize) void {
         const src = self.src;
         var i = start;
         var floor: usize = 0;
@@ -2499,15 +2728,21 @@ pub const Emitter = struct {
             const line = src[i..markup.newlineAt(src, i)];
             const body = std.mem.trimStart(u8, line, " \t");
             if (body.len > 0 and body[0] != '#') break;
+            if (line.len > 0 and line[0] == '\t') self.block_barred = true;
             if (body.len > 0) floor = @max(floor, line.len - body.len + 1);
+            // A line of blanks only is an empty line of the block when it
+            // is no deeper than the content, and content (its extra
+            // blanks) when it is deeper.
+            if (body.len == 0) floor = @max(floor, line.len);
             if (next == i) break;
             i = next;
         }
-        return floor;
+        self.block_floor = floor;
     }
 
     fn endBlockPlacement(self: *Emitter) void {
         self.block_floor = 0;
+        self.block_barred = false;
         self.header_comment = null;
     }
 
@@ -2521,7 +2756,9 @@ pub const Emitter = struct {
         while (it.next()) |line| {
             if (!first) try self.write(self.defaultTerminator());
             first = false;
-            try self.writeIndent(indent);
+            // An empty line is read as one at any indentation: indented,
+            // it was only trailing whitespace.
+            if (line.len > 0) try self.writeIndent(indent);
             try self.write(line);
         }
         // A strip-chomped block still ends its line: see `placeBlock`.
@@ -3234,11 +3471,11 @@ test "a re-emitted keep-chomped block scalar keeps its value" {
     // replayed the same blank lines, which the keep chomping absorbed:
     // `keep\n\n` came back `keep\n\n\n` on every edit of that node.
     const cases = [_]struct { in: []const u8, path: []const []const u8, out: []const u8 }{
-        .{ .in = "- |+\n keep\n\n- x\n", .path = &.{"0"}, .out = "- &z |+\n  keep\n\n- x\n" },
-        .{ .in = "a: |+\n  keep\n\nb: x\n", .path = &.{"a"}, .out = "a: &z |+\n   keep\n\nb: x\n" },
-        .{ .in = "a: >+\n  keep\n\n\nb: x\n", .path = &.{"a"}, .out = "a: &z >+\n   keep\n\n\nb: x\n" },
-        .{ .in = "a: |+\n  keep\n\n", .path = &.{"a"}, .out = "a: &z |+\n   keep\n\n" },
-        .{ .in = "a: |+\n  keep\n\n# c\nb: x\n", .path = &.{"a"}, .out = "a: &z |+\n   keep\n\n# c\nb: x\n" },
+        .{ .in = "- |+\n keep\n\n- x\n", .path = &.{"0"}, .out = "- &z |+\n keep\n\n- x\n" },
+        .{ .in = "a: |+\n  keep\n\nb: x\n", .path = &.{"a"}, .out = "a: &z |+\n  keep\n\nb: x\n" },
+        .{ .in = "a: >+\n  keep\n\n\nb: x\n", .path = &.{"a"}, .out = "a: &z >+\n  keep\n\n\nb: x\n" },
+        .{ .in = "a: |+\n  keep\n\n", .path = &.{"a"}, .out = "a: &z |+\n  keep\n\n" },
+        .{ .in = "a: |+\n  keep\n\n# c\nb: x\n", .path = &.{"a"}, .out = "a: &z |+\n  keep\n\n# c\nb: x\n" },
     };
     for (cases) |c| {
         var doc = try Document.parse(testing.allocator, c.in);

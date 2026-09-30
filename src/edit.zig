@@ -398,14 +398,19 @@ fn refuseIfAnchorReferenced(doc: *Document, doomed: *const Node) Error!void {
 /// leaves; the walk never follows one. Past the depth bound it answers
 /// yes, which only costs the full check.
 fn anchorIn(node: *const Node, depth: usize) bool {
+    return propertyIn(node, false, depth);
+}
+
+/// `anchorIn`, or an alias anywhere in the subtree when `aliases`.
+fn propertyIn(node: *const Node, aliases: bool, depth: usize) bool {
     if (depth >= max_walk_depth) return true;
-    if (node.anchor != null) return true;
+    if (node.anchor != null or (aliases and node.data == .alias)) return true;
     switch (node.data) {
         .mapping => |m| for (m.pairs.items) |pair| {
-            if (anchorIn(pair.key, depth + 1) or anchorIn(pair.value, depth + 1)) return true;
+            if (propertyIn(pair.key, aliases, depth + 1) or propertyIn(pair.value, aliases, depth + 1)) return true;
         },
         .sequence => |sq| for (sq.items.items) |item| {
-            if (anchorIn(item, depth + 1)) return true;
+            if (propertyIn(item, aliases, depth + 1)) return true;
         },
         else => {},
     }
@@ -434,44 +439,6 @@ fn pairKeyOf(target: *const Node) ?*Node {
         else => {},
     }
     return null;
-}
-
-/// Does `node`, or anything under it, alias an anchor defined OUTSIDE
-/// `subtree`? Aliases are leaves; the walk never follows one.
-fn dependsOnOutsideAnchor(subtree: *const Node, node: *const Node, depth: usize) bool {
-    if (depth >= max_walk_depth) return false;
-    switch (node.data) {
-        .alias => |a| return !anchorDefinedIn(subtree, a.name, 0),
-        .mapping => |m| for (m.pairs.items) |pair| {
-            if (dependsOnOutsideAnchor(subtree, pair.key, depth + 1)) return true;
-            if (dependsOnOutsideAnchor(subtree, pair.value, depth + 1)) return true;
-        },
-        .sequence => |sq| for (sq.items.items) |item| {
-            if (dependsOnOutsideAnchor(subtree, item, depth + 1)) return true;
-        },
-        else => {},
-    }
-    return false;
-}
-
-/// Refuse a move that would put an alias ahead of its anchor.
-///
-/// `delete` and `set` strand an alias by removing the anchor outright.
-/// A move keeps it in the document, which is why this was originally
-/// exempt — but an alias needs the anchor to come BEFORE it, and a move
-/// only ever appends at the destination. So `- &x 1\n- *x\n` with
-/// `$[0]` moved to the root emits `- *x\n- &x 1\n`, which does not
-/// parse.
-///
-/// The test is whether an anchor/alias pair CROSSES the subtree
-/// boundary, in either direction: an anchor inside referenced from
-/// outside, or an alias inside whose anchor is outside. When both ends
-/// travel together their relative order is preserved, so a
-/// self-contained move stays allowed.
-fn refuseIfMoveStrandsAlias(doc: *Document, subtree: *const Node) Error!void {
-    const root = doc.root orelse return;
-    if (anchorIn(subtree, 0) and aliasWouldDangle(root, subtree, 0)) return error.AnchorReferenced;
-    if (dependsOnOutsideAnchor(subtree, subtree, 0)) return error.AnchorReferenced;
 }
 
 /// A `..key` walk, collecting every `key` match in pre-order into `out`.
@@ -625,21 +592,28 @@ pub const Editor = struct {
         }
         // An anchor this batch attached or moved can shadow a definition
         // the aliases after it were bound to, or stop shadowing one: the
-        // written document would bind them elsewhere. Checked only then,
-        // so an ordinary edit still costs what it changes.
+        // written document would bind them elsewhere. An alias it placed
+        // can land ahead of its definition, or over it, where it reads
+        // back as nothing. Checked only then, so an ordinary edit still
+        // costs what it changes.
         if (anchored) if (self.doc.root) |root| {
-            if (!try internal.aliasesBindInOrder(self.doc.allocator, root, null, null)) return error.AnchorShadowed;
+            switch (try internal.aliasBinding(self.doc.allocator, root, null, null)) {
+                .in_order => {},
+                .shadowed => return error.AnchorShadowed,
+                .unbound => return error.AnchorReferenced,
+            }
         };
         try txn.commit();
     }
 
-    /// Does `edit` attach or move a subtree that carries an anchor?
+    /// Does `edit` attach or move a subtree that carries an anchor or
+    /// an alias?
     fn placesAnchor(self: *Editor, edit: Edit) bool {
         return switch (edit) {
-            .set => |s| anchorIn(s.value, 0),
-            .insert => |i| anchorIn(i.value, 0),
-            .append => |a| anchorIn(a.value, 0),
-            .move => |m| if (self.one(m.from)) |n| anchorIn(n, 0) else |_| true,
+            .set => |s| propertyIn(s.value, true, 0),
+            .insert => |i| propertyIn(i.value, true, 0),
+            .append => |a| propertyIn(a.value, true, 0),
+            .move => |m| if (self.one(m.from)) |n| propertyIn(n, true, 0) else |_| true,
             .delete => false,
         };
     }
@@ -927,10 +901,13 @@ pub const Editor = struct {
         var ed = Editor{ .doc = doc };
         const node = try ed.oneForWrite(from);
         const target = try ed.oneForWrite(to);
-        try refuseIfMoveStrandsAlias(doc, node);
-        // Detaching a mapping value drops the whole pair, key included
-        // (see the detach loop below), so an anchor on that key leaves
-        // with it. `refuseIfMoveStrandsAlias` only sees the value tree.
+        // An alias the move puts ahead of its anchor, or an anchor it
+        // takes past its aliases, is refused by the check `apply` runs
+        // after any batch that places either (`internal.aliasBinding`):
+        // on the tree as it ends up, so a move that keeps the order is
+        // allowed. Detaching a mapping value drops the whole pair, key
+        // included (see the detach loop below), so an anchor on that key
+        // leaves the document with it.
         if (pairKeyOf(node)) |pair_key| try refuseIfAnchorReferenced(doc, pair_key);
         try refuseAliasContainer(target);
         // Reject moving a node into its own subtree.
@@ -3911,8 +3888,55 @@ test "edits keep the meaning in the shapes the preservation sweep skips" {
         // A null key's entry.
         .{ .in = ": a\nb: c\n", .ops = &.{.{ .delete = "$[\"\"]" }}, .out = "b: c\n" },
         .{ .in = ": a\nb: c\n", .ops = &.{.{ .move = .{ .from = "$[\"\"]", .to = "$", .key = "mv" } }}, .out = "b: c\nmv: a\n" },
+        // An emptied sequence at its key's column, the key opening an
+        // item: `[]` went at the key's column, and read as the next key.
+        .{ .in = "- About:\n  - a\n  - b\n- x\n", .ops = &.{.{ .delete = "$[0].About[*]" }}, .out = "- About:\n    []\n- x\n" },
+        // An empty item nested on its parent's line (`- -`): a block
+        // written ahead of it left it at column 0, an outer item; and
+        // its span, borrowed from the next token, made the emptied
+        // sequence's line run on through the next outer item.
+        .{ .in = "- -\n", .ops = &.{.{ .insert = .{ .p = "$[0]", .pos = "$[0][0]", .v = "n\n", .s = .literal } }}, .out = "- - |\n    n\n  -\n" },
+        .{ .in = "- -\n- 'a: b'\n", .ops = &.{.{ .delete = "$[0][0]" }}, .out = "- []\n- 'a: b'\n" },
+        .{ .in = "- -\r\n- y\r\n", .ops = &.{.{ .delete = "$[0][0]" }}, .out = "- []\r\n- y\r\n" },
+        // A new block value ending its own line took the break of the
+        // line it followed: written again, it left a blank line.
+        .{ .in = "b: 1\n", .ops = &.{.{ .set = .{ .p = "$.mv", .v = "x\n", .s = .literal } }}, .out = "b: 1\nmv: |\n  x\n" },
+        .{ .in = "a: >\n  x\n  y\nb: 1\n# c\n", .ops = &.{.{ .move = .{ .from = "$.a", .to = "$", .key = "mv" } }}, .out = "b: 1\nmv: >\n  x y\n# c\n" },
+        // New entries of a collection whose own were all deleted go at
+        // its first entry's column, past properties over several lines,
+        // not at the last property line's.
+        .{ .in = "key: &a # c\n  !!map\n    k: v\n", .ops = &.{ .{ .delete = "$.key.k" }, .{ .set = .{ .p = "$.key.n", .v = "1" } } }, .out = "key: &a # c\n  !!map\n    n: 1\n" },
+        .{ .in = "key: &a\n    !!map\n  k: v\nz: 1\n", .ops = &.{ .{ .delete = "$.key.k" }, .{ .set = .{ .p = "$.key.n", .v = "1" } } }, .out = "key: &a\n    !!map\n  n: 1\nz: 1\n" },
+        // A new block item ahead of an original one ended its own line,
+        // and the break it took over was written again.
+        .{ .in = "- 1\n- 2\n", .ops = &.{.{ .insert = .{ .p = "$", .pos = "$[1]", .v = "n\n", .s = .literal } }}, .out = "- 1\n- |\n  n\n- 2\n" },
+        // A second delete of an entry that had moved up onto the first
+        // one's line passes the move on to its successor.
+        .{ .in = "- name: Mark\n  hr: 65\n  avg: 0.278\n", .ops = &.{ .{ .delete = "$[0].name" }, .{ .delete = "$[0].hr" } }, .out = "- avg: 0.278\n" },
+        .{ .in = "- - a\n  - b\n  - c\n", .ops = &.{ .{ .delete = "$[0][0]" }, .{ .delete = "$[0][0]" } }, .out = "- - c\n" },
+        // A keep-chomped block's blank lines are its value: a move or a
+        // delete took the block but left them behind, and a moved copy
+        // wrote them again.
+        .{ .in = "a: |+\n  x\n\n# c\nb: 1\n", .ops = &.{.{ .move = .{ .from = "$.a", .to = "$", .key = "mv" } }}, .out = "# c\nb: 1\nmv: |+\n  x\n\n" },
+        .{ .in = "- |+\n  x\n\n- y\n", .ops = &.{.{ .delete = "$[0]" }}, .out = "- y\n" },
+        // An empty line of a literal block is written empty, not as
+        // trailing whitespace.
+        .{ .in = "b: 1\n", .ops = &.{.{ .set = .{ .p = "$.b", .v = "x\n\ny\n", .s = .literal } }}, .out = "b: |\n  x\n\n  y\n" },
+        // A block scalar above a line opening with a tab, which no block
+        // may precede.
+        .{ .in = "foo: 1\n\t\n#\nbar: 2\n", .ops = &.{.{ .set = .{ .p = "$.foo", .v = "a\n  b", .s = .literal } }}, .out = "foo: \"a\\n  b\"\n\t\n#\nbar: 2\n" },
+        .{ .in = "- 1\n\t# c\n- 2\n", .ops = &.{.{ .set = .{ .p = "$[0]", .v = "a\nb\n", .s = .literal } }}, .out = "- \"a\\nb\\n\"\n\t# c\n- 2\n" },
         // No final line break.
         .{ .in = "a: |\n  x\n  ", .ops = &.{.{ .set = .{ .p = "$.new", .v = "y" } }}, .out = "a: |\n  x\nnew: y" },
+        // ... after a block scalar whose last line is blanks that are
+        // content (" " past the indentation), or one nested in the last
+        // entry, where copying the block and breaking its line changed
+        // a keep-chomped value.
+        .{ .in = "a: |\n  x\n   ", .ops = &.{.{ .set = .{ .p = "$.new", .v = "y" } }}, .out = "a: |\n  x\n   \nnew: y\n" },
+        .{ .in = "a:\n  b: |+\n    x\n    y", .ops = &.{.{ .set = .{ .p = "$.new", .v = "y" } }}, .out = "a:\n  b: |-\n    x\n    y\nnew: y\n" },
+        .{ .in = "a:\n  b: |+\n    x\n     ", .ops = &.{.{ .set = .{ .p = "$.new", .v = "y" } }}, .out = "a:\n  b: |-\n    x\n     \nnew: y\n" },
+        .{ .in = "- - |+\n    x", .ops = &.{.{ .append = .{ .p = "$", .v = "c" } }}, .out = "- - \"x\"\n- c" },
+        .{ .in = "a:\n  - |+\n    x\n  ", .ops = &.{.{ .set = .{ .p = "$.new", .v = "y" } }}, .out = "a:\n  - |+\n    x\nnew: y" },
         .{ .in = "a: 1", .ops = &.{.{ .trail = .{ .p = "$.a", .t = "# d" } }}, .out = "a: 1 # d\n" },
         .{ .in = "- 1", .ops = &.{.{ .trail = .{ .p = "$[0]", .t = "# d" } }}, .out = "- 1 # d\n" },
     };
@@ -3948,6 +3972,199 @@ test "edits keep the meaning in the shapes the preservation sweep skips" {
         defer back.deinit();
         try testing.expect(sameTreeForTest(doc.root, back.root));
     }
+}
+
+/// How the randomized edit differential compares a document with its
+/// written-and-read-back self: `sameTreeForTest`, except that YAML's
+/// spellings of null (an untagged plain ``, `~`, `null`, `Null`, `NULL`)
+/// are one value, and an empty document reads back as a null root.
+fn readsBackAs(a: ?*const Node, b: ?*const Node, depth: usize) bool {
+    if (depth > max_walk_depth) return true;
+    const x = a orelse return b == null or isNullForTest(b.?);
+    const y = b orelse return isNullForTest(x);
+    if (x.kind() != y.kind()) return false;
+    if ((x.anchor == null) != (y.anchor == null)) return false;
+    if (x.anchor) |n| if (!std.mem.eql(u8, n, y.anchor.?)) return false;
+    if ((x.tag == null) != (y.tag == null)) return false;
+    if (x.tag) |t| if (!std.mem.eql(u8, t, y.tag.?)) return false;
+    return switch (x.data) {
+        .scalar => |s| std.mem.eql(u8, s.value, y.data.scalar.value) or (isNullForTest(x) and isNullForTest(y)),
+        .alias => |al| std.mem.eql(u8, al.name, y.data.alias.name) and al.target.kind() == y.data.alias.target.kind(),
+        .mapping => |m| m.pairs.items.len == y.data.mapping.pairs.items.len and for (m.pairs.items, y.data.mapping.pairs.items) |p, q| {
+            if (!readsBackAs(p.key, q.key, depth + 1) or !readsBackAs(p.value, q.value, depth + 1)) break false;
+        } else true,
+        .sequence => |sq| sq.items.items.len == y.data.sequence.items.items.len and for (sq.items.items, y.data.sequence.items.items) |i, j| {
+            if (!readsBackAs(i, j, depth + 1)) break false;
+        } else true,
+    };
+}
+
+fn isNullForTest(n: *const Node) bool {
+    if (n.tag != null or n.data != .scalar) return false;
+    const s = n.data.scalar;
+    if (s.style != .plain) return false;
+    for ([_][]const u8{ "", "~", "null", "Null", "NULL" }) |t| if (std.mem.eql(u8, s.value, t)) return true;
+    return false;
+}
+
+test "edits the randomized differential found read back as the tree in memory" {
+    // A differential over the corpus and fixtures, in plain, CRLF, CR,
+    // byte-order-mark and no-final-newline variants: random edits, each
+    // written, read back and compared with the tree in memory. Every row
+    // below was written as a document that read back as another tree, or
+    // did not parse; each is the smallest record that failed without the
+    // fix it pins. The bytes are not pinned: the meaning is.
+    const allocator = testing.allocator;
+    const Style = @import("token.zig").ScalarStyle;
+    const Op = struct {
+        k: enum { set, set_same, delete, append, insert, move, anchor, lead, trail },
+        p: []const u8,
+        p2: []const u8 = "",
+        key: ?[]const u8 = null,
+        v: []const u8 = "",
+        s: Style = .plain,
+        coll: enum { none, seq, map } = .none,
+        flow: bool = false,
+        tag: ?[]const u8 = null,
+        anchor: ?[]const u8 = null,
+        before: bool = false,
+        del: bool = false,
+    };
+    const rows = [_]struct { in: []const u8, ops: []const Op, batch: bool = false }{
+        .{ .in = "key: &anchor\n !!map\n  a: b\n", .ops = &.{.{ .k = .move, .p = ".key[*]", .p2 = ".key", .key = "mv" }} },
+        .{ .in = "a: 1\n\xef\xbb\xbfb: 2", .ops = &.{.{ .k = .delete, .p = ".a" }} },
+        .{ .in = "\t{}\n", .ops = &.{.{ .k = .set, .p = "$", .v = "x\n", .s = .any }} },
+        .{ .in = "---\n---", .ops = &.{.{ .k = .anchor, .p = "$", .anchor = "zq" }} },
+        .{ .in = "-", .ops = &.{.{ .k = .anchor, .p = "[0]", .anchor = "zq" }} },
+        .{ .in = "strip: |-\n  text\nclip: |\n  text\nkeep: |+\n  text", .ops = &.{.{ .k = .move, .p = "[\"clip\"]", .p2 = "$", .key = "mv" }} },
+        .{ .in = "a: \"double\n  quotes\" # lala\nb: plain\n value  # lala\nc  : #lala\n  d\n? # lala\n - seq1\n: # lala\n - #lala\n  seq2\ne:\n &node # lala\n - x: y\nblock: > # lala\n  abcde\n", .batch = true, .ops = &.{ .{ .k = .delete, .p = ".c" }, .{ .k = .set, .p = ".b", .v = "\xe2\x80\xa8", .s = .folded, .anchor = "nw" }, .{ .k = .move, .p = "[\"a\"]", .p2 = "[\"e\"]" }, .{ .k = .move, .p = "..b", .p2 = "$", .key = "mv" } } },
+        .{ .in = "k: {\n k\n :\n v\n }\n", .ops = &.{.{ .k = .set, .p = "[\"k\"].k", .v = "\xe2\x80\xa8", .s = .single_quoted }} },
+        .{ .in = "?\n:\n", .ops = &.{.{ .k = .move, .p = "[\"\"]", .p2 = "$", .key = "mv" }} },
+        .{ .in = "- -\n", .ops = &.{.{ .k = .set, .p = "[0][0]", .v = "\xc2\x85", .s = .any, .coll = .map, .flow = true }} },
+        .{ .in = "\xef\xbb\xbf-", .ops = &.{.{ .k = .anchor, .p = "[0]", .anchor = "zq" }} },
+        .{ .in = "%TAG ! tag:clarkevans.com,2002:\n--- !shape\n  # Use the ! handle for presenting\n  # tag:clarkevans.com,2002:circle\n- !circle\n  center: &ORIGIN {x: 73, y: 129}\n  radius: 7\n- !line\n  start: *ORIGIN\n  finish: { x: 89, y: 102 }\n- !label\n  start: *ORIGIN\n  color: 0xFFEEBB\n  text: Pretty vector drawing.\n", .batch = true, .ops = &.{ .{ .k = .set, .p = "[1]", .v = "\n", .s = .any, .tag = "!" }, .{ .k = .append, .p = "$", .v = ",", .s = .folded } } },
+        .{ .in = "\xef\xbb\xbf# Ranking of 1998 home runs\n---\n- Mark McGwire\n- Sammy Sosa\n- Ken Griffey\n\n# Team ranking\n---\n- Chicago Cubs\n- St Louis Cardinals\n", .batch = true, .ops = &.{ .{ .k = .append, .p = "$", .v = "x\n\n", .s = .single_quoted }, .{ .k = .set, .p = "[0]", .v = "\xc2\x85", .s = .double_quoted, .coll = .seq, .flow = true }, .{ .k = .set, .p = "[2]", .v = "~", .s = .literal, .tag = "tag:yaml.org,2002:int" } } },
+        .{ .in = "\xef\xbb\xbf? explicit key # Empty value\n? |\n  block key\n: - one # Explicit compact\n  - two # block value\n  - \"key: [1, 2]\"\n", .ops = &.{.{ .k = .anchor, .p = ".explicit key", .anchor = "zq" }} },
+        .{ .in = "\xef\xbb\xbf- |+\n   \n", .ops = &.{.{ .k = .set, .p = "$", .v = "multi\nline", .coll = .map }} },
+        .{ .in = "'? q'\n   \n", .ops = &.{.{ .k = .set, .p = "$", .v = "\n\nx", .s = .any, .anchor = "nw" }} },
+    };
+    for (rows) |row| {
+        var docs = try Document.parseAll(allocator, row.in);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        const doc = &docs.items[0];
+        var ed = Editor.init(doc);
+        var edits: std.ArrayList(Edit) = .empty;
+        defer edits.deinit(allocator);
+        for (row.ops) |op| {
+            const value: ?*Node = switch (op.k) {
+                .set, .append, .insert => blk: {
+                    const v = try doc.createScalar(op.v, op.s);
+                    v.tag = op.tag;
+                    if (op.anchor) |a| try doc.setAnchor(v, a);
+                    switch (op.coll) {
+                        .none => break :blk v,
+                        .seq => {
+                            const q = try doc.createSequence();
+                            if (op.flow) q.data.sequence.style = .flow;
+                            try doc.sequenceAppend(q, v);
+                            break :blk q;
+                        },
+                        .map => {
+                            const m = try doc.createMapping();
+                            if (op.flow) m.data.mapping.style = .flow;
+                            try doc.mappingAppend(m, try doc.createScalar("k", .plain), v);
+                            break :blk m;
+                        },
+                    }
+                },
+                .set_same => blk: {
+                    const n = try ed.one(op.p);
+                    const v = try doc.createScalar(n.data.scalar.value, n.data.scalar.style);
+                    v.anchor = n.anchor;
+                    v.tag = n.tag;
+                    break :blk v;
+                },
+                else => null,
+            };
+            const edit: ?Edit = switch (op.k) {
+                .set, .set_same => .{ .set = .{ .path = op.p, .value = value.? } },
+                .delete => .{ .delete = op.p },
+                .append => .{ .append = .{ .sequence = op.p, .value = value.? } },
+                .insert => .{ .insert = .{ .sequence = op.p, .position = op.p2, .value = value.?, .before = op.before } },
+                .move => .{ .move = .{ .from = op.p, .to = op.p2, .key = op.key } },
+                .anchor => blk: {
+                    try doc.setAnchor(try ed.one(op.p), op.anchor);
+                    break :blk null;
+                },
+                .lead => blk: {
+                    try doc.setLeadingComments(try ed.one(op.p), if (op.del) null else op.v);
+                    break :blk null;
+                },
+                .trail => blk: {
+                    try doc.setTrailingComment(try ed.one(op.p), if (op.del) null else op.v);
+                    break :blk null;
+                },
+            };
+            if (edit) |e| {
+                if (row.batch) try edits.append(allocator, e) else try ed.apply(&.{e});
+            }
+        }
+        if (row.batch) try ed.apply(edits.items);
+        const out = try document_mod.writeAll(allocator, docs.items);
+        defer allocator.free(out);
+        errdefer std.debug.print("{f}: wrote {f}\n", .{ std.zig.fmtString(row.in), std.zig.fmtString(out) });
+        var back = try Document.parseAll(allocator, out);
+        defer {
+            for (back.items) |*d| d.deinit();
+            back.deinit(allocator);
+        }
+        try testing.expectEqual(docs.items.len, back.items.len);
+        for (docs.items, back.items) |*x, *y| try testing.expect(readsBackAs(x.root, y.root, 0));
+    }
+}
+
+test "a keep-chomped block followed by more of its entry leaves the blank lines after them" {
+    // A keep block takes the blank lines after it into its value, so the
+    // gap after it skips them -- but only when the block ends the output:
+    // with `j: y` written after it, the blank line before `- 2` is the
+    // source's own separator, and dropping it lost it.
+    var doc = try Document.parse(testing.allocator, "- 1\n\n- 2\n");
+    defer doc.deinit();
+    const m = try doc.createMapping();
+    try doc.mappingAppend(m, try doc.createScalar("k", .plain), try doc.createScalar("x\n\n", .literal));
+    try doc.mappingAppend(m, try doc.createScalar("j", .plain), try doc.createScalar("y", .plain));
+    var ed = Editor.init(&doc);
+    try ed.set("$[0]", m);
+    const out = try doc.write(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("- k: |+\n    x\n\n  j: y\n\n- 2\n", out);
+}
+
+test "an alias placed ahead of its anchor, or over it, is refused" {
+    // Accepted, each wrote `*B` before any `&B` (or with none left),
+    // which does not read back.
+    const allocator = testing.allocator;
+    var doc = try Document.parse(allocator, "a: 0\nq: []\nb: &B 1\nl: [x]\nc: *B\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    const b = try ed.one("$.b");
+    try testing.expectError(error.AnchorReferenced, ed.set("$.a", try doc.createAlias(b)));
+    try testing.expectError(error.AnchorReferenced, ed.set("$.b", try doc.createAlias(b)));
+    try testing.expectError(error.AnchorReferenced, ed.apply(&.{.{ .append = .{ .sequence = "$.q", .value = try doc.createAlias(b) } }}));
+    try testing.expectError(error.AnchorReferenced, ed.apply(&.{.{ .move = .{ .from = "$.c", .to = "$.q", .key = "" } }}));
+    // After the anchor, an alias is fine wherever it goes.
+    try ed.apply(&.{.{ .insert = .{ .sequence = "$.l", .position = "$.l[0]", .value = try doc.createAlias(b), .before = true } }});
+    try ed.apply(&.{.{ .move = .{ .from = "$.c", .to = "$", .key = "z" } }});
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("a: 0\nq: []\nb: &B 1\nl: [*B, x]\nz: *B\n", out);
+    var back = try Document.parse(allocator, out);
+    defer back.deinit();
+    // A node without an anchor has no name to alias.
+    try testing.expectError(error.InvalidSyntax, doc.createAlias(try ed.one("$.a")));
 }
 
 test "an edit that would rebind an alias, or build a cycle, is refused" {

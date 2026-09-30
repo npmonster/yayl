@@ -42,6 +42,8 @@ pub const Value = union(enum) {
     /// One key/value pair of a mapping (spec 3.2.1.1).
     pub const Pair = struct { key: []const u8, value: Value };
 
+    /// The value of the first entry with `key`, by a linear scan (see
+    /// `Node.lookup`).
     pub fn get(self: Value, key: []const u8) ?Value {
         if (self != .mapping) return null;
         for (self.mapping) |m| {
