@@ -684,6 +684,14 @@ and pinned by tests that fail without the fix:
   null): where a block scalar's content ends in the source.
 - The preservation sweep's list of unparseable sub-cases, and the gap it
   kept for L24T-2, are gone with the skips.
+- `document.scalarCoreTag` returns `?CoreTag`: null when an explicit core
+  tag contradicts the scalar's text (`!!int abc`, `!!int 0b101`) or names a
+  collection (`!!seq 42`); it returned a tag whatever the text said.
+  `value` and `schema` report those as `error.TypeMismatch`.
+- `markup.leadingCommentSpan` takes a third argument, `floor`: the offset
+  before which no line is part of the block (the end of what precedes the
+  entry), so the content lines of a block scalar above are not read as
+  comments. Pass 0 for the earlier behaviour.
 
 ### Added
 
@@ -691,6 +699,11 @@ and pinned by tests that fail without the fix:
   document cannot spell when it is set rather than when it is written.
 - `Document.createAlias(target)` makes an alias to an anchored node, to
   place like any other node.
+- Helpers the emitter and the value layer share are public in their
+  modules: `document.coreTextFits`, `document.tagContradictsKind`,
+  `scanner.max_simple_key_chars` and, in `markup`, `propertiesEnd`,
+  `propertiesLineEnd`, `emptyItemDash` and `valueIndicatorEnd`. They serve
+  the library's own layers.
 
 ## 0.19.3 — 2026-09-15
 
