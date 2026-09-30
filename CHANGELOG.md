@@ -506,6 +506,17 @@ tree in memory) found these; each is pinned by a regression test:
   path.
 - A set whose parent path matched several nodes reported
   `error.UnknownPath`; it is `error.AmbiguousOperation`.
+- A replaced sequence item lost the comment on its line (a mapping
+  value's kept it); it stays, on the block header for a block scalar. An
+  item under a line holding several indicators (`- -` over a comment
+  line) had its span start at its content, so deleting it left a null
+  item. A new block scalar in a CRLF document broke its lines with `\n`.
+  Clearing a collection's anchor that stood on a line of its own left the
+  line empty.
+- `writeAll` wrote nothing for a document built with no root, so its
+  neighbours read back as one document; it writes an explicit empty
+  document (`---`). A byte order mark opening a later document became
+  content of it (`\u{FEFF}b: 2` a key); it is dropped there.
 - `defaultTerminator` rescanned the source for its first line break on
   every call, a scan as long as the document for one written on a single
   line; it is taken once.

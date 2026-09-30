@@ -47,6 +47,7 @@ pub const Journal = struct {
         root: ?*Node,
         parent: struct { node: *Node, old: ?*Node },
         src: struct { node: *Node, old: ?markup.Src },
+        trailing: struct { node: *Node, old: ?[]const u8 },
         /// The node's `modified` flag was false.
         modified: *Node,
         alias_target: struct { node: *Node, old: *Node },
@@ -78,6 +79,7 @@ pub const Journal = struct {
             .root => |r| doc.root = r,
             .parent => |x| x.node.parent = x.old,
             .src => |x| x.node.src = x.old,
+            .trailing => |x| x.node.pending_trailing = x.old,
             .modified => |n| n.modified = false,
             .alias_target => |x| x.node.data.alias.target = x.old,
             .pair_inserted => |x| _ = x.map.data.mapping.pairs.orderedRemove(x.index),
@@ -172,6 +174,14 @@ pub fn setSrc(doc: *Document, node: *Node, src: ?markup.Src) !void {
     try reserve(doc);
     record(doc, .{ .src = .{ .node = node, .old = node.src } });
     node.src = src;
+}
+
+/// A written trailing comment for `node` (see `Document.setTrailingComment`),
+/// journaled: `text` must live in the document pool.
+pub fn setPendingTrailing(doc: *Document, node: *Node, text: ?[]const u8) !void {
+    try reserve(doc);
+    record(doc, .{ .trailing = .{ .node = node, .old = node.pending_trailing } });
+    node.pending_trailing = text;
 }
 
 pub fn setAliasTarget(doc: *Document, node: *Node, target: *Node) !void {

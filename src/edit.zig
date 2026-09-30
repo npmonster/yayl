@@ -784,8 +784,16 @@ pub const Editor = struct {
                 // and values carrying properties use ordinary removal and
                 // insertion. Their layout is normalized at the measured
                 // sibling indentation.
+                // The replaced item's trailing comment stays on its line:
+                // a mapping value's does (its key keeps the line), and an
+                // item's went with the old item.
+                const items: []const *Node = cur.items() orelse &.{};
+                const comment = if (ix < items.len) items[ix].trailingComment(doc) else null;
                 _ = (try doc.sequenceRemove(cur, ix)) orelse return error.UnknownPath;
                 try doc.sequenceInsert(cur, ix, value);
+                if (comment) |c| if (value.pending_trailing == null and (value.data == .scalar or value.data == .alias)) {
+                    try internal.setPendingTrailing(doc, value, try doc.pool.dupe(c));
+                };
             },
             // Wildcards, filters and recursive descent can match any
             // number of nodes: not a single deterministic target.
@@ -3863,6 +3871,12 @@ test "edits keep the meaning in the shapes the preservation sweep skips" {
         .{ .in = "- # c\n  x\n- z\n", .ops = &.{.{ .delete = "$[0]" }}, .out = "- z\n" },
         .{ .in = "- # c\n  x\n- z\n", .ops = &.{.{ .set = .{ .p = "$[0]", .v = "NEW" } }}, .out = "- NEW\n- z\n" },
         .{ .in = "- # c\n  x\n", .ops = &.{.{ .append = .{ .p = "$", .v = "y" } }}, .out = "- # c\n  x\n- y\n" },
+        .{ .in = "- -\n    # c\n    x\n  - y\n", .ops = &.{.{ .delete = "$[0][0]" }}, .out = "- - y\n" },
+        // A replaced item keeps its line's comment, as a mapping value does.
+        .{ .in = "- 1 # c\n- 2\n", .ops = &.{.{ .set = .{ .p = "$[0]", .v = "9" } }}, .out = "- 9 # c\n- 2\n" },
+        .{ .in = "- 1 # c\n- 2\n", .ops = &.{.{ .set = .{ .p = "$[0]", .v = "x\ny", .s = .literal } }}, .out = "- |- # c\n  x\n  y\n- 2\n" },
+        // A new block scalar breaks its lines as the document does.
+        .{ .in = "a: 1\r\nb: 2\r\n", .ops = &.{.{ .set = .{ .p = "$.a", .v = "x\ny", .s = .literal } }}, .out = "a: |-\r\n  x\r\n  y\r\nb: 2\r\n" },
         // Document markers.
         .{ .in = "--- a\n", .ops = &.{.{ .set_seq = "$" }}, .out = "---\n- x\n" },
         .{ .in = "--- a\n", .ops = &.{.{ .set_map = "$" }}, .out = "---\nk: x\n" },
@@ -3883,6 +3897,7 @@ test "edits keep the meaning in the shapes the preservation sweep skips" {
         .{ .in = "a: &x\n  b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = null } }}, .out = "a:\n  b: 1\n" },
         .{ .in = "a: &x\n  b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = "y" } }}, .out = "a: &y\n  b: 1\n" },
         .{ .in = "b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$", .name = "r" } }}, .out = "&r\nb: 1\n" },
+        .{ .in = "&col\nkey: v\n", .ops = &.{.{ .anchor = .{ .p = "$", .name = null } }}, .out = "key: v\n" },
         .{ .in = "- k: v\n- j: w\n", .ops = &.{.{ .anchor = .{ .p = "$[0]", .name = "y" } }}, .out = "- &y\n  k: v\n- j: w\n" },
         .{ .in = "top:\n  - k: v\n  - j: w\n", .ops = &.{.{ .anchor = .{ .p = "$.top[0]", .name = "y" } }}, .out = "top:\n  - &y\n    k: v\n  - j: w\n" },
         .{ .in = "a:\nb: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = "x" } }}, .out = "a: &x\nb: 1\n" },
@@ -3959,6 +3974,13 @@ test "an edit that would rebind an alias, or build a cycle, is refused" {
         const same = try doc.write(allocator);
         defer allocator.free(same);
         try testing.expectEqualStrings("a: &x 1\nb: 0\nc: *x\n", same);
+    }
+    // Moving a definition past its alias strands the alias.
+    {
+        var doc = try Document.parse(allocator, "a: &x 1\nb: *x\nc: {}\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try testing.expectError(error.AnchorReferenced, ed.apply(&.{.{ .move = .{ .from = "$.a", .to = "$.c", .key = "a" } }}));
     }
     // YAML gives an alias no properties.
     {

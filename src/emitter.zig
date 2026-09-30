@@ -403,7 +403,7 @@ pub const Emitter = struct {
             try self.write(self.defaultTerminator());
             return self.writeIndent(col);
         }
-        try self.out.insert(self.allocator, self.out.items.len - (pending.len - k), '\n');
+        try self.out.insertSlice(self.allocator, self.out.items.len - (pending.len - k), self.defaultTerminator());
     }
 
     // ------------------------------------------------------------------
@@ -1012,9 +1012,20 @@ pub const Emitter = struct {
             try self.write("- ");
             self.placeNewBlock(item, gap);
             defer self.endBlockPlacement();
-            _ = try self.emitContent(item, entry_col + 2);
-            if (item.pending_trailing) |tt| {
+            // A block scalar's line ends with its header: a trailing
+            // comment goes there (see `placeBlock`).
+            var offered = false;
+            if (item.data == .scalar) if (item.pending_trailing) |tt| {
                 if (tt.len > 0) {
+                    self.header_comment = tt;
+                    offered = true;
+                }
+            };
+            _ = try self.emitContent(item, entry_col + 2);
+            const on_header = offered and self.header_comment == null;
+            self.header_comment = null;
+            if (item.pending_trailing) |tt| {
+                if (tt.len > 0 and !on_header) {
                     try self.writeByte(' ');
                     try self.write(tt);
                 }
@@ -1401,8 +1412,11 @@ pub const Emitter = struct {
         if (p.end > p.start) {
             try self.writeGap(node, s.entry_start, p.start);
             if (!try self.writeProperties(node)) {
-                // Cleared: no blank left before the line break.
+                // Cleared: no blank left before the line break, and no
+                // empty line where they stood alone (`&col` over `k: v`).
                 while (self.out.items.len > 0 and ctype.isBlank(self.out.items[self.out.items.len - 1])) self.out.items.len -= 1;
+                const nl = markup.newlineAt(self.src, p.end);
+                if (self.pendingLine().len == 0 and ctype.isBlankRun(self.src[p.end..nl])) return markup.lineEnd(self.src, p.end);
             }
             return p.end;
         }
@@ -2424,6 +2438,10 @@ pub const Emitter = struct {
         return .{ .core = core, .trailing = trailing };
     }
 
+    /// Block scalars break their lines with the document's own line
+    /// terminator (`defaultTerminator`): a new block in a CRLF file wrote
+    /// `\n`, mixing the two.
+    ///
     /// Block scalar header: `|` or `>` plus the chomping indicator
     /// (`-` strip, `+` keep) computed from the trailing-newline count, and
     /// the comment `placeBlock` moved there, if any.
@@ -2439,7 +2457,7 @@ pub const Emitter = struct {
             try self.write(c);
             self.header_comment = null;
         }
-        try self.writeByte('\n');
+        try self.write(self.defaultTerminator());
     }
 
     /// A block scalar takes every following line indented at least as far
@@ -2501,13 +2519,13 @@ pub const Emitter = struct {
         var it = std.mem.splitScalar(u8, s.core, '\n');
         var first = true;
         while (it.next()) |line| {
-            if (!first) try self.writeByte('\n');
+            if (!first) try self.write(self.defaultTerminator());
             first = false;
             try self.writeIndent(indent);
             try self.write(line);
         }
         // A strip-chomped block still ends its line: see `placeBlock`.
-        for (0..@max(s.trailing, 1)) |_| try self.writeByte('\n');
+        for (0..@max(s.trailing, 1)) |_| try self.write(self.defaultTerminator());
     }
 
     /// `indent` is the column a block scalar's content lines would be
@@ -2690,14 +2708,14 @@ pub const Emitter = struct {
                 // Terminate the previous line, then one blank output
                 // line per value newline (the separator itself plus
                 // each blank value line).
-                for (0..blanks + 2) |_| try self.writeByte('\n');
+                for (0..blanks + 2) |_| try self.write(self.defaultTerminator());
             }
             blanks = 0;
             have_line = true;
             try self.writeIndent(indent);
             try self.write(line);
         }
-        for (0..@max(s.trailing, 1)) |_| try self.writeByte('\n');
+        for (0..@max(s.trailing, 1)) |_| try self.write(self.defaultTerminator());
     }
 
     /// A byte order mark opening a line (at column 0, where a root block

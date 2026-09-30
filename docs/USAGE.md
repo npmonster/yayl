@@ -36,7 +36,10 @@ const yaml = @import("yayl");
 
 `yaml.parse` reads the first document of a stream; `yaml.parseAll`
 reads every document (an unmanaged `std.ArrayList(Document)`;
-deinitialize every document, then the list).
+deinitialize every document, then the list). A later document is not
+checked by `parse`, but the first must end: content after it with no
+`---` (or `...`) to start another document (`[1, 2] garbage`) is an
+error, not dropped.
 
 ~~~zig
 var doc = try yaml.parse(alloc,
@@ -120,6 +123,15 @@ is by name, not by position: with `- &x 1`, `- &x 2`, `- *x`, deleting
 the first item is refused even though the alias resolves to the second
 (later anchors shadow earlier ones). The refusal errs on the safe side;
 replace the alias with a plain value if the shadowed node has to go.
+
+Shadowing the other way is refused too: defining a name again ahead of
+an alias that names the earlier definition (`setAnchor`, or a `set`,
+`insert`, `append` or `move` carrying the anchor) would rebind that
+alias once the document is written and read back, so it fails with
+`error.AnchorShadowed` and changes nothing. A `move` that takes a
+definition past its aliases strands them and is `error.AnchorReferenced`.
+YAML gives an alias no properties, so `setAnchor` on one is
+`error.InvalidSyntax`.
 
 An alias may name an *enclosing* anchor, which makes the document
 cyclic — `&a [*a]` parses. The recursive walks are depth-bounded so this
@@ -660,7 +672,11 @@ name, file sync, then rename): a crash never exposes torn content. This
 is torn-write protection, not a power-loss durability guarantee; sync
 the containing directory if your application requires that guarantee.
 Writing through a symbolic link replaces the file it points to and keeps
-the link; a link to nothing is `error.FileNotFound`.
+the link; a link to nothing is `error.FileNotFound`. The temp file and
+the rename happen in the target's directory, which must be writable.
+Like any replace-by-rename, the new file is a new inode: permissions are
+carried over, but ownership, ACLs and extended attributes are not, and
+other hard links to the old file keep its old content.
 
 `max_bytes` is the parse's input bound too, so it can raise the default
 64 MiB as well as lower it. `parseFileOpts` and `parseAllFileOpts` take

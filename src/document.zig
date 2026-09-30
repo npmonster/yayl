@@ -2205,6 +2205,16 @@ pub fn writeAllOpts(allocator: std.mem.Allocator, docs: []const Document, option
         em.configure(options);
         try em.emitDocument(doc);
 
+        // A document with nothing to write (built with no root) is still
+        // a document of the stream: an explicit empty one, or its
+        // neighbours read back as one.
+        if (body.items.len == 0 and docs.len > 1) try body.appendSlice(allocator, "---\n");
+        // A byte order mark opens a stream; before a later document the
+        // reader takes it for content (`\u{FEFF}b: 2` a key).
+        if (i > 0 and std.mem.startsWith(u8, body.items, "\u{FEFF}")) {
+            std.mem.copyForwards(u8, body.items, body.items[3..]);
+            body.shrinkRetainingCapacity(body.items.len - 3);
+        }
         const join = if (i > 0) boundary(&tail, out.items, body.items) else "";
         try out.ensureUnusedCapacity(allocator, join.len + body.items.len);
         out.appendSliceAssumeCapacity(join);
@@ -3178,6 +3188,28 @@ test "writeAll keeps documents apart when one ends mid-line" {
         errdefer std.debug.print("writeAll gave {f}\n", .{std.zig.fmtString(out)});
         try testing.expectEqual(case.roots.len, back.items.len);
         for (case.roots, back.items) |want, *d| try testing.expectEqualStrings(want, d.root.?.scalarValue().?);
+    }
+
+    // A document built with no root, and a later one opening with a byte
+    // order mark: neither may merge into, or change, its neighbours.
+    {
+        var empty = Document.init(allocator);
+        defer empty.deinit();
+        var y = try Document.parse(allocator, "y\n");
+        defer y.deinit();
+        var b = try Document.parse(allocator, "\u{FEFF}b: 2\n");
+        defer b.deinit();
+        const out = try writeAll(allocator, &.{ empty, y, b, empty });
+        defer allocator.free(out);
+        var back = try Document.parseAll(allocator, out);
+        defer {
+            for (back.items) |*d| d.deinit();
+            back.deinit(allocator);
+        }
+        try testing.expectEqual(@as(usize, 4), back.items.len);
+        try testing.expect(back.items[0].root == null or back.items[0].root.?.scalarValue().?.len == 0);
+        try testing.expectEqualStrings("y", back.items[1].root.?.scalarValue().?);
+        try testing.expectEqualStrings("2", back.items[2].pathGet(&.{"b"}).?.scalarValue().?);
     }
 
     // A comment that belongs to the line the previous document ended on

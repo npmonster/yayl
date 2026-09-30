@@ -187,11 +187,18 @@ pub fn entryStart(source: []const u8, content_start: usize) usize {
             }
             // Only a line holding nothing but the indicator (and a
             // comment): blanks before it, a blank or the end after it.
-            if (body[0] != '-' and body[0] != '?') return content_start;
-            if (body.len > 1 and body[1] != ' ' and body[1] != '\t') return content_start;
-            const after = std.mem.trimStart(u8, body[1..], " \t");
-            if (after.len > 0 and after[0] != '#') return content_start;
-            const indicator = ls + (line.len - body.len);
+            // Several may share it (`- -`, an item holding a sequence):
+            // the content is under the last.
+            var rest = body;
+            var indicator: usize = line_end;
+            while (rest.len > 0 and (rest[0] == '-' or rest[0] == '?') and
+                (rest.len == 1 or rest[1] == ' ' or rest[1] == '\t'))
+            {
+                indicator = ls + (line.len - rest.len);
+                rest = std.mem.trimStart(u8, rest[1..], " \t");
+            }
+            if (indicator == line_end) return content_start;
+            if (rest.len > 0 and rest[0] != '#') return content_start;
             // And only when the content is actually indented UNDER the
             // indicator. A block entry's content sits deeper than its
             // `-`/`?`; content at the same or a lower column belongs to
