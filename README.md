@@ -4,7 +4,7 @@ A YAML parser, document model, and emitter for Zig. Parse a config, change one v
 
 Most YAML libraries parse into a plain map and drop everything else, so writing the file back reformats it and your comments are gone. yayl keeps the source layout in the tree and re-emits from it.
 
-> **Status: feature complete.** Scanner, parser, a document model that keeps source spans, and an emitter. Passes the named yaml-test-suite corpus (15 unnamed sub-cases are tracked skips, listed in `tests/conformance.zig`), does byte-faithful round trips, and ships an editing API, a value runtime, optional schema validation, and bounded file I/O. `make verify` gates all of it; the numbers are under [Development](#development).
+> **Status: feature complete.** Scanner, parser, a document model that keeps source spans, and an emitter. Passes the whole pinned yaml-test-suite corpus (397 records, unnamed sub-cases included, no skips), does byte-faithful round trips, and ships an editing API, a value runtime, optional schema validation, and bounded file I/O. `make verify` gates all of it; the numbers are under [Development](#development).
 
 > **Written by AI agents** under human direction. See the [disclosure](#ai-development-disclosure) below.
 
@@ -247,11 +247,11 @@ The gates, in both Debug and ReleaseSafe:
 
 | Gate | Result |
 | --- | --- |
-| yaml-test-suite conformance | 382/397 pass, 15 tracked skips (unnamed sub-cases), 0 fail |
-| byte-faithful round trips | 297/303 pass, 6 tracked skips, 0 fail, plus real-world fixtures |
-| edit preservation | 296 corpus documents under edits (the 6 unparseable sub-cases and 1 preservation gap are skipped), plus every fixture position |
+| yaml-test-suite conformance | 397/397 pass, no skips, 0 fail |
+| byte-faithful round trips | 303/303 pass, no skips, 0 fail, plus real-world fixtures |
+| edit preservation | all 303 valid corpus cases under edits (298 documents, 5 empty), plus every fixture position |
 | event-tree parity vs libfyaml | 269/269 compared, zero mismatches |
-| emission oracle (libfyaml parses what we emit) | 539 documents across both emission paths, zero findings |
+| emission oracle (libfyaml parses what we emit) | 816 documents across three emission paths, zero findings |
 | allocation-failure injection | zero leaks |
 
 ## License

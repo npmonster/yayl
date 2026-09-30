@@ -87,12 +87,13 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 | `fy-diag.c`           | `src/diag.zig`         | ✅ core — levels/marks/render done; source excerpts not yet        |
 | `fy-utf8.c`           | `src/utf8.zig`         | ✅ done — strict decode/encode/validate                            |
 | `fy-ctype.c`          | `src/ctype.zig`        | ✅ done — byte-level classes (indicators are ASCII)                |
-| `fy-scan.c`           | `src/scanner.zig`      | ✅ done — corpus green (382/397; 15 unnamed sub-cases tracked)      |
+| `fy-scan.c`           | `src/scanner.zig`      | ✅ done — corpus green (397/397, no skips)                          |
 | `fy-parse.c`          | `src/parser.zig`       | ✅ done — event streams byte-identical to libfyaml (differential)  |
 | `fy-event.c`          | `src/event.zig`        | ✅ done                                                            |
 | `fy-doc.c` `fy-node.c` `fy-docbuilder.c` | `src/document.zig` | ✅ done — semantic model + per-node/entry spans (comments and blank lines round-trip); merge keys (`<<`) resolved on request |
 | `fy-emit.c`           | `src/emitter.zig`      | ✅ done — faithful (untouched bytes exact) + normalized emit; modified subtrees normalize internal layout, new/moved ones re-emit block at the measured indent |
 | `fy-atom.c`           | —                      | ⬜ not ported (atom interning; optional optimization)              |
+| `fy-accel.c`          | —                      | ⬜ not ported (hashed key lookup; lookups are linear, documented in USAGE) |
 | `fy-tag.c`            | in `parser.zig`        | 🟡 shorthand resolution done; no `fy_tag` cache                    |
 | `fy-wpool.c`          | —                      | ⬜ out of scope for v1 (threading)                                 |
 | `fy-markup.c`         | `src/markup.zig`       | ✅ done — source-span arithmetic behind byte-faithful round trips  |
@@ -103,13 +104,17 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 
 ### Scanner status
 
-The pinned yaml-test-suite corpus is green: 382 pass, 15 tracked skips
-(the unnamed sub-cases of the tab-marker tests, listed in
-`tests/conformance.zig`), 0 fail. The named cases all pass: explicit
-keys, tab strictness (column-0 tabs indenting constructs are rejected;
-separation tabs are fine), flow/quoted continuation indentation bounds,
-block scalar folding/indentation indicators. `make verify` and
-`make roundtrip` keep it honest (stale-skip guards).
+The pinned yaml-test-suite corpus is green: all 397 records pass, the
+46 unnamed sub-cases included, with no skips. That covers explicit keys,
+tab strictness (a tab may separate, never indent: column-0 tabs, tabs
+after `-`/`?`/`:` ahead of a nested block construct, and tabs ahead of
+a quoted or flow continuation line's block column are rejected, as
+libfyaml rejects them), flow/quoted continuation indentation bounds,
+`\<TAB>` escapes, and block scalar folding/indentation indicators.
+`make verify` and `make roundtrip` keep it honest (stale-skip guards).
+Where libfyaml is looser than the spec (a plain continuation indented
+by a tab, `?\tk` over `: v`), the scanner follows the spec and says so
+in a PORT NOTE.
 
 ### Parser status
 
@@ -137,6 +142,12 @@ measured indent width.
 - **Parse cache**: none in v1 (same note).
 - **Threading (`fy-wpool`)** and **atom interning (`fy-atom`)** remain
   optional, out of scope.
+- **Hashed key lookup (`fy-accel`)**: not ported. Lookups scan a
+  mapping's entries (first match wins, for duplicate keys), so reading
+  every key of a huge mapping one by one is quadratic; `docs/USAGE.md`
+  says so and shows the one-pass alternative. Nodes are public structs
+  a caller can change in place, so a cached index could go stale
+  silently.
 - **Merge keys (`<<`)** are opt-in via `ParseOptions.resolve_merge_keys`
   or `Document.resolveMergeKeys` (YAML 1.1; see
   `docs/design/merge-keys.md`). Off by default, so the round-trip and
@@ -148,7 +159,7 @@ measured indent width.
   quoting, round trips, editing, value conversion, schemas, file I/O,
   allocation-failure injection — `zig build test`.
 - **Conformance gate**: full yaml-test-suite corpus (397 records),
-  event-tree comparison, 15 tracked unnamed-sub-case skips, 0 fail —
+  event-tree comparison, no skips, 0 fail —
   `make conformance`.
 - **Round-trip gate**: `emit(parseAll(x)) == x` over the corpus and
   real-world fixtures — `make roundtrip`.
@@ -158,12 +169,12 @@ measured indent width.
   over the fixtures and a bounded corpus pass — `make preservation`.
 - **Emission oracle**: the vendored libfyaml parses every document yayl
   emits — `make emission-oracle` (report-only in CI until it has
-  soaked). It sweeps TWO emission paths: `faithful` replays the author's
-  bytes and styles, and `value` rebuilds each document through
-  `yaml.value` first, so the emitter has to choose every scalar's form.
-  The second is the only gate that sees the style-choosing code at all —
-  every other gate starts from parsed documents, where the styles come
-  from the source.
+  soaked). It sweeps THREE emission paths: `faithful` replays the
+  author's bytes and styles, `value` rebuilds each document through
+  `yaml.value` first, so the emitter has to choose every scalar's form,
+  and `merged` re-emits with merge keys resolved. `value` is the only
+  gate that sees the style-choosing code at all — every other gate
+  starts from parsed documents, where the styles come from the source.
 
 ## Zig 0.16 gotchas already paid for (don't re-learn these)
 

@@ -15,7 +15,8 @@ level; `fail: true` cases must be rejected. Results land in
 
 Skips live in the harness's `skips` table and always carry a reason and
 a target card — nothing is skipped silently. That table is currently
-empty, so conformance is 351/351 with no skips.
+empty: every record passes, the 46 unnamed sub-cases included, so
+conformance is 397/397 with no skips.
 
 ## Round-trip gate
 

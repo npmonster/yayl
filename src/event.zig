@@ -65,6 +65,12 @@ pub const Event = struct {
         /// node (empty key/value). Its marks point at the *next* token,
         /// so CST code must never emit its span verbatim.
         synthetic: bool = false,
+        /// Block scalars with content: the source offset just past the
+        /// last content line's text. The end mark runs on over the
+        /// trailing empty lines, and blanks there cannot be told apart
+        /// from content by looking (`|` then `  x` then `   ` ends in the
+        /// content line " "), so the scanner records where content ends.
+        content_end: ?usize = null,
     };
 
     pub const CollectionStart = struct {

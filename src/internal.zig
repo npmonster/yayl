@@ -14,6 +14,7 @@ const ctype = @import("ctype.zig");
 const document_mod = @import("document.zig");
 const markup = @import("markup.zig");
 const utf8 = @import("utf8.zig");
+const TagDirective = @import("token.zig").TagDirective;
 
 const Document = document_mod.Document;
 const Node = document_mod.Node;
@@ -263,6 +264,60 @@ pub fn inlineValue(value: *const Node) bool {
     };
 }
 
+/// The core schema's tag prefix, written `!!`.
+pub const yaml_tag_prefix = "tag:yaml.org,2002:";
+
+/// INTERNAL. Does a document with `directives` give `handle` a prefix of
+/// its own?
+pub fn handleRedefined(directives: []const TagDirective, handle: []const u8) bool {
+    for (directives) |td| {
+        if (std.mem.eql(u8, td.handle, handle)) return true;
+    }
+    return false;
+}
+
+/// INTERNAL. True when `tag` can be written, verbatim or as a shorthand,
+/// in a document with `directives`: the choice `Emitter.writeTag` makes.
+/// A shorthand escapes any byte its suffix cannot hold, so only a tag
+/// left to the verbatim form can be unspellable. `Document.setTag`
+/// refuses such a tag; the emitter refuses to write one.
+pub fn tagSpellable(directives: []const TagDirective, tag: []const u8) bool {
+    if (std.mem.eql(u8, tag, "!")) return true;
+    for (directives) |td| {
+        if (tag.len > td.prefix.len and std.mem.startsWith(u8, tag, td.prefix)) return true;
+    }
+    if (!handleRedefined(directives, "!!") and tag.len > yaml_tag_prefix.len and std.mem.startsWith(u8, tag, yaml_tag_prefix)) return true;
+    if (!handleRedefined(directives, "!") and tag.len > 1 and tag[0] == '!') return true;
+    return verbatimSpellable(tag);
+}
+
+/// INTERNAL. True when `tag` can be written `!<tag>`, which is read raw
+/// up to the `>`: printable UTF-8 with no blank, line break or `>`.
+pub fn verbatimSpellable(tag: []const u8) bool {
+    if (tag.len == 0 or !utf8.valid(tag)) return false;
+    var i: usize = 0;
+    while (utf8.decode(tag, i) catch unreachable) |d| : (i += d.len) {
+        if (d.cp == ' ' or d.cp == '>' or !utf8.isPrintableCodepoint(d.cp) or ctype.isBreak(tag[i])) return false;
+    }
+    return true;
+}
+
+test "a tag is spellable unless it falls to a verbatim form it cannot take" {
+    const none: []const TagDirective = &.{};
+    try std.testing.expect(tagSpellable(none, "!"));
+    try std.testing.expect(tagSpellable(none, "tag:yaml.org,2002:str x")); // `!!str%20x`
+    try std.testing.expect(tagSpellable(none, "!local thing"));
+    try std.testing.expect(tagSpellable(none, "tag:example.com,2000:app"));
+    try std.testing.expect(!tagSpellable(none, "tag:example.com,2000:a b"));
+    try std.testing.expect(!tagSpellable(none, "a>b"));
+    try std.testing.expect(!tagSpellable(none, ""));
+    try std.testing.expect(!tagSpellable(none, "x\ny"));
+    // With `!` redefined, a local tag has only the verbatim form.
+    const bang: []const TagDirective = &.{.{ .handle = "!", .prefix = "tag:example.com,2000:" }};
+    try std.testing.expect(!tagSpellable(bang, "!a b"));
+    try std.testing.expect(tagSpellable(bang, "tag:example.com,2000:a b"));
+}
+
 /// INTERNAL. True when `name` can be written as an anchor or alias name
 /// (spec 6.9.2 `ns-anchor-char`): one or more printable characters in
 /// valid UTF-8, none of them a blank, a line break, a flow indicator or
@@ -379,6 +434,82 @@ fn outerFraming(src: []const u8, container: *const Node, line: usize) ?struct { 
     return .{ .own = cs.start, .after = after };
 }
 
+/// Whether every byte of `[from, to)` lies in one of `node`'s tombstones.
+fn coveredByDrops(node: *const Node, from: usize, to: usize) bool {
+    var i = from;
+    outer: while (i < to) {
+        for (Document.droppedOf(node)) |d| {
+            if (i >= d[0] and i < d[1]) {
+                i = d[1];
+                continue :outer;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+/// INTERNAL. The start of a line holding only an explicit key indicator
+/// (`?`, and perhaps a comment) above `pos`'s line, with only blank and
+/// comment lines between; null when there is none.
+pub fn explicitIndicatorAbove(src: []const u8, pos: usize) ?usize {
+    var ls = markup.lineStart(src, pos);
+    while (ls > 0) {
+        const prev = markup.lineStart(src, ls - 1);
+        const body = std.mem.trimStart(u8, src[prev..markup.newlineAt(src, prev)], " \t");
+        if (body.len == 0 or body[0] == '#') {
+            ls = prev;
+            continue;
+        }
+        if (body[0] != '?') return null;
+        const rest = std.mem.trimStart(u8, body[1..], " \t");
+        if (body.len > 1 and !ctype.isBlank(body[1])) return null;
+        return if (rest.len == 0 or rest[0] == '#') prev else null;
+    }
+    return null;
+}
+
+/// Past the blank lines at `to` when `node`'s source ends in a
+/// keep-chomped block scalar (`|+`, `>+`): they are its value's trailing
+/// line breaks, not space between entries. Left behind by a tombstone
+/// that stopped at the block's last content line, they stayed in the gap
+/// while a moved copy of the block wrote them again.
+fn keptBlanksEnd(src: []const u8, node: *const Node, to: usize) usize {
+    var n = node;
+    var depth: usize = 0;
+    // Down to the last original leaf, as the block would be.
+    while (depth < Node.max_parent_walk) : (depth += 1) {
+        n = switch (n.data) {
+            .mapping => |m| if (m.pairs.items.len == 0) break else blk: {
+                const last = m.pairs.items[m.pairs.items.len - 1];
+                const vs = last.value.src orelse return to;
+                break :blk if (vs.synthetic) last.key else last.value;
+            },
+            .sequence => |sq| if (sq.items.items.len == 0) break else sq.items.items[sq.items.items.len - 1],
+            else => break,
+        };
+    }
+    if (n.data != .scalar) return to;
+    const ns = n.src orelse return to;
+    if (ns.synthetic) return to;
+    var h = markup.propertiesLineEnd(src, ns.start) orelse markup.propertiesEnd(src, ns.start);
+    while (h < src.len and (src[h] == ' ' or src[h] == '\t')) h += 1;
+    if (h >= src.len or (src[h] != '|' and src[h] != '>')) return to;
+    h += 1;
+    var keep = false;
+    while (h < src.len and (src[h] == '+' or src[h] == '-' or std.ascii.isDigit(src[h]))) : (h += 1) {
+        if (src[h] == '+') keep = true;
+    }
+    if (!keep) return to;
+    var i = to;
+    while (i < src.len) {
+        const next = markup.lineEnd(src, i);
+        if (next == i or !ctype.isBlankRun(src[i..markup.newlineAt(src, i)])) break;
+        i = next;
+    }
+    return i;
+}
+
 pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
     const src = self.source orelse return;
     const ks = p.key.src orelse return;
@@ -386,6 +517,9 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
     // indicator its entry starts with; skipping it left a deleted entry
     // in the output (and a moved one there as well as at its new place).
     if (ks.synthetic and !(ks.entry_start < src.len and (src[ks.entry_start] == ':' or src[ks.entry_start] == '?'))) return;
+    // An explicit null key (`?` over `:`) points at its `:`; the entry
+    // starts at the `?` line above.
+    const entry_start = if (ks.synthetic) explicitIndicatorAbove(src, ks.entry_start) orelse ks.entry_start else ks.entry_start;
     switch (map.data) {
         .mapping => |*m| {
             // A flow collection re-emits normalized from the tree, so
@@ -393,8 +527,8 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
             // line with the parent's `key:`, so a line-range
             // tombstone would swallow those bytes too.
             if (m.style == .flow) return;
-            var from = markup.lineStart(src, ks.entry_start);
-            var to = markup.lineEnd(src, p.src_end orelse ks.end);
+            var from = markup.lineStart(src, entry_start);
+            var to = keptBlanksEnd(src, p.value, markup.lineEnd(src, p.src_end orelse ks.end));
             // The first entry's line can carry enclosing nodes' framing
             // (`- name: x`, `? x: 1` for a key mapping, `: x: 1` for an
             // explicit key's value). It outlives the entry: leave it and
@@ -404,7 +538,7 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
             // separates them: a comment in between has to stay where the
             // author put it. Taking the whole line lost a `: ` (a
             // different tree) and left a bare `- ` or `? ` behind.
-            if (outerFraming(src, map, markup.lineStart(src, ks.entry_start))) |fr| {
+            if (outerFraming(src, map, markup.lineStart(src, entry_start))) |fr| {
                 if (nextEntryStart(m, p)) |nx| {
                     if (nx >= to and ctype.isBlankRun(src[to..nx])) {
                         from = fr.own;
@@ -430,6 +564,18 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
                     // does not parse.
                     from = fr.own;
                     to = markup.newlineAt(src, p.src_end orelse ks.end);
+                }
+            } else if (from < entry_start and coveredByDrops(map, from, entry_start)) {
+                // This entry had moved up onto an earlier one's line (that
+                // tombstone took its indentation): it is first on the line
+                // now, and passes the move on to its successor. Taking its
+                // whole line left the earlier line's indentation in front
+                // of the successor's own (`-\n    avg`).
+                if (nextEntryStart(m, p)) |nx| {
+                    if (nx >= to and ctype.isBlankRun(src[to..nx])) {
+                        from = entry_start;
+                        to = nx;
+                    }
                 }
             }
             if (to <= from) return;
@@ -464,13 +610,26 @@ pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
                 // gap re-emitted the deleted bytes verbatim). Found by
                 // the preservation corpus sweep once `parse`'s region
                 // covered the document tail.
-                const from = if (is.end > 0) markup.lineStart(src, is.end - 1) else 0;
-                const to = is.end;
+                var from = if (is.end > 0) markup.lineStart(src, is.end - 1) else 0;
+                var to = is.end;
+                // Its own `-` says which line that is: the line before the
+                // borrowed point is the next item's indentation when that
+                // item is indented (`- -` over `  - x`).
+                if (markup.emptyItemDash(src, is.end)) |dash| {
+                    from = markup.lineStart(src, dash);
+                    to = markup.lineEnd(src, dash);
+                }
+                // An outer item's `- ` on the line (`- -`) outlives it, and
+                // so does the line's break.
+                if (outerFraming(src, seq, from)) |fr| {
+                    from = @max(from, fr.own);
+                    to = @min(to, markup.newlineAt(src, from));
+                }
                 if (to > from) try dropRange(self, seq, from, to);
                 return;
             }
             var from = markup.lineStart(src, is.entry_start);
-            var to = markup.lineEnd(src, is.end);
+            var to = keptBlanksEnd(src, item, markup.lineEnd(src, is.end));
             // The first item's line can carry enclosing nodes' framing
             // (an outer item's `- ` in `- - a`, an explicit key's `? `
             // or value's `: `). It outlives this item, so leave it and
@@ -499,6 +658,14 @@ pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
                     // minus `$[0][0]` emitted a bare `[]`).
                     from = fr.own;
                     to = markup.newlineAt(src, is.end);
+                }
+            } else if (from < is.entry_start and coveredByDrops(seq, from, is.entry_start)) {
+                // Moved up onto an earlier item's line (see dropPairSpan).
+                if (nextItemStart(s, item)) |nx| {
+                    if (nx >= to and ctype.isBlankRun(src[to..nx])) {
+                        from = is.entry_start;
+                        to = nx;
+                    }
                 }
             }
             if (to <= from) return;
@@ -553,41 +720,56 @@ pub fn attachRefusal(parent: *Node, child: *Node) ?error{ WouldCycle, NestingToo
     return null;
 }
 
+/// How the aliases under a root bind once the document is written and
+/// read back (see `aliasBinding`).
+pub const Binding = enum {
+    /// Each to its current target.
+    in_order,
+    /// One to another definition of its name.
+    shadowed,
+    /// One to no definition: none of its name comes before it.
+    unbound,
+};
+
 /// INTERNAL. Would every alias under `root` still bind to its current
 /// target once the document is written and read back? A reader binds an
 /// alias to the nearest definition of its name before it (a later `&x`
 /// shadows an earlier one), so an edit that defines a name again, or
 /// moves a definition, rebinds the aliases after it: in memory `*x` kept
-/// its old target, and the written document meant something else. An
-/// alias with no definition before it is not judged: that is a forward
-/// alias in a hand-built tree, which no edit made. `renamed`, when set,
-/// gives that node the anchor `as` for the check (a `setAnchor` about to
-/// happen).
-pub fn aliasesBindInOrder(allocator: std.mem.Allocator, root: *const Node, renamed: ?*const Node, as: ?[]const u8) !bool {
+/// its old target, and the written document meant something else. And
+/// an alias placed ahead of every definition of its name, or over the
+/// node that carried it, does not read back at all. The first problem
+/// found is reported. `renamed`, when set, gives that node the anchor
+/// `as` for the check (a `setAnchor` about to happen).
+pub fn aliasBinding(allocator: std.mem.Allocator, root: *const Node, renamed: ?*const Node, as: ?[]const u8) !Binding {
     var defs: std.StringHashMapUnmanaged(*const Node) = .empty;
     defer defs.deinit(allocator);
     return bindsInOrder(allocator, root, &defs, renamed, as, 0);
 }
 
-fn bindsInOrder(allocator: std.mem.Allocator, node: *const Node, defs: *std.StringHashMapUnmanaged(*const Node), renamed: ?*const Node, as: ?[]const u8, depth: usize) !bool {
-    if (depth >= Node.max_parent_walk) return true;
+fn bindsInOrder(allocator: std.mem.Allocator, node: *const Node, defs: *std.StringHashMapUnmanaged(*const Node), renamed: ?*const Node, as: ?[]const u8, depth: usize) !Binding {
+    if (depth >= Node.max_parent_walk) return .in_order;
     // A definition comes before its node's content (`&x [*x]`).
     const anchor = if (renamed == node) as else node.anchor;
     if (anchor) |a| try defs.put(allocator, a, node);
     switch (node.data) {
         .scalar => {},
-        .alias => |al| if (defs.get(al.name)) |bound| {
-            if (bound != al.target) return false;
+        .alias => |al| {
+            const bound = defs.get(al.name) orelse return .unbound;
+            if (bound != al.target) return .shadowed;
         },
         .mapping => |m| for (m.pairs.items) |p| {
-            if (!try bindsInOrder(allocator, p.key, defs, renamed, as, depth + 1)) return false;
-            if (!try bindsInOrder(allocator, p.value, defs, renamed, as, depth + 1)) return false;
+            for ([_]*const Node{ p.key, p.value }) |n| {
+                const b = try bindsInOrder(allocator, n, defs, renamed, as, depth + 1);
+                if (b != .in_order) return b;
+            }
         },
         .sequence => |sq| for (sq.items.items) |item| {
-            if (!try bindsInOrder(allocator, item, defs, renamed, as, depth + 1)) return false;
+            const b = try bindsInOrder(allocator, item, defs, renamed, as, depth + 1);
+            if (b != .in_order) return b;
         },
     }
-    return true;
+    return .in_order;
 }
 
 /// INTERNAL. Replace the existing value node `existing` (a value of

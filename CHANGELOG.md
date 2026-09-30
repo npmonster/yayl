@@ -521,6 +521,65 @@ tree in memory) found these; each is pinned by a regression test:
   every call, a scan as long as the document for one written on a single
   line; it is taken once.
 
+**The whole yaml-test-suite corpus passes, with no skips.** The 15
+unnamed sub-cases that were tracked skips now pass: a `\<TAB>` escape in
+a double-quoted scalar is a tab (3RLN, DE56, KH5V); a whitespace-only
+last line deeper than a block scalar's indentation is content (`x` over
+three spaces is `x\n \n`, L24T); and a tab is refused where it would
+indent, as libfyaml refuses it: after `-`, `?` or an explicit key's `:`
+ahead of a nested block construct (`-\t-`, `?\tkey:`), and ahead of a
+quoted or flow continuation line's block column (DK95, Y79Y). Two valid
+shapes were refused and are accepted: a blank line holding a tab after a
+nested block collection (DK95), and a tab-indented comment line after a
+plain scalar (`foo: 1` over `\t# c`). The round-trip and preservation
+gates lose their skips with them. The non-specific tag `!` was resolved
+through a `%TAG !` directive; it stays `!`.
+
+**Edits whose output read back as a different document, or not at
+all.** A randomized edit differential (edit, write, read back, compare
+with the tree in memory; plain, CRLF, CR, byte-order-mark and
+no-final-newline variants of the corpus and fixtures) found these, now
+fixed and pinned by regression tests:
+
+- A block scalar ending a file with no final line break, followed by a
+  new entry: a keep-chomped `|+` value gained a line break, also when the
+  block was nested in the last entry, and a last line of blanks that was
+  content (`   ` under `  x`) was dropped.
+- A keep-chomped block's trailing blank lines are its value, but a move
+  or delete left them behind, and a moved copy wrote them again.
+- Emptying the inner sequence of `- -` with another item after it wrote
+  that item twice (`- []- y`); an item inserted ahead of such an empty
+  item left it at column 0, an outer item; a document ending in one lost
+  its final line break.
+- An emptied sequence at its key's column under `- key:` wrote `[]` at
+  the key's column, where it read as the next key.
+- A block scalar was written above a line opening with a tab, which no
+  reader accepts; such a value is quoted instead. A block scalar written
+  ahead of comment or whitespace-only lines deeper than its content took
+  them in; its content goes deeper than them.
+- A new entry in a mapping whose first remaining entry is an explicit
+  key with its `?` on a line of its own was written at the key text's
+  column and did not parse.
+- An alias placed ahead of its anchor, or over the node carrying it, was
+  accepted and written as a document that does not parse; it is
+  `error.AnchorReferenced`.
+- A root replaced after leading blanks (`\t{}`) kept a tab as its
+  indentation; an empty document's root anchor or tag (`--- &x`) was
+  dropped; a byte order mark that is content (the first bytes of a key)
+  became the stream's mark once what preceded it was deleted, and was
+  lost.
+- Properties over several lines (`&a` over `!!map`) lost their second
+  line when an entry below was edited; an explicit key's new empty value
+  with an anchor or tag was written on the key's line (`? a: &x`); a flow
+  mapping key whose `:` ended its line had the new value glued to it.
+- A move or delete of an entry that had moved up onto a deleted entry's
+  line left that line's indentation in front of its successor, and a
+  deleted explicit null key (`?` over `:`) left its `?` behind.
+- Cosmetic: a new block value at the end of a mapping left a blank line
+  after it, a literal block's empty lines were written indented, and an
+  original block scalar re-emitted in place was indented at its `|`
+  column rather than its content's.
+
 ### Changed
 
 - `edit.cloneTreeWhole` is removed. It existed for the clone the undo
@@ -565,6 +624,22 @@ tree in memory) found these; each is pinned by a regression test:
   and text after a segment is `error.InvalidPath`.
 - A block scalar the emitter writes always ends its last line, and a
   written leading comment is written at the entry's column.
+- A `move` of a subtree whose anchors or aliases cross its boundary was
+  refused with `error.AnchorReferenced` whenever they did, even when every
+  alias still followed its anchor afterwards. The batch is now judged on
+  the tree it leaves: refused when an alias ends up ahead of its anchor,
+  allowed otherwise. A batch that places an alias gets the same check.
+- `Token.Scalar` and `Event.ScalarEvent` gain `content_end` (defaulted to
+  null): where a block scalar's content ends in the source.
+- The preservation sweep's list of unparseable sub-cases, and the gap it
+  kept for L24T-2, are gone with the skips.
+
+### Added
+
+- `Document.setTag(node, tag)` sets or clears a tag, refusing one the
+  document cannot spell when it is set rather than when it is written.
+- `Document.createAlias(target)` makes an alias to an anchored node, to
+  place like any other node.
 
 ## 0.19.3 — 2026-09-15
 

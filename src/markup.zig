@@ -35,7 +35,10 @@ pub const Src = struct {
     synthetic: bool = false,
 };
 
-/// The offset of the first byte of the line containing `offset`.
+/// The offset of the first byte of the line containing `offset`. The
+/// first line starts after a byte order mark: the mark opens the stream
+/// and is no part of the line, and read as content it hid a line holding
+/// only `-` or `?` from every check that looks at a line's bytes.
 pub fn lineStart(source: []const u8, offset: usize) usize {
     // A lone CR is a line break too (YAML 1.2 §5.4:
     // `b-break ::= CRLF | CR | LF`), and the scanner agrees —
@@ -58,6 +61,7 @@ pub fn lineStart(source: []const u8, offset: usize) usize {
             else => {},
         }
     }
+    if (offset >= bom.len and std.mem.startsWith(u8, source, bom)) return bom.len;
     return 0;
 }
 
@@ -92,11 +96,9 @@ pub fn newlineAt(source: []const u8, offset: usize) usize {
 /// count codepoints, but for indentation derivation bytes are what the
 /// emitter needs (indentation is ASCII spaces).
 pub fn columnOf(source: []const u8, offset: usize) usize {
-    const ls = lineStart(source, offset);
-    // A byte order mark opens the stream but takes no column: counted, it
-    // put the first line's entries three columns deep once re-emitted.
-    if (ls == 0 and offset >= bom.len and std.mem.startsWith(u8, source, bom)) return offset - bom.len;
-    return offset - ls;
+    // A byte order mark takes no column (see `lineStart`): counted, it put
+    // the first line's entries three columns deep once re-emitted.
+    return offset - lineStart(source, offset);
 }
 
 const bom = "\u{FEFF}";
@@ -135,12 +137,20 @@ pub fn propertiesEnd(source: []const u8, start: usize) usize {
 /// just past that line: the node's content begins on a later line.
 /// Null when content follows them on the same line, or there are none.
 pub fn propertiesLineEnd(source: []const u8, start: usize) ?usize {
-    const end = propertiesEnd(source, start);
-    if (end == start) return null;
-    var i = end;
-    while (i < source.len and (source[i] == ' ' or source[i] == '\t')) i += 1;
-    if (i < source.len and source[i] != '\n' and source[i] != '\r' and source[i] != '#') return null;
-    return lineEnd(source, i);
+    var line_end: ?usize = null;
+    var at = start;
+    // Properties may take several lines (`&a` over `!!map` over the
+    // first entry): the header runs through the last of them.
+    while (true) {
+        const end = propertiesEnd(source, at);
+        if (end == at) return line_end;
+        var i = end;
+        while (i < source.len and (source[i] == ' ' or source[i] == '\t')) i += 1;
+        if (i < source.len and source[i] != '\n' and source[i] != '\r' and source[i] != '#') return line_end;
+        line_end = lineEnd(source, i);
+        at = line_end.?;
+        while (at < source.len and (source[at] == ' ' or source[at] == '\t')) at += 1;
+    }
 }
 
 /// Walk backwards from a node's content start to find the block entry
@@ -216,6 +226,31 @@ pub fn entryStart(source: []const u8, content_start: usize) usize {
         }
     }
     return content_start;
+}
+
+/// The `-` of an empty sequence item whose span is the point `at`
+/// borrowed from the next token: the last `-` indicator before it,
+/// across blank and comment lines and a comment after the dash.
+pub fn emptyItemDash(src: []const u8, at: usize) ?usize {
+    var end = @min(at, src.len);
+    while (true) {
+        const ls = lineStart(src, if (end > 0) end - 1 else 0);
+        var line = src[ls..@min(end, newlineAt(src, ls))];
+        if (std.mem.indexOf(u8, line, " #")) |c| line = line[0..c];
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "#")) line = line[0..0];
+        const body = std.mem.trimEnd(u8, line, " \t");
+        if (body.len > 0) {
+            if (body[body.len - 1] != '-') return null;
+            if (body.len > 1 and !isBlankByte(body[body.len - 2])) return null;
+            return ls + body.len - 1;
+        }
+        if (ls == 0 or ls == end) return null;
+        end = ls;
+    }
+}
+
+fn isBlankByte(c: u8) bool {
+    return c == ' ' or c == '\t';
 }
 
 /// Find the end of the `:` that terminates a mapping key starting the

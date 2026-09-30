@@ -96,6 +96,14 @@ Nested lookup by key path (`pathGet`), or `node.lookup` for one key:
 const port = doc.pathGet(&.{ "server", "port" }) orelse return error.Missing;
 ~~~
 
+A key lookup (`lookup`, `pathGet`, an edit path's key segment,
+`Value.get`) scans the mapping's entries in order, as the first-match
+rule for duplicate keys needs: its cost is linear in the mapping's
+size. That is nothing for configuration-sized mappings, but looking up
+every key of an 80,000-entry mapping one at a time is quadratic
+(about 20 s). To read many keys of a large mapping, walk `pairs()` once
+into a hash map of your own, keeping the first entry of each key.
+
 `yaml.resolveCoreTag(value, style)` resolves a plain scalar to its YAML
 1.2.2 Core Schema tag (spec 10.3.2). Quoted scalars always resolve to
 `str`.
@@ -108,9 +116,18 @@ A tag whose content cannot be read as the type it names (`!!int abc`) is
 `error.TypeMismatch`. Non-core tags (`!myapp/thing`) are carried on the
 node and preserved on emission, but do not affect resolution.
 
+Set or clear a node's tag with `doc.setTag(node, "tag:yaml.org,2002:str")`
+(the resolved form, as the parser reports it; `null` clears). A tag the
+document cannot spell -- one left to the verbatim `!<...>` form and
+holding a blank, a `>` or a line break -- is `error.InvalidSyntax` there
+and then, instead of at `write`, where assigning `node.tag` directly
+would only surface it.
+
 Anchors and aliases are first-class nodes: `- &v 42` followed by
 `- *v` produces a distinct alias node resolving to the anchor target
-(`node.isAlias()`, `node.resolveAlias()`).
+(`node.isAlias()`, `node.resolveAlias()`). To add one, anchor the target
+and create an alias to it: `doc.createAlias(target)` (a target with no
+anchor is `error.InvalidSyntax`), then place it like any node.
 
 The anchor lives on the node, so deleting or replacing the node an alias
 still names is refused with `error.AnchorReferenced`. To give an
@@ -128,8 +145,11 @@ Shadowing the other way is refused too: defining a name again ahead of
 an alias that names the earlier definition (`setAnchor`, or a `set`,
 `insert`, `append` or `move` carrying the anchor) would rebind that
 alias once the document is written and read back, so it fails with
-`error.AnchorShadowed` and changes nothing. A `move` that takes a
-definition past its aliases strands them and is `error.AnchorReferenced`.
+`error.AnchorShadowed` and changes nothing. An edit that leaves an alias
+ahead of every definition of its name -- a `move` taking a definition
+past its aliases, or an alias placed before its anchor or over the node
+carrying it -- strands it and is `error.AnchorReferenced`. Moves that
+keep an alias after its anchor are fine, whichever of the two moves.
 YAML gives an alias no properties, so `setAnchor` on one is
 `error.InvalidSyntax`.
 

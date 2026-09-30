@@ -32,34 +32,10 @@ const Skip = struct {
 ///
 /// The pinned corpus has 397 records; 351 carry a `name` and 46 are
 /// unnamed sub-cases of a named parent (tabs in various contexts, split
-/// scalars, ...). The loader used to drop every unnamed record, which
-/// silently hid the 15 failures below. They are now loaded and tracked
-/// here; the stale-skip guard fails the gate if any starts passing.
-const skips: []const Skip = &.{
-    // Split by FAILURE KIND, so later triage can tell a permissiveness
-    // hole from a strictness gap. Both hid behind one generic target
-    // before, and "accepts invalid input" is a different bug class from
-    // "rejects valid input".
-    //
-    // Parser TOO STRICT: yayl rejects what the suite accepts.
-    .{ .id = "3RLN-2", .reason = "rejects a double-quoted escape the suite accepts (hard-tab marker)", .target = "corpus strictness: tab-marker escape" },
-    .{ .id = "3RLN-5", .reason = "rejects a double-quoted escape the suite accepts (hard-tab marker)", .target = "corpus strictness: tab-marker escape" },
-    .{ .id = "DE56-3", .reason = "rejects a double-quoted escape the suite accepts (hard-tab marker)", .target = "corpus strictness: tab-marker escape" },
-    .{ .id = "DE56-4", .reason = "rejects a double-quoted escape the suite accepts (hard-tab marker)", .target = "corpus strictness: tab-marker escape" },
-    .{ .id = "KH5V-2", .reason = "rejects a double-quoted escape the suite accepts (hard-tab marker)", .target = "corpus strictness: tab-marker escape" },
-    .{ .id = "DK95-5", .reason = "rejects the indentation this case accepts", .target = "corpus strictness: tab indentation" },
-    // Parser TOO PERMISSIVE: yayl accepts what the suite marks invalid.
-    .{ .id = "DK95-2", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
-    .{ .id = "Y79Y-4", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
-    .{ .id = "Y79Y-5", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
-    .{ .id = "Y79Y-6", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
-    .{ .id = "Y79Y-7", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
-    .{ .id = "Y79Y-8", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
-    .{ .id = "Y79Y-9", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
-    .{ .id = "Y79Y-10", .reason = "accepts a tab form the suite marks invalid", .target = "corpus permissiveness: tab accepted" },
-    // Event-tree divergence only: the bytes round-trip unchanged.
-    .{ .id = "L24T-2", .reason = "event tree differs; the document round-trips", .target = "corpus event-tree divergence" },
-};
+/// scalars, ...). Every record is loaded and every one now passes, so
+/// the table is empty; the stale-skip guard fails the gate if an entry
+/// added here later starts passing.
+const skips: []const Skip = &.{};
 
 fn findSkip(id: []const u8) ?Skip {
     for (skips) |s| if (std.mem.eql(u8, s.id, id)) return s;

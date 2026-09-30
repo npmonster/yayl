@@ -401,6 +401,10 @@ pub const Parser = struct {
             // Verbatim tag.
             return self.trackBytes(try self.allocator.dupe(u8, suffix));
         }
+        // The non-specific tag `!` is never a handle and a suffix: a
+        // `%TAG !` directive redefines `!foo`, not `!` itself (it
+        // resolved to the directive's bare prefix).
+        if (std.mem.eql(u8, handle, "!") and suffix.len == 0) return "!";
         if (self.handle_index.get(handle)) |index| {
             const td = self.tag_directives.items[index];
             var out: std.ArrayList(u8) = .empty;
@@ -492,6 +496,7 @@ pub const Parser = struct {
                         .style = tok.data.scalar.style,
                         .anchor = anchor,
                         .tag = tag,
+                        .content_end = tok.data.scalar.content_end,
                     } },
                 };
             },

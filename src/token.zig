@@ -88,6 +88,8 @@ pub const Token = struct {
     pub const Scalar = struct {
         value: []const u8,
         style: ScalarStyle,
+        /// Block scalars: see `Event.ScalarEvent.content_end`.
+        content_end: ?usize = null,
     };
 
     /// DIRECTIVE payload: name and parameters.
