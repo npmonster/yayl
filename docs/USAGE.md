@@ -325,7 +325,7 @@ on the document model:
 
 | Syntax | Meaning |
 | --- | --- |
-| `$.a.b[0]` | mapping keys and sequence indices (`$` optional) |
+| `$.a.b[0]` | mapping keys and sequence indices (`$` optional; `$ref` is the root key `$ref`, since `$` is the root only before `.`, `[` or nothing) |
 | `[*]` | every child, in document order |
 | `..name` | recursive descent: every `name` at any depth |
 | `[?key=value]` | every child that is a mapping whose `key` equals `value` |
@@ -486,8 +486,11 @@ Rejected with `error.InvalidSyntax`, rather than silently dropped at
 emission time: comment text that is not one raw comment (no `#`, or a
 line break in a trailing comment), trailing comments on block
 collections (address the last entry), on the pair's key (the comment
-follows the value), on literal/folded or multi-line scalars (the value
-owns its lines), anything inside a flow collection, and anything inside
+follows the value), on literal/folded scalars or scalars whose value
+holds a line break (the value owns its lines; a quoted scalar the source
+wrapped over several lines but whose value has no break takes the
+comment, and is rewritten onto one line), anything inside a flow
+collection, and anything inside
 a new or moved subtree, which is laid out afresh without comments (a new
 entry itself takes them). Bytes the
 scanner would refuse on re-parse are refused on the way in, so a write

@@ -448,6 +448,68 @@ for violation text and the paths built on the way down.
   USAGE said the emitter admits two fewer levels than conversion; it
   admits up to two fewer, and one on a linear chain.
 
+**Edits wrote YAML that did not parse, or that read back as another
+tree.** A randomized differential over the fixtures and the corpus (about
+63,000 edits and batches, each written, read back and compared with the
+tree in memory) found these; each is pinned by a regression test:
+
+- Any edit to a document opening with a byte order mark: its three bytes
+  were counted as columns, so the first entry moved three columns in.
+  The preservation sweep skipped such documents for this reason; it now
+  sweeps them (42 variant documents, up from 28).
+- A block scalar written by an edit took in what followed it: a comment
+  after the old value on its line (`a: 1 # c` set to `x\ny` read back
+  `y # c`), comment lines indented as deep as its content, and, for
+  keep chomping, the blank lines after it. A block scalar now ends its
+  own line, sits deeper than the comments after it, moves a same-line
+  comment onto its header (`a: |- # c`), and a keep-chomped one takes
+  over the blank lines it would absorb.
+- A new block collection replacing a root that shared its line with
+  `---` or a tab was written on that line (`--- - x`); content was glued
+  to a document marker (`{}...`, `x...`, `---x`).
+- An item whose dash carried a comment (`- # c\n  x`) had its span start
+  at its content, so deleting it left a null item and setting it wrote
+  the new item above the old dash.
+- An empty new item left only `- ` on its line, and the next item read it
+  as its own framing (`- - x`, a nested sequence); an item inserted
+  first with a block scalar left the next item at column 0; once every
+  original entry of a collection was gone, new ones went to the
+  enclosing item's column (`-\n  - 42` refilled wrote `- x`).
+- A written leading comment kept the caller's own indentation, which
+  could put it inside a block scalar above; it is written at the entry's
+  column, as documented.
+- A replaced flow-mapping value lost its `:` when the colon was not
+  right after the key (`{"foo"\n: "bar"}`, `{foo, b: 1}`).
+- A new entry after a keep-chomped block in a CRLF document was written
+  between the CR and the LF; a comment in a flow collection of a
+  CR-terminated document hid a delete.
+- An anchor set on, changed on or cleared from a parsed block collection
+  or an empty value was never written; an empty key with an anchor or
+  tag lost the blank before its `:` (`&c: b` defines `c:`).
+- Deleting an entry with a null key (`: a`) left it in the output, and
+  moving one copied it.
+- A trailing comment written on the last entry of a file with no final
+  line break was dropped; a new entry after a whitespace-only last line
+  went inside the block scalar above it.
+- Setting a node as a value of its own descendant panicked in ReleaseSafe;
+  it is `error.WouldCycle`, as the append paths already returned.
+- An anchor set on an alias was silently never written (YAML gives
+  aliases no properties); it is `error.InvalidSyntax`.
+- Defining an anchor name again ahead of an alias bound to the earlier
+  definition (`setAnchor`, or a set, insert, append or move carrying the
+  anchor) rebinds that alias once the document is written and read back,
+  while in memory it kept its target; such an edit is refused with the
+  new `error.AnchorShadowed`.
+- A path starting `$` and a key character took the `$` for the root:
+  `delete("$ref")` deleted `ref`. `$` is the root only before `.`, `[`
+  or nothing, and text after a segment (`$.items[0]name`) is an invalid
+  path.
+- A set whose parent path matched several nodes reported
+  `error.UnknownPath`; it is `error.AmbiguousOperation`.
+- `defaultTerminator` rescanned the source for its first line break on
+  every call, a scan as long as the document for one written on a single
+  line; it is taken once.
+
 ### Changed
 
 - `edit.cloneTreeWhole` is removed. It existed for the clone the undo
@@ -486,6 +548,12 @@ for violation text and the paths built on the way down.
 - `parse` fails on a first document followed by content that cannot
   begin another document.
 - `writeFile` through a symbolic link replaces the link's target.
+- `edit.Error` gains `AnchorShadowed` (see Fixed), which `setAnchor` can
+  return too; `setAnchor` on an alias is `error.InvalidSyntax`.
+- A path starting `$` followed by a key character is a key (`$ref`),
+  and text after a segment is `error.InvalidPath`.
+- A block scalar the emitter writes always ends its last line, and a
+  written leading comment is written at the entry's column.
 
 ## 0.19.3 — 2026-09-15
 

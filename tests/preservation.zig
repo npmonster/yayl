@@ -48,15 +48,27 @@ fn lineOf(src: []const u8, off: usize) usize {
     return n;
 }
 
+/// The lines of `s`, compared without a leading byte order mark: the
+/// emitter keeps it at the start of the output, so deleting the first
+/// entry moves it onto the next line, which is no change to that line.
+/// `keepsBom` checks the mark itself survives.
 fn splitLines(allocator: std.mem.Allocator, s: []const u8) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer out.deinit(allocator);
-    var it = std.mem.splitScalar(u8, s, '\n');
+    const body = if (std.mem.startsWith(u8, s, bom)) s[bom.len..] else s;
+    var it = std.mem.splitScalar(u8, body, '\n');
     while (it.next()) |line| try out.append(allocator, line);
     // A trailing newline produces one empty final element; drop it so
     // both sides compare on content lines only.
     if (out.items.len > 0 and out.items[out.items.len - 1].len == 0) _ = out.pop();
     return try out.toOwnedSlice(allocator);
+}
+
+const bom = "\xEF\xBB\xBF";
+
+/// An edit keeps the byte order mark the input opened with.
+fn keepsBom(input: []const u8, out: []const u8) bool {
+    return !std.mem.startsWith(u8, input, bom) or std.mem.startsWith(u8, out, bom);
 }
 
 /// `input` with every occurrence of `byte` replaced by `with` — the
@@ -578,7 +590,6 @@ const Stats = struct {
     skipped_tab_span: usize = 0,
     skipped_unsupported: usize = 0,
     skipped_no_final_newline: usize = 0,
-    skipped_bom: usize = 0,
     capped_targets: usize = 0,
     capped_containers: usize = 0,
     unaddressable: usize = 0,
@@ -813,7 +824,7 @@ fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats)
         },
     );
     std.debug.print(
-        "  skipped: {d} sole-child, {d} dangling anchor, {d} multi-line, {d} alias, {d} flow, {d} empty, {d} same non-scalar, {d} tab-span, {d} unsupported constructs, {d} no-final-newline, {d} bom\n" ++
+        "  skipped: {d} sole-child, {d} dangling anchor, {d} multi-line, {d} alias, {d} flow, {d} empty, {d} same non-scalar, {d} tab-span, {d} unsupported constructs, {d} no-final-newline\n" ++
             "  skipped: {d} unaddressable paths, {d} round-trip-unstable, {d} move/insert related, {d} unusable destinations; capped: {d} targets, {d} containers\n",
         .{
             stats.skipped_sole_child,
@@ -826,7 +837,6 @@ fn printSummary(label: []const u8, noun: []const u8, units: usize, stats: Stats)
             stats.skipped_tab_span,
             stats.skipped_unsupported,
             stats.skipped_no_final_newline,
-            stats.skipped_bom,
             stats.unaddressable,
             stats.skipped_roundtrip_unstable,
             stats.skipped_move_related,
@@ -883,14 +893,6 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
         defer allocator.free(plain);
         if (!std.mem.eql(u8, plain, input)) {
             stats.skipped_roundtrip_unstable += 1;
-            return;
-        }
-        // A byte-order mark keeps the document's untouched bytes exact
-        // (the round-trip gate and the BOM unit test prove it), but the
-        // edited walk still misaligns its slots around the prefix.
-        // Counted, never swept.
-        if (std.mem.startsWith(u8, input, "\xEF\xBB\xBF")) {
-            stats.skipped_bom += 1;
             return;
         }
         stats.documents += 1;
@@ -1012,6 +1014,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
         const out = try doc.write(allocator);
         defer allocator.free(out);
         const out_lines = try splitLines(allocator, out);
+        if (!keepsBom(input, out)) failures.add("{s}: an edit dropped the byte order mark", .{name});
         defer allocator.free(out_lines);
         // Whatever the shape, the result must still be YAML and must no
         // longer resolve the deleted path.
@@ -1170,6 +1173,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
         const out = try doc.write(allocator);
         defer allocator.free(out);
         const out_lines = try splitLines(allocator, out);
+        if (!keepsBom(input, out)) failures.add("{s}: an edit dropped the byte order mark", .{name});
         defer allocator.free(out_lines);
         const idx = oneLineChanged(orig_lines, out_lines) orelse {
             failures.add("{s}: set {s}: more than one line changed", .{ name, t.path });
@@ -1271,6 +1275,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             const out = try doc.write(allocator);
             defer allocator.free(out);
             const out_lines = try splitLines(allocator, out);
+            if (!keepsBom(input, out)) failures.add("{s}: an edit dropped the byte order mark", .{name});
             defer allocator.free(out_lines);
             const at = pureInsertion(orig_lines, out_lines) orelse {
                 failures.add("{s}: map add under {s}: not a pure line insertion", .{ name, c.path });
@@ -1332,6 +1337,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
             const out = try doc.write(allocator);
             defer allocator.free(out);
             const out_lines = try splitLines(allocator, out);
+            if (!keepsBom(input, out)) failures.add("{s}: an edit dropped the byte order mark", .{name});
             defer allocator.free(out_lines);
             if (pureInsertion(orig_lines, out_lines) == null) {
                 failures.add("{s}: seq append to {s}: not a pure line insertion", .{ name, c.path });
@@ -1390,6 +1396,7 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
         const out = try doc.write(allocator);
         defer allocator.free(out);
         const out_lines = try splitLines(allocator, out);
+        if (!keepsBom(input, out)) failures.add("{s}: an edit dropped the byte order mark", .{name});
         defer allocator.free(out_lines);
         const at = pureInsertionReframed(orig_lines, out_lines) orelse {
             failures.add("{s}: insert before {s}: not a pure line insertion", .{ name, t.path });
@@ -1997,7 +2004,7 @@ test "preservation sweep: every edit position in every single-document fixture" 
     try std.testing.expect(stats.same_sets > 0);
     try std.testing.expect(stats.inserts > 0);
     try std.testing.expect(stats.moves > 0);
-    try std.testing.expectEqual(names.items.len, stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable + stats.skipped_bom);
+    try std.testing.expectEqual(names.items.len, stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable);
     if (failures.list.items.len > 0) {
         for (failures.list.items) |f| std.debug.print("  PRESERVATION-FAIL {s}\n", .{f});
         return error.TestUnexpectedResult;
@@ -2306,7 +2313,7 @@ test "preservation sweep: bounded edits over every valid corpus document" {
 
     // Every valid document accounted for: edited, root-less, or one of
     // the documented round-trip-unstable shapes.
-    try std.testing.expectEqual(@as(usize, 296), stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable + stats.skipped_bom);
+    try std.testing.expectEqual(@as(usize, 296), stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable);
     // The bounded sweep must still exercise every operation kind.
     try std.testing.expect(stats.deletes > 0);
     try std.testing.expect(stats.sets > 0);
@@ -2376,8 +2383,8 @@ test "preservation sweep: CRLF, BOM and no-final-newline fixture variants" {
         // Three variants derived in memory — no new fixture files.
         const crlf = try replaceByte(allocator, input, '\n', "\r\n");
         defer allocator.free(crlf);
-        const bom = try std.fmt.allocPrint(allocator, "\xEF\xBB\xBF{s}", .{input});
-        defer allocator.free(bom);
+        const with_bom = try std.fmt.allocPrint(allocator, bom ++ "{s}", .{input});
+        defer allocator.free(with_bom);
         const nofinal = if (std.mem.endsWith(u8, input, "\n"))
             try allocator.dupe(u8, input[0 .. input.len - 1])
         else
@@ -2385,7 +2392,7 @@ test "preservation sweep: CRLF, BOM and no-final-newline fixture variants" {
         defer allocator.free(nofinal);
         const variants = [_]struct { label: []const u8, bytes: []const u8 }{
             .{ .label = "crlf", .bytes = crlf },
-            .{ .label = "bom", .bytes = bom },
+            .{ .label = "bom", .bytes = with_bom },
             .{ .label = "no-final-newline", .bytes = nofinal },
         };
         for (variants) |v| {
@@ -2401,7 +2408,7 @@ test "preservation sweep: CRLF, BOM and no-final-newline fixture variants" {
     // the bounded sweeps still exercised the no-op, insert and move
     // paths.
     try std.testing.expectEqual(names.items.len * 3, attempted);
-    try std.testing.expectEqual(attempted, stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable + stats.skipped_bom);
+    try std.testing.expectEqual(attempted, stats.documents + stats.skipped_no_root + stats.skipped_roundtrip_unstable);
     try std.testing.expect(stats.same_sets > 0);
     try std.testing.expect(stats.inserts > 0);
     try std.testing.expect(stats.moves > 0);

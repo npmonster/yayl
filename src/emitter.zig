@@ -57,6 +57,9 @@ pub const Emitter = struct {
     emitted: std.AutoHashMap(*const Node, void),
     /// Active source for faithful emission (empty when normalized).
     src: []const u8 = "",
+    /// The line break the emitter writes where it lays out a line itself:
+    /// the source's first (`firstTerminator`), or `\n`.
+    terminator: []const u8 = "\n",
     indent_step: usize = 2,
     /// True when the caller set `indent_step` explicitly, so faithful
     /// emission must not overwrite it with the source's own convention.
@@ -69,10 +72,11 @@ pub const Emitter = struct {
     /// a comment for its header line: see `placeBlock`.
     block_floor: usize = 0,
     header_comment: ?[]const u8 = null,
-    /// Output offset just past the last alias name written, so a value
-    /// indicator written right after it can be kept apart from it (see
+    /// Output offset just past the last token a `:` written next would be
+    /// read as part of -- an alias name, or an anchor or tag with nothing
+    /// after it -- so a value indicator there is kept apart from it (see
     /// `writeValueIndicator`).
-    alias_end: ?usize = null,
+    open_end: ?usize = null,
     /// The `%TAG` directives of the document being written: the handles a
     /// tag can be written with (see `writeTag`).
     directives: []const token_mod.TagDirective = &.{},
@@ -154,7 +158,7 @@ pub const Emitter = struct {
         if (!internal.validAnchorName(name)) return error.InvalidSyntax;
         try self.writeByte('*');
         try self.write(name);
-        self.alias_end = self.out.items.len;
+        self.open_end = self.out.items.len;
     }
 
     /// Write an anchor, `&name`; see `writeAlias`.
@@ -165,11 +169,13 @@ pub const Emitter = struct {
     }
 
     /// Write a mapping value indicator (`:` or `: `) after a key. An
-    /// anchor name may hold a `:` (spec 6.9.2 `ns-anchor-char`), so an
-    /// alias key written `*r: v` names the anchor `r:`, which is unknown
-    /// or wrong; after an alias the indicator is kept apart, `*r : v`.
+    /// anchor name may hold a `:` (spec 6.9.2 `ns-anchor-char`), and a tag
+    /// too, so an alias key written `*r: v` names the anchor `r:`, and an
+    /// empty key with properties `&c: v` defines `c:` (`!!str: v`, the tag
+    /// `!!str:`); after such a token the indicator is kept apart,
+    /// `*r : v`.
     fn writeValueIndicator(self: *Emitter, indicator: []const u8) Error!void {
-        if (self.alias_end == self.out.items.len) try self.writeByte(' ');
+        if (self.open_end == self.out.items.len) try self.writeByte(' ');
         try self.write(indicator);
     }
 
@@ -187,7 +193,7 @@ pub const Emitter = struct {
         const chars = utf8.countCodepoints(written) catch limit + 1;
         if (chars <= limit) return false;
         try self.out.insertSlice(self.allocator, key_start, "? ");
-        if (self.alias_end) |*end| {
+        if (self.open_end) |*end| {
             if (end.* >= key_start) end.* += 2;
         }
         return true;
@@ -222,6 +228,10 @@ pub const Emitter = struct {
         while (i > 0) : (i -= 1) {
             if (items[i - 1] == '\n' or items[i - 1] == '\r') return items[i..];
         }
+        // The output's first line: a byte order mark there is no content
+        // (see `markup.columnOf`), and taken for some it cut the line
+        // before the first entry.
+        if (std.mem.startsWith(u8, items, "\u{FEFF}")) return items[3..];
         return items;
     }
 
@@ -358,8 +368,17 @@ pub const Emitter = struct {
             return true;
         }
         // Indentation, or an indicator left by a deleted entry, already
-        // in place: keep the original bytes.
-        if (isEntryFraming(pending)) return false;
+        // in place: keep the original bytes. Blanks that are not this
+        // entry's indentation (a whitespace-only last line with no line
+        // break after it) are replaced: kept, they put the entry inside a
+        // block scalar above.
+        if (isEntryFraming(pending)) {
+            if (pending.len != col and ctype.isBlankRun(pending)) {
+                self.out.shrinkRetainingCapacity(self.out.items.len - pending.len);
+                try self.writeIndent(col);
+            }
+            return false;
+        }
         try self.write(self.defaultTerminator());
         try self.writeIndent(col);
         return false;
@@ -425,6 +444,8 @@ pub const Emitter = struct {
         if (doc.source) |src| {
             self.src = src;
             defer self.src = "";
+            self.terminator = firstTerminator(src);
+            defer self.terminator = "\n";
             return self.emitFaithful(doc);
         }
 
@@ -570,8 +591,9 @@ pub const Emitter = struct {
             if (pending.len > 0 and !internal.inlineValue(node)) {
                 // A block collection cannot open on the line of a `---`
                 // or after a tab (`--- - x` does not parse): a line of
-                // its own, at column 0.
-                try self.write(self.defaultTerminator());
+                // its own, at column 0, and no blanks left behind.
+                while (self.out.items.len > 0 and ctype.isBlank(self.out.items[self.out.items.len - 1])) self.out.items.len -= 1;
+                if (self.pendingLine().len > 0) try self.write(self.defaultTerminator());
                 at = 0;
             } else if (pending.len > 0 and !ctype.isBlank(pending[pending.len - 1])) {
                 // `---` with nothing after it: `---x` is not a marker.
@@ -633,20 +655,18 @@ pub const Emitter = struct {
         if (v.kind() != .scalar) return gap;
         if (v.data.scalar.style != .literal and v.data.scalar.style != .folded) return gap;
 
+        // Whole lines at a time: stepping one byte past a line break
+        // stopped between the CR and LF of a CRLF, and the new entry went
+        // in between them (`a\r- c\r\n\n`, a different keep value).
         var g = gap;
         while (g < src.len) {
             const nl = markup.newlineAt(src, g);
             if (nl < g) break; // never slice inverted (defensive)
-            if (nl == g) {
-                // The cursor sits ON a line break: an empty line, which
-                // the blank run consumes like any other.
-                g = g + 1;
-                continue;
-            }
-            if (std.mem.indexOfNone(u8, src[g..nl], " \t\r") != null) break; // content line
-            g = if (nl < src.len) nl + 1 else src.len;
+            if (std.mem.indexOfNone(u8, src[g..nl], " \t") != null) break; // content line
+            const next = markup.lineEnd(src, g);
+            if (next <= g) break;
+            g = next;
         }
-        if (g > src.len) g = src.len;
         if (g > gap) {
             try self.write(src[gap..g]);
             return g;
@@ -794,7 +814,7 @@ pub const Emitter = struct {
         if (key_spanned and self.nodeClean(key)) {
             try self.emitted.put(key, {});
             try self.write(src[ks.?.entry_start..ks.?.end]);
-            if (key.data == .alias) self.alias_end = self.out.items.len;
+            if (endsOpen(key)) self.open_end = self.out.items.len;
         } else {
             try self.emitted.put(key, {});
             // A modified key keeps its framing -- the `- ` or `? ` in
@@ -897,7 +917,10 @@ pub const Emitter = struct {
                 // line with its chomping break.
                 const base = pair_end orelse vs.end;
                 const le = markup.lineEnd(src, base);
-                if (stop >= le) return stop;
+                // Not while a written trailing comment is owed: at the end of a
+                // file with no final line break the walk reaches the line end
+                // too, and the comment was dropped.
+                if (stop >= le and value.pending_trailing == null) return stop;
                 if (self.endsWithNewline()) return self.pastKeptBlanks(value, le);
                 // Write the remainder of the line the walk actually
                 // stopped on — when the value's LAST entry was deleted,
@@ -1011,7 +1034,7 @@ pub const Emitter = struct {
                 // column 0 (`- |` inserted first, then `- x`). Put it back.
                 if (nextOriginalItem(container, item)) |next| {
                     const ns = next.src.?;
-                    if (markup.lineStart(src, ns.entry_start) < gap and gap <= ns.entry_start) {
+                    if (!self.indentStillToCome(container, gap, ns.entry_start)) {
                         try self.writeIndent(markup.columnOf(src, ns.entry_start));
                     }
                 }
@@ -1065,7 +1088,10 @@ pub const Emitter = struct {
             // consumed the line terminator; writing the remainder on top
             // of that would append a blank line after the item.
             const le = markup.lineEnd(src, s.end);
-            if (stop >= le) return stop;
+            // Not while a written trailing comment is owed: at the end of a
+            // file with no final line break the walk reaches the line end
+            // too, and the comment was dropped.
+            if (stop >= le and item.pending_trailing == null) return stop;
             if (self.endsWithNewline()) return self.pastKeptBlanks(item, le);
             return self.writeEntryTail(item, s.end);
         }
@@ -1082,6 +1108,19 @@ pub const Emitter = struct {
     /// blank lines there, which were the old block's kept breaks, then
     /// doubled them on every edit (`keep\n\n` read back `keep\n\n\n`).
     /// So those are skipped.
+    /// Will the gap from `gap` to the entry at `entry` write that entry's
+    /// indentation? Not when this entry already took it as framing (it
+    /// lies before `gap`), nor when a replaced sibling's tombstone covers
+    /// it.
+    fn indentStillToCome(self: *const Emitter, container: *const Node, gap: usize, entry: usize) bool {
+        const ls = markup.lineStart(self.src, entry);
+        if (ls < gap) return false;
+        for (Document.droppedOf(container)) |d| {
+            if (d[0] < entry and d[1] > ls) return false;
+        }
+        return true;
+    }
+
     /// The first item after `item` in `container` that has source bytes.
     fn nextOriginalItem(container: *const Node, item: *const Node) ?*const Node {
         const items = switch (container.data) {
@@ -1136,7 +1175,7 @@ pub const Emitter = struct {
     fn emitKeyContent(self: *Emitter, key: *Node, col: usize, explicit: bool) Error!usize {
         switch (key.data) {
             .scalar => |s| {
-                if (try self.writeProperties(key)) try self.writeByte(' ');
+                try self.writeScalarProperties(key);
                 try self.emitScalarValue(s.value, s.style, col, explicit, false);
                 return if (key.src) |ks| ks.end else 0;
             },
@@ -1152,8 +1191,7 @@ pub const Emitter = struct {
         defer self.leave();
         switch (node.data) {
             .scalar => |s| {
-                const props = try self.writeProperties(node);
-                if (props) try self.writeByte(' ');
+                try self.writeScalarProperties(node);
                 try self.emitScalarValue(s.value, s.style, indent, true, false);
                 return if (node.src) |sn| sn.end else 0;
             },
@@ -1192,6 +1230,12 @@ pub const Emitter = struct {
                 // re-emitted with the first entry, but when that entry
                 // is deleted the next one must pick them up.
                 var gap = node.src.?.entry_start;
+                if (self.propsChanged(node)) {
+                    gap = try self.rewriteProps(node) orelse {
+                        try self.emitNode(node, indent);
+                        return node.src.?.end;
+                    };
+                }
                 const col = self.entryColumn(node, indent);
                 for (m.pairs.items) |pair| {
                     gap = try self.emitPair(node, pair, col, gap);
@@ -1219,6 +1263,12 @@ pub const Emitter = struct {
                     return 0;
                 }
                 var gap = node.src.?.entry_start; // see the mapping case
+                if (self.propsChanged(node)) {
+                    gap = try self.rewriteProps(node) orelse {
+                        try self.emitNode(node, indent);
+                        return node.src.?.end;
+                    };
+                }
                 const col = self.entryColumn(node, indent);
                 for (sq.items.items) |item| {
                     gap = try self.emitItem(node, item, col, gap);
@@ -1228,11 +1278,119 @@ pub const Emitter = struct {
         }
     }
 
+    /// Whether a parsed block collection's anchor or tag differs from what
+    /// its source spells. Its slot walk copies the source bytes, so a
+    /// changed anchor was silently not written (`setAnchor` on `a:\n  b: 1`
+    /// wrote the input back), and a cleared or renamed one stayed.
+    fn propsChanged(self: *const Emitter, node: *const Node) bool {
+        const s = node.src orelse return false;
+        if (s.synthetic) return false;
+        const src = self.src;
+        const end = markup.propertiesEnd(src, s.start);
+        var anchor: ?[]const u8 = null;
+        var tag: ?[]const u8 = null;
+        var i = s.start;
+        while (i < end) {
+            var j = i + 1;
+            if (src[i] == '!' and j < end and src[j] == '<') {
+                j = (std.mem.indexOfScalarPos(u8, src, i, '>') orelse end - 1) + 1;
+            } else {
+                while (j < end and !ctype.isBlank(src[j])) j += 1;
+            }
+            if (src[i] == '&') anchor = src[i + 1 .. j] else if (src[i] == '!') tag = src[i..j];
+            i = j;
+            while (i < end and ctype.isBlank(src[i])) i += 1;
+        }
+        if ((anchor == null) != (node.anchor == null)) return true;
+        if (anchor) |a| if (!std.mem.eql(u8, a, node.anchor.?)) return true;
+        if ((tag == null) != (node.tag == null)) return true;
+        if (tag) |t| return !self.tagSpells(t, node.tag.?);
+        return false;
+    }
+
+    /// Does the tag text `text`, as the source spells it, resolve to
+    /// `resolved` in this document? (The parser's resolution: a
+    /// verbatim tag is its content; a shorthand is its handle's prefix
+    /// and the suffix with `%XX` decoded.)
+    fn tagSpells(self: *const Emitter, text: []const u8, resolved: []const u8) bool {
+        if (std.mem.startsWith(u8, text, "!<")) return std.mem.eql(u8, text[2 .. text.len - 1], resolved);
+        if (text.len == 1) return std.mem.eql(u8, resolved, "!");
+        const second = std.mem.indexOfScalarPos(u8, text, 1, '!');
+        const handle = if (second) |k| text[0 .. k + 1] else "!";
+        const suffix = text[handle.len..];
+        var prefix: []const u8 = if (std.mem.eql(u8, handle, "!!")) yaml_tag_prefix else "!";
+        for (self.directives) |td| {
+            if (std.mem.eql(u8, td.handle, handle)) prefix = td.prefix;
+        }
+        if (!std.mem.startsWith(u8, resolved, prefix)) return false;
+        var rest = resolved[prefix.len..];
+        var i: usize = 0;
+        while (i < suffix.len) {
+            var c = suffix[i];
+            i += 1;
+            if (c == '%' and i + 1 < suffix.len) {
+                const hi = ctype.hexValue(suffix[i]) orelse return false;
+                const lo = ctype.hexValue(suffix[i + 1]) orelse return false;
+                c = (hi << 4) | lo;
+                i += 2;
+            }
+            if (rest.len == 0 or rest[0] != c) return false;
+            rest = rest[1..];
+        }
+        return rest.len == 0;
+    }
+
+    /// Write a parsed block collection's new properties where its old ones
+    /// were, and return where its slot walk resumes. With none in the
+    /// source, they go on the line the collection hangs from: after the
+    /// `---` or on a line of their own for a root, after the key for a
+    /// mapping value on the lines below. Null when there is no such place
+    /// the source bytes leave (a compact `- k: v` item, a comment after
+    /// the key): the caller re-emits the collection normalized.
+    fn rewriteProps(self: *Emitter, node: *Node) Error!?usize {
+        const src = self.src;
+        const s = node.src.?;
+        const end = markup.propertiesEnd(src, s.start);
+        if (end > s.start) {
+            try self.writeGap(node, s.entry_start, s.start);
+            if (!try self.writeProperties(node)) {
+                // Cleared: no blank left before the line break.
+                while (self.out.items.len > 0 and ctype.isBlank(self.out.items[self.out.items.len - 1])) self.out.items.len -= 1;
+            }
+            return end;
+        }
+        if (node.parent == null) {
+            try self.writeGap(node, s.entry_start, s.start);
+            _ = try self.writeProperties(node);
+            try self.write(self.terminatorAt(s.start));
+            return s.start;
+        }
+        const parent = node.parent.?;
+        if (parent.data != .mapping or !ctype.isBlankRun(self.pendingLine())) return null;
+        // The key's line, above the collection's first entry.
+        const line_start = self.out.items.len - self.pendingLine().len;
+        var brk = line_start;
+        while (brk > 0 and (self.out.items[brk - 1] == '\n' or self.out.items[brk - 1] == '\r')) brk -= 1;
+        if (brk == line_start) return null;
+        const above = self.out.items[markup.lineStart(self.out.items, brk)..brk];
+        if (std.mem.indexOfScalar(u8, above, '#') != null) return null;
+        const at = self.out.items.len;
+        try self.writeByte(' ');
+        _ = try self.writeProperties(node);
+        const props = try self.allocator.dupe(u8, self.out.items[at..]);
+        defer self.allocator.free(props);
+        self.out.shrinkRetainingCapacity(at);
+        try self.out.insertSlice(self.allocator, brk, props);
+        return s.entry_start;
+    }
+
     /// True when a pair's value is a synthesized empty node (`key:` with
     /// nothing after the colon, or an explicit-key-only pair).
     fn pairEndsAtColon(pair: Pair) bool {
         const v = pair.value;
         if (v.kind() != .scalar) return false;
+        // Given an anchor or tag, it has something to write (`a: &x`).
+        if (v.anchor != null or v.tag != null) return false;
         if (v.data.scalar.value.len != 0) return false;
         const vs = v.src orelse return false;
         return vs.synthetic;
@@ -1428,14 +1586,31 @@ pub const Emitter = struct {
             else => {},
         }
         // No original entry left to copy the column from (they were all
-        // deleted or replaced). The container's own `entry_start` still
-        // records where its first entry sat, which is the column its
-        // entries belong at — `fallback` is the container's own column,
-        // so stepping in from it would indent one level too deep.
+        // deleted or replaced). The container's span still starts where
+        // its first entry sat, past any properties (`- !!map` over
+        // `  foo: bar`): that is the column its entries belong at.
+        // `entry_start` is not -- for a collection that is a sequence
+        // item it is the item's `-` (`-\n  - 42` refilled wrote `- x` at
+        // column 0) -- and `fallback` is the container's own column, so
+        // stepping in from it would indent one level too deep.
         if (node.src) |s| {
-            if (!s.synthetic) return markup.columnOf(src, s.entry_start);
+            if (!s.synthetic) return markup.columnOf(src, firstContent(src, s.start));
         }
         return fallback + self.indent_step;
+    }
+
+    /// The first byte at or after `start` that is not a node property,
+    /// a blank, a line break or a comment.
+    fn firstContent(src: []const u8, start: usize) usize {
+        var i = markup.propertiesEnd(src, start);
+        while (i < src.len) {
+            switch (src[i]) {
+                ' ', '\t', '\n', '\r' => i += 1,
+                '#' => i = markup.newlineAt(src, i),
+                else => return i,
+            }
+        }
+        return start;
     }
 
     /// True when a node can be emitted from its original bytes.
@@ -1534,15 +1709,16 @@ pub const Emitter = struct {
     /// the source's first break. A programmatic or single-line source
     /// breaks with `\n`, as it always did.
     fn defaultTerminator(self: *const Emitter) []const u8 {
-        const src = self.src;
-        var i: usize = 0;
-        while (i < src.len) : (i += 1) {
-            if (src[i] == '\n') return "\n";
-            if (src[i] == '\r') {
-                return if (i + 1 < src.len and src[i + 1] == '\n') "\r\n" else "\r";
-            }
-        }
-        return "\n";
+        return self.terminator;
+    }
+
+    /// The first line break of `src` (see `defaultTerminator`), found
+    /// once per document: it is asked for at every new line the emitter
+    /// lays out, and a document on one line is scanned to its end.
+    fn firstTerminator(src: []const u8) []const u8 {
+        const i = std.mem.indexOfAny(u8, src, "\r\n") orelse return "\n";
+        if (src[i] == '\n') return "\n";
+        return if (i + 1 < src.len and src[i + 1] == '\n') "\r\n" else "\r";
     }
 
     /// Write the tail of an entry's line: the trailing comment and the
@@ -1655,8 +1831,7 @@ pub const Emitter = struct {
         switch (node.data) {
             .scalar => |s| {
                 if (node.anchor) |a| try self.seen.put(node, a);
-                const props = try self.writeProperties(node);
-                if (props) try self.writeByte(' ');
+                try self.writeScalarProperties(node);
                 try self.emitScalarValue(s.value, s.style, indent, true, false);
             },
             .mapping => |*m| {
@@ -1786,7 +1961,9 @@ pub const Emitter = struct {
             switch (src[i]) {
                 ' ', '\t', '\n', '\r' => {},
                 ',' => commas += 1,
-                '#' => while (i + 1 < to and src[i + 1] != '\n') : (i += 1) {},
+                // A comment runs to any line break: stopping only at `\n`
+                // read the rest of a CR-terminated stream as comment.
+                '#' => while (i + 1 < to and !ctype.isBreak(src[i + 1])) : (i += 1) {},
                 else => return null,
             }
         }
@@ -1891,12 +2068,22 @@ pub const Emitter = struct {
                         // Key, colon and the spacing after it are the
                         // author's; only the value is ours to rewrite.
                         // A replaced value has no span left, so the slot
-                        // is bounded by the colon and the pair's end.
-                        const vstart = if (pair.value.src) |vs|
-                            vs.start
-                        else
-                            markup.spaceEnd(src, markup.colonEnd(src, ks.end));
-                        try self.write(src[ks.entry_start..vstart]);
+                        // is bounded by the colon and the pair's end. The
+                        // colon may sit on a later line (`"foo"\n: v`), and
+                        // a pair with no value may have none (`{foo, b}`):
+                        // then it is written, or the value joined the key.
+                        if (pair.value.src) |vs| {
+                            try self.write(src[ks.entry_start..vs.start]);
+                        } else {
+                            const colon = markup.valueIndicatorEnd(src, ks.end, pend);
+                            if (colon == ks.end) {
+                                try self.write(src[ks.entry_start..ks.end]);
+                                if (endsOpen(pair.key)) self.open_end = self.out.items.len;
+                                try self.writeValueIndicator(": ");
+                            } else {
+                                try self.write(src[ks.entry_start..markup.spaceEnd(src, colon)]);
+                            }
+                        }
                         try self.emitFlowBody(pair.value);
                     }
                     gap = pend;
@@ -1996,6 +2183,30 @@ pub const Emitter = struct {
     // ------------------------------------------------------------------
     // Properties: anchors and tags
     // ------------------------------------------------------------------
+
+    /// A scalar's properties and the blank that separates them from its
+    /// text. An empty plain scalar (null) has no text: the blank would
+    /// trail the line (`a: &x `), and a `:` written next would join the
+    /// last property instead (see `writeValueIndicator`).
+    fn writeScalarProperties(self: *Emitter, node: *Node) Error!void {
+        if (!try self.writeProperties(node)) return;
+        const s = node.data.scalar;
+        if (s.value.len == 0 and s.style == .plain) {
+            self.open_end = self.out.items.len;
+        } else {
+            try self.writeByte(' ');
+        }
+    }
+
+    /// Whether a node written as-is ends with a token a `:` would join:
+    /// an alias, or properties on an empty plain scalar.
+    fn endsOpen(node: *const Node) bool {
+        return switch (node.data) {
+            .alias => true,
+            .scalar => |s| s.value.len == 0 and s.style == .plain and (node.anchor != null or node.tag != null),
+            else => false,
+        };
+    }
 
     /// Write "&anchor" and the node tag (if any). Returns true when
     /// anything was written.

@@ -29,7 +29,10 @@ const Node = document_mod.Node;
 /// the targets of `set`, `insert`, `append` and `move`) but matches
 /// several; the `NotA*` errors describe a value whose shape does not
 /// fit the edit; `MoveIntoSubtree` rejects moving a node into its own
-/// subtree.
+/// subtree. `AnchorReferenced` refuses an edit that would strand an
+/// alias, and `AnchorShadowed` one after which an alias would bind to a
+/// different definition once written and read back (see
+/// `Document.setAnchor`).
 pub const Error = error{
     InvalidPath,
     InvalidSyntax,
@@ -42,6 +45,7 @@ pub const Error = error{
     NestingTooDeep,
     WouldCycle,
     AnchorReferenced,
+    AnchorShadowed,
     AliasPath,
     OutOfMemory,
 };
@@ -105,7 +109,8 @@ pub const Segment = union(enum) {
 };
 
 /// A parsed path. Parse with `Path.parse` (grammar in the module docs).
-/// `$` at the start is optional and denotes the root.
+/// `$` at the start is optional and denotes the root when a `.` or `[`
+/// (or nothing) follows it; otherwise it begins a key (`$ref`).
 pub const Path = struct {
     segments: []const Segment,
 
@@ -115,8 +120,11 @@ pub const Path = struct {
         errdefer segments.deinit(allocator);
 
         var i: usize = 0;
-        // Optional root marker.
-        if (i < input.len and input[i] == '$') i += 1;
+        // Optional root marker -- only where a segment or nothing follows:
+        // `$ref` and `$schema` are ordinary keys (OpenAPI and JSON Schema
+        // are full of them), and reading the `$` as the root made
+        // `delete("$ref")` delete the key `ref` instead.
+        if (input.len > 0 and input[0] == '$' and (input.len == 1 or input[1] == '.' or input[1] == '[')) i = 1;
 
         while (i < input.len) {
             const c = input[i];
@@ -189,7 +197,9 @@ pub const Path = struct {
                     return error.InvalidPath;
                 }
             } else {
-                // Bare leading key (`a.b` without `$` or `.`).
+                // Bare leading key (`a.b` without `$` or `.`), and only
+                // leading: after a segment, `$.items[0]name` is not a path.
+                if (i != 0) return error.InvalidPath;
                 const start = i;
                 while (i < input.len and input[i] != '.' and input[i] != '[') i += 1;
                 try segments.append(allocator, .{ .key = input[start..i] });
@@ -608,8 +618,30 @@ pub const Editor = struct {
         var txn: internal.Transaction = undefined;
         txn.begin(self.doc);
         errdefer txn.abort();
-        for (edits) |edit| try applyOne(self.doc, edit);
+        var anchored = false;
+        for (edits) |edit| {
+            if (!anchored) anchored = self.placesAnchor(edit);
+            try applyOne(self.doc, edit);
+        }
+        // An anchor this batch attached or moved can shadow a definition
+        // the aliases after it were bound to, or stop shadowing one: the
+        // written document would bind them elsewhere. Checked only then,
+        // so an ordinary edit still costs what it changes.
+        if (anchored) if (self.doc.root) |root| {
+            if (!try internal.aliasesBindInOrder(self.doc.allocator, root, null, null)) return error.AnchorShadowed;
+        };
         try txn.commit();
+    }
+
+    /// Does `edit` attach or move a subtree that carries an anchor?
+    fn placesAnchor(self: *Editor, edit: Edit) bool {
+        return switch (edit) {
+            .set => |s| anchorIn(s.value, 0),
+            .insert => |i| anchorIn(i.value, 0),
+            .append => |a| anchorIn(a.value, 0),
+            .move => |m| if (self.one(m.from)) |n| anchorIn(n, 0) else |_| true,
+            .delete => false,
+        };
     }
 
     fn applyOne(doc: *Document, edit: Edit) Error!void {
@@ -693,7 +725,8 @@ pub const Editor = struct {
         const root = doc.root orelse return error.UnknownPath;
         const found = try resolveForWrite(doc.allocator, root, .{ .segments = parent });
         defer doc.allocator.free(found);
-        if (found.len != 1) return error.UnknownPath;
+        if (found.len == 0) return error.UnknownPath;
+        if (found.len > 1) return error.AmbiguousOperation;
         return found[0];
     }
 
@@ -3761,4 +3794,198 @@ test "a batch edit refuses a forward alias instead of stranding it" {
     // An edit that strands nothing runs.
     try ed.set("$.other", try doc.createScalar("1", .plain));
     try testing.expectEqual(@as(usize, 3), root.pairs().?.len);
+}
+
+/// Structural equality for the edit regression table: kind, scalar text,
+/// anchor, tag and alias name, recursively.
+fn sameTreeForTest(a: ?*const Node, b: ?*const Node) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    if (x.kind() != y.kind()) return false;
+    if (!std.meta.eql(x.anchor == null, y.anchor == null)) return false;
+    if (x.anchor) |n| if (!std.mem.eql(u8, n, y.anchor.?)) return false;
+    if ((x.tag == null) != (y.tag == null)) return false;
+    if (x.tag) |t| if (!std.mem.eql(u8, t, y.tag.?)) return false;
+    return switch (x.data) {
+        .scalar => |s| std.mem.eql(u8, s.value, y.data.scalar.value),
+        .alias => |al| std.mem.eql(u8, al.name, y.data.alias.name),
+        .mapping => |m| m.pairs.items.len == y.data.mapping.pairs.items.len and for (m.pairs.items, y.data.mapping.pairs.items) |p, q| {
+            if (!sameTreeForTest(p.key, q.key) or !sameTreeForTest(p.value, q.value)) break false;
+        } else true,
+        .sequence => |sq| sq.items.items.len == y.data.sequence.items.items.len and for (sq.items.items, y.data.sequence.items.items) |i, j| {
+            if (!sameTreeForTest(i, j)) break false;
+        } else true,
+    };
+}
+
+test "edits keep the meaning in the shapes the preservation sweep skips" {
+    // Found by a randomized differential over the fixtures and corpus
+    // (edit, write, read back, compare with the tree in memory). Each
+    // output was wrong -- unparseable, or read back as another tree --
+    // and each is pinned as the bytes now written.
+    const allocator = testing.allocator;
+    const Op = union(enum) {
+        set: struct { p: []const u8, v: []const u8, s: @import("token.zig").ScalarStyle = .plain },
+        set_seq: []const u8,
+        set_map: []const u8,
+        delete: []const u8,
+        append: struct { p: []const u8, v: []const u8, s: @import("token.zig").ScalarStyle = .plain },
+        insert: struct { p: []const u8, pos: []const u8, v: []const u8, s: @import("token.zig").ScalarStyle = .plain },
+        move: struct { from: []const u8, to: []const u8, key: []const u8 },
+        anchor: struct { p: []const u8, name: ?[]const u8 },
+        lead: struct { p: []const u8, t: []const u8 },
+        trail: struct { p: []const u8, t: []const u8 },
+    };
+    const bom = "\xEF\xBB\xBF";
+    const cases = [_]struct { in: []const u8, ops: []const Op, out: []const u8 }{
+        // Any edit to a document opening with a byte order mark.
+        .{ .in = bom ++ "a: 1\nb: 2\n", .ops = &.{.{ .set = .{ .p = "$.b", .v = "3" } }}, .out = bom ++ "a: 1\nb: 3\n" },
+        .{ .in = bom ++ "a: 1\nb: 2\n", .ops = &.{.{ .trail = .{ .p = "$.b", .t = "# t" } }}, .out = bom ++ "a: 1\nb: 2 # t\n" },
+        // A block scalar written by an edit took in what followed it.
+        .{ .in = "a: 1 # c\n", .ops = &.{.{ .set = .{ .p = "$.a", .v = "x\ny" } }}, .out = "a: |- # c\n  x\n  y\n" },
+        .{ .in = "a:\n  b: 1 # note\n", .ops = &.{.{ .set = .{ .p = "$.a.b", .v = "x\ny", .s = .literal } }}, .out = "a:\n  b: |- # note\n    x\n    y\n" },
+        .{ .in = "a: 1 # c\n", .ops = &.{.{ .set = .{ .p = "$", .v = "x\n", .s = .literal } }}, .out = "| # c\nx\n" },
+        .{ .in = "a: 1\n# tail\n", .ops = &.{.{ .set = .{ .p = "$", .v = "x\n", .s = .literal } }}, .out = "|\n x\n# tail\n" },
+        .{ .in = "a:\n  b: 1\n  # c\nd: 2\n", .ops = &.{.{ .set = .{ .p = "$.a", .v = "x\ny" } }}, .out = "a: |-\n   x\n   y\n  # c\nd: 2\n" },
+        .{ .in = "a: 1\n", .ops = &.{.{ .set = .{ .p = "$", .v = "x\n\n", .s = .literal } }}, .out = "|+\nx\n\n" },
+        .{ .in = "- 1\n\n- 2\n", .ops = &.{.{ .set = .{ .p = "$[0]", .v = "x\n\n", .s = .literal } }}, .out = "- |+\n  x\n\n- 2\n" },
+        .{ .in = "a:\n  - 1\n\nb: 2\n", .ops = &.{.{ .append = .{ .p = "$.a", .v = "x\n\n", .s = .literal } }}, .out = "a:\n  - 1\n  - |+\n    x\n\nb: 2\n" },
+        .{ .in = "a: |\n  t\nb: 2\n", .ops = &.{.{ .lead = .{ .p = "$.b", .t = "  # x" } }}, .out = "a: |\n  t\n# x\nb: 2\n" },
+        // Indentation and item framing around new and replaced items.
+        .{ .in = "a:\n  - x\n", .ops = &.{.{ .insert = .{ .p = "$.a", .pos = "$.a[0]", .v = "q\n", .s = .literal } }}, .out = "a:\n  - |\n    q\n  - x\n" },
+        .{ .in = "a:\n  - x\n  - y\n", .ops = &.{.{ .insert = .{ .p = "$.a", .pos = "$.a[0]", .v = "" } }}, .out = "a:\n  -\n  - x\n  - y\n" },
+        .{ .in = "- - x\n  - y\n", .ops = &.{.{ .set = .{ .p = "$[0][0]", .v = "" } }}, .out = "- -\n  - y\n" },
+        .{ .in = "-\n  - 42\n", .ops = &.{.{ .set = .{ .p = "$[0][0]", .v = "x" } }}, .out = "-\n  - x\n" },
+        .{ .in = "- - one\n  - two\n", .ops = &.{ .{ .set = .{ .p = "$[0][0]", .v = "z" } }, .{ .set = .{ .p = "$[0][1]", .v = "z" } } }, .out = "- - z\n  - z\n" },
+        .{ .in = "- - x\n", .ops = &.{.{ .set = .{ .p = "$[0][0]", .v = "a\nb", .s = .literal } }}, .out = "- - |-\n    a\n    b\n" },
+        .{ .in = "- !!map\n  foo: bar\n", .ops = &.{ .{ .delete = "$[0].foo" }, .{ .set = .{ .p = "$[0].k", .v = "v" } } }, .out = "- !!map\n  k: v\n" },
+        .{ .in = "- :\n", .ops = &.{.{ .set = .{ .p = "$[0][\"\"]", .v = "a\nb", .s = .literal } }}, .out = "- : |-\n    a\n    b\n" },
+        .{ .in = "- # c\n  x\n- z\n", .ops = &.{.{ .delete = "$[0]" }}, .out = "- z\n" },
+        .{ .in = "- # c\n  x\n- z\n", .ops = &.{.{ .set = .{ .p = "$[0]", .v = "NEW" } }}, .out = "- NEW\n- z\n" },
+        .{ .in = "- # c\n  x\n", .ops = &.{.{ .append = .{ .p = "$", .v = "y" } }}, .out = "- # c\n  x\n- y\n" },
+        // Document markers.
+        .{ .in = "--- a\n", .ops = &.{.{ .set_seq = "$" }}, .out = "---\n- x\n" },
+        .{ .in = "--- a\n", .ops = &.{.{ .set_map = "$" }}, .out = "---\nk: x\n" },
+        .{ .in = "\ta\n", .ops = &.{.{ .set_seq = "$" }}, .out = "- x\n" },
+        .{ .in = "a: 1\n...\n", .ops = &.{.{ .delete = "$.a" }}, .out = "{}\n...\n" },
+        .{ .in = "---\n...\n", .ops = &.{.{ .set = .{ .p = "$", .v = "x" } }}, .out = "---\nx\n...\n" },
+        .{ .in = "---", .ops = &.{.{ .set = .{ .p = "$", .v = "x" } }}, .out = "--- x" },
+        // Flow mappings whose `:` does not follow the key directly.
+        .{ .in = "{\"foo\"\n: \"bar\"}\n", .ops = &.{.{ .set = .{ .p = "$.foo", .v = "x" } }}, .out = "{\"foo\"\n: x}\n" },
+        .{ .in = "{foo, b: 1}\n", .ops = &.{.{ .set = .{ .p = "$.foo", .v = "x" } }}, .out = "{foo: x, b: 1}\n" },
+        // CRLF and CR line breaks.
+        .{ .in = "- |+\r\n  a\r\n\r\n", .ops = &.{.{ .append = .{ .p = "$", .v = "c" } }}, .out = "- |+\r\n  a\r\n\r\n- c\r\n" },
+        .{ .in = "k: |+\r\n  a\r\n\r\n", .ops = &.{.{ .set = .{ .p = "$.j", .v = "c" } }}, .out = "k: |+\r\n  a\r\n\r\nj: c\r\n" },
+        .{ .in = "- |\r\n  a\r\n", .ops = &.{.{ .append = .{ .p = "$", .v = "c" } }}, .out = "- |\r\n  a\r\n- c\r\n" },
+        .{ .in = "[a, # c\rb]\r", .ops = &.{.{ .delete = "$[1]" }}, .out = "[a]\r" },
+        // Properties of a parsed collection, of an empty value and key.
+        .{ .in = "a:\n  b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = "x" } }}, .out = "a: &x\n  b: 1\n" },
+        .{ .in = "a: &x\n  b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = null } }}, .out = "a:\n  b: 1\n" },
+        .{ .in = "a: &x\n  b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = "y" } }}, .out = "a: &y\n  b: 1\n" },
+        .{ .in = "b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$", .name = "r" } }}, .out = "&r\nb: 1\n" },
+        .{ .in = "a:\nb: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = "x" } }}, .out = "a: &x\nb: 1\n" },
+        .{ .in = "!!str : a\n", .ops = &.{.{ .set = .{ .p = "$[\"\"]", .v = "b" } }}, .out = "!!str : b\n" },
+        .{ .in = "&c : a\n", .ops = &.{.{ .set = .{ .p = "$[\"\"]", .v = "b" } }}, .out = "&c : b\n" },
+        // A null key's entry.
+        .{ .in = ": a\nb: c\n", .ops = &.{.{ .delete = "$[\"\"]" }}, .out = "b: c\n" },
+        .{ .in = ": a\nb: c\n", .ops = &.{.{ .move = .{ .from = "$[\"\"]", .to = "$", .key = "mv" } }}, .out = "b: c\nmv: a\n" },
+        // No final line break.
+        .{ .in = "a: |\n  x\n  ", .ops = &.{.{ .set = .{ .p = "$.new", .v = "y" } }}, .out = "a: |\n  x\nnew: y" },
+        .{ .in = "a: 1", .ops = &.{.{ .trail = .{ .p = "$.a", .t = "# d" } }}, .out = "a: 1 # d\n" },
+        .{ .in = "- 1", .ops = &.{.{ .trail = .{ .p = "$[0]", .t = "# d" } }}, .out = "- 1 # d\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(allocator, c.in);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        for (c.ops) |op| switch (op) {
+            .set => |s| try ed.set(s.p, try doc.createScalar(s.v, s.s)),
+            .set_seq => |p| {
+                const q = try doc.createSequence();
+                try doc.sequenceAppend(q, try doc.createScalar("x", .plain));
+                try ed.set(p, q);
+            },
+            .set_map => |p| {
+                const m = try doc.createMapping();
+                try doc.mappingAppend(m, try doc.createScalar("k", .plain), try doc.createScalar("x", .plain));
+                try ed.set(p, m);
+            },
+            .delete => |p| try ed.delete(p),
+            .append => |a| try ed.apply(&.{.{ .append = .{ .sequence = a.p, .value = try doc.createScalar(a.v, a.s) } }}),
+            .insert => |i| try ed.apply(&.{.{ .insert = .{ .sequence = i.p, .position = i.pos, .value = try doc.createScalar(i.v, i.s), .before = true } }}),
+            .move => |m| try ed.apply(&.{.{ .move = .{ .from = m.from, .to = m.to, .key = m.key } }}),
+            .anchor => |a| try doc.setAnchor(try ed.one(a.p), a.name),
+            .lead => |l| try doc.setLeadingComments(try ed.one(l.p), l.t),
+            .trail => |t| try doc.setTrailingComment(try ed.one(t.p), t.t),
+        };
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        errdefer std.debug.print("{f}: wrote {f}\n", .{ std.zig.fmtString(c.in), std.zig.fmtString(out) });
+        try testing.expectEqualStrings(c.out, out);
+        var back = try Document.parse(allocator, out);
+        defer back.deinit();
+        try testing.expect(sameTreeForTest(doc.root, back.root));
+    }
+}
+
+test "an edit that would rebind an alias, or build a cycle, is refused" {
+    const allocator = testing.allocator;
+    // A later `&x` shadows an earlier one for the aliases after it, once
+    // written and read back: in memory `*x` kept its target, and the
+    // written document meant another.
+    {
+        var doc = try Document.parse(allocator, "- &x 1\n- 2\n- *x\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try testing.expectError(error.AnchorShadowed, doc.setAnchor(try ed.one("$[1]"), "x"));
+        // After every alias it is harmless.
+        try doc.sequenceAppend(doc.root.?, try doc.createScalar("3", .plain));
+        try doc.setAnchor(try ed.one("$[3]"), "x");
+    }
+    {
+        var doc = try Document.parse(allocator, "a: &x 1\nb: 0\nc: *x\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const v = try doc.createScalar("NEW", .plain);
+        try doc.setAnchor(v, "x");
+        try testing.expectError(error.AnchorShadowed, ed.set("$.b", v));
+        const same = try doc.write(allocator);
+        defer allocator.free(same);
+        try testing.expectEqualStrings("a: &x 1\nb: 0\nc: *x\n", same);
+    }
+    // YAML gives an alias no properties.
+    {
+        var doc = try Document.parse(allocator, "a: &x 1\nb: *x\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        const alias = doc.root.?.pairs().?[1].value;
+        try testing.expectError(error.InvalidSyntax, doc.setAnchor(alias, "q"));
+        _ = &ed;
+    }
+    // A node set as a value of its own descendant: a parent cycle, which
+    // panicked in `markModified` (the append paths already refused it).
+    {
+        var doc = try Document.parse(allocator, "a:\n  b: 1\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try testing.expectError(error.WouldCycle, ed.set("$.a.b", doc.root.?));
+        try testing.expectError(error.WouldCycle, doc.pathSet(&.{ "a", "b" }, doc.root.?));
+    }
+}
+
+test "the path grammar reads `$ref` as a key, and refuses text after a segment" {
+    const allocator = testing.allocator;
+    // `$` followed by a key character was taken for the root marker, so
+    // `delete("$ref")` deleted `ref` (OpenAPI and JSON Schema documents
+    // are full of `$ref` and `$schema`).
+    var doc = try Document.parse(allocator, "$ref: '#/defs/a'\nref: keep\nitems: [a]\nl: [{k: 1}, {k: 2}]\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.delete("$ref");
+    try testing.expect(doc.root.?.lookup("$ref") == null);
+    try testing.expectEqualStrings("keep", doc.root.?.lookup("ref").?.scalarValue().?);
+    try testing.expectError(error.InvalidPath, ed.all("$.items[0]name"));
+    try testing.expectError(error.InvalidPath, ed.all("items[0]name"));
+    // A set whose parent matches several nodes names no single target.
+    try testing.expectError(error.AmbiguousOperation, ed.set("$.l[*].k", try doc.createScalar("3", .plain)));
 }

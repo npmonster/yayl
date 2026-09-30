@@ -1161,10 +1161,19 @@ pub const Document = struct {
     /// mark: the YAML anchor alphabet. Anything else is
     /// `error.InvalidSyntax`.
     pub fn setAnchor(self: *Document, node: *Node, name: ?[]const u8) !void {
+        // YAML gives an alias no properties (spec 7.1): one set here was
+        // silently never written.
+        if (node.data == .alias and name != null) return error.InvalidSyntax;
         if (name) |n| {
             if (!internal.validAnchorName(n)) return error.InvalidSyntax;
             if (node.anchor) |cur| {
                 if (std.mem.eql(u8, cur, n)) return;
+            }
+            // A name defined again shadows the earlier definition for the
+            // aliases after it, once written and read back; refused while
+            // any of them still names the earlier node.
+            if (self.root) |root| {
+                if (!try internal.aliasesBindInOrder(self.allocator, root, node, n)) return error.AnchorShadowed;
             }
         } else if (node.anchor == null) return;
         if (node.anchor) |cur| {
@@ -1229,8 +1238,8 @@ pub const Document = struct {
 
     /// Append a key/value pair to a mapping node, maintaining parent links.
     pub fn mappingAppend(self: *Document, map: *Node, key: *Node, value: *Node) !void {
-        if (attachRefusal(map, key)) |reason| return reason;
-        if (attachRefusal(map, value)) |reason| return reason;
+        if (internal.attachRefusal(map, key)) |reason| return reason;
+        if (internal.attachRefusal(map, value)) |reason| return reason;
         try internal.attachPair(self, map, key, value);
         try internal.adopt(self, key);
         try internal.adopt(self, value);
@@ -1238,7 +1247,7 @@ pub const Document = struct {
 
     /// Append an item to a sequence node, maintaining parent links.
     pub fn sequenceAppend(self: *Document, seq: *Node, item: *Node) !void {
-        if (attachRefusal(seq, item)) |reason| return reason;
+        if (internal.attachRefusal(seq, item)) |reason| return reason;
         try internal.attachItem(self, seq, item);
         try internal.adopt(self, item);
     }
@@ -1250,7 +1259,7 @@ pub const Document = struct {
     /// then tripped its parent-cycle assert -- a panic reachable through
     /// the public API (and through `Editor`'s insert/set).
     pub fn sequenceInsert(self: *Document, seq: *Node, index: usize, item: *Node) !void {
-        if (attachRefusal(seq, item)) |reason| return reason;
+        if (internal.attachRefusal(seq, item)) |reason| return reason;
         switch (seq.data) {
             .sequence => {
                 try internal.insertItem(self, seq, index, item);
@@ -2034,25 +2043,6 @@ pub const Document = struct {
             }
             cur = n.parent;
         }
-    }
-
-    /// Why attaching `child` under `parent` must be refused, or null
-    /// when it is safe. `child` being `parent` itself or one of its
-    /// ancestors is a parent cycle. An ancestor chain longer than the
-    /// walk bound is reported as `NestingTooDeep` rather than a cycle:
-    /// `markModified` asserts past the same bound, so attaching there
-    /// would build a tree the rest of the module cannot maintain. The
-    /// chain is acyclic by induction — this is the check that keeps it so
-    /// — hence the plain walk.
-    fn attachRefusal(parent: *Node, child: *Node) ?error{ WouldCycle, NestingTooDeep } {
-        var cur: ?*Node = parent;
-        var guard: usize = 0;
-        while (cur) |n| : (guard += 1) {
-            if (n == child) return error.WouldCycle;
-            if (guard >= Node.max_parent_walk) return error.NestingTooDeep;
-            cur = n.parent;
-        }
-        return null;
     }
 
     /// The `dropped` tombstone list of a collection node (source ranges

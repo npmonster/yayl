@@ -372,7 +372,10 @@ fn outerFraming(src: []const u8, container: *const Node, line: usize) ?struct { 
 pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
     const src = self.source orelse return;
     const ks = p.key.src orelse return;
-    if (ks.synthetic) return;
+    // A null key (`: a`) has no text, but its span still points at the
+    // indicator its entry starts with; skipping it left a deleted entry
+    // in the output (and a moved one there as well as at its new place).
+    if (ks.synthetic and !(ks.entry_start < src.len and (src[ks.entry_start] == ':' or src[ks.entry_start] == '?'))) return;
     switch (map.data) {
         .mapping => |*m| {
             // A flow collection re-emits normalized from the tree, so
@@ -521,6 +524,62 @@ pub fn sequenceReplace(self: *Document, seq: *Node, index: usize, value: *Node) 
     }
 }
 
+/// INTERNAL. Why attaching `child` under `parent` must be refused, or null
+/// when it is safe. `child` being `parent` itself or one of its
+/// ancestors is a parent cycle. An ancestor chain longer than the
+/// walk bound is reported as `NestingTooDeep` rather than a cycle:
+/// `markModified` asserts past the same bound, so attaching there
+/// would build a tree the rest of the module cannot maintain. The
+/// chain is acyclic by induction — this is the check that keeps it so
+/// — hence the plain walk.
+pub fn attachRefusal(parent: *Node, child: *Node) ?error{ WouldCycle, NestingTooDeep } {
+    var cur: ?*Node = parent;
+    var guard: usize = 0;
+    while (cur) |n| : (guard += 1) {
+        if (n == child) return error.WouldCycle;
+        if (guard >= Node.max_parent_walk) return error.NestingTooDeep;
+        cur = n.parent;
+    }
+    return null;
+}
+
+/// INTERNAL. Would every alias under `root` still bind to its current
+/// target once the document is written and read back? A reader binds an
+/// alias to the nearest definition of its name before it (a later `&x`
+/// shadows an earlier one), so an edit that defines a name again, or
+/// moves a definition, rebinds the aliases after it: in memory `*x` kept
+/// its old target, and the written document meant something else. An
+/// alias with no definition before it is not judged: that is a forward
+/// alias in a hand-built tree, which no edit made. `renamed`, when set,
+/// gives that node the anchor `as` for the check (a `setAnchor` about to
+/// happen).
+pub fn aliasesBindInOrder(allocator: std.mem.Allocator, root: *const Node, renamed: ?*const Node, as: ?[]const u8) !bool {
+    var defs: std.StringHashMapUnmanaged(*const Node) = .empty;
+    defer defs.deinit(allocator);
+    return bindsInOrder(allocator, root, &defs, renamed, as, 0);
+}
+
+fn bindsInOrder(allocator: std.mem.Allocator, node: *const Node, defs: *std.StringHashMapUnmanaged(*const Node), renamed: ?*const Node, as: ?[]const u8, depth: usize) !bool {
+    if (depth >= Node.max_parent_walk) return true;
+    // A definition comes before its node's content (`&x [*x]`).
+    const anchor = if (renamed == node) as else node.anchor;
+    if (anchor) |a| try defs.put(allocator, a, node);
+    switch (node.data) {
+        .scalar => {},
+        .alias => |al| if (defs.get(al.name)) |bound| {
+            if (bound != al.target) return false;
+        },
+        .mapping => |m| for (m.pairs.items) |p| {
+            if (!try bindsInOrder(allocator, p.key, defs, renamed, as, depth + 1)) return false;
+            if (!try bindsInOrder(allocator, p.value, defs, renamed, as, depth + 1)) return false;
+        },
+        .sequence => |sq| for (sq.items.items) |item| {
+            if (!try bindsInOrder(allocator, item, defs, renamed, as, depth + 1)) return false;
+        },
+    }
+    return true;
+}
+
 /// INTERNAL. Replace the existing value node `existing` (a value of
 /// `map`) with `value`, preserving pair order and the key node. Returns
 /// false when `existing` is not a value of `map`.
@@ -531,6 +590,9 @@ pub fn mappingReplace(self: *Document, map: *Node, existing: *Node, value: *Node
     };
     for (pairs, 0..) |p, i| {
         if (p.value == existing) {
+            // Set as a value of its own descendant (`$.a.b` to `$`): a
+            // parent cycle, which the append paths already refused.
+            if (attachRefusal(map, value)) |reason| return reason;
             try setParent(self, value, map);
             try setPairValue(self, map, i, value);
             // A spanned replacement (a clone) would otherwise look

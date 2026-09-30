@@ -92,8 +92,14 @@ pub fn newlineAt(source: []const u8, offset: usize) usize {
 /// count codepoints, but for indentation derivation bytes are what the
 /// emitter needs (indentation is ASCII spaces).
 pub fn columnOf(source: []const u8, offset: usize) usize {
-    return offset - lineStart(source, offset);
+    const ls = lineStart(source, offset);
+    // A byte order mark opens the stream but takes no column: counted, it
+    // put the first line's entries three columns deep once re-emitted.
+    if (ls == 0 and offset >= bom.len and std.mem.startsWith(u8, source, bom)) return offset - bom.len;
+    return offset - ls;
 }
+
+const bom = "\u{FEFF}";
 
 /// The end of the node properties (`&anchor`, `!tag`, `!<verbatim>`)
 /// that begin at `start`, or `start` when none do. A node that is
