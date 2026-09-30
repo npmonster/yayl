@@ -4361,8 +4361,9 @@ test "a block scalar written beside the lines of a deleted entry keeps its value
 
 test "a moved item's trailing comment goes on its block scalar's header" {
     // A trailing comment travels with the item. Written after a block
-    // scalar's last line it is a line of the block (` # two` under `|+`
-    // read back as content); for an item in a sequence it went on the
+    // scalar's last line it can be a line of the block (at a one-space
+    // indentation step ` # two` under `|+` read back as content); for an
+    // item in a sequence it went on the
     // header, for the value of a mapping entry it did not.
     const allocator = testing.allocator;
     var doc = try Document.parse(allocator, "z:\n  - x  # one\n  - y  # two\n");

@@ -606,7 +606,8 @@ and pinned by tests that fail without the fix:
 - A tag or anchor on a root collection indented by a blank or more left
   its first entry at column 0 over its siblings (` &x` / `- a` /
   ` - b`), and a mapping root did not parse. The line after a root's
-  properties was broken with a line feed in a CRLF or CR document.
+  properties was broken with a line feed in a CRLF or CR document
+  (cosmetic: the document still read back).
 - A block scalar written beside lines a deleted entry owned took a
   whitespace-only line, or a comment, from behind it into its value:
   the indentation it needs is measured from what will follow it, and the
@@ -614,8 +615,9 @@ and pinned by tests that fail without the fix:
   block takes were missed the same way when the entry behind it had been
   deleted.
 - A trailing comment travelling with an item that became a block scalar's
-  value was written after the block, as a line of it (` # c` under `|+`);
-  it goes on the header line, as it does for an item of a sequence.
+  value was written after the block, where it can be read as a line of it
+  (at a one-space indentation step, ` # c` under `|+` was content); it
+  goes on the header line, as it does for an item of a sequence.
 - A first document with no content (its root set to null, or left empty)
   was written as nothing, and `\n---\nb: 2` reads back as one document. It
   gets a `---` of its own, after the byte order mark if there is one.
