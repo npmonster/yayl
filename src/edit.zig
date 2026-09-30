@@ -4380,6 +4380,18 @@ test "a moved item's trailing comment goes on its block scalar's header" {
     const out = try doc.write(allocator);
     defer allocator.free(out);
     try testing.expectEqualStrings("z:\n  - x  # one\nmv: |+ # two\n  v\n\n", out);
+    // At a one-space indentation step the comment after the block WAS its
+    // content, and a key of several lines is written quoted, never `? |`,
+    // so its value's comment goes on the header too.
+    for ([_][]const u8{ "mv", "m\nv" }) |key| {
+        var d = try Document.parse(allocator, "z:\n - x  # one\n - y  # two\n");
+        defer d.deinit();
+        var e = Editor.init(&d);
+        try e.apply(&.{.{ .set = .{ .path = "$.z[1]", .value = try d.createScalar("v\n\n", .literal) } }});
+        try e.apply(&.{.{ .move = .{ .from = "$.z[1]", .to = "$", .key = key } }});
+        errdefer std.debug.print("key {f}\n", .{std.zig.fmtString(key)});
+        try expectReadsBack(allocator, &d, "moved block scalar at a one-space step");
+    }
 }
 
 test "an entry with no key text is written apart from an explicit key that has no value" {

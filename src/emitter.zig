@@ -888,10 +888,7 @@ pub const Emitter = struct {
             }
             self.placeNewBlock(container, value, gap);
             defer self.endBlockPlacement();
-            // A key of several lines is written `? |...`, whose header
-            // would take the value's comment.
-            const offered = key.data == .scalar and std.mem.indexOfScalar(u8, key.data.scalar.value, '\n') == null and
-                self.offerHeaderComment(value);
+            const offered = self.offerHeaderComment(value);
             try self.emitEntry(key, value, entry_col);
             try self.writeOwedTrailing(value, offered);
             if (owed_terminator and !self.endsWithNewline()) try self.write(self.defaultTerminator());
