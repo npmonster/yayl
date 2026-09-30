@@ -4245,6 +4245,38 @@ test "a property on a block collection under a key, then another edit inside it,
     try testing.expectEqualStrings("k: # note\n  &x\n  - b\nz: 1\n", out);
 }
 
+test "new properties on a block value under an explicit key leave it where it sat" {
+    // A block collection whose properties cannot follow its key's line (a
+    // comment ends it, or it is a value after `: `) is written normalized,
+    // and its column was corrected against its key's TEXT: the `k` of `? k`
+    // sits a step in from the entry, so the value went two columns deeper
+    // than the file's own layout for nothing (spec example 8.17, with an
+    // anchor set on the `: - one` sequence).
+    const allocator = testing.allocator;
+    const cases = [_]struct { input: []const u8, want: []const u8 }{
+        .{ .input = "? k\n: - a\n  - b\n", .want = "? k\n: &x\n  - a\n  - b\n" },
+        .{ .input = "? k\n: # note\n  - a\n  - b\n", .want = "? k\n: # note\n  &x\n  - a\n  - b\n" },
+        .{ .input = "- ? k\n  : - a\n    - b\n", .want = "- ? k\n  : &x\n    - a\n    - b\n" },
+        .{ .input = "- ? k\n  : # note\n    a: 1\n", .want = "- ? k\n  : # note\n    &x\n    a: 1\n" },
+        .{
+            .input = "? explicit key # Empty value\n? |\n  block key\n: - one # Explicit compact\n  - two # block value\n",
+            .want = "? explicit key # Empty value\n? |\n  block key\n: &x\n  - one\n  - two # block value\n",
+        },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(allocator, c.input);
+        defer doc.deinit();
+        const map = if (doc.root.?.kind() == .sequence) doc.root.?.items().?[0] else doc.root.?;
+        const pairs = map.pairs().?;
+        try doc.setAnchor(pairs[pairs.len - 1].value, "x");
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(c.input)});
+        try testing.expectEqualStrings(c.want, out);
+        try expectReadsBack(allocator, &doc, "properties under an explicit key");
+    }
+}
+
 test "a property on an indented root collection keeps its first entry in line" {
     // The root's properties take a line of their own, and the walk resumed
     // at the first entry's content: the blanks before it had gone out ahead
@@ -4359,6 +4391,77 @@ test "a block scalar written beside the lines of a deleted entry keeps its value
     try testing.expectEqualStrings("text: |\n    a\n\n    c\n\n    \n", out);
 }
 
+test "writing after deleting many entries takes time in proportion to them" {
+    // A write asks what the deleted entries left behind -- is this byte
+    // one of theirs, where does the run of them end -- at every gap it
+    // copies and along every line after a value it re-emits, and each ask
+    // walked the whole list of tombstones from its first range: after N
+    // deletions the write cost N squared (32,000 entries: 0.65 s, against
+    // 3 ms for the same write now; in a mapping with every other entry
+    // deleted, 0.15 s). Both shapes: the ranges of entries deleted in a
+    // row touch and merge into one, and with a live entry between each
+    // they stay N.
+    //
+    // The two sizes differ by 8x: time in proportion to the entries
+    // grows ~8x (10x measured), the scan of the list ~64x (34x measured
+    // in the every-other shape, where the entries themselves still cost).
+    // The bound sits between with room for a slow or busy machine; the
+    // fastest of three runs of each is judged. Leak-checked without
+    // `testing.allocator`'s stack traces, which make thousands of
+    // allocations slow.
+    var leak_check: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer testing.expect(leak_check.deinit() == .ok) catch @panic("leaked memory");
+    const allocator = leak_check.allocator();
+    const io = testing.io;
+
+    for ([_]bool{ false, true }) |every_other| {
+        var fastest: [2]i96 = undefined;
+        for ([_]usize{ 1000, 8000 }, &fastest) |count, *slot| {
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(allocator);
+            try text.appendSlice(allocator, "m:\n  k: 1\n");
+            for (0..count) |i| try text.print(allocator, "  e{d}: {d}\n\n", .{ i, i });
+            try text.appendSlice(allocator, "z: 1\n");
+            var doc = try Document.parse(allocator, text.items);
+            defer doc.deinit();
+
+            var paths: std.ArrayList([]u8) = .empty;
+            defer {
+                for (paths.items) |p| allocator.free(p);
+                paths.deinit(allocator);
+            }
+            var deletes: std.ArrayList(Edit) = .empty;
+            defer deletes.deinit(allocator);
+            for (0..count) |i| {
+                if (every_other and i % 2 == 1) continue;
+                const path = try std.fmt.allocPrint(allocator, "$.m.e{d}", .{i});
+                try paths.append(allocator, path);
+                try deletes.append(allocator, .{ .delete = path });
+            }
+            var ed = Editor.init(&doc);
+            try ed.apply(deletes.items);
+            try ed.apply(&.{.{ .set = .{ .path = "$.m.k", .value = try doc.createScalar("x\ny\n", .literal) } }});
+
+            slot.* = std.math.maxInt(i96);
+            for (0..3) |_| {
+                const start = std.Io.Timestamp.now(io, .awake);
+                const out = try doc.write(allocator);
+                const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
+                defer allocator.free(out);
+                // The scenario is what it claims to be: the block scalar
+                // written in place of `k`'s value, and the entries that
+                // were not deleted still there.
+                try testing.expect(std.mem.startsWith(u8, out, "m:\n  k: |\n    x\n    y\n"));
+                try testing.expect(std.mem.endsWith(u8, out, "\nz: 1\n"));
+                try testing.expectEqual(if (every_other) count / 2 else 0, std.mem.count(u8, out, "\n  e"));
+                slot.* = @min(slot.*, elapsed);
+            }
+            if (count == 1000) try expectReadsBack(allocator, &doc, "after many deletions");
+        }
+        try testing.expect(fastest[1] < fastest[0] * 20);
+    }
+}
+
 test "a moved item's trailing comment goes on its block scalar's header" {
     // A trailing comment travels with the item. Written after a block
     // scalar's last line it can be a line of the block (at a one-space
@@ -4427,6 +4530,59 @@ test "an entry with no key text is written apart from an explicit key that has n
     const out2 = try plain.write(allocator);
     defer allocator.free(out2);
     try testing.expectEqualStrings("a: 1\n: v\n", out2);
+    // A new item whose first entry has a null key opens a mapping of its
+    // own: the explicit key ending the item before it is no part of that
+    // mapping, and the bare form stays.
+    var items = try Document.parse(allocator, "- ? d\n");
+    defer items.deinit();
+    const item = try items.createMapping();
+    try items.mappingAppend(item, try items.createScalar("", .plain), try items.createScalar("v", .plain));
+    var ed3 = Editor.init(&items);
+    try ed3.apply(&.{.{ .append = .{ .sequence = "$", .value = item } }});
+    const out3 = try items.write(allocator);
+    defer allocator.free(out3);
+    try testing.expectEqualStrings("- ? d\n- : v\n", out3);
+}
+
+test "a null key kept from the source is written apart from an explicit key ahead of it" {
+    // `? e`, an entry, then `: v` is three entries, the last with a null
+    // key. Deleting the middle one left `? e` and `: v` adjacent, and the
+    // source's bare `: v` became the value of `e`: the entry was lost.
+    // A key written new gets its `?` (see the test above); one kept from
+    // the source is copied, and needs it just the same.
+    const allocator = testing.allocator;
+    const cases = [_]struct { input: []const u8, delete: []const u8, set: ?[]const u8 = null, want: []const u8 }{
+        .{ .input = "? e\nx: 1\n: v\n", .delete = "$.x", .want = "? e\n?\n: v\n" },
+        .{ .input = "m:\n  ? e\n  x: 1\n  : v\n", .delete = "$.m.x", .want = "m:\n  ? e\n  ?\n  : v\n" },
+        .{ .input = "- ? e\n  x: 1\n  : v\n", .delete = "$[0].x", .want = "- ? e\n  ?\n  : v\n" },
+        // Its value changed too: the entry is re-emitted, not copied.
+        .{ .input = "? e\nx: 1\n: v\n", .delete = "$.x", .set = "$[\"\"]", .want = "? e\n?\n: w\n" },
+        // Comment and blank lines between them stay.
+        .{ .input = "? e\n# note\nx: 1\n\n: v\n", .delete = "$.x", .want = "? e\n# note\n\n?\n: v\n" },
+        // Two entries between them.
+        .{ .input = "? e\nx: 1\ny: 2\n: v\n", .delete = "$.y", .want = "? e\nx: 1\n: v\n" },
+    };
+    for (cases) |c| {
+        var doc = try Document.parse(allocator, c.input);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .delete = c.delete }});
+        if (c.set) |path| try ed.apply(&.{.{ .set = .{ .path = path, .value = try doc.createScalar("w", .plain) } }});
+        errdefer std.debug.print("{f} minus {s}\n", .{ std.zig.fmtString(c.input), c.delete });
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+        try expectReadsBack(allocator, &doc, "null key after a deleted entry");
+    }
+    // The entry that opens an item is another mapping's first: the explicit
+    // key that ends the item before it is no part of it.
+    var doc = try Document.parse(allocator, "- ? e\n- : v\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{.{ .set = .{ .path = "$[1][\"\"]", .value = try doc.createScalar("w", .plain) } }});
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("- ? e\n- : w\n", out);
 }
 
 test "new entries sit where the properties of an empty key do" {

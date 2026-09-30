@@ -55,6 +55,9 @@ pub const Emitter = struct {
     /// Nodes emitted by the faithful walker (cycle/duplicate guard for
     /// programmatically shared nodes).
     emitted: std.AutoHashMap(*const Node, void),
+    /// Each collection's tombstones as sorted, disjoint ranges, built the
+    /// first time they are asked for: see `dropsOf`.
+    merged_drops: std.AutoHashMap(*const Node, std.ArrayList([2]usize)),
     /// Active source for faithful emission (empty when normalized).
     src: []const u8 = "",
     /// The line break the emitter writes where it lays out a line itself:
@@ -133,12 +136,16 @@ pub const Emitter = struct {
             .out = out,
             .seen = std.AutoHashMap(*const Node, []const u8).init(allocator),
             .emitted = std.AutoHashMap(*const Node, void).init(allocator),
+            .merged_drops = std.AutoHashMap(*const Node, std.ArrayList([2]usize)).init(allocator),
         };
     }
 
     pub fn deinit(self: *Emitter) void {
         self.seen.deinit();
         self.emitted.deinit();
+        var lists = self.merged_drops.valueIterator();
+        while (lists.next()) |list| list.deinit(self.allocator);
+        self.merged_drops.deinit();
     }
 
     // ------------------------------------------------------------------
@@ -189,6 +196,9 @@ pub const Emitter = struct {
     /// with no value: `? e` and nothing after it. Read from what was
     /// written, past comments and the deeper lines of the key's own text.
     fn endsOpenExplicitKey(self: *const Emitter, col: usize) bool {
+        // An entry that shares its line with framing (`- `) opens a mapping
+        // of its own; what is written above belongs to another node.
+        if (!ctype.isBlankRun(self.pendingLine())) return false;
         const out = self.out.items;
         var pos = out.len - self.pendingLine().len;
         while (pos > 0) {
@@ -210,6 +220,25 @@ pub const Emitter = struct {
             return body[0] == '?' and (body.len == 1 or ctype.isBlank(body[1]));
         }
         return false;
+    }
+
+    /// Before the `:` of an entry with a null key, at column `col`: when the
+    /// entry written last is an explicit key with no value (`? e`), a bare
+    /// `: v` after it is that key's value and the null key's entry is lost,
+    /// so the null key gets its `?` on a line of its own. Says whether it
+    /// did.
+    fn markNullKey(self: *Emitter, col: usize) Error!bool {
+        if (!self.endsOpenExplicitKey(col)) return false;
+        try self.writeByte('?');
+        try self.newlineAt(col);
+        return true;
+    }
+
+    /// Whether `key` is a null key the source spells with no text at all:
+    /// its entry opens with the `:` (`: v`).
+    fn isBareNullKey(self: *const Emitter, key: *const Node) bool {
+        const ks = key.src orelse return false;
+        return isNullScalar(key) and ks.entry_start < self.src.len and self.src[ks.entry_start] == ':';
     }
 
     /// Make the key written since `key_start` an explicit one (`? key`)
@@ -628,7 +657,7 @@ pub const Emitter = struct {
             // or opens a line of its own in the source (an end marker),
             // and the cursor is mid-line, re-own the break. (Surfaced
             // when `parse` stopped dropping the tail.)
-            if (doc.root) |root| if (!self.endsWithNewline()) if (firstLiveTail(root, stop, doc.region_end)) |at| {
+            if (doc.root) |root| if (!self.endsWithNewline()) if (try self.firstLiveTail(root, stop, doc.region_end)) |at| {
                 if (src[at] == '#' or (at == markup.lineStart(src, at) and !ctype.isBreak(src[at]))) {
                     try self.write(self.defaultTerminator());
                 }
@@ -675,7 +704,7 @@ pub const Emitter = struct {
                 // `---` with nothing after it: `---x` is not a marker.
                 try self.writeByte(' ');
             }
-            self.placeBlock(node, orig_end);
+            try self.placeBlock(node, orig_end);
             defer self.endBlockPlacement();
             _ = try self.emitContent(node, at);
             if (self.endsWithNewline()) return self.pastKeptBlanks(node, markup.lineEnd(self.src, orig_end));
@@ -697,7 +726,7 @@ pub const Emitter = struct {
             // line remainder (or a written trailing comment) and tail
             // from there.
             .scalar, .alias => {
-                self.placeBlock(node, s.end);
+                try self.placeBlock(node, s.end);
                 defer self.endBlockPlacement();
                 _ = try self.emitContent(node, indent);
                 if (self.endsWithNewline()) {
@@ -783,6 +812,7 @@ pub const Emitter = struct {
                 try self.emitted.put(value, {});
                 try self.writeGap(container, gap_start, key.src.?.entry_start);
                 try self.breakBeforeEntry(entry_col);
+                if (self.isBareNullKey(key)) _ = try self.markNullKey(entry_col);
                 try self.write(src[key.src.?.entry_start..pend]);
                 return pend;
             }
@@ -848,6 +878,7 @@ pub const Emitter = struct {
                     try self.writePendingLeadingText(pt, markup.columnOf(src, s.entry_start), self.terminatorAt(s.entry_start), false);
                 }
                 try self.breakBeforeEntry(entry_col);
+                if (self.isBareNullKey(key)) _ = try self.markNullKey(entry_col);
             }
         } else if (pair_end == null) {
             // Brand-new pair. While the previous entry's line is still
@@ -886,13 +917,13 @@ pub const Emitter = struct {
             if (try self.openEntryLine(entry_col, pending, self.terminatorAt(gap))) {
                 owed_terminator = true;
             }
-            self.placeNewBlock(container, value, gap);
+            try self.placeNewBlock(container, value, gap);
             defer self.endBlockPlacement();
             const offered = self.offerHeaderComment(value);
             try self.emitEntry(key, value, entry_col);
             try self.writeOwedTrailing(value, offered);
             if (owed_terminator and !self.endsWithNewline()) try self.write(self.defaultTerminator());
-            if (self.endsWithNewline()) return self.pastKeptBlanksIn(container, value, self.pastTakenBreak(container, gap));
+            if (self.endsWithNewline()) return self.pastKeptBlanksIn(container, value, try self.pastTakenBreak(container, gap));
             return gap;
         }
 
@@ -1001,7 +1032,7 @@ pub const Emitter = struct {
                 if (try self.writeCleanSlice(value, vs.entry_start)) |vend| {
                     return self.writeEntryTail(value, pair_end orelse vend);
                 }
-                self.placeBlock(value, pair_end orelse vs.end);
+                try self.placeBlock(value, pair_end orelse vs.end);
                 defer self.endBlockPlacement();
                 // An original block scalar re-emitted here keeps the
                 // column its content had; the value's own column (the
@@ -1028,7 +1059,7 @@ pub const Emitter = struct {
                 // where the next gap starts, so it is usable just when
                 // it points at live bytes: after a brand-new last entry
                 // it still sits inside the deleted entry's text.
-                const from = if (stop < base and !dropCovers(value, stop)) stop else base;
+                const from = if (stop < base and !try self.dropCovers(value, stop)) stop else base;
                 _ = try self.writeEntryTail(value, from);
                 // Advance past the value's original extent either way,
                 // so the tombstoned tail is not re-emitted.
@@ -1050,7 +1081,7 @@ pub const Emitter = struct {
             return gap_start;
         }
         // Brand-new value: layout by its shape.
-        if (pair_end) |pe| self.placeBlock(value, pe) else self.placeNewBlock(container, value, gap_start);
+        if (pair_end) |pe| try self.placeBlock(value, pe) else try self.placeNewBlock(container, value, gap_start);
         defer self.endBlockPlacement();
         if (expl) {
             // `? key` gaining a value it did not have: the value
@@ -1115,7 +1146,7 @@ pub const Emitter = struct {
                 owed_terminator = true;
             }
             try self.write("- ");
-            self.placeNewBlock(container, item, gap);
+            try self.placeNewBlock(container, item, gap);
             defer self.endBlockPlacement();
             const offered = self.offerHeaderComment(item);
             _ = try self.emitContent(item, entry_col + 2);
@@ -1141,7 +1172,7 @@ pub const Emitter = struct {
                 }
                 // A keep-chomped block takes the blank lines after it into
                 // its value; the next entry's gap must not write them again.
-                return self.pastKeptBlanksIn(container, item, self.pastTakenBreak(container, gap));
+                return self.pastKeptBlanksIn(container, item, try self.pastTakenBreak(container, gap));
             }
             return gap;
         };
@@ -1201,7 +1232,7 @@ pub const Emitter = struct {
             if (!framingOwnedByContent(item)) {
                 try self.write(src[s.entry_start..s.start]);
             }
-            self.placeBlock(item, s.end);
+            try self.placeBlock(item, s.end);
             defer self.endBlockPlacement();
             const stop = try self.emitContent(item, self.blockContentColumn(item) orelse markup.columnOf(src, s.start));
             // A container walk that re-emitted its last entry already
@@ -1246,18 +1277,10 @@ pub const Emitter = struct {
     /// was on, so the source's break still ahead (past any tombstones)
     /// is taken: written too, it left a blank line after a block scalar
     /// (`b: 1` then a new `mv: |`), or after an empty item's `- -`.
-    fn pastTakenBreak(self: *const Emitter, container: *const Node, gap: usize) usize {
+    fn pastTakenBreak(self: *Emitter, container: *const Node, gap: usize) Error!usize {
         const src = self.src;
         var next = gap;
-        outer: while (next < src.len) {
-            for (Document.droppedOf(container)) |d| {
-                if (next >= d[0] and next < d[1]) {
-                    next = d[1];
-                    continue :outer;
-                }
-            }
-            break;
-        }
+        if (next < src.len) next = coverEnd(try self.dropsOf(container), next) orelse next;
         if (next < src.len and markup.lineStart(src, next) != next and ctype.isBreak(src[next])) {
             return markup.lineEnd(src, next);
         }
@@ -1280,13 +1303,13 @@ pub const Emitter = struct {
 
     /// `pastKeptBlanks` from a brand-new entry's gap in `container`,
     /// where the blank lines can sit behind a replaced entry's tombstone.
-    fn pastKeptBlanksIn(self: *const Emitter, container: *const Node, node: *const Node, from: usize) usize {
+    fn pastKeptBlanksIn(self: *Emitter, container: *const Node, node: *const Node, from: usize) Error!usize {
         _ = node;
         if (self.kept_end != self.out.items.len) return from;
         return self.skipBlankLines(container, from);
     }
 
-    fn pastKeptBlanks(self: *const Emitter, node: *const Node, le: usize) usize {
+    fn pastKeptBlanks(self: *Emitter, node: *const Node, le: usize) Error!usize {
         if (self.kept_end != self.out.items.len) return le;
         return self.skipBlankLines(node.parent, le);
     }
@@ -1297,10 +1320,10 @@ pub const Emitter = struct {
     /// what would follow. A keep-chomped block takes those into its value,
     /// and behind a deleted entry they were missed (`pastKeptBlanks` looked
     /// only at the line after the block, and `Chomping:` stood there).
-    fn skipBlankLines(self: *const Emitter, holder: ?*const Node, from: usize) usize {
+    fn skipBlankLines(self: *Emitter, holder: ?*const Node, from: usize) Error!usize {
         var i = from;
         while (i < self.src.len) {
-            if (droppedEnd(holder, i)) |end| {
+            if (try self.droppedEnd(holder, i)) |end| {
                 i = end;
                 continue;
             }
@@ -1457,7 +1480,7 @@ pub const Emitter = struct {
                 for (parent.data.mapping.pairs.items) |pair| {
                     if (pair.value != node) continue;
                     if (pair.key.src) |ks| {
-                        const key_col = markup.columnOf(self.src, ks.start);
+                        const key_col = keyEntryColumn(self.src, ks);
                         if (col <= key_col) col = key_col + self.indent_step;
                     }
                     break;
@@ -1603,7 +1626,7 @@ pub const Emitter = struct {
             // A deleted first entry leaves them to the next one, which
             // carries its own indentation (see `emitPairEdited`).
             const line = markup.lineStart(self.src, s.start);
-            if (!dropCovers(node, s.start) and ctype.isBlankRun(self.src[line..s.start])) {
+            if (!try self.dropCovers(node, s.start) and ctype.isBlankRun(self.src[line..s.start])) {
                 try self.writeIndent(s.start - line);
             }
             return s.start;
@@ -1787,6 +1810,26 @@ pub const Emitter = struct {
         return saw_q;
     }
 
+    /// The column the mapping entry whose key spans `ks` sits at.
+    fn keyEntryColumn(src: []const u8, ks: markup.Src) usize {
+        // An EXPLICIT-key entry (`? key`) is the one case where the text
+        // column is not the entry column: its key text sits one step in
+        // from the line's indentation, and a brand-new plain key written
+        // there would land inside the previous explicit entry's value
+        // slot. Entries live at the indicator's column.
+        if (explicitKeySpan(src, ks.entry_start, ks.start)) {
+            return markup.columnOf(src, ks.entry_start);
+        }
+        const col = textColumn(src, ks.entry_start, ks.start);
+        // ... also when the `?` has a line of its own (`? # c` over
+        // `  - seq`): the key's text is deeper than the entry, and a new
+        // key written there did not parse.
+        if (internal.explicitIndicatorAbove(src, ks.start)) |q| {
+            return @min(col, markup.columnOf(src, markup.spaceEnd(src, q)));
+        }
+        return col;
+    }
+
     fn entryColumn(self: *Emitter, node: *Node, fallback: usize) usize {
         const src = self.src;
         switch (node.data) {
@@ -1803,27 +1846,7 @@ pub const Emitter = struct {
                         // `steps:` / `  - name: build` / `  shell: bash`
                         // -- which reads as a sibling of the list and
                         // does not parse. Keys sit at `start`.
-                        if (!s.synthetic) {
-                            // An EXPLICIT-key entry (`? key`) is the one
-                            // case where the text column is not the entry
-                            // column: its key text sits one step in from
-                            // the line's indentation, and a brand-new
-                            // plain key written there would land inside
-                            // the previous explicit entry's value slot.
-                            // Entries live at the indicator's column.
-                            if (explicitKeySpan(src, s.entry_start, s.start)) {
-                                return markup.columnOf(src, s.entry_start);
-                            }
-                            const col = textColumn(src, s.entry_start, s.start);
-                            // ... also when the `?` has a line of its own
-                            // (`? # c` over `  - seq`): the key's text is
-                            // deeper than the entry, and a new key written
-                            // there did not parse.
-                            if (internal.explicitIndicatorAbove(src, s.start)) |q| {
-                                return @min(col, markup.columnOf(src, markup.spaceEnd(src, q)));
-                            }
-                            return col;
-                        }
+                        if (!s.synthetic) return keyEntryColumn(src, s);
                     }
                 }
             },
@@ -1985,64 +2008,108 @@ pub const Emitter = struct {
         return s.end;
     }
 
+    /// `container`'s tombstones (`Document.droppedOf`) as sorted, disjoint
+    /// ranges, touching and overlapping ones merged. Built the first time
+    /// they are asked for and kept for the emission, so that each of the
+    /// questions below is a binary search: the raw list is walked from its
+    /// start for every gap and every line, which made writing after N
+    /// deletions cost N squared.
+    fn dropsOf(self: *Emitter, container: *const Node) Error![]const [2]usize {
+        const raw = Document.droppedOf(container);
+        if (raw.len == 0) return raw;
+        if (self.merged_drops.get(container)) |merged| return merged.items;
+        var merged = try std.ArrayList([2]usize).initCapacity(self.allocator, raw.len);
+        errdefer merged.deinit(self.allocator);
+        for (raw) |d| {
+            if (d[0] < d[1]) merged.appendAssumeCapacity(d);
+        }
+        std.mem.sort([2]usize, merged.items, {}, rangeStartsFirst);
+        var n: usize = 0;
+        for (merged.items) |d| {
+            if (n > 0 and d[0] <= merged.items[n - 1][1]) {
+                merged.items[n - 1][1] = @max(merged.items[n - 1][1], d[1]);
+            } else {
+                merged.items[n] = d;
+                n += 1;
+            }
+        }
+        merged.shrinkRetainingCapacity(n);
+        try self.merged_drops.put(container, merged);
+        return merged.items;
+    }
+
+    fn rangeStartsFirst(_: void, a: [2]usize, b: [2]usize) bool {
+        return a[0] < b[0];
+    }
+
+    fn startsAtOrBefore(offset: usize, range: [2]usize) bool {
+        return range[0] <= offset;
+    }
+
+    fn endsAtOrBefore(offset: usize, range: [2]usize) bool {
+        return range[1] <= offset;
+    }
+
+    /// Where the range of `drops` (as `dropsOf` returns them) that covers
+    /// `offset` ends; null when none does.
+    fn coverEnd(drops: []const [2]usize, offset: usize) ?usize {
+        const started = std.sort.partitionPoint([2]usize, drops, offset, startsAtOrBefore);
+        if (started == 0) return null;
+        const last = drops[started - 1];
+        return if (offset < last[1]) last[1] else null;
+    }
+
+    /// The ranges of `drops` that end after `offset`.
+    fn dropsAfter(drops: []const [2]usize, offset: usize) []const [2]usize {
+        return drops[std.sort.partitionPoint([2]usize, drops, offset, endsAtOrBefore)..];
+    }
+
     /// Write the gap bytes [from, to), skipping tombstoned ranges of
     /// removed entries inside the container.
     fn writeGap(self: *Emitter, container: *const Node, from: usize, to: usize) Error!void {
-        const src = self.src;
         if (to <= from) return;
-        const drops = Document.droppedOf(container);
         var i: usize = from;
-        outer: while (i < to) {
-            for (drops) |d| {
-                if (d[0] < to and d[1] > i) {
-                    if (d[0] > i) try self.write(src[i..d[0]]);
-                    i = @max(i, d[1]);
-                    continue :outer;
-                }
-            }
-            try self.write(src[i..to]);
-            return;
+        for (dropsAfter(try self.dropsOf(container), from)) |d| {
+            if (d[0] >= to) break;
+            if (d[0] > i) try self.write(self.src[i..d[0]]);
+            i = @max(i, d[1]);
         }
+        if (i < to) try self.write(self.src[i..to]);
     }
 
     /// The offset of the first byte at/after `from` that a tombstone does
     /// not cover, up to `to`; null when the whole range is deleted or
     /// empty. Used to decide how the verbatim tail opens.
-    fn firstLiveTail(container: *const Node, from: usize, to: usize) ?usize {
+    fn firstLiveTail(self: *Emitter, container: *const Node, from: usize, to: usize) Error!?usize {
         var i: usize = from;
-        outer: while (i < to) {
-            for (Document.droppedOf(container)) |d| {
-                if (d[0] < to and d[1] > i) {
-                    if (d[0] > i) return i;
-                    i = @max(i, d[1]);
-                    continue :outer;
-                }
-            }
-            return i;
+        for (dropsAfter(try self.dropsOf(container), from)) |d| {
+            if (d[0] >= to) break;
+            if (d[0] > i) return i;
+            i = @max(i, d[1]);
         }
-        return null;
+        return if (i < to) i else null;
     }
 
     /// Where the range that covers `offset` ends, when `offset` points at
     /// bytes an entry deleted from `holder`, or from a collection that
     /// holds it, used to own.
-    fn droppedEnd(holder: ?*const Node, offset: usize) ?usize {
+    fn droppedEnd(self: *Emitter, holder: ?*const Node, offset: usize) Error!?usize {
         var at = holder;
         while (at) |n| : (at = n.parent) {
-            for (Document.droppedOf(n)) |d| {
-                if (offset >= d[0] and offset < d[1]) return d[1];
-            }
+            if (coverEnd(try self.dropsOf(n), offset)) |end| return end;
         }
         return null;
     }
 
     /// True when `offset` falls inside one of `container`'s tombstoned
     /// ranges, i.e. points at bytes a deleted entry used to own.
-    fn dropCovers(container: *const Node, offset: usize) bool {
-        for (Document.droppedOf(container)) |d| {
-            if (offset >= d[0] and offset < d[1]) return true;
-        }
-        return false;
+    fn dropCovers(self: *Emitter, container: *const Node, offset: usize) Error!bool {
+        return coverEnd(try self.dropsOf(container), offset) != null;
+    }
+
+    /// `offset` when it starts a line, else the start of the next one.
+    fn lineCeil(src: []const u8, offset: usize) usize {
+        return if (markup.lineStart(src, offset) == offset) offset else markup.lineEnd(src, offset);
     }
 
     /// Write the rest of the line after `offset` (trailing comment,
@@ -2246,12 +2313,10 @@ pub const Emitter = struct {
                 // keys (through `emitFlowNode`) kept theirs, so an alias
                 // to an anchored scalar key emitted `*k` with no `&k`.
                 if (key.anchor) |a| try self.seen.put(key, a);
-                if (isNullScalar(key) and self.endsOpenExplicitKey(indent)) {
+                if (isNullScalar(key) and try self.markNullKey(indent)) {
                     // A null key written bare, `: v`, after `? e` and
                     // nothing else, is that key's value: `? e` / `: v` is
                     // one entry, and the new one is lost. Explicit too.
-                    try self.writeByte('?');
-                    try self.newlineAt(indent);
                     try self.writeByte(':');
                 } else {
                     const key_start = self.out.items.len;
@@ -2815,7 +2880,7 @@ pub const Emitter = struct {
     /// cannot join it: a comment there goes on the header line instead
     /// (`a: |- # c`). Only a scalar can become a block at the top; the
     /// caller clears this with `endBlockPlacement`.
-    fn placeBlock(self: *Emitter, node: *const Node, old_end: usize) void {
+    fn placeBlock(self: *Emitter, node: *const Node, old_end: usize) Error!void {
         if (node.data == .alias) return;
         const src = self.src;
         const nl = markup.newlineAt(src, old_end);
@@ -2823,28 +2888,23 @@ pub const Emitter = struct {
         // A collection's block scalars sit inside it: only a scalar's
         // header is on the line the old value's comment was.
         if (node.data == .scalar and rest.len > 0 and rest[0] == '#') self.header_comment = rest;
-        self.setBlockFloor(node.parent, markup.lineEnd(src, old_end));
+        try self.setBlockFloor(node.parent, markup.lineEnd(src, old_end));
     }
 
     /// `placeBlock` for a brand-new entry, whose next source line (the
     /// next original entry's gap) starts at `gap`, or after it when `gap`
     /// is mid-line.
-    fn placeNewBlock(self: *Emitter, container: *const Node, node: *const Node, gap: usize) void {
+    fn placeNewBlock(self: *Emitter, container: *const Node, node: *const Node, gap: usize) Error!void {
         if (node.data == .alias) return;
         const src = self.src;
-        var from = if (markup.lineStart(src, gap) == gap) gap else markup.lineEnd(src, gap);
+        var from = lineCeil(src, gap);
         // Past the lines of entries deleted or replaced here: the new
         // entry takes their place, and what follows them follows it.
-        outer: while (from < src.len) {
-            for (Document.droppedOf(container)) |d| {
-                if (from >= d[0] and from < d[1]) {
-                    from = if (markup.lineStart(src, d[1]) == d[1]) d[1] else markup.lineEnd(src, d[1]);
-                    continue :outer;
-                }
-            }
-            break;
+        const drops = try self.dropsOf(container);
+        while (from < src.len) {
+            from = lineCeil(src, coverEnd(drops, from) orelse break);
         }
-        self.setBlockFloor(container, from);
+        try self.setBlockFloor(container, from);
     }
 
     /// Set `block_floor` to one past the deepest comment line from
@@ -2860,13 +2920,13 @@ pub const Emitter = struct {
     /// or not, the blanks left after a deleted entry went unseen, and a
     /// line of them deeper than the block became its content
     /// (`bar: 2` / `    ` deleted from ahead of a new `text: |`).
-    fn setBlockFloor(self: *Emitter, holder: ?*const Node, start: usize) void {
+    fn setBlockFloor(self: *Emitter, holder: ?*const Node, start: usize) Error!void {
         const src = self.src;
         var i = start;
         var floor: usize = 0;
         while (i < src.len) {
-            if (droppedEnd(holder, i)) |end| {
-                const past = if (markup.lineStart(src, end) == end) end else markup.lineEnd(src, end);
+            if (try self.droppedEnd(holder, i)) |end| {
+                const past = lineCeil(src, end);
                 if (past > i) {
                     i = past;
                     continue;
@@ -4310,4 +4370,95 @@ test "a tag is written with the document's own handles, and escaped" {
     try testing.expectEqualStrings("tag:example.com,2000:x y", back2.pathGet(&.{"a"}).?.tag.?);
     try testing.expectEqualStrings("!raw", back2.pathGet(&.{"b"}).?.tag.?);
     try testing.expectEqualStrings("tag:yaml.org,2002:str", back2.pathGet(&.{"c"}).?.tag.?);
+}
+
+/// A mapping whose `dropped` list holds `ranges` as given.
+fn nodeWithDrops(doc: *Document, ranges: []const [2]usize) !*Node {
+    const map = try doc.createMapping();
+    try map.data.mapping.dropped.appendSlice(doc.pool.allocator(), ranges);
+    return map;
+}
+
+fn coveredByRaw(ranges: []const [2]usize, offset: usize) bool {
+    for (ranges) |d| {
+        if (offset >= d[0] and offset < d[1]) return true;
+    }
+    return false;
+}
+
+test "the merged view of a collection's tombstones answers what the raw ranges do" {
+    // `dropsOf` merges the ranges into sorted, disjoint ones and every
+    // question asked of them is a binary search. Against the byte-by-byte
+    // answer, for lists that overlap, nest, touch, hold empty ranges, and
+    // come in any order (`dropRange` keeps them ascending by start; the
+    // view sorts its own copy, so it does not depend on that).
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7061);
+    const random = prng.random();
+    const text = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV";
+    for (0..3000) |_| {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        var ranges: [8][2]usize = undefined;
+        const count = random.uintLessThan(usize, ranges.len + 1);
+        for (ranges[0..count]) |*d| {
+            const from = random.uintLessThan(usize, text.len + 1);
+            d.* = .{ from, @min(text.len, from + random.uintLessThan(usize, 12)) };
+        }
+        const map = try nodeWithDrops(&doc, ranges[0..count]);
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        var em = Emitter.init(allocator, &out);
+        defer em.deinit();
+        em.src = text;
+
+        for (0..text.len + 1) |offset| {
+            const covered = coveredByRaw(ranges[0..count], offset);
+            try testing.expectEqual(covered, try em.dropCovers(map, offset));
+            // Where the run of deleted bytes that covers it ends: the first
+            // byte at or after it that no range covers.
+            var end = offset;
+            while (coveredByRaw(ranges[0..count], end)) end += 1;
+            try testing.expectEqual(if (covered) end else null, try em.droppedEnd(map, offset));
+        }
+        for (0..8) |_| {
+            const from = random.uintLessThan(usize, text.len + 1);
+            const to = random.uintLessThan(usize, text.len + 1);
+            var live: std.ArrayList(u8) = .empty;
+            defer live.deinit(allocator);
+            var first: ?usize = null;
+            for (from..@max(from, to)) |i| {
+                if (coveredByRaw(ranges[0..count], i)) continue;
+                if (first == null) first = i;
+                try live.append(allocator, text[i]);
+            }
+            out.clearRetainingCapacity();
+            try em.writeGap(map, from, to);
+            try testing.expectEqualStrings(live.items, out.items);
+            try testing.expectEqual(first, try em.firstLiveTail(map, from, to));
+        }
+        // Built once, and only for a collection that has tombstones.
+        try testing.expectEqual(@as(u32, @intFromBool(count > 0)), em.merged_drops.count());
+    }
+}
+
+fn mergeDropsAllocating(allocator: std.mem.Allocator) !void {
+    var doc = Document.init(allocator);
+    defer doc.deinit();
+    const map = try nodeWithDrops(&doc, &.{ .{ 30, 40 }, .{ 2, 9 }, .{ 9, 12 }, .{ 5, 6 } });
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var em = Emitter.init(allocator, &out);
+    defer em.deinit();
+    em.src = "0123456789012345678901234567890123456789";
+    try testing.expectEqual(@as(?usize, 12), try em.droppedEnd(map, 3));
+    try testing.expect(try em.dropCovers(map, 35));
+    try em.writeGap(map, 0, 40);
+    // `[2, 12)` and `[30, 40)` are gone: bytes 0-1 and 12-29 are left.
+    try testing.expectEqualStrings("01234567890123456789", out.items);
+}
+
+test "allocation failures while merging a collection's tombstones leak nothing" {
+    try std.testing.checkAllAllocationFailures(testing.allocator, mergeDropsAllocating, .{});
 }

@@ -443,32 +443,33 @@ fn outerFraming(src: []const u8, container: *const Node, line: usize) ?struct { 
 /// then `image` removed wrote `-   ports`).
 fn blankOrDropped(node: *const Node, src: []const u8, from: usize, to: usize) bool {
     var i = from;
-    outer: while (i < to) {
-        for (Document.droppedOf(node)) |d| {
-            if (i >= d[0] and i < d[1]) {
-                i = d[1];
-                continue :outer;
-            }
-        }
+    while (true) {
+        i = skipDropped(node, i);
+        if (i >= to) return true;
         if (!ctype.isBlankRun(src[i .. i + 1])) return false;
         i += 1;
     }
-    return true;
 }
 
 /// Whether every byte of `[from, to)` lies in one of `node`'s tombstones.
 fn coveredByDrops(node: *const Node, from: usize, to: usize) bool {
-    var i = from;
-    outer: while (i < to) {
+    return skipDropped(node, from) >= to;
+}
+
+/// The first offset at or after `at` that none of `node`'s tombstones
+/// covers: `at` itself when none does, else past the chain of ranges that
+/// runs on from it.
+fn skipDropped(node: *const Node, at: usize) usize {
+    var i = at;
+    outer: while (true) {
         for (Document.droppedOf(node)) |d| {
             if (i >= d[0] and i < d[1]) {
                 i = d[1];
                 continue :outer;
             }
         }
-        return false;
+        return i;
     }
-    return true;
 }
 
 /// INTERNAL. The start of a line holding only an explicit key indicator
