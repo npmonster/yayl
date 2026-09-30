@@ -3885,6 +3885,11 @@ test "edits keep the meaning in the shapes the preservation sweep skips" {
         .{ .in = "b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$", .name = "r" } }}, .out = "&r\nb: 1\n" },
         .{ .in = "a:\nb: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = "x" } }}, .out = "a: &x\nb: 1\n" },
         .{ .in = "!!str : a\n", .ops = &.{.{ .set = .{ .p = "$[\"\"]", .v = "b" } }}, .out = "!!str : b\n" },
+        // Properties that are not the collection's own are left alone:
+        // ones running over lines, a first key's, a deleted first key's.
+        .{ .in = "key: &anchor\n !!map\n  a: b\n", .ops = &.{.{ .set = .{ .p = "$.key.a", .v = "c" } }}, .out = "key: &anchor\n !!map\n  a: c\n" },
+        .{ .in = "top:\n  &k 'key' : v\n  j: w\n", .ops = &.{.{ .set = .{ .p = "$.top.j", .v = "x" } }}, .out = "top:\n  &k 'key' : v\n  j: x\n" },
+        .{ .in = "-\n  !!null : a\n  b: x\n", .ops = &.{.{ .delete = "$[0][\"\"]" }}, .out = "-\n  b: x\n" },
         .{ .in = "&c : a\n", .ops = &.{.{ .set = .{ .p = "$[\"\"]", .v = "b" } }}, .out = "&c : b\n" },
         // A null key's entry.
         .{ .in = ": a\nb: c\n", .ops = &.{.{ .delete = "$[\"\"]" }}, .out = "b: c\n" },

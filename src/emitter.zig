@@ -1278,6 +1278,61 @@ pub const Emitter = struct {
         }
     }
 
+    /// The properties a parsed block collection's source gives it: its
+    /// anchor and tag text, and the byte range they span. They may run
+    /// over lines (`&a` over `!!map` over the first entry). Properties at
+    /// the collection's start belong to its first entry instead when that
+    /// entry starts there (`&k key: v`, the key's anchor), as the span of
+    /// a mapping starts at its first key's.
+    const SourceProps = struct { anchor: ?[]const u8 = null, tag: ?[]const u8 = null, start: usize = 0, end: usize = 0 };
+
+    fn sourceProps(self: *const Emitter, node: *const Node) SourceProps {
+        const s = node.src orelse return .{};
+        const src = self.src;
+        var limit = s.end;
+        const first: ?usize = switch (node.data) {
+            .mapping => |m| if (m.pairs.items.len > 0) (if (m.pairs.items[0].key.src) |ks| ks.entry_start else null) else null,
+            .sequence => |sq| if (sq.items.items.len > 0) (if (sq.items.items[0].src) |is| is.entry_start else null) else null,
+            else => null,
+        };
+        if (first) |f| {
+            if (f <= s.start) return .{ .start = s.start, .end = s.start };
+            limit = @min(limit, f);
+        }
+        // So do they when that entry has since been deleted: its
+        // tombstone covers them (`-\n  !!null : a` minus the pair left
+        // `!!null` looking like the mapping's own tag).
+        for (Document.droppedOf(node)) |d| {
+            if (d[0] <= s.start and s.start < d[1]) return .{ .start = s.start, .end = s.start };
+        }
+        var out: SourceProps = .{ .start = s.start, .end = s.start };
+        var i = s.start;
+        while (i < limit) {
+            switch (src[i]) {
+                '&', '!' => {
+                    var j = i + 1;
+                    if (src[i] == '!' and j < limit and src[j] == '<') {
+                        j = (std.mem.indexOfScalarPos(u8, src, i, '>') orelse limit - 1) + 1;
+                    } else {
+                        while (j < limit) : (j += 1) {
+                            switch (src[j]) {
+                                ' ', '\t', '\r', '\n', ',', '[', ']', '{', '}' => break,
+                                else => {},
+                            }
+                        }
+                    }
+                    if (src[i] == '&') out.anchor = src[i + 1 .. j] else out.tag = src[i..j];
+                    out.end = j;
+                    i = j;
+                },
+                ' ', '\t', '\r', '\n' => i += 1,
+                '#' => i = markup.newlineAt(src, i),
+                else => break,
+            }
+        }
+        return out;
+    }
+
     /// Whether a parsed block collection's anchor or tag differs from what
     /// its source spells. Its slot walk copies the source bytes, so a
     /// changed anchor was silently not written (`setAnchor` on `a:\n  b: 1`
@@ -1285,26 +1340,11 @@ pub const Emitter = struct {
     fn propsChanged(self: *const Emitter, node: *const Node) bool {
         const s = node.src orelse return false;
         if (s.synthetic) return false;
-        const src = self.src;
-        const end = markup.propertiesEnd(src, s.start);
-        var anchor: ?[]const u8 = null;
-        var tag: ?[]const u8 = null;
-        var i = s.start;
-        while (i < end) {
-            var j = i + 1;
-            if (src[i] == '!' and j < end and src[j] == '<') {
-                j = (std.mem.indexOfScalarPos(u8, src, i, '>') orelse end - 1) + 1;
-            } else {
-                while (j < end and !ctype.isBlank(src[j])) j += 1;
-            }
-            if (src[i] == '&') anchor = src[i + 1 .. j] else if (src[i] == '!') tag = src[i..j];
-            i = j;
-            while (i < end and ctype.isBlank(src[i])) i += 1;
-        }
-        if ((anchor == null) != (node.anchor == null)) return true;
-        if (anchor) |a| if (!std.mem.eql(u8, a, node.anchor.?)) return true;
-        if ((tag == null) != (node.tag == null)) return true;
-        if (tag) |t| return !self.tagSpells(t, node.tag.?);
+        const p = self.sourceProps(node);
+        if ((p.anchor == null) != (node.anchor == null)) return true;
+        if (p.anchor) |a| if (!std.mem.eql(u8, a, node.anchor.?)) return true;
+        if ((p.tag == null) != (node.tag == null)) return true;
+        if (p.tag) |t| return !self.tagSpells(t, node.tag.?);
         return false;
     }
 
@@ -1348,16 +1388,15 @@ pub const Emitter = struct {
     /// the source bytes leave (a compact `- k: v` item, a comment after
     /// the key): the caller re-emits the collection normalized.
     fn rewriteProps(self: *Emitter, node: *Node) Error!?usize {
-        const src = self.src;
         const s = node.src.?;
-        const end = markup.propertiesEnd(src, s.start);
-        if (end > s.start) {
-            try self.writeGap(node, s.entry_start, s.start);
+        const p = self.sourceProps(node);
+        if (p.end > p.start) {
+            try self.writeGap(node, s.entry_start, p.start);
             if (!try self.writeProperties(node)) {
                 // Cleared: no blank left before the line break.
                 while (self.out.items.len > 0 and ctype.isBlank(self.out.items[self.out.items.len - 1])) self.out.items.len -= 1;
             }
-            return end;
+            return p.end;
         }
         if (node.parent == null) {
             try self.writeGap(node, s.entry_start, s.start);
