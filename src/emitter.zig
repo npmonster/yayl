@@ -1232,8 +1232,12 @@ pub const Emitter = struct {
                 var gap = node.src.?.entry_start;
                 if (self.propsChanged(node)) {
                     gap = try self.rewriteProps(node) orelse {
+                        // Normalized, after the item framing the slot walk
+                        // would have written with the first entry.
+                        const s = node.src.?;
+                        if (s.entry_start < s.start) try self.write(self.src[s.entry_start..s.start]);
                         try self.emitNode(node, indent);
-                        return node.src.?.end;
+                        return s.end;
                     };
                 }
                 const col = self.entryColumn(node, indent);
@@ -1265,8 +1269,12 @@ pub const Emitter = struct {
                 var gap = node.src.?.entry_start; // see the mapping case
                 if (self.propsChanged(node)) {
                     gap = try self.rewriteProps(node) orelse {
+                        // Normalized, after the item framing the slot walk
+                        // would have written with the first entry.
+                        const s = node.src.?;
+                        if (s.entry_start < s.start) try self.write(self.src[s.entry_start..s.start]);
                         try self.emitNode(node, indent);
-                        return node.src.?.end;
+                        return s.end;
                     };
                 }
                 const col = self.entryColumn(node, indent);

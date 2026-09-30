@@ -1075,7 +1075,7 @@ pub const Document = struct {
                         // (it can after a `...`).
                         // Looked for from the root's end: the region takes
                         // the rest of the root's last line.
-                        if (last.root != null) if (firstContentLine(input[last.body_end..])) |line| {
+                        if (last.root != null and !last.explicit_end) if (firstContentLine(input[last.body_end..])) |line| {
                             if (line[0] != '%' and !(line[0] == '-' and isMarkerLine(line, 0))) _ = try p.nextEvent();
                         };
                         break;
@@ -4938,9 +4938,11 @@ test "parse refuses a first document that does not end" {
     }
     // A malformed LATER document still does not fail a single-document
     // parse.
-    var doc = try Document.parse(allocator, "a: 1\n---\n[unclosed\n");
-    defer doc.deinit();
-    try testing.expectEqualStrings("1", doc.pathGet(&.{"a"}).?.scalarValue().?);
+    for ([_][]const u8{ "a: 1\n---\n[unclosed\n", "a: 1\n...\n@b\n", "a: 1\n...\n\"unterminated\n" }) |in| {
+        var doc = try Document.parse(allocator, in);
+        defer doc.deinit();
+        try testing.expectEqualStrings("1", doc.pathGet(&.{"a"}).?.scalarValue().?);
+    }
 }
 
 test "a tag escape that decodes to invalid UTF-8 is refused" {

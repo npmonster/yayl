@@ -3883,6 +3883,8 @@ test "edits keep the meaning in the shapes the preservation sweep skips" {
         .{ .in = "a: &x\n  b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = null } }}, .out = "a:\n  b: 1\n" },
         .{ .in = "a: &x\n  b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = "y" } }}, .out = "a: &y\n  b: 1\n" },
         .{ .in = "b: 1\n", .ops = &.{.{ .anchor = .{ .p = "$", .name = "r" } }}, .out = "&r\nb: 1\n" },
+        .{ .in = "- k: v\n- j: w\n", .ops = &.{.{ .anchor = .{ .p = "$[0]", .name = "y" } }}, .out = "- &y\n  k: v\n- j: w\n" },
+        .{ .in = "top:\n  - k: v\n  - j: w\n", .ops = &.{.{ .anchor = .{ .p = "$.top[0]", .name = "y" } }}, .out = "top:\n  - &y\n    k: v\n  - j: w\n" },
         .{ .in = "a:\nb: 1\n", .ops = &.{.{ .anchor = .{ .p = "$.a", .name = "x" } }}, .out = "a: &x\nb: 1\n" },
         .{ .in = "!!str : a\n", .ops = &.{.{ .set = .{ .p = "$[\"\"]", .v = "b" } }}, .out = "!!str : b\n" },
         // Properties that are not the collection's own are left alone:
