@@ -8,10 +8,13 @@
 //! A seeded PRNG mutating a seed corpus: deterministic, and reproducible
 //! from its seed. It runs as a bounded smoke in `zig build test` and at
 //! length in `zig build fuzz`. Zig 0.16.0 does have `std.testing.fuzz`,
-//! but its coverage-guided mode does not build on that toolchain: the
-//! test runner's own fuzz path passes a `*builtin.StackTrace` to
-//! `std.debug.writeStackTrace`, which takes a `*debug.StackTrace`, so
-//! `zig build test --fuzz` fails to compile whichever test calls it.
+//! but its coverage-guided mode does not build in Debug on that
+//! toolchain: the test runner's own fuzz path passes the error return
+//! trace, a `*builtin.StackTrace`, to `std.debug.writeStackTrace`, which
+//! takes a `*debug.StackTrace`, so `zig build test --fuzz` fails to
+//! compile whichever test calls it. Only where error return traces are
+//! on, though: in ReleaseSafe and ReleaseFast `@errorReturnTrace()` is
+//! null at compile time, the call is never analysed, and it builds.
 //! When a toolchain builds it, `fuzzOnce` is the function to hand it.
 //! (An earlier note here said the entry point did not exist.) The
 //! contract:
