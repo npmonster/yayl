@@ -636,6 +636,16 @@ and pinned by tests that fail without the fix:
   source: deleting the entry between them left `? e` over `: v`, one
   entry, and the null key's was lost. The kept entry now gets its `?` as a
   new one does.
+- A new entry with a written leading comment after an emptied explicit
+  value at the end of a source with no final line break: the comment went
+  above the `: `, which the entry then continued (`? d` / `# c` /
+  `: n: x`, read as `{d: {n: x}}`).
+- A tab with nothing after it on its line, after a value indicator
+  (`:\t` and a line break), was taken for indentation, and the next
+  line's `:` was refused (`found a tab used to indent a mapping value
+  indicator`). libfyaml accepts these; so does the scanner now, and an
+  edit that left a null key on such a line no longer writes a document
+  that does not parse.
 
 **Writing after many deletions took time in proportion to their square.**
 Every gap a write copies, and every line after a value it re-emits, asks
