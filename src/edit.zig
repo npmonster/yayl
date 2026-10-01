@@ -4405,9 +4405,10 @@ test "writing after deleting many entries takes time in proportion to them" {
     // The two sizes differ by 8x: time in proportion to the entries
     // grows ~8x (10x measured), the scan of the list ~64x (34x measured
     // in the every-other shape, where the entries themselves still cost).
-    // The bound sits between with room for a slow or busy machine; the
-    // fastest of three runs of each is judged. Leak-checked without
-    // `testing.allocator`'s stack traces, which make thousands of
+    // The bound sits between. Each size is timed as the fastest of five
+    // writes, and a machine too busy for that gets three attempts: the
+    // quadratic code fails all of them, by a wide margin. Leak-checked
+    // without `testing.allocator`'s stack traces, which make thousands of
     // allocations slow.
     var leak_check: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer testing.expect(leak_check.deinit() == .ok) catch @panic("leaked memory");
@@ -4415,15 +4416,18 @@ test "writing after deleting many entries takes time in proportion to them" {
     const io = testing.io;
 
     for ([_]bool{ false, true }) |every_other| {
-        var fastest: [2]i96 = undefined;
-        for ([_]usize{ 1000, 8000 }, &fastest) |count, *slot| {
+        const sizes = [_]usize{ 1000, 8000 };
+        var docs: [sizes.len]Document = undefined;
+        var built: usize = 0;
+        defer for (docs[0..built]) |*d| d.deinit();
+        for (sizes, &docs) |count, *doc| {
             var text: std.ArrayList(u8) = .empty;
             defer text.deinit(allocator);
             try text.appendSlice(allocator, "m:\n  k: 1\n");
             for (0..count) |i| try text.print(allocator, "  e{d}: {d}\n\n", .{ i, i });
             try text.appendSlice(allocator, "z: 1\n");
-            var doc = try Document.parse(allocator, text.items);
-            defer doc.deinit();
+            doc.* = try Document.parse(allocator, text.items);
+            built += 1;
 
             var paths: std.ArrayList([]u8) = .empty;
             defer {
@@ -4438,27 +4442,37 @@ test "writing after deleting many entries takes time in proportion to them" {
                 try paths.append(allocator, path);
                 try deletes.append(allocator, .{ .delete = path });
             }
-            var ed = Editor.init(&doc);
+            var ed = Editor.init(doc);
             try ed.apply(deletes.items);
             try ed.apply(&.{.{ .set = .{ .path = "$.m.k", .value = try doc.createScalar("x\ny\n", .literal) } }});
 
-            slot.* = std.math.maxInt(i96);
-            for (0..3) |_| {
-                const start = std.Io.Timestamp.now(io, .awake);
-                const out = try doc.write(allocator);
-                const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
-                defer allocator.free(out);
-                // The scenario is what it claims to be: the block scalar
-                // written in place of `k`'s value, and the entries that
-                // were not deleted still there.
-                try testing.expect(std.mem.startsWith(u8, out, "m:\n  k: |\n    x\n    y\n"));
-                try testing.expect(std.mem.endsWith(u8, out, "\nz: 1\n"));
-                try testing.expectEqual(if (every_other) count / 2 else 0, std.mem.count(u8, out, "\n  e"));
-                slot.* = @min(slot.*, elapsed);
-            }
-            if (count == 1000) try expectReadsBack(allocator, &doc, "after many deletions");
+            // The scenario is what it claims to be: the block scalar
+            // written in place of `k`'s value, and the entries that were
+            // not deleted still there.
+            const out = try doc.write(allocator);
+            defer allocator.free(out);
+            try testing.expect(std.mem.startsWith(u8, out, "m:\n  k: |\n    x\n    y\n"));
+            try testing.expect(std.mem.endsWith(u8, out, "\nz: 1\n"));
+            try testing.expectEqual(if (every_other) count / 2 else 0, std.mem.count(u8, out, "\n  e"));
+            if (count == sizes[0]) try expectReadsBack(allocator, doc, "after many deletions");
         }
-        try testing.expect(fastest[1] < fastest[0] * 20);
+        var linear = false;
+        for (0..3) |_| {
+            var fastest: [sizes.len]i96 = @splat(std.math.maxInt(i96));
+            for (&docs, &fastest) |*doc, *slot| {
+                for (0..5) |_| {
+                    const start = std.Io.Timestamp.now(io, .awake);
+                    const out = try doc.write(allocator);
+                    slot.* = @min(slot.*, std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds);
+                    allocator.free(out);
+                }
+            }
+            if (fastest[1] < fastest[0] * 20) {
+                linear = true;
+                break;
+            }
+        }
+        try testing.expect(linear);
     }
 }
 
@@ -4705,6 +4719,31 @@ test "a new entry after a finished empty item, or an emptied value, starts a lin
         try e2.apply(&.{.{ .set = .{ .path = "$.n", .value = try d2.createScalar("x", .plain) } }});
         errdefer std.debug.print("{f}\n", .{std.zig.fmtString(c.base)});
         try expectReadsBack(allocator, &d2, "new key after an emptied value");
+    }
+    // The same with a leading comment on the new entry: the comment went
+    // above the `: `, which the entry then continued (`? d` / `# c` /
+    // `: n: x`), whatever its key -- a null one too, and a moved one.
+    for ([_][]const u8{ "n", "" }) |key| {
+        for ([_][]const u8{ "# c", "# a\n# b" }) |comment| {
+            for ([_][]const u8{ "? d\n: 23", "a: 4.2\n? d\n: 23" }) |base| {
+                for ([_]bool{ false, true }) |moved| {
+                    var d2 = try Document.parse(allocator, base);
+                    defer d2.deinit();
+                    var e2 = Editor.init(&d2);
+                    const path = try std.fmt.allocPrint(allocator, "$[\"{s}\"]", .{key});
+                    defer allocator.free(path);
+                    try e2.apply(&.{.{ .set = .{ .path = "$.d", .value = try d2.createScalar("", .plain) } }});
+                    if (moved and std.mem.startsWith(u8, base, "a:")) {
+                        try e2.apply(&.{.{ .move = .{ .from = "$.a", .to = "$", .key = key } }});
+                    } else {
+                        try e2.apply(&.{.{ .set = .{ .path = path, .value = try d2.createScalar("x", .plain) } }});
+                    }
+                    try d2.setLeadingComments(try e2.one(path), comment);
+                    errdefer std.debug.print("{f} key {f} {s}\n", .{ std.zig.fmtString(base), std.zig.fmtString(key), if (moved) "moved" else "set" });
+                    try expectReadsBack(allocator, &d2, "commented new key after an emptied value");
+                }
+            }
+        }
     }
 }
 

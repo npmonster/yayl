@@ -442,35 +442,42 @@ fn outerFraming(src: []const u8, container: *const Node, line: usize) ?struct { 
 /// was (`- name` / `  image` / `  res` / `  ports` with `res`, `name` and
 /// then `image` removed wrote `-   ports`).
 fn blankOrDropped(node: *const Node, src: []const u8, from: usize, to: usize) bool {
+    var walk: DropWalk = .{ .drops = Document.droppedOf(node) };
     var i = from;
     while (true) {
-        i = skipDropped(node, i);
+        i = walk.skip(i);
         if (i >= to) return true;
         if (!ctype.isBlankRun(src[i .. i + 1])) return false;
         i += 1;
     }
 }
 
-/// Whether every byte of `[from, to)` lies in one of `node`'s tombstones.
-fn coveredByDrops(node: *const Node, from: usize, to: usize) bool {
-    return skipDropped(node, from) >= to;
+/// INTERNAL. Whether every byte of `[from, to)` lies in one of `node`'s
+/// tombstones.
+pub fn coveredByDrops(node: *const Node, from: usize, to: usize) bool {
+    var walk: DropWalk = .{ .drops = Document.droppedOf(node) };
+    return walk.skip(from) >= to;
 }
 
-/// The first offset at or after `at` that none of `node`'s tombstones
-/// covers: `at` itself when none does, else past the chain of ranges that
-/// runs on from it.
-fn skipDropped(node: *const Node, at: usize) usize {
-    var i = at;
-    outer: while (true) {
-        for (Document.droppedOf(node)) |d| {
-            if (i >= d[0] and i < d[1]) {
-                i = d[1];
-                continue :outer;
-            }
+/// A forward walk over a collection's tombstones, which `dropRange` keeps
+/// ascending by start (they may overlap or touch). Offsets asked of it
+/// must not decrease; each range is then looked at once, so a walk over
+/// a gap is linear in its bytes and the ranges before its end. A scan
+/// from the first range at every byte made deleting thousands of entries
+/// from one item quadratic in the bytes between them.
+const DropWalk = struct {
+    drops: []const [2]usize,
+    next: usize = 0,
+
+    /// The first offset at or after `at` that no tombstone covers.
+    fn skip(self: *DropWalk, at: usize) usize {
+        var i = at;
+        while (self.next < self.drops.len and self.drops[self.next][0] <= i) : (self.next += 1) {
+            i = @max(i, self.drops[self.next][1]);
         }
         return i;
     }
-}
+};
 
 /// INTERNAL. The start of a line holding only an explicit key indicator
 /// (`?`, and perhaps a comment) above `pos`'s line, with only blank and

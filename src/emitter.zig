@@ -429,8 +429,20 @@ pub const Emitter = struct {
     /// (claiming the terminator left the sibling at column 0).
     fn openEntryLine(self: *Emitter, col: usize, leading: ?[]const u8, term: []const u8) Error!bool {
         const pending = self.pendingLine();
+        // Framing carries the entry only where the entry begins right after
+        // it: a deleted first entry's `- ` for the next one, at the column
+        // that follows. `: ` left as an emptied value's indicator, or a
+        // finished empty item's `- `, is not the start of a line for an
+        // entry of the collection around it (`? d` / `: n: x` made the new
+        // key a compact mapping inside `d`'s value).
+        const framed = isEntryFraming(pending) and (ctype.isBlankRun(pending) or pending.len == col);
         if (leading) |t| if (t.len > 0) {
             const fresh = pending.len == 0;
+            // The block is written above the framing it lifts off, which
+            // the entry then continues: so framing that is not this
+            // entry's ends its line first (`? d` / `# c` / `: n: x` read
+            // as `{d: {n: x}}`).
+            if (!fresh and !framed and isEntryFraming(pending)) try self.write(self.defaultTerminator());
             try self.writePendingLeadingText(t, col, term, true);
             return fresh;
         };
@@ -445,13 +457,6 @@ pub const Emitter = struct {
         // break after it) cannot stay under the entry: they would put it
         // inside a block scalar above. (Blanks that are such a block's
         // content never get here: see `keepBlockBeforeNew`.)
-        // Framing carries the entry only where the entry begins right after
-        // it: a deleted first entry's `- ` for the next one, at the column
-        // that follows. `: ` left as an emptied value's indicator, or a
-        // finished empty item's `- `, is not the start of a line for an
-        // entry of the collection around it (`? d` / `: n: x` made the new
-        // key a compact mapping inside `d`'s value).
-        const framed = isEntryFraming(pending) and (ctype.isBlankRun(pending) or pending.len == col);
         if (framed) {
             if (pending.len != col and ctype.isBlankRun(pending)) {
                 self.out.shrinkRetainingCapacity(self.out.items.len - pending.len);
@@ -924,7 +929,7 @@ pub const Emitter = struct {
             try self.emitEntry(key, value, entry_col);
             try self.writeOwedTrailing(value, offered);
             if (owed_terminator and !self.endsWithNewline()) try self.write(self.defaultTerminator());
-            if (self.endsWithNewline()) return self.pastKeptBlanksIn(container, value, try self.pastTakenBreak(container, gap));
+            if (self.endsWithNewline()) return self.pastKeptBlanksIn(container, try self.pastTakenBreak(container, gap));
             return gap;
         }
 
@@ -1173,7 +1178,7 @@ pub const Emitter = struct {
                 }
                 // A keep-chomped block takes the blank lines after it into
                 // its value; the next entry's gap must not write them again.
-                return self.pastKeptBlanksIn(container, item, try self.pastTakenBreak(container, gap));
+                return self.pastKeptBlanksIn(container, try self.pastTakenBreak(container, gap));
             }
             return gap;
         };
@@ -1267,6 +1272,9 @@ pub const Emitter = struct {
     fn indentStillToCome(self: *const Emitter, container: *const Node, gap: usize, entry: usize) bool {
         const ls = markup.lineStart(self.src, entry);
         if (ls < gap) return false;
+        // One range at a time, not the merged view (`dropsOf`): it asks
+        // whether a single tombstone spans the line start and reaches
+        // the entry, and two touching ranges merged into one would.
         for (Document.droppedOf(container)) |d| {
             if (d[0] < entry and d[1] > ls) return false;
         }
@@ -1304,8 +1312,7 @@ pub const Emitter = struct {
 
     /// `pastKeptBlanks` from a brand-new entry's gap in `container`,
     /// where the blank lines can sit behind a replaced entry's tombstone.
-    fn pastKeptBlanksIn(self: *Emitter, container: *const Node, node: *const Node, from: usize) Error!usize {
-        _ = node;
+    fn pastKeptBlanksIn(self: *Emitter, container: *const Node, from: usize) Error!usize {
         if (self.kept_end != self.out.items.len) return from;
         return self.skipBlankLines(container, from);
     }
@@ -1478,12 +1485,14 @@ pub const Emitter = struct {
         var col = indent;
         if (node.parent) |parent| {
             if (parent.data == .mapping) {
+                // Every entry of a block mapping sits at one column, so the
+                // first key with a span gives this one's: looking for the
+                // node's own key cost a scan of the pairs per collection,
+                // and a write of N of them N squared.
                 for (parent.data.mapping.pairs.items) |pair| {
-                    if (pair.value != node) continue;
-                    if (pair.key.src) |ks| {
-                        const key_col = keyEntryColumn(self.src, ks);
-                        if (col <= key_col) col = key_col + self.indent_step;
-                    }
+                    const ks = pair.key.src orelse continue;
+                    const key_col = keyEntryColumn(self.src, ks);
+                    if (col <= key_col) col = key_col + self.indent_step;
                     break;
                 }
             }
@@ -1517,9 +1526,7 @@ pub const Emitter = struct {
         // So do they when that entry has since been deleted: its
         // tombstone covers them (`-\n  !!null : a` minus the pair left
         // `!!null` looking like the mapping's own tag).
-        for (Document.droppedOf(node)) |d| {
-            if (d[0] <= s.start and s.start < d[1]) return .{ .start = s.start, .end = s.start };
-        }
+        if (internal.coveredByDrops(node, s.start, s.start + 1)) return .{ .start = s.start, .end = s.start };
         var out: SourceProps = .{ .start = s.start, .end = s.start };
         var i = s.start;
         while (i < limit) {
