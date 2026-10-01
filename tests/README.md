@@ -35,3 +35,28 @@ fix.
 
 Quote round-trip numbers as `pass/total` from a fresh report — the
 denominator includes the skips.
+
+## Randomized edit differential
+
+Run: `zig build randedit -- [seed] [iterations] [steps]` (or
+`make randedit RANDEDIT_ARGS="seed iterations steps"`; the defaults,
+1 2 4, are a smoke). `tests/randedit.zig` takes every valid corpus case
+and every fixture, in five variants (as written, CRLF, CR, a byte order
+mark, no final line break), and applies up to `steps` random steps
+`iterations` times each: a direct node operation (anchor, tag, comments)
+or an `Editor` batch of one to three edits, on a random document of the
+stream. After every step the stream must write, parse back with the same
+document count, read back as the tree in memory (kinds, anchors, tags,
+scalar values and the core type each resolves to, alias names), and
+reproduce itself when parsed and written again. A batch made to fail must
+leave the output byte-identical; a set to an identical scalar must change
+no byte; every allocation goes through a 256 MB cap that must be back at
+0 when the run ends.
+
+It exits 1 on any finding and prints the first 40 in full (seed,
+iteration, case, variant, the ops and the bytes), so a finding
+reproduces from its line. It also prints a hash of every stream written:
+two builds that must write the same bytes, a refactor, print the same
+hash for the same arguments. CI runs seed 1 at 20 iterations,
+report-only while it soaks; a release review runs ~60 iterations a seed
+over several seeds.
