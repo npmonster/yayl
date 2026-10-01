@@ -5074,9 +5074,15 @@ test "parsing stays linear on shapes that were quadratic" {
     // Judged against the same shape in ASCII, which no load on the
     // machine changes: ASCII keys pass the bound at once and were never
     // recounted, so the multibyte parse was about 1000 times slower.
-    const cjk = try flowOfNested(allocator, &buf, "\u{4E2D}");
-    const ascii = try flowOfNested(allocator, &buf, "x");
-    try testing.expect(cjk < @max(ascii, 1) * 20);
+    //
+    // Each check gets three attempts: a machine busy enough to skew one
+    // measurement fails a linear parse at most now and then, and the
+    // quadratic one every time.
+    try testing.expect(for (0..3) |_| {
+        const cjk = try flowOfNested(allocator, &buf, "\u{4E2D}");
+        const ascii = try flowOfNested(allocator, &buf, "x");
+        if (cjk < @max(ascii, 1) * 20) break true;
+    } else false);
 
     // Each collection value searched its mapping's pairs from the front
     // for itself: a mapping of mappings, the commonest shape there is,
@@ -5085,18 +5091,23 @@ test "parsing stays linear on shapes that were quadratic" {
     // take about 4 times as long now.
     buf.clearRetainingCapacity();
     for (0..10_000) |i| try buf.print(allocator, "k{d}:\n  x: 1\n", .{i});
-    const small = @max(1, try parseMillis(buf.items));
+    const small_len = buf.items.len;
     for (10_000..40_000) |i| try buf.print(allocator, "k{d}:\n  x: 1\n", .{i});
-    const large = try parseMillis(buf.items);
-    try testing.expect(large < small * 8);
+    try testing.expect(for (0..3) |_| {
+        const small = @max(1, try parseMillis(buf.items[0..small_len]));
+        const large = try parseMillis(buf.items);
+        if (large < small * 8) break true;
+    } else false);
 
     // `%TAG` handles were found by a linear search, for the duplicate
     // check and for every tag: 16,000 of each took 5.5 s in Debug under
     // the test allocator, and take 0.3 s. By growth again: four times
     // the directives and tags took 16 times as long.
-    const tags_small = @max(1, try tagsMillis(allocator, &buf, 4_000));
-    const tags_large = try tagsMillis(allocator, &buf, 16_000);
-    try testing.expect(tags_large < tags_small * 8);
+    try testing.expect(for (0..3) |_| {
+        const tags_small = @max(1, try tagsMillis(allocator, &buf, 4_000));
+        const tags_large = try tagsMillis(allocator, &buf, 16_000);
+        if (tags_large < tags_small * 8) break true;
+    } else false);
 }
 
 /// Parse time of four nested flow collections of 520 `item` entries each.
