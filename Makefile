@@ -8,7 +8,7 @@ ZIG ?= zig
 .DEFAULT_GOAL := help
 .MAIN: help
 
-.PHONY: help all build check test test-release examples fmt fmt-write docs corpus libfyaml conformance roundtrip preservation differential emission-oracle consume verify clean
+.PHONY: help all build check test test-release examples fmt fmt-write docs corpus libfyaml conformance roundtrip preservation randedit differential emission-oracle consume verify clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' Makefile
@@ -55,6 +55,13 @@ roundtrip: corpus ## Byte-faithful round trip over the corpus and tests/fixtures
 
 preservation: ## Edit-preservation sweeps over fixtures and corpus (edits change only what they should)
 	$(ZIG) build preservation --summary all
+
+# Random edit sequences, each written and read back; RANDEDIT_ARGS is
+# `seed iterations steps` (the default is a smoke; a release review runs
+# ~60 iterations a seed over several seeds).
+RANDEDIT_ARGS ?= 1 2 4
+randedit: corpus ## Randomized edit differential: random edits written and read back (RANDEDIT_ARGS="seed iterations steps")
+	$(ZIG) build randedit -- $(RANDEDIT_ARGS)
 
 differential: corpus libfyaml ## Compare yayl vs libfyaml event streams over the corpus (needs a C compiler)
 	sh scripts/differential.sh

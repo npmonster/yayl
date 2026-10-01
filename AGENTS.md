@@ -175,6 +175,14 @@ measured indent width.
   and `merged` re-emits with merge keys resolved. `value` is the only
   gate that sees the style-choosing code at all — every other gate
   starts from parsed documents, where the styles come from the source.
+- **Randomized edit differential**: random sequences of edits through the
+  public API (sets, deletes, inserts, moves, aliases, anchors, tags,
+  comments) on every valid corpus case and fixture in five line-ending
+  variants; every write must read back as the tree in memory (scalar
+  core types included), a failed batch must roll back byte for byte, and
+  nothing may leak — `make randedit` / `zig build randedit -- seed
+  iterations steps` (report-only in CI while it soaks). The other edit
+  gates check one edit at a time; this one found ten shapes they passed.
 
 ## Zig 0.16 gotchas already paid for (don't re-learn these)
 
@@ -213,7 +221,8 @@ src/schema.zig                     opt-in validation descriptors
 src/file.zig                       bounded reads, atomic writes
 src/{fuzz,internal}.zig            fuzz harness; shared internals
 tests/                             gate harnesses (conformance, roundtrip,
-                                   preservation, bench, dump) + fixtures
+                                   preservation, randedit, bench, dump)
+                                   + fixtures
 docs/                              USAGE.md, design notes
 scripts/                           gate drivers (corpus/libfyaml fetch,
                                    differential, emission-oracle, bench)

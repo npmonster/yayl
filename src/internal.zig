@@ -434,20 +434,50 @@ fn outerFraming(src: []const u8, container: *const Node, line: usize) ?struct { 
     return .{ .own = cs.start, .after = after };
 }
 
-/// Whether every byte of `[from, to)` lies in one of `node`'s tombstones.
-fn coveredByDrops(node: *const Node, from: usize, to: usize) bool {
+/// Whether `[from, to)` holds nothing but blanks, line breaks and bytes in
+/// one of `node`'s tombstones: text a deleted entry owned is gone, so it
+/// separates nothing. A successor moves up onto a removed first entry's
+/// line only when nothing but that lies between them; an entry deleted
+/// earlier, from after it, sat between and left the successor where it
+/// was (`- name` / `  image` / `  res` / `  ports` with `res`, `name` and
+/// then `image` removed wrote `-   ports`).
+fn blankOrDropped(node: *const Node, src: []const u8, from: usize, to: usize) bool {
+    var walk: DropWalk = .{ .drops = Document.droppedOf(node) };
     var i = from;
-    outer: while (i < to) {
-        for (Document.droppedOf(node)) |d| {
-            if (i >= d[0] and i < d[1]) {
-                i = d[1];
-                continue :outer;
-            }
-        }
-        return false;
+    while (true) {
+        i = walk.skip(i);
+        if (i >= to) return true;
+        if (!ctype.isBlankRun(src[i .. i + 1])) return false;
+        i += 1;
     }
-    return true;
 }
+
+/// INTERNAL. Whether every byte of `[from, to)` lies in one of `node`'s
+/// tombstones.
+pub fn coveredByDrops(node: *const Node, from: usize, to: usize) bool {
+    var walk: DropWalk = .{ .drops = Document.droppedOf(node) };
+    return walk.skip(from) >= to;
+}
+
+/// A forward walk over a collection's tombstones, which `dropRange` keeps
+/// ascending by start (they may overlap or touch). Offsets asked of it
+/// must not decrease; each range is then looked at once, so a walk over
+/// a gap is linear in its bytes and the ranges before its end. A scan
+/// from the first range at every byte made deleting thousands of entries
+/// from one item quadratic in the bytes between them.
+const DropWalk = struct {
+    drops: []const [2]usize,
+    next: usize = 0,
+
+    /// The first offset at or after `at` that no tombstone covers.
+    fn skip(self: *DropWalk, at: usize) usize {
+        var i = at;
+        while (self.next < self.drops.len and self.drops[self.next][0] <= i) : (self.next += 1) {
+            i = @max(i, self.drops[self.next][1]);
+        }
+        return i;
+    }
+};
 
 /// INTERNAL. The start of a line holding only an explicit key indicator
 /// (`?`, and perhaps a comment) above `pos`'s line, with only blank and
@@ -540,7 +570,7 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
             // different tree) and left a bare `- ` or `? ` behind.
             if (outerFraming(src, map, markup.lineStart(src, entry_start))) |fr| {
                 if (nextEntryStart(m, p)) |nx| {
-                    if (nx >= to and ctype.isBlankRun(src[to..nx])) {
+                    if (nx >= to and blankOrDropped(map, src, to, nx)) {
                         from = fr.own;
                         to = nx;
                     } else {
@@ -572,7 +602,7 @@ pub fn dropPairSpan(self: *Document, map: *Node, p: Pair) !void {
                 // whole line left the earlier line's indentation in front
                 // of the successor's own (`-\n    avg`).
                 if (nextEntryStart(m, p)) |nx| {
-                    if (nx >= to and ctype.isBlankRun(src[to..nx])) {
+                    if (nx >= to and blankOrDropped(map, src, to, nx)) {
                         from = entry_start;
                         to = nx;
                     }
@@ -637,7 +667,7 @@ pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
             // dropPairSpan for the mapping equivalent).
             if (outerFraming(src, seq, from)) |fr| {
                 if (nextItemStart(s, item)) |nx| {
-                    if (nx >= to and ctype.isBlankRun(src[to..nx])) {
+                    if (nx >= to and blankOrDropped(seq, src, to, nx)) {
                         from = fr.own;
                         to = nx;
                     } else {
@@ -662,7 +692,7 @@ pub fn dropItemSpan(self: *Document, seq: *Node, item: *Node) !void {
             } else if (from < is.entry_start and coveredByDrops(seq, from, is.entry_start)) {
                 // Moved up onto an earlier item's line (see dropPairSpan).
                 if (nextItemStart(s, item)) |nx| {
-                    if (nx >= to and ctype.isBlankRun(src[to..nx])) {
+                    if (nx >= to and blankOrDropped(seq, src, to, nx)) {
                         from = is.entry_start;
                         to = nx;
                     }

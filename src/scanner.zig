@@ -874,6 +874,8 @@ pub const Scanner = struct {
         }
         if (!tab) return false;
         const c = self.at(off);
+        // Nothing follows on the line: trailing whitespace, not indentation.
+        if (c == 0 or ctype.isBreak(c) or c == '#') return false;
         const nested = c == '?' or c == ':' or c == '|' or c == '>' or
             (c == '-' and ctype.isBlankz(self.at(off + 1)));
         if (nested) {
@@ -1920,13 +1922,22 @@ test "tabs that indent a construct are rejected where libfyaml rejects them" {
     }
     // Separation, not indentation: accepted by libfyaml and the suite.
     for ([_][]const u8{
-        "-\t-1\n",                 "-\ta: 1\n",            "- a\n-\tb: 1\n", "-\t\"q\": 1\n",
-        "? a\n:\tb\n",             "?\t&x a: 1\n",         "a:\t|\n  x\n",   "-\t\n  - x\n",
-        "foo: \"bar\n  \tbaz\"\n", "- [\n  \tfoo\n  ]\n",  "[a,\n\tb]\n",    "a: [\n \tb]\n",
+        "-\t-1\n",                 "-\ta: 1\n",            "- a\n-\tb: 1\n",   "-\t\"q\": 1\n",
+        "? a\n:\tb\n",             "?\t&x a: 1\n",         "a:\t|\n  x\n",     "-\t\n  - x\n",
+        "foo: \"bar\n  \tbaz\"\n", "- [\n  \tfoo\n  ]\n",  "[a,\n\tb]\n",      "a: [\n \tb]\n",
         // PORT NOTE: libfyaml rejects these valid documents (see the
         // tab mark's clearing in `skipToNextToken`).
-        "?\tk\n: v\n",             "a:\n  ?\tb\n  :\tc\n",
+        "?\tk\n: v\n",             "a:\n  ?\tb\n  :\tc\n", "? a\n:\t\nc: d\n", "?\t\n: v\nc: d\n",
+        ":\t",
     }) |in| {
+        var r = try scanAll(testing.allocator, in);
+        r.deinit(testing.allocator);
+    }
+    // A tab with nothing after it on its line indents nothing: it is
+    // trailing whitespace, and the next line's `:` is not tab-indented. It
+    // was taken for indentation and that `:` refused, so an edit that
+    // left a null key on such a line wrote a document that did not parse.
+    for ([_][]const u8{ ":\t\nc: d\n", "a:\n  :\t\nc: d\n", ":\t# c\nc: d\n", ":\t\n  - x\nc: d\n" }) |in| {
         var r = try scanAll(testing.allocator, in);
         r.deinit(testing.allocator);
     }
@@ -1942,6 +1953,18 @@ test "a final whitespace-only line of a block scalar is content (corpus L24T)" {
     var v = try scalarValues("foo: |\n  x\n   ");
     defer freeValues(&v);
     try testing.expectEqualStrings("x\n \n", v.items[1]);
+}
+
+test "an escape must name a Unicode scalar value" {
+    // Past U+10FFFF, or half of a surrogate pair, it names no character;
+    // the bounds themselves are characters.
+    for ([_][]const u8{ "\"\\uD800\"\n", "\"\\uDBFF\"\n", "\"\\uDFFF\"\n", "\"\\U00110000\"\n", "\"\\UFFFFFFFF\"\n" }) |in| {
+        try testing.expectError(error.InvalidEscape, scanAll(testing.allocator, in));
+    }
+    for ([_][]const u8{ "\"\\uD7FF\"\n", "\"\\uE000\"\n", "\"\\U0010FFFF\"\n", "\"\\u0000\"\n" }) |in| {
+        var r = try scanAll(testing.allocator, in);
+        r.deinit(testing.allocator);
+    }
 }
 
 test "rejections required by the corpus" {

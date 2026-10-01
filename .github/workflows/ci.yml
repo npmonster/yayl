@@ -124,6 +124,31 @@ jobs:
       - name: Assert libfyaml parses everything yayl emits
         run: sh scripts/emission-oracle.sh
 
+  # The randomized edit differential drives random sequences of edits
+  # through the public API over the corpus and fixtures, and checks that
+  # every write reads back as the tree in memory, that failed batches roll
+  # back byte for byte, and that nothing leaks. The other gates check one
+  # edit at a time; this one found ten shapes they let through. A fixed
+  # seed, so a red run reproduces with the same command. Report-only while
+  # it soaks, like the emission oracle.
+  randedit:
+    name: Randomized edit differential (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Fetch pinned YAML Test Suite corpus
+        run: sh scripts/fetch-corpus.sh
+
+      - name: Random edits, written and read back (seed 1, 20 iterations)
+        run: zig build randedit -- 1 20 4
+
   # The in-tree gates above all build from the working tree, so they
   # cannot see the one failure mode that breaks every dependent while
   # staying green here: a source file missing from `.paths` in

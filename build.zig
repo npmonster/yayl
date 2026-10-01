@@ -77,6 +77,28 @@ pub fn build(b: *std.Build) void {
     const preservation_step = b.step("preservation", "Edit-preservation sweeps over real-world fixtures");
     preservation_step.dependOn(&run_preservation.step);
 
+    // Randomized edit differential: random sequences of edits through the
+    // public API, each written, read back and compared with the tree in
+    // memory. ReleaseSafe whatever -Doptimize says (library included): a
+    // seed runs tens of thousands of iterations.
+    const randedit_exe = b.addExecutable(.{
+        .name = "randedit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/randedit.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "yayl", .module = b.createModule(.{
+                .root_source_file = b.path("src/yaml.zig"),
+                .target = target,
+                .optimize = .ReleaseSafe,
+            }) }},
+        }),
+    });
+    const run_randedit = b.addRunArtifact(randedit_exe);
+    if (b.args) |args| run_randedit.addArgs(args);
+    const randedit_step = b.step("randedit", "Randomized edit differential (seed, iterations, steps via --)");
+    randedit_step.dependOn(&run_randedit.step);
+
     // Event-tree dump CLI for the libfyaml differential harness
     // (scripts/differential.sh compiles the C reference with the
     // system compiler and compares its event trees against ours).

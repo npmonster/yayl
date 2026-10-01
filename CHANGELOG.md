@@ -580,6 +580,85 @@ fixed and pinned by regression tests:
   original block scalar re-emitted in place was indented at its `|`
   column rather than its content's.
 
+**A second, independent randomized edit differential found more edits that
+wrote another document, or none.** It runs the same check as the one
+above, written again from scratch so that what one misses the other may
+not (the corpus and fixtures in plain, CRLF, CR, byte-order-mark and
+no-final-newline variants; random edits through the Editor API, each
+written, read back and compared with the tree in memory), and it also
+requires a batch that fails to leave the output byte-identical and a set to
+an identical scalar to change no byte. On ten seeds (about 950,000
+documents and 2.1 million edit batches) it reported 679 failures on the
+release candidate (430 documents that read back as another tree, 234 that
+did not parse, 15 that lost or gained a document), and 733 on ten fresh
+seeds; it reports none on either set now, and every failed batch
+(about 840,000 in each set) left the output byte-identical. What it found, now fixed
+and pinned by tests that fail without the fix:
+
+- A tag or anchor on a block collection under a key whose line ends in a
+  comment, or with comment lines below it, was written at column 0, the
+  key's own, where it reads as the key's sibling (`k: # note` / `&x` /
+  `  - b` did not parse). It went there whenever the collection's first
+  entry had been replaced, moved or deleted, and, for a sequence at its
+  key's column, whenever that entry was given a comment. It is now on a
+  line of its own at the entries' column, or one step in from the key when
+  they sat at the key's.
+- A tag or anchor on a root collection indented by a blank or more left
+  its first entry at column 0 over its siblings (` &x` / `- a` /
+  ` - b`), and a mapping root did not parse. The line after a root's
+  properties was broken with a line feed in a CRLF or CR document
+  (cosmetic: the document still read back).
+- A block scalar written beside lines a deleted entry owned took a
+  whitespace-only line, or a comment, from behind it into its value:
+  the indentation it needs is measured from what will follow it, and the
+  measurement stopped at the deleted entry. The blank lines a keep-chomped
+  block takes were missed the same way when the entry behind it had been
+  deleted.
+- A trailing comment travelling with an item that became a block scalar's
+  value was written after the block, where it can be read as a line of it
+  (at a one-space indentation step, ` # c` under `|+` was content); it
+  goes on the header line, as it does for an item of a sequence.
+- A first document with no content (its root set to null, or left empty)
+  was written as nothing, and `\n---\nb: 2` reads back as one document. It
+  gets a `---` of its own, after the byte order mark if there is one.
+- `? e` with no value, followed by a new entry with no key text, was
+  written `: v`, the value of `e`; the new entry is written `?` over `: v`,
+  in a sequence item's compact form (`- ? e`) too.
+- A new entry beside an empty key that has properties (`- !!str : a`)
+  was measured from the `:` after them, as far right as that column.
+- Removing the entries ahead of a compact item's survivor left the
+  survivor's own indentation behind the dash (`-   ports: [80]`) when a
+  later entry had been deleted first.
+- A new entry written straight after an empty item's `- ` or an emptied
+  explicit key's `: ` continued that line (`s:` / `- t: x`, `? d` /
+  `: n: x`), making it the item's or the value's own.
+- `? e` with no value, an entry, then a null-key entry `: v` from the
+  source: deleting the entry between them left `? e` over `: v`, one
+  entry, and the null key's was lost. The kept entry now gets its `?` as a
+  new one does.
+- A new entry with a written leading comment after an emptied explicit
+  value at the end of a source with no final line break: the comment went
+  above the `: `, which the entry then continued (`? d` / `# c` /
+  `: n: x`, read as `{d: {n: x}}`).
+- A tab with nothing after it on its line, after a value indicator
+  (`:\t` and a line break), was taken for indentation, and the next
+  line's `:` was refused (`found a tab used to indent a mapping value
+  indicator`). libfyaml accepts these; so does the scanner now, and an
+  edit that left a null key on such a line no longer writes a document
+  that does not parse.
+
+**Writing after many deletions took time in proportion to their square.**
+Every gap a write copies, and every line after a value it re-emits, asks
+whether its bytes belong to a deleted entry, and each question walked a
+collection's whole list of deleted ranges from its start. A mapping with
+every other entry of 32,000 deleted took 0.15 s to write; the fixes above
+asked once a line through runs of deleted entries, and 32,000 deleted in
+a row took 0.65 s. The ranges are now merged and sorted once a write and
+searched by bisection: 3 ms for either, growing linearly (128,000
+entries: 15 ms). The bytes written are the same: the randomized
+differential writes identical output, stream for stream, before and
+after (3.9 million written streams).
+
 ### Changed
 
 - `edit.cloneTreeWhole` is removed. It existed for the clone the undo
@@ -633,6 +712,21 @@ fixed and pinned by regression tests:
   null): where a block scalar's content ends in the source.
 - The preservation sweep's list of unparseable sub-cases, and the gap it
   kept for L24T-2, are gone with the skips.
+- `document.scalarCoreTag` returns `?CoreTag`: null when an explicit core
+  tag contradicts the scalar's text (`!!int abc`, `!!int 0b101`) or names a
+  collection (`!!seq 42`); it returned a tag whatever the text said.
+  `value` and `schema` report those as `error.TypeMismatch`.
+- Fields added to public structs, all of them internal state that their
+  own functions set: `Document.shared_source` and `Document.journal`,
+  `Parser.handle_index`, `Scanner.tab_indent`, and on `Emitter`
+  `terminator`, `kept_end`, `block_floor`, `block_barred`,
+  `header_comment`, `open_end`, `directives` and `merged_drops`. Only
+  `merged_drops` has no default: build an `Emitter` with `init`, as
+  before.
+- `markup.leadingCommentSpan` takes a third argument, `floor`: the offset
+  before which no line is part of the block (the end of what precedes the
+  entry), so the content lines of a block scalar above are not read as
+  comments. Pass 0 for the earlier behaviour.
 
 ### Added
 
@@ -640,6 +734,18 @@ fixed and pinned by regression tests:
   document cannot spell when it is set rather than when it is written.
 - `Document.createAlias(target)` makes an alias to an anchored node, to
   place like any other node.
+- Helpers the emitter and the value layer share are public in their
+  modules: `document.coreTextFits`, `document.tagContradictsKind`,
+  `scanner.max_simple_key_chars` and, in `markup`, `propertiesEnd`,
+  `propertiesLineEnd`, `emptyItemDash` and `valueIndicatorEnd`. They serve
+  the library's own layers.
+- `zig build randedit -- [seed] [iterations] [steps]` (`make randedit`):
+  the randomized edit differential as a gate. Random sequences of edits
+  through the public API on every valid corpus case and fixture, in five
+  line-ending variants, each written and read back against the tree in
+  memory (scalar core types included), failed batches checked for a
+  byte-identical rollback, leaks counted. It runs report-only in CI. See
+  `tests/README.md`.
 
 ## 0.19.3 — 2026-09-15
 

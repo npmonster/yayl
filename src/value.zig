@@ -1178,6 +1178,95 @@ test "float Values emit a form that reparses to the same float" {
     }
 }
 
+test "non-finite floats are written as YAML spells them and read back as floats" {
+    // `{d}` writes them `nan`, `inf`, `-inf`: plain strings to the core
+    // schema. YAML's spellings are `.nan`, `.inf` and `-.inf`.
+    const allocator = testing.allocator;
+    const cases = [_]struct { f: f64, text: []const u8 }{
+        .{ .f = std.math.nan(f64), .text = ".nan" },
+        .{ .f = std.math.inf(f64), .text = ".inf" },
+        .{ .f = -std.math.inf(f64), .text = "-.inf" },
+    };
+    for (cases) |c| {
+        var doc = Document.init(allocator);
+        defer doc.deinit();
+        const node = try toNode(&doc, .{ .float = c.f });
+        try testing.expectEqualStrings(c.text, node.scalarValue().?);
+        const back = try nodeToValue(allocator, node);
+        defer freeValue(allocator, back);
+        try testing.expect(back == .float);
+        if (std.math.isNan(c.f)) {
+            try testing.expect(std.math.isNan(back.float));
+        } else {
+            try testing.expectEqual(c.f, back.float);
+        }
+    }
+}
+
+test "allocation failures in map, union and pointer conversions leak nothing" {
+    try std.testing.checkAllAllocationFailures(testing.allocator, mapUnionPointerConversions, .{});
+}
+
+fn mapUnionPointerConversions(allocator: std.mem.Allocator) !void {
+    const Map = std.StringArrayHashMapUnmanaged([]const u8);
+    const Choice = union(enum) { path: []const u8, port: u16, inherit: void };
+    const Rich = struct {
+        labels: Map,
+        choice: Choice,
+        boxed: *const []const u8,
+        // A default is cloned, not handed out: a pointer to a slice makes
+        // the clone allocate the box and then the slice.
+        spare: *const []const u8 = &@as([]const u8, "spare"),
+    };
+    const source = try parseToValue(allocator,
+        \\labels: {a: one, b: two}
+        \\choice: {path: /etc/app}
+        \\boxed: hello
+        \\
+    );
+    defer freeValue(allocator, source);
+
+    // Value to Zig: each map key and value, the union's payload, the box
+    // and its slice, and the cloned default are allocated in an order
+    // whose failure leaves the earlier ones for an `errdefer` to free.
+    const rich = try toZig(Rich, allocator, source);
+    defer deinitZig(Rich, allocator, rich);
+    try testing.expectEqualStrings("hello", rich.boxed.*);
+    try testing.expectEqualStrings("spare", rich.spare.*);
+
+    // Zig to Value, the same shapes out again.
+    const back = try fromZig(allocator, rich);
+    defer freeValue(allocator, back);
+    try testing.expectEqual(@as(usize, 4), back.mapping.len);
+}
+
+// The map a default points at. Filled at run time, so a default that is a
+// pointer to it is cloned with real entries; a map default written inline
+// can only be empty.
+var cloned_default_source: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+
+fn cloneMapDefault(allocator: std.mem.Allocator) !void {
+    const Cfg = struct {
+        name: []const u8 = "x",
+        extra: *const std.StringArrayHashMapUnmanaged([]const u8) = &cloned_default_source,
+    };
+    const out = try toZig(Cfg, allocator, .{ .mapping = &.{} });
+    defer deinitZig(Cfg, allocator, out);
+    try testing.expect(out.extra != &cloned_default_source);
+    try testing.expectEqualStrings("v2", out.extra.get("k2").?);
+}
+
+test "allocation failures cloning a map default leak nothing" {
+    // `cloneZig` copies each key and value of a map default; a failure
+    // part way through must free the copies made so far.
+    const allocator = testing.allocator;
+    defer cloned_default_source.deinit(allocator);
+    try cloned_default_source.put(allocator, "k1", "v1");
+    try cloned_default_source.put(allocator, "k2", "v2");
+    try cloned_default_source.put(allocator, "k3", "v3");
+    try std.testing.checkAllAllocationFailures(allocator, cloneMapDefault, .{});
+}
+
 test "parseToValueResolved can be bounded" {
     const allocator = testing.allocator;
     // Merge resolution amplifies: the source is tiny, the resolved tree is

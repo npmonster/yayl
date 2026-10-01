@@ -235,6 +235,7 @@ make verify        # every gate below except differential
 make conformance   # yaml-test-suite corpus
 make roundtrip     # emit(parse(x)) == x over corpus + fixtures
 make preservation  # an edit changes only the lines it should (fixtures + corpus)
+make randedit      # random edit sequences written and read back (RANDEDIT_ARGS="seed iterations steps")
 make consume       # build a package against the packaged library (.paths check)
 make differential  # event-stream parity vs libfyaml (needs a C compiler)
 make emission-oracle  # libfyaml parses everything yayl emits (report-only; needs a C compiler)
@@ -252,6 +253,7 @@ The gates, in both Debug and ReleaseSafe:
 | edit preservation | all 303 valid corpus cases under edits (298 documents, 5 empty), plus every fixture position |
 | event-tree parity vs libfyaml | 269/269 compared, zero mismatches |
 | emission oracle (libfyaml parses what we emit) | 816 documents across three emission paths, zero findings |
+| randomized edit differential | 95,100 runs a seed (317 inputs x 5 variants x 60), each up to 4 edit steps written and read back, zero findings |
 | allocation-failure injection | zero leaks |
 
 ## License
