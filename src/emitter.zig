@@ -812,7 +812,6 @@ pub const Emitter = struct {
                 try self.emitted.put(value, {});
                 try self.writeGap(container, gap_start, key.src.?.entry_start);
                 try self.breakBeforeEntry(entry_col);
-                if (self.isBareNullKey(key)) _ = try self.markNullKey(entry_col);
                 try self.write(src[key.src.?.entry_start..pend]);
                 return pend;
             }
@@ -878,6 +877,8 @@ pub const Emitter = struct {
                     try self.writePendingLeadingText(pt, markup.columnOf(src, s.entry_start), self.terminatorAt(s.entry_start), false);
                 }
                 try self.breakBeforeEntry(entry_col);
+                // A bare null key's span is synthetic, so it is never
+                // clean and always comes this way: see `markNullKey`.
                 if (self.isBareNullKey(key)) _ = try self.markNullKey(entry_col);
             }
         } else if (pair_end == null) {
