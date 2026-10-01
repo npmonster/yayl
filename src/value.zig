@@ -1240,6 +1240,33 @@ fn mapUnionPointerConversions(allocator: std.mem.Allocator) !void {
     try testing.expectEqual(@as(usize, 4), back.mapping.len);
 }
 
+// The map a default points at. Filled at run time, so a default that is a
+// pointer to it is cloned with real entries; a map default written inline
+// can only be empty.
+var cloned_default_source: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+
+fn cloneMapDefault(allocator: std.mem.Allocator) !void {
+    const Cfg = struct {
+        name: []const u8 = "x",
+        extra: *const std.StringArrayHashMapUnmanaged([]const u8) = &cloned_default_source,
+    };
+    const out = try toZig(Cfg, allocator, .{ .mapping = &.{} });
+    defer deinitZig(Cfg, allocator, out);
+    try testing.expect(out.extra != &cloned_default_source);
+    try testing.expectEqualStrings("v2", out.extra.get("k2").?);
+}
+
+test "allocation failures cloning a map default leak nothing" {
+    // `cloneZig` copies each key and value of a map default; a failure
+    // part way through must free the copies made so far.
+    const allocator = testing.allocator;
+    defer cloned_default_source.deinit(allocator);
+    try cloned_default_source.put(allocator, "k1", "v1");
+    try cloned_default_source.put(allocator, "k2", "v2");
+    try cloned_default_source.put(allocator, "k3", "v3");
+    try std.testing.checkAllAllocationFailures(allocator, cloneMapDefault, .{});
+}
+
 test "parseToValueResolved can be bounded" {
     const allocator = testing.allocator;
     // Merge resolution amplifies: the source is tiny, the resolved tree is
