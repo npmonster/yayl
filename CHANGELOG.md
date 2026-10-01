@@ -632,6 +632,22 @@ and pinned by tests that fail without the fix:
 - A new entry written straight after an empty item's `- ` or an emptied
   explicit key's `: ` continued that line (`s:` / `- t: x`, `? d` /
   `: n: x`), making it the item's or the value's own.
+- `? e` with no value, an entry, then a null-key entry `: v` from the
+  source: deleting the entry between them left `? e` over `: v`, one
+  entry, and the null key's was lost. The kept entry now gets its `?` as a
+  new one does.
+
+**Writing after many deletions took time in proportion to their square.**
+Every gap a write copies, and every line after a value it re-emits, asks
+whether its bytes belong to a deleted entry, and each question walked a
+collection's whole list of deleted ranges from its start. A mapping with
+every other entry of 32,000 deleted took 0.15 s to write; the fixes above
+asked once a line through runs of deleted entries, and 32,000 deleted in
+a row took 0.65 s. The ranges are now merged and sorted once a write and
+searched by bisection: 3 ms for either, growing linearly (128,000
+entries: 15 ms). The bytes written are the same: the randomized
+differential writes identical output, stream for stream, before and
+after (3.9 million written streams).
 
 ### Changed
 
@@ -690,6 +706,13 @@ and pinned by tests that fail without the fix:
   tag contradicts the scalar's text (`!!int abc`, `!!int 0b101`) or names a
   collection (`!!seq 42`); it returned a tag whatever the text said.
   `value` and `schema` report those as `error.TypeMismatch`.
+- Fields added to public structs, all of them internal state that their
+  own functions set: `Document.shared_source` and `Document.journal`,
+  `Parser.handle_index`, `Scanner.tab_indent`, and on `Emitter`
+  `terminator`, `kept_end`, `block_floor`, `block_barred`,
+  `header_comment`, `open_end`, `directives` and `merged_drops`. Only
+  `merged_drops` has no default: build an `Emitter` with `init`, as
+  before.
 - `markup.leadingCommentSpan` takes a third argument, `floor`: the offset
   before which no line is part of the block (the end of what precedes the
   entry), so the content lines of a block scalar above are not read as
@@ -706,6 +729,13 @@ and pinned by tests that fail without the fix:
   `scanner.max_simple_key_chars` and, in `markup`, `propertiesEnd`,
   `propertiesLineEnd`, `emptyItemDash` and `valueIndicatorEnd`. They serve
   the library's own layers.
+- `zig build randedit -- [seed] [iterations] [steps]` (`make randedit`):
+  the randomized edit differential as a gate. Random sequences of edits
+  through the public API on every valid corpus case and fixture, in five
+  line-ending variants, each written and read back against the tree in
+  memory (scalar core types included), failed batches checked for a
+  byte-identical rollback, leaks counted. It runs report-only in CI. See
+  `tests/README.md`.
 
 ## 0.19.3 — 2026-09-15
 
