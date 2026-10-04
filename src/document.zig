@@ -2190,6 +2190,7 @@ pub const Document = struct {
         defer em.deinit();
         em.configure(options);
         try em.emitDocument(self);
+        if (self.root != null) try markEmptyDocument(allocator, &out);
         return try out.toOwnedSlice(allocator);
     }
 };
@@ -2261,29 +2262,12 @@ pub fn writeAllOpts(allocator: std.mem.Allocator, docs: []const Document, option
         }
         after_keep = ends_keep;
 
-        // A document with nothing to write (built with no root, or a root
-        // set to null) is still a document of the stream: an explicit empty
-        // one, or its neighbours read back as one. Nothing to write is no
-        // content line -- a null root leaves a blank line, or a comment and
-        // a `...` -- and no marker of its own. After another document
+        // A document with a root is a document whatever it holds, and one
+        // with none in a stream of several is still one of them: its
+        // neighbours would read it as theirs. After another document
         // `boundary` supplies the `---`; a first one has nothing before it
         // to mark it, and `\n---\nb: 2` reads back as one document.
-        const mark = if (std.mem.startsWith(u8, body.items, "\u{FEFF}")) "\u{FEFF}".len else 0;
-        if (docs.len > 1 and hasNoContent(body.items[mark..])) {
-            // The marker breaks its line as the document does; the bytes
-            // are copied out first, for the insert moves what they point at.
-            // A byte order mark stays first: it opens the stream.
-            var marker: [5]u8 = .{ '-', '-', '-', '\n', 0 };
-            var len: usize = 4;
-            if (std.mem.indexOfAny(u8, body.items, "\r\n")) |k| {
-                marker[3] = body.items[k];
-                if (body.items[k] == '\r' and k + 1 < body.items.len and body.items[k + 1] == '\n') {
-                    marker[4] = '\n';
-                    len = 5;
-                }
-            }
-            try body.insertSlice(allocator, mark, marker[0..len]);
-        }
+        if (docs.len > 1 or doc.root != null) try markEmptyDocument(allocator, &body);
         // A byte order mark opens a stream; before a later document the
         // reader takes it for content (`\u{FEFF}b: 2` a key).
         if (i > 0 and std.mem.startsWith(u8, body.items, "\u{FEFF}")) {
@@ -2343,6 +2327,30 @@ fn finishesLine(text: []const u8) bool {
 /// anything else -- content, a `---`, a directive -- and it has some: a
 /// document may open with a comment and a `...` that end nothing, and then
 /// go on (spec example 9.3).
+/// Give a written document with nothing to write an explicit `---`, so
+/// that it reads back as a document. Nothing to write is no content line:
+/// a null root leaves a blank line, or a comment and a `...`, and a reader
+/// that follows the spec reads that as no document at all (yayl reads it
+/// as one with no root). A marker the document has is content, so it is
+/// never doubled.
+fn markEmptyDocument(allocator: std.mem.Allocator, body: *std.ArrayList(u8)) !void {
+    // A byte order mark stays first: it opens the stream.
+    const mark = if (std.mem.startsWith(u8, body.items, "\u{FEFF}")) "\u{FEFF}".len else 0;
+    if (!hasNoContent(body.items[mark..])) return;
+    // The marker breaks its line as the document does; the bytes are
+    // copied out first, for the insert moves what they point at.
+    var marker: [5]u8 = .{ '-', '-', '-', '\n', 0 };
+    var len: usize = 4;
+    if (std.mem.indexOfAny(u8, body.items, "\r\n")) |k| {
+        marker[3] = body.items[k];
+        if (body.items[k] == '\r' and k + 1 < body.items.len and body.items[k + 1] == '\n') {
+            marker[4] = '\n';
+            len = 5;
+        }
+    }
+    try body.insertSlice(allocator, mark, marker[0..len]);
+}
+
 fn hasNoContent(text: []const u8) bool {
     var it: LineIter = .{ .src = text };
     while (it.next()) |line| {
@@ -3496,6 +3504,78 @@ test "the stream-end tracker agrees with the line-by-line definition on every sh
     try testing.expectEqual(@as(usize, 335_923), checked);
     // Not vacuous: plenty of inputs do end a stream, and plenty do not.
     try testing.expect(yes > 1000 and yes < checked / 2);
+}
+
+test "a document whose root is null is still a document" {
+    // A root set to a null value left a body with no content: a blank
+    // line, or only the comments around it. yayl reads that back as a
+    // document with no root, but a reader that follows the spec (libfyaml,
+    // libyaml) sees an empty stream, and the document is gone. It gets a
+    // `---`, alone or with the document after it, written or programmatic.
+    const allocator = testing.allocator;
+    const edit_mod = @import("edit.zig");
+    const Case = struct { input: []const u8, want: []const u8 };
+    for ([_]Case{
+        .{ .input = "a: 1\n", .want = "---\n\n" },
+        .{ .input = "x\n", .want = "---\n\n" },
+        .{ .input = "# head\na: 1\n", .want = "---\n# head\n" },
+        .{ .input = "a: 1\n# tail\n", .want = "---\n\n# tail\n" },
+        .{ .input = "a: 1\r\n", .want = "---\r\n\r\n" },
+        .{ .input = "\u{FEFF}a: 1\n", .want = "\u{FEFF}---\n\n" },
+        // A marker already there is kept, and none is added.
+        .{ .input = "--- &x\na: 1\n", .want = "--- \n" },
+        .{ .input = "%YAML 1.2\n---\na: 1\n...\n", .want = "%YAML 1.2\n---\n...\n" },
+    }) |c| {
+        var doc = try Document.parse(allocator, c.input);
+        defer doc.deinit();
+        var ed = edit_mod.Editor.init(&doc);
+        try ed.apply(&.{.{ .set = .{ .path = "$", .value = try doc.createScalar("", .plain) } }});
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(c.input)});
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+        const all = try writeAll(allocator, (&doc)[0..1]);
+        defer allocator.free(all);
+        try testing.expectEqualStrings(c.want, all);
+    }
+    // Built in code: a null root is a document too; no root is none.
+    var built = Document.init(allocator);
+    defer built.deinit();
+    built.root = try built.createScalar("", .plain);
+    const one = try built.write(allocator);
+    defer allocator.free(one);
+    try testing.expectEqualStrings("---\n\n", one);
+    built.root = null;
+    const none = try built.write(allocator);
+    defer allocator.free(none);
+    try testing.expectEqualStrings("", none);
+}
+
+test "a parsed document whose root is removed writes without it" {
+    // `doc.root = null` on a parsed document was ignored: the writer copied
+    // the root's old bytes back. It now writes what is left -- the head
+    // and the tail, comments included -- which reads back as a document
+    // with no root, as a file of comments does.
+    const allocator = testing.allocator;
+    const Case = struct { input: []const u8, want: []const u8 };
+    for ([_]Case{
+        .{ .input = "a: 1\n", .want = "\n" },
+        .{ .input = "# head\na: 1\n", .want = "# head\n\n" },
+        .{ .input = "a: 1 # c\n# tail\n", .want = " # c\n# tail\n" },
+        .{ .input = "- x\n- y\n", .want = "\n" },
+        .{ .input = "--- &x\na: 1\n", .want = "--- \n" },
+    }) |c| {
+        var doc = try Document.parse(allocator, c.input);
+        defer doc.deinit();
+        doc.root = null;
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(c.input)});
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+        var back = try Document.parse(allocator, out);
+        defer back.deinit();
+        if (!std.mem.startsWith(u8, c.input, "---")) try testing.expect(back.root == null);
+    }
 }
 
 test "a first document with no content is still a document of the stream" {

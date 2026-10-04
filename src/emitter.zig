@@ -648,6 +648,11 @@ pub const Emitter = struct {
             const block_col = if (isEntryFraming(self.pendingLine())) col else 0;
             if (root.pending_leading) |pt| try self.writePendingLeadingText(pt, block_col, self.terminatorAt(doc.body_start), false);
             stop = try self.emitRoot(root, col, doc.body_end);
+        } else if (doc.body_end > doc.body_start) {
+            // A root removed from a parsed document (`doc.root = null`):
+            // its bytes go with it, and the head and tail stay. Copied, the
+            // old root came back as if nothing had been done.
+            stop = doc.body_end;
         }
         if (stop < doc.region_end) {
             // Deleted-entry tombstones of the root container can reach
