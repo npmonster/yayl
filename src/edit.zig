@@ -4346,6 +4346,28 @@ test "a property written above the first line breaks it as the document does" {
     }
 }
 
+test "no block scalar is written over a blank line with a tab in its indentation" {
+    // The lines after a block scalar, up to the next content, are read with
+    // its indentation: a blank line there may hold fewer spaces than the
+    // content, then nothing. A tab among them (`  \t`) is neither: libyaml
+    // rejects the document, and a reader that keeps going takes the tab for
+    // content. Only a tab opening the line barred the block; a tab after
+    // blanks did not, and an edit wrote output libyaml cannot read. The
+    // value is written quoted instead, as for a tab at column 0.
+    const allocator = testing.allocator;
+    for ([_][]const u8{ "a: 1\n  \t\nb: 2\n", "a: 1\n \t \nb: 2\n", "a: 1\n  \t# c\nb: 2\n", "a: 1\n\t\nb: 2\n" }) |input| {
+        var doc = try Document.parse(allocator, input);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .set = .{ .path = "$.a", .value = try doc.createScalar("x\ny\n", .literal) } }});
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        errdefer std.debug.print("{f} wrote {f}\n", .{ std.zig.fmtString(input), std.zig.fmtString(out) });
+        try testing.expect(std.mem.startsWith(u8, out, "a: \"x\\ny\\n\"\n"));
+        try expectReadsBack(allocator, &doc, "block scalar before a tab line");
+    }
+}
+
 test "a block scalar written beside the lines of a deleted entry keeps its value" {
     // The indentation a new block scalar needs is measured from the lines
     // that will follow it -- comments and blanks up to the next content

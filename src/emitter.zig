@@ -2923,9 +2923,10 @@ pub const Emitter = struct {
     /// Set `block_floor` to one past the deepest comment line from
     /// `start` (a line start) up to the next content line, and at least
     /// as deep as any line of blanks there, or 0 when there is none.
-    /// One of those lines opening with a tab bars block scalars: the tab
-    /// sits where the block's indentation is read, which no reader
-    /// accepts, however deep the content (libfyaml agrees).
+    /// A tab in the leading blanks of one of those lines bars block
+    /// scalars: it sits where the block's indentation is read. At column 0
+    /// no reader accepts it; after blanks (`  \t`) libyaml rejects it and
+    /// a lenient reader takes it for content.
     ///
     /// The scan runs through the lines of entries deleted from `holder`
     /// (or from what holds it): they are not written, so what follows
@@ -2949,7 +2950,7 @@ pub const Emitter = struct {
             const line = src[i..markup.newlineAt(src, i)];
             const body = std.mem.trimStart(u8, line, " \t");
             if (body.len > 0 and body[0] != '#') break;
-            if (line.len > 0 and line[0] == '\t') self.block_barred = true;
+            if (std.mem.indexOfScalar(u8, line[0 .. line.len - body.len], '\t') != null) self.block_barred = true;
             if (body.len > 0) floor = @max(floor, line.len - body.len + 1);
             // A line of blanks only is an empty line of the block when it
             // is no deeper than the content, and content (its extra
