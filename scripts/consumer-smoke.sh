@@ -13,7 +13,7 @@
 # drift between the documented API and the shipped one fails here too.
 set -eu
 
-ZIG="${ZIG:-zig}"
+ZIG=$(sh "$(dirname "$0")/zig-path.sh")
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

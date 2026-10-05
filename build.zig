@@ -99,6 +99,20 @@ pub fn build(b: *std.Build) void {
     const randedit_step = b.step("randedit", "Randomized edit differential (seed, iterations, steps via --)");
     randedit_step.dependOn(&run_randedit.step);
 
+    // Edited output consumed by an independent libyaml reader.
+    const compat_exe = b.addExecutable(.{
+        .name = "libyaml-compat",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/libyaml_compat.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "yayl", .module = module }},
+        }),
+    });
+    const run_compat = b.addRunArtifact(compat_exe);
+    if (b.args) |args| run_compat.addArgs(args);
+    b.step("libyaml-compat", "Generate edited documents for the libyaml compatibility gate").dependOn(&run_compat.step);
+
     // Event-tree dump CLI for the libfyaml differential harness
     // (scripts/differential.sh compiles the C reference with the
     // system compiler and compares its event trees against ours).

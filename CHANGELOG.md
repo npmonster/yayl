@@ -3,6 +3,32 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Fixed
+
+- Edited values followed by tab-containing blank/comment indentation now
+  normalize those leading tabs to spaces. Quoting alone did not make such
+  output readable by libyaml 0.2.5. Comment text, line endings, unrelated
+  source gaps and whole documents written without edits stay exact.
+- Reference libfyaml builds now supply the pinned revision as VERSION,
+  share one build recipe and treat compiler warnings as errors.
+- Make and gate scripts consistently select the tested Zig 0.16.0 compiler,
+  including when another Zig version is the default in PATH.
+
+### Verification
+
+- Emission-oracle and randomized-edit CI jobs now fail the build on findings.
+- Added a blocking libyaml edited-output gate and a bounded mutation gate
+  for 16 named regression and allocation-cleanup cases. Baselines must run
+  and pass; mutants must compile and fail their selected test. Compile
+  errors, resource limits and timeouts are separate failures. Source hashes,
+  exit status, measured process-tree memory and logs are retained.
+- `make verify` includes every correctness gate. Development dependencies
+  now include Python 3, pkg-config and libyaml headers.
+- Qualified historical mutation results: finite differential comparisons
+  establish only that no behavior difference was observed on those inputs.
+
 ## 0.20.1 — 2026-10-05
 
 ### Fixed
@@ -25,11 +51,12 @@ a document with no root, as a file of comments does.
 after it although the source ended with one. It is kept now, and a
 CR-only file keeps its own break.
 
-**Mutation testing.** Every library `errdefer` deleted and every
-comparison flipped at its boundary, one at a time (449 mutants): the
-ones that changed what yayl reads or writes and that no test caught now
-each have a test. Among them: a trailing comment written twice when the
-last entry of a collection ending a file with no final line break was
+**Mutation testing.** A campaign of 449 deleted `errdefer`s and flipped
+comparisons found nine observed behavioral gaps and three production
+allocation-cleanup gaps, each now protected by a regression test. The
+191 comparison survivors with no observed differences on sampled inputs
+were not proven equivalent. Among the covered gaps: a trailing comment
+written twice when the last entry of a collection ending a file with no final line break was
 changed; reads past the end of the source for a property-only value
 (`a: &x`) ending a file, which crashed under the mutant; non-ASCII text
 pushed into double quotes by an off-by-one; and leaks on failure in

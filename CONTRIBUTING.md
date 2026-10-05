@@ -6,8 +6,9 @@ lives in [AGENTS.md](AGENTS.md); read it before touching code.
 
 ## Ground rules
 
-- **Zig 0.16.0**: CI pins this exact version; `build.zig.zon` sets it
-  as `.minimum_zig_version`, so a later 0.16.x also builds.
+- **Zig 0.16.0**: use the exact tested version. Make and the gate scripts
+  select it from PATH or an installed zvm toolchain; `ZIG` may select it
+  explicitly. Do not infer compatibility with another compiler version.
 - **Conversion first**: yayl ports libfyaml's architecture. When in
   doubt, match its observable behavior, and mark deliberate deviations
   with a `PORT NOTE:` comment.
@@ -20,9 +21,16 @@ lives in [AGENTS.md](AGENTS.md); read it before touching code.
 ## Before you open a PR
 
 ```sh
-make verify        # every gate except differential (which needs a C compiler)
-make differential  # optional: event parity vs libfyaml (needs a C compiler)
+make verify        # all correctness gates, including independent parsers
+make mutation-smoke # recheck the 16 named regression mutations separately
 ```
+
+The full gate needs a C compiler, Python 3, pkg-config and libyaml headers.
+Install `libyaml-dev pkg-config` on Debian/Ubuntu or `libyaml pkg-config`
+with Homebrew on macOS. Reference C builds treat warnings as errors.
+Emission, randomized-edit, libyaml and mutation jobs all block CI.
+Mutation evidence is retained in `zig-out/mutation-smoke/`; an infrastructure
+failure cannot count as a kill, and sampled survivors are not proven equivalent.
 
 `make help` lists every target; the gates and their current numbers are
 in the README's Development section.
@@ -47,8 +55,9 @@ GitHub Pages on every `v*` tag.
    after — a change can invalidate a test that encoded the old
    behavior.
 3. Gate in a detached worktree (a shared checkout may hold another
-   session's uncommitted work): `make verify`, plus
-   `scripts/differential.sh` with `vendor/` copied in.
+   session's uncommitted work): `make verify` with the development
+   dependencies installed. Fetch the pinned corpora rather than relying on
+   another checkout's unverified vendor tree.
 4. Commit as `release: X.Y.Z`, push `main`, then tag the pushed
    commit by explicit sha (`git tag -a vX.Y.Z <sha>`) and push the tag.
 5. Publish the GitHub Release: `gh release create vX.Y.Z --title ...

@@ -179,8 +179,8 @@ measured indent width.
 - **Edit-preservation gate**: an edit changes only the lines it should,
   over the fixtures and a bounded corpus pass — `make preservation`.
 - **Emission oracle**: the vendored libfyaml parses every document yayl
-  emits — `make emission-oracle` (report-only in CI until it has
-  soaked). It sweeps THREE emission paths: `faithful` replays the
+  emits — `make emission-oracle` (blocking in CI). It sweeps THREE
+  emission paths: `faithful` replays the
   author's bytes and styles, `value` rebuilds each document through
   `yaml.value` first, so the emitter has to choose every scalar's form,
   and `merged` re-emits with merge keys resolved. `value` is the only
@@ -192,8 +192,17 @@ measured indent width.
   variants; every write must read back as the tree in memory (scalar
   core types included), a failed batch must roll back byte for byte, and
   nothing may leak — `make randedit` / `zig build randedit -- seed
-  iterations steps` (report-only in CI while it soaks). The other edit
-  gates check one edit at a time; this one found ten shapes they passed.
+  iterations steps` (blocking in CI). The other edit gates check one
+  edit at a time; this one found ten shapes they passed.
+- **libyaml compatibility**: edited values beside tab-containing blank and
+  comment lines, five scalar styles, three line endings, BOM/no BOM —
+  `make libyaml-compat` (blocking in CI). Only affected leading tabs become
+  spaces; untouched documents and unrelated gaps remain exact.
+- **Targeted mutations**: `make mutation-smoke` rechecks 16 named regressions
+  in temporary source copies. A baseline must run and pass its selected
+  test; a mutant must compile and fail that test. Infrastructure errors,
+  timeouts and memory limits fail separately. Never call a survivor
+  equivalent from a finite randomized comparison.
 
 ## Zig 0.16 gotchas already paid for (don't re-learn these)
 

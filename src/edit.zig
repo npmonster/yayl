@@ -3924,8 +3924,8 @@ test "edits keep the meaning in the shapes the preservation sweep skips" {
         .{ .in = "b: 1\n", .ops = &.{.{ .set = .{ .p = "$.b", .v = "x\n\ny\n", .s = .literal } }}, .out = "b: |\n  x\n\n  y\n" },
         // A block scalar above a line opening with a tab, which no block
         // may precede.
-        .{ .in = "foo: 1\n\t\n#\nbar: 2\n", .ops = &.{.{ .set = .{ .p = "$.foo", .v = "a\n  b", .s = .literal } }}, .out = "foo: \"a\\n  b\"\n\t\n#\nbar: 2\n" },
-        .{ .in = "- 1\n\t# c\n- 2\n", .ops = &.{.{ .set = .{ .p = "$[0]", .v = "a\nb\n", .s = .literal } }}, .out = "- \"a\\nb\\n\"\n\t# c\n- 2\n" },
+        .{ .in = "foo: 1\n\t\n#\nbar: 2\n", .ops = &.{.{ .set = .{ .p = "$.foo", .v = "a\n  b", .s = .literal } }}, .out = "foo: \"a\\n  b\"\n \n#\nbar: 2\n" },
+        .{ .in = "- 1\n\t# c\n- 2\n", .ops = &.{.{ .set = .{ .p = "$[0]", .v = "a\nb\n", .s = .literal } }}, .out = "- \"a\\nb\\n\"\n # c\n- 2\n" },
         // No final line break.
         .{ .in = "a: |\n  x\n  ", .ops = &.{.{ .set = .{ .p = "$.new", .v = "y" } }}, .out = "a: |\n  x\nnew: y" },
         // ... after a block scalar whose last line is blanks that are
@@ -4366,6 +4366,98 @@ test "no block scalar is written over a blank line with a tab in its indentation
         try testing.expect(std.mem.startsWith(u8, out, "a: \"x\\ny\\n\"\n"));
         try expectReadsBack(allocator, &doc, "block scalar before a tab line");
     }
+}
+
+test "edited values normalize only adjacent tab-only lines and comment indentation for libyaml" {
+    const allocator = testing.allocator;
+    for ([_][]const u8{ "\n", "\r\n", "\r" }) |nl| {
+        const input = try std.fmt.allocPrint(allocator, "# head{s} \t{s}a: 1{s}  \t{s} \t# comment{s} \t {s}b: 2{s} \t{s}c: 3{s}", .{ nl, nl, nl, nl, nl, nl, nl, nl, nl });
+        defer allocator.free(input);
+        var doc = try Document.parse(allocator, input);
+        defer doc.deinit();
+        const unchanged = try doc.write(allocator);
+        defer allocator.free(unchanged);
+        try testing.expectEqualStrings(input, unchanged);
+
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .set = .{ .path = "$.a", .value = try doc.createScalar("x\ny\n", .literal) } }});
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        const want = try std.fmt.allocPrint(allocator, "# head{s} \t{s}a: \"x\\ny\\n\"{s}   {s}  # comment{s}   {s}b: 2{s} \t{s}c: 3{s}", .{ nl, nl, nl, nl, nl, nl, nl, nl, nl });
+        defer allocator.free(want);
+        try testing.expectEqualStrings(want, out);
+        try expectReadsBack(allocator, &doc, "libyaml blank-line compatibility");
+
+        const again = try doc.write(allocator);
+        defer allocator.free(again);
+        try testing.expectEqualStrings(out, again);
+    }
+}
+
+test "an edited flow root normalizes its tab gap without changing the next document" {
+    const allocator = testing.allocator;
+    for ([_][]const u8{ "\n", "\r\n", "\r" }) |nl| {
+        const input = try std.fmt.allocPrint(allocator, "\u{FEFF}[1]{s} \t# text\tkept{s}---{s}b: 2{s} \t{s}", .{ nl, nl, nl, nl, nl });
+        defer allocator.free(input);
+        var docs = try Document.parseAll(allocator, input);
+        defer {
+            for (docs.items) |*doc| doc.deinit();
+            docs.deinit(allocator);
+        }
+        var ed = Editor.init(&docs.items[0]);
+        try ed.apply(&.{.{ .set = .{ .path = "$[0]", .value = try docs.items[0].createScalar("x\ny\n", .double_quoted) } }});
+        const out = try document_mod.writeAll(allocator, docs.items);
+        defer allocator.free(out);
+        const want = try std.fmt.allocPrint(allocator, "\u{FEFF}[\"x\\ny\\n\"]{s}  # text\tkept{s}---{s}b: 2{s} \t{s}", .{ nl, nl, nl, nl, nl });
+        defer allocator.free(want);
+        try testing.expectEqualStrings(want, out);
+    }
+}
+
+test "tab normalization offsets do not carry into separately parsed documents" {
+    const allocator = testing.allocator;
+    // The affected separator tab at offset 10 coincides with scalar
+    // content in a separate stream. Only source identity distinguishes it.
+    var docs = try Document.parseAll(allocator, "[1]\n      \t\n---\nb: 2\n");
+    defer {
+        for (docs.items) |*doc| doc.deinit();
+        docs.deinit(allocator);
+    }
+    var others = try Document.parseAll(allocator, "[9]\n---\n|\n\tfoo\n");
+    defer {
+        for (others.items) |*doc| doc.deinit();
+        others.deinit(allocator);
+    }
+    var ed = Editor.init(&docs.items[0]);
+    try ed.apply(&.{.{ .set = .{ .path = "$[0]", .value = try docs.items[0].createScalar("x\ny\n", .double_quoted) } }});
+    const out = try document_mod.writeAll(allocator, &.{ docs.items[0], others.items[1] });
+    defer allocator.free(out);
+    try testing.expectEqualStrings("[\"x\\ny\\n\"]\n---\n|\n\tfoo\n", out);
+}
+
+fn writeWithTabLine(allocator: std.mem.Allocator) !void {
+    var doc = try Document.parse(allocator, "a: 1\n  \t\nb: 2\n");
+    defer doc.deinit();
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{.{ .set = .{ .path = "$.a", .value = try doc.createScalar("x\ny\n", .literal) } }});
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("a: \"x\\ny\\n\"\n   \nb: 2\n", out);
+
+    var docs = try Document.parseAll(allocator, "[1]\n \t\n---\nb: 2\n");
+    defer {
+        for (docs.items) |*part| part.deinit();
+        docs.deinit(allocator);
+    }
+    var stream_ed = Editor.init(&docs.items[0]);
+    try stream_ed.apply(&.{.{ .set = .{ .path = "$[0]", .value = try docs.items[0].createScalar("x\ny\n", .double_quoted) } }});
+    const stream = try document_mod.writeAll(allocator, docs.items);
+    defer allocator.free(stream);
+    try testing.expectEqualStrings("[\"x\\ny\\n\"]\n  \n---\nb: 2\n", stream);
+}
+
+test "allocation failures normalizing tab-only lines leak nothing" {
+    try std.testing.checkAllAllocationFailures(testing.allocator, writeWithTabLine, .{});
 }
 
 test "a block scalar written beside the lines of a deleted entry keeps its value" {

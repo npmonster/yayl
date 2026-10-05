@@ -2236,13 +2236,28 @@ pub fn writeAllOpts(allocator: std.mem.Allocator, docs: []const Document, option
     // The previous document ended with a keep-chomped block scalar, which
     // takes any blank lines after it into its value.
     var after_keep = false;
+    // A separator after an edited value may live in the next region's
+    // head. Carry its exact offsets only while the source is contiguous.
+    var preceding_tabs: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer preceding_tabs.deinit(allocator);
 
     for (docs, 0..) |*doc, i| {
         body.clearRetainingCapacity();
         var em = emitter_mod.Emitter.init(allocator, &body);
         defer em.deinit();
         em.configure(options);
+        if (i > 0 and doc.shared_source != null and
+            doc.shared_source == docs[i - 1].shared_source and
+            doc.region_start == docs[i - 1].region_end)
+        {
+            em.preceding_tabs = &preceding_tabs;
+        }
         try em.emitDocument(doc);
+        preceding_tabs.clearRetainingCapacity();
+        var tab_offsets = em.normalized_tabs.keyIterator();
+        while (tab_offsets.next()) |at| {
+            if (at.* >= doc.region_end) try preceding_tabs.put(allocator, at.*, {});
+        }
         const ends_keep = em.kept_end == body.items.len;
         // The blank lines a document opens with (after a previous one it
         // follows without a marker line) join that block: dropped, the

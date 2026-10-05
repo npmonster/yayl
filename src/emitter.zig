@@ -81,6 +81,12 @@ pub const Emitter = struct {
     /// No block scalar may be written here: see `setBlockFloor`.
     block_barred: bool = false,
     header_comment: ?[]const u8 = null,
+    /// Tabs in source blank/comment indentation following an edited slot.
+    /// Kept per document, so a later gap can normalize just those bytes.
+    normalized_tabs: std.AutoHashMapUnmanaged(usize, void) = .empty,
+    /// Internal: affected separation stored in the next document's head.
+    /// writeAll supplies this only for contiguous regions of one source.
+    preceding_tabs: ?*const std.AutoHashMapUnmanaged(usize, void) = null,
     /// Output offset just past the last token a `:` written next would be
     /// read as part of -- an alias name, or an anchor or tag with nothing
     /// after it -- so a value indicator there is kept apart from it (see
@@ -141,6 +147,7 @@ pub const Emitter = struct {
     }
 
     pub fn deinit(self: *Emitter) void {
+        self.normalized_tabs.deinit(self.allocator);
         self.seen.deinit();
         self.emitted.deinit();
         var lists = self.merged_drops.valueIterator();
@@ -154,6 +161,22 @@ pub const Emitter = struct {
 
     fn write(self: *Emitter, bytes: []const u8) Error!void {
         try self.out.appendSlice(self.allocator, bytes);
+    }
+
+    /// Copy source bytes, replacing only tabs registered by placement of
+    /// an edited slot. Scalar content and unrelated gaps stay exact.
+    fn writeSource(self: *Emitter, from: usize, to: usize) Error!void {
+        var copied = from;
+        if (self.normalized_tabs.count() > 0) {
+            for (self.src[from..to], from..) |c, at| {
+                if (c == '\t' and self.normalized_tabs.contains(at)) {
+                    try self.write(self.src[copied..at]);
+                    try self.writeByte(' ');
+                    copied = at + 1;
+                }
+            }
+        }
+        try self.write(self.src[copied..to]);
     }
 
     fn writeByte(self: *Emitter, b: u8) Error!void {
@@ -524,6 +547,11 @@ pub const Emitter = struct {
     /// byte-faithfully outside modified slots; programmatic documents
     /// emit normalized.
     pub fn emitDocument(self: *Emitter, doc: *const Document) Error!void {
+        self.normalized_tabs.clearRetainingCapacity();
+        if (self.preceding_tabs) |tabs| {
+            var keys = tabs.keyIterator();
+            while (keys.next()) |at| try self.normalized_tabs.put(self.allocator, at.*, {});
+        }
         self.directives = doc.tag_directives.items;
         defer self.directives = &.{};
         if (doc.source) |src| {
@@ -632,10 +660,10 @@ pub const Emitter = struct {
             if (root.src != null) {
                 try self.writeGap(root, doc.region_start, doc.body_start);
             } else {
-                try self.write(src[doc.region_start..doc.body_start]);
+                try self.writeSource(doc.region_start, doc.body_start);
             }
         } else {
-            try self.write(src[doc.region_start..doc.body_start]);
+            try self.writeSource(doc.region_start, doc.body_start);
         }
         var stop = doc.body_start;
         if (doc.root) |root| {
@@ -678,7 +706,7 @@ pub const Emitter = struct {
             if (doc.root != null and doc.root.?.src != null) {
                 try self.writeGap(doc.root.?, stop, doc.region_end);
             } else {
-                try self.write(src[stop..doc.region_end]);
+                try self.writeSource(stop, doc.region_end);
             }
             // If everything remaining was deleted, the file's final
             // newline is still structural: keep the output terminated,
@@ -750,7 +778,13 @@ pub const Emitter = struct {
             },
             // Modified container: its slot walk consumes through the
             // last entry's line end.
-            else => return self.emitContent(node, indent),
+            else => {
+                // A changed flow root also owns the separation after its
+                // closing bracket; its inner slot walk cannot see it.
+                if (internal.inlineValue(node)) try self.placeBlock(node, s.end);
+                defer self.endBlockPlacement();
+                return self.emitContent(node, indent);
+            },
         }
     }
 
@@ -806,7 +840,7 @@ pub const Emitter = struct {
             g = next;
         }
         if (g > gap) {
-            try self.write(src[gap..g]);
+            try self.writeSource(gap, g);
             return g;
         }
         return gap;
@@ -815,7 +849,6 @@ pub const Emitter = struct {
     /// Emit a mapping entry. `gap_start` is where this entry's leading
     /// gap begins in the source; returns where the next gap begins.
     fn emitPair(self: *Emitter, container: *const Node, pair: Pair, entry_col: usize, gap_start: usize) Error!usize {
-        const src = self.src;
         const key = pair.key;
         const value = pair.value;
 
@@ -826,7 +859,7 @@ pub const Emitter = struct {
                 try self.emitted.put(value, {});
                 try self.writeGap(container, gap_start, key.src.?.entry_start);
                 try self.breakBeforeEntry(entry_col);
-                try self.write(src[key.src.?.entry_start..pend]);
+                try self.writeSource(key.src.?.entry_start, pend);
                 return pend;
             }
         }
@@ -932,7 +965,7 @@ pub const Emitter = struct {
             if (try self.openEntryLine(entry_col, pending, self.terminatorAt(gap))) {
                 owed_terminator = true;
             }
-            try self.placeNewBlock(container, value, gap);
+            try self.placeNewBlock(container, gap);
             defer self.endBlockPlacement();
             const offered = self.offerHeaderComment(value);
             try self.emitEntry(key, value, entry_col);
@@ -950,7 +983,7 @@ pub const Emitter = struct {
         var key_end: usize = if (ks) |s| s.end else 0;
         if (key_spanned and self.nodeClean(key)) {
             try self.emitted.put(key, {});
-            try self.write(src[ks.?.entry_start..ks.?.end]);
+            try self.writeSource(ks.?.entry_start, ks.?.end);
             if (endsOpen(key)) self.open_end = self.out.items.len;
         } else {
             try self.emitted.put(key, {});
@@ -958,7 +991,7 @@ pub const Emitter = struct {
             // [entry_start, start) -- and re-emits only its content. A
             // block collection key's own walk writes that framing with
             // its first entry, as for items (`? ? - a` otherwise).
-            if (key_spanned and !framingOwnedByContent(key)) try self.write(src[ks.?.entry_start..ks.?.start]);
+            if (key_spanned and !framingOwnedByContent(key)) try self.writeSource(ks.?.entry_start, ks.?.start);
             const key_col = if (ks) |s| markup.columnOf(src, s.start) else entry_col;
             const key_start = self.out.items.len;
             const stop = try self.emitKeyContent(key, key_col, expl);
@@ -976,7 +1009,7 @@ pub const Emitter = struct {
         // bytes and stop.
         if (value_empty) {
             if (ks != null and pair_end != null) {
-                try self.write(src[@min(key_end, pair_end.?)..pair_end.?]);
+                try self.writeSource(@min(key_end, pair_end.?), pair_end.?);
                 return self.writeEntryTail(value, pair_end.?);
             }
             try self.writeValueIndicator(":");
@@ -1019,7 +1052,7 @@ pub const Emitter = struct {
                                 try self.writeIndent(vcol);
                             }
                         } else {
-                            try self.write(src[key_end..vs.entry_start]);
+                            try self.writeSource(key_end, vs.entry_start);
                         }
                         // The key's own column: a first key's
                         // entry_start is the `- ` of the item it opens.
@@ -1096,7 +1129,7 @@ pub const Emitter = struct {
             return gap_start;
         }
         // Brand-new value: layout by its shape.
-        if (pair_end) |pe| try self.placeBlock(value, pe) else try self.placeNewBlock(container, value, gap_start);
+        if (pair_end) |pe| try self.placeBlock(value, pe) else try self.placeNewBlock(container, gap_start);
         defer self.endBlockPlacement();
         if (expl) {
             // `? key` gaining a value it did not have: the value
@@ -1161,7 +1194,7 @@ pub const Emitter = struct {
                 owed_terminator = true;
             }
             try self.write("- ");
-            try self.placeNewBlock(container, item, gap);
+            try self.placeNewBlock(container, gap);
             defer self.endBlockPlacement();
             const offered = self.offerHeaderComment(item);
             _ = try self.emitContent(item, entry_col + 2);
@@ -1245,7 +1278,7 @@ pub const Emitter = struct {
             // with `$[0].a` set wrote `{a: Z}` at the parent's column,
             // and a refilled `- {}` did not parse at all.
             if (!framingOwnedByContent(item)) {
-                try self.write(src[s.entry_start..s.start]);
+                try self.writeSource(s.entry_start, s.start);
             }
             try self.placeBlock(item, s.end);
             defer self.endBlockPlacement();
@@ -1263,7 +1296,7 @@ pub const Emitter = struct {
         }
         // Synthesized empty item: the entry shell only.
         try self.emitted.put(item, {});
-        try self.write(src[s.entry_start..s.start]);
+        try self.writeSource(s.entry_start, s.start);
         return s.end;
     }
 
@@ -1421,7 +1454,7 @@ pub const Emitter = struct {
                         // Normalized, after the item framing the slot walk
                         // would have written with the first entry.
                         const s = node.src.?;
-                        if (s.entry_start < s.start) try self.write(self.src[s.entry_start..s.start]);
+                        if (s.entry_start < s.start) try self.writeSource(s.entry_start, s.start);
                         try self.emitNode(node, try self.openNormalizedBlock(node, indent));
                         return s.end;
                     };
@@ -1464,7 +1497,7 @@ pub const Emitter = struct {
                         // Normalized, after the item framing the slot walk
                         // would have written with the first entry.
                         const s = node.src.?;
-                        if (s.entry_start < s.start) try self.write(self.src[s.entry_start..s.start]);
+                        if (s.entry_start < s.start) try self.writeSource(s.entry_start, s.start);
                         try self.emitNode(node, try self.openNormalizedBlock(node, indent));
                         return s.end;
                     };
@@ -2021,7 +2054,7 @@ pub const Emitter = struct {
         if (!self.nodeClean(node)) return null;
         const s = node.src.?;
         try self.emitted.put(node, {});
-        try self.write(self.src[from..s.end]);
+        try self.writeSource(from, s.end);
         return s.end;
     }
 
@@ -2088,10 +2121,10 @@ pub const Emitter = struct {
         var i: usize = from;
         for (dropsAfter(try self.dropsOf(container), from)) |d| {
             if (d[0] >= to) break;
-            if (d[0] > i) try self.write(self.src[i..d[0]]);
+            if (d[0] > i) try self.writeSource(i, d[0]);
             i = @max(i, d[1]);
         }
-        if (i < to) try self.write(self.src[i..to]);
+        if (i < to) try self.writeSource(i, to);
     }
 
     /// The offset of the first byte at/after `from` that a tombstone does
@@ -2134,7 +2167,7 @@ pub const Emitter = struct {
     fn writeRemainder(self: *Emitter, offset: usize) Error!usize {
         const src = self.src;
         const le = markup.lineEnd(src, offset);
-        if (offset < le) try self.write(src[offset..le]);
+        if (offset < le) try self.writeSource(offset, le);
         return le;
     }
 
@@ -2524,9 +2557,9 @@ pub const Emitter = struct {
                     const pend = pair.src_end.?;
                     // Opening bracket, or the comma and layout since the
                     // previous entry -- comments included.
-                    try self.write(src[gap..ks.entry_start]);
+                    try self.writeSource(gap, ks.entry_start);
                     if (pair.value.src != null and self.nodeClean(pair.value)) {
-                        try self.write(src[ks.entry_start..pend]);
+                        try self.writeSource(ks.entry_start, pend);
                     } else {
                         // Key, colon and the spacing after it are the
                         // author's; only the value is ours to rewrite.
@@ -2536,16 +2569,16 @@ pub const Emitter = struct {
                         // a pair with no value may have none (`{foo, b}`):
                         // then it is written, or the value joined the key.
                         if (pair.value.src) |vs| {
-                            try self.write(src[ks.entry_start..vs.start]);
+                            try self.writeSource(ks.entry_start, vs.start);
                         } else {
                             const colon = markup.valueIndicatorEnd(src, ks.end, pend);
                             if (colon == ks.end) {
-                                try self.write(src[ks.entry_start..ks.end]);
+                                try self.writeSource(ks.entry_start, ks.end);
                                 if (endsOpen(pair.key)) self.open_end = self.out.items.len;
                                 try self.writeValueIndicator(": ");
                             } else {
                                 const vstart = markup.spaceEnd(src, colon);
-                                try self.write(src[ks.entry_start..vstart]);
+                                try self.writeSource(ks.entry_start, vstart);
                                 // Nothing after the `:` on its line: a
                                 // plain key's value needs a blank there.
                                 if (vstart == colon) try self.writeByte(' ');
@@ -2559,11 +2592,11 @@ pub const Emitter = struct {
             .sequence => |*sq| {
                 for (sq.items.items) |item| {
                     const is = item.src.?;
-                    try self.write(src[gap..is.entry_start]);
+                    try self.writeSource(gap, is.entry_start);
                     if (self.nodeClean(item)) {
-                        try self.write(src[is.entry_start..is.end]);
+                        try self.writeSource(is.entry_start, is.end);
                     } else {
-                        try self.write(src[is.entry_start..is.start]);
+                        try self.writeSource(is.entry_start, is.start);
                         if (!try self.writeNullFlowItem(item)) try self.emitFlowBody(item);
                     }
                     gap = is.end;
@@ -2572,7 +2605,7 @@ pub const Emitter = struct {
             else => unreachable,
         }
         // Trailing layout and the closing bracket.
-        try self.write(src[gap..cs.end]);
+        try self.writeSource(gap, cs.end);
     }
 
     /// Emit a node in flow style, registering it for alias tracking.
@@ -2898,7 +2931,6 @@ pub const Emitter = struct {
     /// (`a: |- # c`). Only a scalar can become a block at the top; the
     /// caller clears this with `endBlockPlacement`.
     fn placeBlock(self: *Emitter, node: *const Node, old_end: usize) Error!void {
-        if (node.data == .alias) return;
         const src = self.src;
         const nl = markup.newlineAt(src, old_end);
         const rest = std.mem.trim(u8, src[@min(old_end, nl)..nl], " \t");
@@ -2911,8 +2943,7 @@ pub const Emitter = struct {
     /// `placeBlock` for a brand-new entry, whose next source line (the
     /// next original entry's gap) starts at `gap`, or after it when `gap`
     /// is mid-line.
-    fn placeNewBlock(self: *Emitter, container: *const Node, node: *const Node, gap: usize) Error!void {
-        if (node.data == .alias) return;
+    fn placeNewBlock(self: *Emitter, container: *const Node, gap: usize) Error!void {
         const src = self.src;
         var from = lineCeil(src, gap);
         // Past the lines of entries deleted or replaced here: the new
@@ -2954,7 +2985,16 @@ pub const Emitter = struct {
             const line = src[i..markup.newlineAt(src, i)];
             const body = std.mem.trimStart(u8, line, " \t");
             if (body.len > 0 and body[0] != '#') break;
-            if (std.mem.indexOfScalar(u8, line[0 .. line.len - body.len], '\t') != null) self.block_barred = true;
+            if (std.mem.indexOfScalar(u8, line[0 .. line.len - body.len], '\t') != null) {
+                self.block_barred = true;
+                // PORT NOTE: libyaml rejects leading tabs on following
+                // blank/comment lines after quoted/flow values, although
+                // the spec allows them as comment-line separation. Edits
+                // normalize just those tabs; untouched bytes stay exact.
+                for (line[0 .. line.len - body.len], i..) |c, at| {
+                    if (c == '\t') try self.normalized_tabs.put(self.allocator, at, {});
+                }
+            }
             if (body.len > 0) floor = @max(floor, line.len - body.len + 1);
             // A line of blanks only is an empty line of the block when it
             // is no deeper than the content, and content (its extra

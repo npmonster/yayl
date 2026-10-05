@@ -7,8 +7,8 @@
 //!
 //!   delete → output is the input minus one contiguous run of lines,
 //!            and the run contains the deleted entry
-//!   set    → output is the input with exactly one line changed (the
-//!            target's line), and re-parses to the new value
+//!   set    → the target's line changes, adjacent blank/comment leading
+//!            tabs become spaces, and the output re-parses to the new value
 //!   add    → output is the input plus inserted lines, nothing changed
 //!   failed batch → output is byte-identical to the input
 //!
@@ -62,6 +62,48 @@ fn splitLines(allocator: std.mem.Allocator, s: []const u8) ![][]const u8 {
     // both sides compare on content lines only.
     if (out.items.len > 0 and out.items[out.items.len - 1].len == 0) _ = out.pop();
     return try out.toOwnedSlice(allocator);
+}
+
+/// Independent expectation for the authorized libyaml whitespace exception.
+/// Only leading tabs on blank/comment lines after the target become spaces.
+fn changedLineWithTabGaps(orig: [][]const u8, out: [][]const u8, target: usize) ?usize {
+    if (orig.len != out.len or target >= orig.len) return null;
+    if (std.mem.eql(u8, orig[target], out[target])) return null;
+    var adjacent = true;
+    for (orig, out, 0..) |a, b, line| {
+        if (line == target) continue;
+        if (line > target and adjacent) {
+            const text = std.mem.trimEnd(u8, a, "\r");
+            const body = std.mem.trimStart(u8, text, " \t");
+            if (body.len == 0 or body[0] == '#') {
+                if (a.len != b.len) return null;
+                const leading = text.len - body.len;
+                for (a, b, 0..) |c, written, col| {
+                    const want: u8 = if (col < leading and c == '\t') ' ' else c;
+                    if (written != want) return null;
+                }
+                continue;
+            }
+            adjacent = false;
+        }
+        if (!std.mem.eql(u8, a, b)) return null;
+    }
+    return target;
+}
+
+test "tab gap preservation allows only adjacent leading replacements" {
+    const orig = [_][]const u8{ "a: 1", " \t", " \t# text\tkept", "b: 2", "\t" };
+    const want = [_][]const u8{ "a: zz-edited", "  ", "  # text\tkept", "b: 2", "\t" };
+    try std.testing.expectEqual(@as(?usize, 0), changedLineWithTabGaps(@constCast(&orig), @constCast(&want), 0));
+    var bad = want;
+    bad[4] = " ";
+    try std.testing.expectEqual(@as(?usize, null), changedLineWithTabGaps(@constCast(&orig), &bad, 0));
+    bad = want;
+    bad[2] = "  # text kept";
+    try std.testing.expectEqual(@as(?usize, null), changedLineWithTabGaps(@constCast(&orig), &bad, 0));
+    bad = want;
+    bad[1] = "";
+    try std.testing.expectEqual(@as(?usize, null), changedLineWithTabGaps(@constCast(&orig), &bad, 0));
 }
 
 const bom = "\xEF\xBB\xBF";
@@ -1188,8 +1230,8 @@ fn sweepFixture(allocator: std.mem.Allocator, name: []const u8, raw_input: []con
         const out_lines = try splitLines(allocator, out);
         if (!keepsBom(input, out)) failures.add("{s}: an edit dropped the byte order mark", .{name});
         defer allocator.free(out_lines);
-        const idx = oneLineChanged(orig_lines, out_lines) orelse {
-            failures.add("{s}: set {s}: more than one line changed", .{ name, t.path });
+        const idx = changedLineWithTabGaps(orig_lines, out_lines, t.line) orelse {
+            failures.add("{s}: set {s}: changes exceed the target and adjacent leading tabs", .{ name, t.path });
             continue;
         };
         if (idx != t.line) {

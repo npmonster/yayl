@@ -76,6 +76,29 @@ jobs:
           name: conformance-report
           path: zig-out/conformance-report.json
 
+  # One stable check for branch protection. A failed or skipped correctness
+  # job fails this check; benchmarks are deliberately outside it.
+  quality-gates:
+    name: Quality gates
+    if: always()
+    needs: [verify, platform, consume, emission-oracle, randedit, libyaml-compat, mutation-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every correctness job to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          results = json.loads(os.environ['RESULTS'])
+          failed = {job: state['result'] for job, state in results.items() if state['result'] != 'success'}
+          print('correctness results:', results)
+          if failed:
+              print('failed or skipped correctness jobs:', failed)
+              sys.exit(1)
+          PY
+
   # Benchmarks report numbers; they never gate a build. Shared runners
   # are too noisy for performance thresholds — this job exists so the
   # hot paths get exercised (and their trend visible in the logs) on
@@ -102,13 +125,11 @@ jobs:
   # The emission oracle checks every document yayl emits with an
   # INDEPENDENT parser (the vendored libfyaml), closing the loop the
   # round-trip gate cannot: yayl's parser re-reading yayl's output
-  # shares its author's spec misreadings. Report-only while it soaks;
-  # the intent is to gate once it has a clean history.
+  # shares its author's spec misreadings. Any finding fails CI.
   emission-oracle:
-    name: Emission oracle (report only)
+    name: Emission oracle
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 
@@ -129,13 +150,11 @@ jobs:
   # every write reads back as the tree in memory, that failed batches roll
   # back byte for byte, and that nothing leaks. The other gates check one
   # edit at a time; this one found ten shapes they let through. A fixed
-  # seed, so a red run reproduces with the same command. Report-only while
-  # it soaks, like the emission oracle.
+  # seed, so a red run reproduces with the same command. Findings fail CI.
   randedit:
-    name: Randomized edit differential (report only)
+    name: Randomized edit differential
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 
@@ -148,6 +167,38 @@ jobs:
 
       - name: Random edits, written and read back (seed 1, 20 iterations)
         run: zig build randedit -- 1 20 4
+
+  libyaml-compat:
+    name: Edited output vs libyaml
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Install the independent parser
+        run: sudo apt-get update && sudo apt-get install -y libyaml-dev pkg-config
+      - name: Check edited output and scalar values
+        run: make libyaml-compat
+
+  mutation-smoke:
+    name: Targeted mutation regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Verify the regression tests kill their mutations
+        run: make mutation-smoke
+      - name: Upload mutation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutation-smoke
+          path: zig-out/mutation-smoke/
 
   # The in-tree gates above all build from the working tree, so they
   # cannot see the one failure mode that breaks every dependent while

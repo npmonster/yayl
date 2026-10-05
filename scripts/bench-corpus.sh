@@ -12,7 +12,8 @@ set -eu
 ITERS="${1:-20}"
 BENCH="zig-out/bin/bench"
 
-zig build bench -Doptimize=ReleaseFast
+ZIG=$(sh scripts/zig-path.sh)
+"$ZIG" build bench -Doptimize=ReleaseFast
 
 for f in tests/fixtures/*.yaml tests/fixtures/*.yml; do
     [ -f "$f" ] || continue
