@@ -21,8 +21,8 @@ your review covers. Check any later commits before approving release.
 Read AGENTS.md first. In this workspace, operate through Plumb and call
 session_start with your own stable conversation identity. Inspect active
 sessions and claims. Use an isolated checkout for destructive probes and
-negative controls. Do not overwrite another session's files, change credentials,
-merge, tag or publish as part of this review.
+negative controls. Do not overwrite another session's files, merge, tag or publish as part of
+this review.
 
 ## User-authorized behavior
 
@@ -188,16 +188,9 @@ this work. The new persistent gate covers 16 specified regressions; it is not
 a rerun or proof of equivalence for every historical survivor. Finite random
 tests cannot establish that the whole library is bug-free.
 
-Do not repeat historical credit use, background-process cleanup, free-memory
-attribution or exposed-token rotation as verified facts from repository state.
-Credential incident closure requires revocation/rotation evidence from the
-token owner; never print a secret or grant broader permissions to simplify
-publishing. A live gh auth status check found two separate authenticated
-accounts, golimpio and atlas-from-plumb, both using OAuth credentials.
-Atlas being inactive locally does not mean its server-side credential is
-revoked. Its current validity does not establish whether the previously
-exposed credential was replaced. Do not confuse an account name with a
-personal-access-token name; the exposure remains unclosed without evidence.
+Do not repeat historical credit use, background-process cleanup or free-memory
+attribution as verified facts from repository state. Operational claims need
+independent evidence and are separate from library correctness.
 
 ## Deliverable
 
