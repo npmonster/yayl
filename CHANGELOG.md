@@ -20,6 +20,22 @@ copied the old root's bytes back. It now writes the document without
 them, keeping its head and tail (comments, markers), which reads back as
 a document with no root, as a file of comments does.
 
+**A root set in an empty document lost the file's final line break.**
+`---` with its root set to `x` was written `---\nx`, with no line break
+after it although the source ended with one. It is kept now, and a
+CR-only file keeps its own break.
+
+**Mutation testing.** Every library `errdefer` deleted and every
+comparison flipped at its boundary, one at a time (449 mutants): the
+ones that changed what yayl reads or writes and that no test caught now
+each have a test. Among them: a trailing comment written twice when the
+last entry of a collection ending a file with no final line break was
+changed; reads past the end of the source for a property-only value
+(`a: &x`) ending a file, which crashed under the mutant; non-ASCII text
+pushed into double quotes by an off-by-one; and leaks on failure in
+fixed-array conversions, array default clones and the schema byte
+budget.
+
 **A block scalar could be written over a blank line with a tab in its
 indentation.** The lines after a block scalar, up to the next content,
 are read with its indentation, and a tab there (`  \t`) is neither an
