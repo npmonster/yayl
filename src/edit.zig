@@ -4346,6 +4346,28 @@ test "a property written above the first line breaks it as the document does" {
     }
 }
 
+test "no block scalar is written over a blank line with a tab in its indentation" {
+    // The lines after a block scalar, up to the next content, are read with
+    // its indentation: a blank line there may hold fewer spaces than the
+    // content, then nothing. A tab among them (`  \t`) is neither: libyaml
+    // rejects the document, and a reader that keeps going takes the tab for
+    // content. Only a tab opening the line barred the block; a tab after
+    // blanks did not, and an edit wrote output libyaml cannot read. The
+    // value is written quoted instead, as for a tab at column 0.
+    const allocator = testing.allocator;
+    for ([_][]const u8{ "a: 1\n  \t\nb: 2\n", "a: 1\n \t \nb: 2\n", "a: 1\n  \t# c\nb: 2\n", "a: 1\n\t\nb: 2\n" }) |input| {
+        var doc = try Document.parse(allocator, input);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .set = .{ .path = "$.a", .value = try doc.createScalar("x\ny\n", .literal) } }});
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        errdefer std.debug.print("{f} wrote {f}\n", .{ std.zig.fmtString(input), std.zig.fmtString(out) });
+        try testing.expect(std.mem.startsWith(u8, out, "a: \"x\\ny\\n\"\n"));
+        try expectReadsBack(allocator, &doc, "block scalar before a tab line");
+    }
+}
+
 test "a block scalar written beside the lines of a deleted entry keeps its value" {
     // The indentation a new block scalar needs is measured from the lines
     // that will follow it -- comments and blanks up to the next content
@@ -4473,6 +4495,128 @@ test "writing after deleting many entries takes time in proportion to them" {
             }
         }
         try testing.expect(linear);
+    }
+}
+
+test "a collection re-emitted at the end of a file with no final line break writes its tail once" {
+    // The walk over a changed collection ends exactly at the line end when
+    // the file has no final break; the line's remainder (its trailing
+    // comment) was then already written, and must not be written again.
+    const allocator = testing.allocator;
+    const Case = struct { input: []const u8, path: []const u8, want: []const u8 };
+    for ([_]Case{
+        // The last entry, whose line carries the comment, is the changed one.
+        .{ .input = "a:\n- one\n- two # c", .path = "$.a[1]", .want = "a:\n- one\n- &x two # c" },
+        .{ .input = "a:\n  - one\n  - two # c", .path = "$.a[1]", .want = "a:\n  - one\n  - &x two # c" },
+        .{ .input = "- - one\n  - two # c", .path = "$[0][1]", .want = "- - one\n  - &x two # c" },
+        .{ .input = "a:\n  k: 1\n  j: 2 # c", .path = "$.a.j", .want = "a:\n  k: 1\n  j: &x 2 # c" },
+        .{ .input = "a:\n- one\n- two # c", .path = "$.a[0]", .want = "a:\n- &x one\n- two # c" },
+    }) |c| {
+        var doc = try Document.parse(allocator, c.input);
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try doc.setAnchor(try ed.one(c.path), "x");
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}
+
+test "the indent step is not measured from an indentless sequence" {
+    // A sequence at its key's column (`s:` / `- a`) has no indentation to
+    // measure: it is passed over, and the step comes from the next
+    // collection that has one. Measured as 0, new content was laid out one
+    // column deep.
+    const allocator = testing.allocator;
+    var doc = try Document.parse(allocator, "s:\n- a\nm:\n  k: v\n");
+    defer doc.deinit();
+    const inner = try doc.createMapping();
+    try doc.mappingAppend(inner, try doc.createScalar("y", .plain), try doc.createScalar("1", .plain));
+    const outer = try doc.createMapping();
+    try doc.mappingAppend(outer, try doc.createScalar("x", .plain), inner);
+    var ed = Editor.init(&doc);
+    try ed.apply(&.{.{ .set = .{ .path = "$.n", .value = outer } }});
+    const out = try doc.write(allocator);
+    defer allocator.free(out);
+    try testing.expectEqualStrings("s:\n- a\nm:\n  k: v\nn:\n  x:\n    y: 1\n", out);
+}
+
+test "a re-emitted block scalar keeps the column of its first content line" {
+    // Measured from the first line that has content, past leading empty
+    // ones; and a header with nothing after it, at the end of a file with
+    // no final line break, measures nothing (no read past the end).
+    const allocator = testing.allocator;
+    const Case = struct { input: []const u8, want: []const u8 };
+    for ([_]Case{
+        .{ .input = "- |\n\n  x\n", .want = "- &x |\n\n  x\n" },
+        .{ .input = "- >\n \n  \n  x\n", .want = "- &x |\n\n\n  x\n" },
+        .{ .input = "a: |", .want = "a: &x \"\"" },
+        .{ .input = "- |", .want = "- &x \"\"" },
+        // A value that is only properties, ending the file: its span ends
+        // at the last byte, and nothing past it may be read.
+        .{ .input = "a: &w", .want = "a: &x" },
+        .{ .input = "- &w", .want = "- &x" },
+        .{ .input = "a: !t", .want = "a: &x !t" },
+    }) |c| {
+        var doc = try Document.parse(allocator, c.input);
+        defer doc.deinit();
+        const node = if (doc.root.?.kind() == .mapping) doc.root.?.pairs().?[0].value else doc.root.?.items().?[0];
+        try doc.setAnchor(node, "x");
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+        try expectReadsBack(allocator, &doc, "re-emitted block scalar");
+    }
+}
+
+test "single quotes stay for text past ASCII" {
+    // Only ASCII controls and DEL need double quotes' escapes. Text past
+    // ASCII is written as asked; its UTF-8 bytes (0x80 among them, in `À`
+    // and U+2028) are not controls. A lone C1 control is escaped.
+    const allocator = testing.allocator;
+    const Case = struct { value: []const u8, want: []const u8 };
+    for ([_]Case{
+        .{ .value = "\u{C0}", .want = "k: '\u{C0}'\n" },
+        .{ .value = "a\u{2028}b", .want = "k: 'a\u{2028}b'\n" },
+        .{ .value = "\u{80}", .want = "k: \"\\u0080\"\n" },
+    }) |c| {
+        var doc = try Document.parse(allocator, "k: 1\n");
+        defer doc.deinit();
+        var ed = Editor.init(&doc);
+        try ed.apply(&.{.{ .set = .{ .path = "$.k", .value = try doc.createScalar(c.value, .single_quoted) } }});
+        const out = try doc.write(allocator);
+        defer allocator.free(out);
+        try testing.expectEqualStrings(c.want, out);
+    }
+}
+
+test "a root set in an empty document keeps the file's final line break" {
+    // An empty document's root has no bytes; written in their place, the
+    // new root ended the file without the line break the source ended with.
+    const allocator = testing.allocator;
+    const Case = struct { input: []const u8, index: usize, want: []const u8 };
+    for ([_]Case{
+        .{ .input = "---\n", .index = 0, .want = "---\nx\n" },
+        .{ .input = "---\n---\n", .index = 1, .want = "---\n---\nx\n" },
+        .{ .input = "a: 1\n---\n", .index = 1, .want = "a: 1\n---\nx\n" },
+        .{ .input = "---\n# c\n", .index = 0, .want = "---\n# c\nx\n" },
+        .{ .input = "---\r\n", .index = 0, .want = "---\r\nx\r\n" },
+        .{ .input = "---\r", .index = 0, .want = "---\rx\r" },
+        // No final break in the source: none is added.
+        .{ .input = "---", .index = 0, .want = "--- x" },
+    }) |c| {
+        var docs = try Document.parseAll(allocator, c.input);
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+        const doc = &docs.items[c.index];
+        var ed = Editor.init(doc);
+        try ed.apply(&.{.{ .set = .{ .path = "$", .value = try doc.createScalar("x", .plain) } }});
+        const out = try document_mod.writeAll(allocator, docs.items);
+        defer allocator.free(out);
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(c.input)});
+        try testing.expectEqualStrings(c.want, out);
     }
 }
 

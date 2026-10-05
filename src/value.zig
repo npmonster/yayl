@@ -1267,6 +1267,28 @@ test "allocation failures cloning a map default leak nothing" {
     try std.testing.checkAllAllocationFailures(allocator, cloneMapDefault, .{});
 }
 
+test "a fixed array conversion that fails part way frees what it converted" {
+    // Elements are converted in order; when a later one does not convert,
+    // the strings made for the earlier ones must be freed.
+    const allocator = testing.allocator;
+    const v = try parseToValue(allocator, "[ok, {not: a string}]\n");
+    defer freeValue(allocator, v);
+    try testing.expectError(error.TypeMismatch, toZig([2][]const u8, allocator, v));
+}
+
+fn cloneArrayDefault(allocator: std.mem.Allocator) !void {
+    const Cfg = struct { pair: [2][]const u8 = .{ "first", "second" } };
+    const out = try toZig(Cfg, allocator, .{ .mapping = &.{} });
+    defer deinitZig(Cfg, allocator, out);
+    try testing.expectEqualStrings("second", out.pair[1]);
+}
+
+test "allocation failures cloning an array default leak nothing" {
+    // The default is cloned element by element; a failure on the second
+    // must free the first.
+    try std.testing.checkAllAllocationFailures(testing.allocator, cloneArrayDefault, .{});
+}
+
 test "parseToValueResolved can be bounded" {
     const allocator = testing.allocator;
     // Merge resolution amplifies: the source is tiny, the resolved tree is

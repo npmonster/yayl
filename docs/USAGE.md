@@ -271,6 +271,20 @@ one leaves the others byte-identical. Deleting an entry removes its
 whole line (leading indent and trailing comment included); appends
 use the sibling entries' indentation.
 
+A block scalar (`|`, `>`) that an edit writes reads every following
+line with its own indentation, up to the next content line, so it is
+placed with those lines in mind, and they are left as they are:
+
+- It sits deeper than the comment lines after it, or they would be
+  read as part of its value.
+- It sits at least as deep as a whitespace-only line after it, which
+  would otherwise be read as content. A stray line of twenty spaces
+  therefore gives a block indented twenty columns: the value is right,
+  and the line is the author's to keep or remove.
+- A tab in the leading blanks of such a line cannot be indentation, so
+  no block scalar is written there: the value is written quoted instead.
+- A comment on the old value's line moves to the block's header line.
+
 One case is not a plain line removal. When the deleted entry is the
 first key of a mapping that is itself a sequence item, its line also
 carries the `- ` indicator — and that indicator belongs to the item,
@@ -288,8 +302,8 @@ indicator keeps a line of its own instead. Editing an entry inside a
 flow collection rewrites only that line, and no edit re-indents a
 sibling it did not touch. These are enforced per position by
 `make preservation`: every addressable edit position of the
-real-world fixtures, a bounded pass over all 269 valid
-yaml-test-suite corpus documents, and CRLF, BOM and no-final-newline
+real-world fixtures, a bounded pass over all 303 valid
+yaml-test-suite corpus cases, and CRLF, BOM and no-final-newline
 variants of every fixture — each output re-parsed and compared as a
 semantic value tree, with shapes that legitimately normalize counted
 as skips rather than asserted away. The skip summary also names the

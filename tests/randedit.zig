@@ -473,12 +473,7 @@ fn runOne(gpa: std.mem.Allocator, st: *Stats, at: Where, steps: usize) !void {
             back.deinit(a);
         }
         if (back.items.len != docs.items.len) {
-            // One document with a null root is written as nothing, which
-            // reads back as an empty stream.
-            const empty_ok = docs.items.len == 1 and back.items.len == 0 and
-                std.mem.trim(u8, out, " \t\r\n").len == 0 and
-                (docs.items[0].root == null or isNull(docs.items[0].root.?));
-            if (!empty_ok) return report(gpa, st, "document-count-changed", at, hist.items, out);
+            return report(gpa, st, "document-count-changed", at, hist.items, out);
         } else for (docs.items, back.items) |*x, *y| {
             if (!sameTree(x.root, y.root, 0)) return report(gpa, st, "reads-back-as-another-tree", at, hist.items, out);
         }

@@ -648,8 +648,16 @@ pub const Emitter = struct {
             const block_col = if (isEntryFraming(self.pendingLine())) col else 0;
             if (root.pending_leading) |pt| try self.writePendingLeadingText(pt, block_col, self.terminatorAt(doc.body_start), false);
             stop = try self.emitRoot(root, col, doc.body_end);
+        } else if (doc.body_end > doc.body_start) {
+            // A root removed from a parsed document (`doc.root = null`):
+            // its bytes go with it, and the head and tail stay. Copied, the
+            // old root came back as if nothing had been done.
+            stop = doc.body_end;
         }
-        if (stop < doc.region_end) {
+        // An empty tail too: a root written where an empty document had
+        // none ends the region, and the file's final line break still
+        // has to be written (`---` set to `x` lost it).
+        if (stop <= doc.region_end) {
             // Deleted-entry tombstones of the root container can reach
             // into the tail (when the last surviving entry is new).
             const before = self.out.items.len;
@@ -673,10 +681,11 @@ pub const Emitter = struct {
                 try self.write(src[stop..doc.region_end]);
             }
             // If everything remaining was deleted, the file's final
-            // newline is still structural: keep the output terminated.
+            // newline is still structural: keep the output terminated,
+            // with the source's own break (a CR-only file too).
             if (self.out.items.len == before and self.out.items.len > 0 and
-                self.out.items[self.out.items.len - 1] != '\n' and
-                src.len > 0 and src[src.len - 1] == '\n')
+                !ctype.isBreak(self.out.items[self.out.items.len - 1]) and
+                src.len > 0 and ctype.isBreak(src[src.len - 1]))
             {
                 try self.write(self.defaultTerminator());
             }
@@ -2918,9 +2927,10 @@ pub const Emitter = struct {
     /// Set `block_floor` to one past the deepest comment line from
     /// `start` (a line start) up to the next content line, and at least
     /// as deep as any line of blanks there, or 0 when there is none.
-    /// One of those lines opening with a tab bars block scalars: the tab
-    /// sits where the block's indentation is read, which no reader
-    /// accepts, however deep the content (libfyaml agrees).
+    /// A tab in the leading blanks of one of those lines bars block
+    /// scalars: it sits where the block's indentation is read. At column 0
+    /// no reader accepts it; after blanks (`  \t`) libyaml rejects it and
+    /// a lenient reader takes it for content.
     ///
     /// The scan runs through the lines of entries deleted from `holder`
     /// (or from what holds it): they are not written, so what follows
@@ -2944,7 +2954,7 @@ pub const Emitter = struct {
             const line = src[i..markup.newlineAt(src, i)];
             const body = std.mem.trimStart(u8, line, " \t");
             if (body.len > 0 and body[0] != '#') break;
-            if (line.len > 0 and line[0] == '\t') self.block_barred = true;
+            if (std.mem.indexOfScalar(u8, line[0 .. line.len - body.len], '\t') != null) self.block_barred = true;
             if (body.len > 0) floor = @max(floor, line.len - body.len + 1);
             // A line of blanks only is an empty line of the block when it
             // is no deeper than the content, and content (its extra

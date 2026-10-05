@@ -145,6 +145,10 @@ pub const Scanner = struct {
     /// follows; the next `:` is then indented by that tab (libfyaml
     /// `tab_used_for_ws`, see `tabIndentCheck`).
     tab_indent: bool = false,
+    /// The token being fetched is the first on its line, and a tab came
+    /// before it there (see `skipToNextToken`): a simple key saved now
+    /// starts a block mapping entry the tab indents.
+    line_tab_led: bool = false,
     simple_keys: std.ArrayList(SimpleKey) = .empty,
     /// One boolean per flow level: true when the collection is a flow
     /// sequence (`[`) and false for a flow mapping (`{`). Used to decide
@@ -175,6 +179,9 @@ pub const Scanner = struct {
         /// `simpleKeyTooLong` counts each byte once.
         chars: usize = 0,
         counted_to: usize = 0,
+        /// The key opens a line a tab began: confirmed in block context,
+        /// it is a block mapping entry the tab indents.
+        tab_led: bool = false,
     };
 
     /// Scan `input` under the default `Options`.
@@ -456,6 +463,7 @@ pub const Scanner = struct {
             .mark = self.mark,
             .pos = self.pos,
             .counted_to = self.pos,
+            .tab_led = self.line_tab_led,
         };
         try self.removeSimpleKey();
         self.simple_keys.items[self.simple_keys.items.len - 1] = sk;
@@ -528,34 +536,26 @@ pub const Scanner = struct {
                     if (line_start) lead_tab = true;
                     if (line_start and self.flow_level == 0) {
                         // A tab in a block-context line's leading
-                        // whitespace is only decoration, never
-                        // indentation: it is an error when the content
-                        // it precedes would roll a block indent. Tab at
-                        // column 0 before a plain scalar that turns out
-                        // to be a key is exactly that (corpus 4EJS);
-                        // tabs after a leading space (DK95), before
-                        // flow indicators (6CA3/Q5MG), before a comment
-                        // or a blank line are acceptable.
-                        if (self.mark.column == 1) {
-                            var off: usize = 0;
-                            while (ctype.isBlank(self.at(off))) off += 1;
-                            const nc = self.at(off);
-                            const blank_after = ctype.isBlankz(self.at(off + 1));
-                            const block_indicator = switch (nc) {
-                                '-', '?', ':', '|', '>' => blank_after or nc != '-',
-                                else => false,
-                            };
-                            // Nested inside a block collection a
-                            // column-0 tab that tries to indent any
-                            // construct is an error (corpus 4EJS); at
-                            // the top level only block indicators
-                            // reject.
-                            const nested = self.indent >= 0;
-                            const flows = nc == '[' or nc == '{';
-                            const inert = nc == 0 or ctype.isBreak(nc) or nc == '#';
-                            if (block_indicator or (nested and !flows and !inert)) {
-                                return self.failWith(error.InvalidIndentation, self.mark, "found a tab character where an indentation space is expected", .{});
-                            }
+                        // whitespace is never indentation (spec 6.1), at
+                        // column 0 or after spaces. It may separate the
+                        // indentation from flow or scalar content (DK95),
+                        // or come before a comment or a blank line. It is
+                        // an error before a block indicator, which begins
+                        // block structure (` \t- a`), and inside a block
+                        // collection before anything the line's spaces
+                        // alone do not indent past the collection's column
+                        // (corpus 4EJS: `a:` / `\tb:`; `a:` / `\t[b]`).
+                        // A key after it is refused when it is confirmed
+                        // (`SimpleKey.tab_led`).
+                        var off: usize = 0;
+                        while (ctype.isBlank(self.at(off))) off += 1;
+                        const nc = self.at(off);
+                        const block_indicator = (nc == '-' or nc == '?' or nc == ':') and ctype.isBlankz(self.at(off + 1));
+                        const inert = nc == 0 or ctype.isBreak(nc) or nc == '#';
+                        // The spaces reach column `lead_spaces + 1` (columns count from 1).
+                        const shallow = self.indent >= 0 and @as(isize, @intCast(lead_spaces + 1)) <= self.indent;
+                        if (!inert and (block_indicator or shallow)) {
+                            return self.failWith(error.InvalidIndentation, self.mark, "found a tab character where an indentation space is expected", .{});
                         }
                     }
                     self.skipCp();
@@ -601,6 +601,7 @@ pub const Scanner = struct {
                 lead_tab = false;
             } else break;
         }
+        self.line_tab_led = line_start and lead_tab and self.flow_level == 0;
         // Inside a flow collection nested in a block one, a line's
         // indentation must come before any tab: a tab reached before the
         // block's column is used as indentation (corpus Y79Y, and
@@ -807,7 +808,11 @@ pub const Scanner = struct {
         self.simple_key_allowed = self.flow_level == 0;
         const start = self.mark;
         self.skipCp();
-        _ = try self.tabIndentCheck();
+        // A tab after the `-` may separate it from a scalar or a flow
+        // collection, not from a compact mapping (`-\ta: 1`): spaces only
+        // there (spec 8.2.1 `s-l+block-indented`). The mark makes the
+        // mapping's `:` refuse it. PORT NOTE: libfyaml accepts it.
+        self.tab_indent = try self.tabIndentCheck() and self.simple_key_allowed;
         try self.appendToken(.{ .data = .block_entry, .start = start, .end = self.mark });
     }
 
@@ -837,6 +842,9 @@ pub const Scanner = struct {
         }
         const sk = &self.simple_keys.items[self.simple_keys.items.len - 1];
         const explicit = !sk.possible;
+        if (sk.possible and sk.tab_led and self.flow_level == 0) {
+            return self.failWith(error.InvalidIndentation, sk.mark, "found a tab character where an indentation space is expected", .{});
+        }
         if (sk.possible) {
             try self.insertToken(sk.token_number, .{ .data = .key, .start = sk.mark, .end = sk.mark });
             // A confirmed simple key starts a block mapping at its own
@@ -876,7 +884,9 @@ pub const Scanner = struct {
         const c = self.at(off);
         // Nothing follows on the line: trailing whitespace, not indentation.
         if (c == 0 or ctype.isBreak(c) or c == '#') return false;
-        const nested = c == '?' or c == ':' or c == '|' or c == '>' or
+        // A block scalar header may follow (`-\t|`, spec 8.1
+        // `s-l+block-scalar`). PORT NOTE: libfyaml rejects it.
+        const nested = c == '?' or c == ':' or
             (c == '-' and ctype.isBlankz(self.at(off + 1)));
         if (nested) {
             return self.failWith(error.InvalidIndentation, self.mark, "found a tab used to indent a block collection", .{});
@@ -886,7 +896,8 @@ pub const Scanner = struct {
 
     fn fetchAnchor(self: *Scanner, tag: Token.Kind) !void {
         try self.saveSimpleKey();
-        self.tab_indent = false;
+        // The tab mark stays: properties do not end the separation a tab
+        // made (`?\t&x a: 1` is a compact mapping after a tab).
         self.simple_key_allowed = false;
         const tok = try self.scanAnchor(tag);
         try self.appendToken(tok);
@@ -894,7 +905,7 @@ pub const Scanner = struct {
 
     fn fetchTag(self: *Scanner) !void {
         try self.saveSimpleKey();
-        self.tab_indent = false;
+        // As for an anchor: the tab mark stays.
         self.simple_key_allowed = false;
         const tok = try self.scanTag();
         try self.appendToken(tok);
@@ -1206,8 +1217,11 @@ pub const Scanner = struct {
                 break :outer;
             }
             // A tab in the first column tries to be indentation, which
-            // a tab cannot be (corpus Y79Y).
-            if (c == '\t' and self.mark.column == 1) {
+            // a tab cannot be (corpus Y79Y), inside a collection. A root
+            // block scalar's content may start at column 0 (its parent's
+            // indentation is -1), so there the tab is content.
+            // PORT NOTE: libfyaml rejects it at the root too.
+            if (c == '\t' and self.mark.column == 1 and self.indent >= 0) {
                 return self.failWith(error.InvalidIndentation, self.mark, "found a tab character where an indentation space is expected", .{});
             }
             if (indent == 0) {
@@ -1355,8 +1369,10 @@ pub const Scanner = struct {
                 while (ctype.isBlank(self.at(0))) self.skipCp();
                 // Its indentation must come before any tab: a tab reached
                 // before the block's column is used as indentation (corpus
-                // DK95; libfyaml: "invalid tab used as indentation").
-                if (tabbed and self.flow_level == 0 and !ctype.isBreak(self.at(0)) and
+                // DK95; libfyaml: "invalid tab used as indentation"). A
+                // blank line too: inside the quotes it is one of the
+                // scalar's lines.
+                if (tabbed and self.flow_level == 0 and
                     @as(isize, @intCast(lead)) < self.indent)
                 {
                     return self.failWith(error.InvalidIndentation, self.mark, "found a tab used as indentation in a quoted scalar", .{});
@@ -1530,6 +1546,10 @@ pub const Scanner = struct {
             // Consume the whitespace/line breaks that follow the run.
             const snap_pos = self.pos;
             const snap_mark = self.mark;
+            // A blank line with a tab before the scalar's column: a comment
+            // line if the scalar ends before it, but part of the scalar,
+            // and so refused, if it goes on past it (see below).
+            var tab_blank: ?Mark = null;
             while (ctype.isBlank(self.at(0)) or ctype.isBreak(self.at(0))) {
                 if (ctype.isBreak(self.at(0))) {
                     breaks += 1;
@@ -1553,6 +1573,7 @@ pub const Scanner = struct {
                         if (nc != 0 and nc != '#' and !ctype.isBreak(nc)) {
                             return self.failWith(error.InvalidIndentation, self.mark, "found a tab character that violates indentation", .{});
                         }
+                        if (nc != '#' and tab_blank == null) tab_blank = self.mark;
                     }
                     if (breaks == 0) try ws.append(self.allocator, self.at(0));
                     self.skipCp();
@@ -1568,6 +1589,12 @@ pub const Scanner = struct {
                 self.pos = snap_pos;
                 self.mark = snap_mark;
                 break;
+            }
+            // The scalar goes on: a blank line it crossed is one of its own
+            // lines, read with its indentation (`k: v` / `\t` / ` a`).
+            // PORT NOTE: libfyaml accepts it.
+            if (tab_blank) |m| {
+                return self.failWith(error.InvalidIndentation, m, "found a tab character that violates indentation", .{});
             }
         }
 
@@ -1863,21 +1890,20 @@ test "tabs before flow content are allowed, tab block indentation is not" {
         var r = try scanAll(testing.allocator, in);
         r.deinit(testing.allocator);
     }
-    try testing.expectError(error.InvalidIndentation, scanAll(testing.allocator, "\t|literal\n"));
+    // A tab may come before a root block scalar's header (see the next
+    // test); this header is not one.
+    try testing.expectError(error.InvalidSyntax, scanAll(testing.allocator, "\t|literal\n"));
     // Content after such a tab is indented by it (see the PORT NOTE).
     try testing.expectError(error.InvalidIndentation, scanAll(testing.allocator, "a: b\n\tc\n"));
-    // A tab before plain content is not indentation of a block construct
-    // and is accepted.
+    // A tab before plain content that turns out to be a key is the
+    // indentation of a block mapping entry: refused (the reference parser,
+    // libfyaml and libyaml agree). Before plain content that stays a scalar
+    // it is separation.
+    try testing.expectError(error.InvalidIndentation, scanAll(testing.allocator, "\tkey: value\n"));
     {
-        var r = try scanAll(testing.allocator, "\tkey: value\n");
-        defer r.deinit(testing.allocator);
-        var scalars: std.ArrayList([]const u8) = .empty;
-        defer scalars.deinit(testing.allocator);
-        for (r.toks.items) |t| {
-            if (t.data == .scalar) try scalars.append(testing.allocator, t.data.scalar.value);
-        }
-        try testing.expectEqualStrings("key", scalars.items[0]);
-        try testing.expectEqualStrings("value", scalars.items[1]);
+        var values = try scalarValues("\tjust a scalar\n");
+        defer freeValues(&values);
+        try testing.expectEqualStrings("just a scalar", values.items[0]);
     }
 }
 
@@ -1901,14 +1927,30 @@ fn freeValues(values: *std.ArrayList([]const u8)) void {
     values.deinit(testing.allocator);
 }
 
-test "tabs that indent a construct are rejected where libfyaml rejects them" {
-    // A tab after a block indicator may not indent a nested block
-    // construct (corpus Y79Y-5..10).
+test "tabs that indent a construct are rejected" {
+    // Indentation is spaces only (spec 6.1). A tab may separate tokens on a
+    // line, or sit between a line's indentation and the flow or scalar
+    // content it carries (DK95), but never where block structure begins.
+    // Each list was checked against the YAML 1.2 reference parser, which is
+    // the spec's grammar run as a program; libfyaml is looser on some and
+    // stricter on others (PORT NOTEs below).
     for ([_][]const u8{
-        "-\t-\n",    "- \t-\n",           "?\t-\n",      "? -\n:\t-\n",
-        "?\tkey:\n", "? key:\n:\tkey:\n", "-\t|\n  x\n", "-\t>\n  x\n",
-        "-\t? x\n",  "?\t\"k\": 1\n",
+        // After a block indicator, before a nested block construct (Y79Y).
+        "-\t-\n",       "- \t-\n",           "?\t-\n",         "? -\n:\t-\n",
+        "?\tkey:\n",    "? key:\n:\tkey:\n", "-\t? x\n",       "?\t\"k\": 1\n",
+        // ... and before a compact mapping: one after `- ` or `? ` may be
+        // separated by spaces only. PORT NOTE: libfyaml accepts these.
+        "-\ta: 1\n",    "- \ta: 1\n",        "- a\n-\tb: 1\n", "-\t\"q\": 1\n",
+        "?\t&x a: 1\n", "-\t!t a: 1\n",
+        // In a line's leading blanks, before a block indicator or a key,
+        // after spaces as at column 0. PORT NOTE: libfyaml accepts some.
+             " \t- a\n",       " \t?\n",
+        " \t:\n",       "\tk:\n",            " \tk: v\n",      "a:\n  \tk: v\n",
+        // Before content that would have to be indented past a block's
+        // column: the tab cannot make up the difference (4EJS).
+        " :\n \ta\n",   "a:\n\t[b]\n",       "a:\n\t|\n x\n",
     }) |in| {
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(in)});
         try testing.expectError(error.InvalidIndentation, scanAll(testing.allocator, in));
     }
     // A simple key's value may not open a sequence on its own line.
@@ -1917,19 +1959,47 @@ test "tabs that indent a construct are rejected where libfyaml rejects them" {
     // indentation (corpus DK95-2, Y79Y-4).
     for ([_][]const u8{
         "foo: \"bar\n\tbaz\"\n", "a:\n  b: \"x\n  \ty\"\n", "- [\n\tfoo,\n foo\n ]\n", "a: 'x\n\ty'\n",
+        // A blank line of a quoted scalar is one of its lines too.
+        "a: \"x\n\t\n y\"\n",    "a: 'x\n\t\n y'\n",        "- \"x\n\t\n  y\"\n",
     }) |in| {
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(in)});
         try testing.expectError(error.InvalidIndentation, scanAll(testing.allocator, in));
     }
-    // Separation, not indentation: accepted by libfyaml and the suite.
+    for ([_][]const u8{ "a: \"x\n \t\n y\"\n", "\"x\n\t\ny\"\n", "a: [x,\n\t\n y]\n" }) |in| {
+        var r = try scanAll(testing.allocator, in);
+        r.deinit(testing.allocator);
+    }
+    // Separation, not indentation: accepted by the reference parser and
+    // the suite.
     for ([_][]const u8{
-        "-\t-1\n",                 "-\ta: 1\n",            "- a\n-\tb: 1\n",   "-\t\"q\": 1\n",
-        "? a\n:\tb\n",             "?\t&x a: 1\n",         "a:\t|\n  x\n",     "-\t\n  - x\n",
+        "-\t-1\n",                 "- a\n- \tb\n",         "-\t[a]\n",         "-\t&x a\n",
+        "? a\n:\tb\n",             "? a\n:\t[b]\n",        "a:\t|\n  x\n",     "-\t\n  - x\n",
         "foo: \"bar\n  \tbaz\"\n", "- [\n  \tfoo\n  ]\n",  "[a,\n\tb]\n",      "a: [\n \tb]\n",
-        // PORT NOTE: libfyaml rejects these valid documents (see the
-        // tab mark's clearing in `skipToNextToken`).
+        "a:\n \t[b]\n",            "- \t# c\n  a: 1\n",    "\t[\n\t]\n",       "\t{}\n",
+        // PORT NOTE: libfyaml rejects these valid documents (see the tab
+        // mark's clearing in `skipToNextToken`, and `tabIndentCheck`): a
+        // block scalar after a block indicator and a tab, a root block
+        // scalar after a tab, and a root block scalar whose content opens
+        // with a tab (the root's content may start at column 0).
         "?\tk\n: v\n",             "a:\n  ?\tb\n  :\tc\n", "? a\n:\t\nc: d\n", "?\t\n: v\nc: d\n",
-        ":\t",
+        ":\t",                     "-\t|\n  x\n",          "-\t>\n  x\n",      "\t|\n x\n",
+        "|\n\t\n",                 "|\n\tx\n",
     }) |in| {
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(in)});
+        var r = try scanAll(testing.allocator, in);
+        r.deinit(testing.allocator);
+    }
+    // A blank line inside a multi-line plain scalar is part of it, and is
+    // read with its indentation: a tab there before the scalar's column is
+    // refused, as it is before content (`a: b` / `\tc`). Between nodes the
+    // same line is a comment line and stands (DK95-4). Root scalars have no
+    // column to reach.
+    for ([_][]const u8{ "k: v\n\t\n a\n", "a: x\n\t\n  y\n", ":\tv\n\t\n a\n", "- x\n\t\n  y\n" }) |in| {
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(in)});
+        try testing.expectError(error.InvalidIndentation, scanAll(testing.allocator, in));
+    }
+    for ([_][]const u8{ "a: x\n \t\n  y\n", "x\n\t\ny\n", "foo: 1\n\t\nbar: 2\n", "a: x\n\t\nb: y\n", "- x\n\t\n- y\n" }) |in| {
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(in)});
         var r = try scanAll(testing.allocator, in);
         r.deinit(testing.allocator);
     }

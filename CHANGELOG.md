@@ -3,6 +3,77 @@
 Notable changes to yayl. Pre-1.0, the minor version is the release
 series; APIs may still move, and anything that does is listed here.
 
+## Unreleased
+
+### Fixed
+
+**A document whose root was set to null was lost to other readers.** A
+root set to a null value left a body with no content line: a blank
+line, or the comments around it. yayl read that back as a document with
+no root, but a reader that follows the spec (libfyaml, libyaml) read an
+empty stream. Every document with a root now gets a `---` when nothing
+else marks it, in `write` and `writeAll` alike, as the first empty
+document of a multi-document stream already did.
+
+**`doc.root = null` on a parsed document was ignored.** The writer
+copied the old root's bytes back. It now writes the document without
+them, keeping its head and tail (comments, markers), which reads back as
+a document with no root, as a file of comments does.
+
+**A root set in an empty document lost the file's final line break.**
+`---` with its root set to `x` was written `---\nx`, with no line break
+after it although the source ended with one. It is kept now, and a
+CR-only file keeps its own break.
+
+**Mutation testing.** Every library `errdefer` deleted and every
+comparison flipped at its boundary, one at a time (449 mutants): the
+ones that changed what yayl reads or writes and that no test caught now
+each have a test. Among them: a trailing comment written twice when the
+last entry of a collection ending a file with no final line break was
+changed; reads past the end of the source for a property-only value
+(`a: &x`) ending a file, which crashed under the mutant; non-ASCII text
+pushed into double quotes by an off-by-one; and leaks on failure in
+fixed-array conversions, array default clones and the schema byte
+budget.
+
+**A block scalar could be written over a blank line with a tab in its
+indentation.** The lines after a block scalar, up to the next content,
+are read with its indentation, and a tab there (`  \t`) is neither an
+empty line nor content: libyaml rejects the document. Only a tab at
+column 0 barred the block style; a tab anywhere in such a line's
+leading blanks now does, and the value is written quoted.
+
+**Tabs are read as the spec's grammar says.** yayl followed libfyaml,
+which is looser than the spec in some places and stricter in others.
+Checked against the YAML 1.2 reference parser over ~30,000 generated
+documents:
+
+- Refused now: a tab in a line's leading blanks before a block indicator
+  or a key, after spaces as at column 0 (` \t- a`, `\tk: v`); a tab
+  before anything a block collection's column must be reached by spaces
+  (`a:` / `\t[b]`); a tab between `- ` or `? ` and a compact mapping
+  (`-\ta: 1`, `?\t&x a: 1`); a tab in the indentation of a blank line
+  inside a multi-line plain or quoted scalar (`k: v` / `\t` / ` a`).
+- Accepted now: a block scalar header after a block indicator and a tab
+  (`-\t|`), a root block scalar after a tab (`\t|`), and a root block
+  scalar whose content opens with a tab (`|` / `\tx`).
+
+**`: - a` parsed.** An entry with no key whose value opened a compact
+sequence or mapping on the `:` line was accepted. It is an implicit
+entry, whose block collection value starts on a line of its own: it is
+refused as `k: - a` is. After an explicit key (`? x` / `: - a`) it
+stays valid.
+
+### Changed
+
+- Documents with the tab and `: - a` shapes listed under Fixed no longer
+  parse (`error.InvalidIndentation`, `error.InvalidSyntax`). They were
+  never valid YAML; the reference parser and libyaml reject them.
+- A document with a null root is written with a `---`.
+- New fields on public structs, internal state with defaults:
+  `Parser.bare_value_line`, `Scanner.line_tab_led` and
+  `Scanner.SimpleKey.tab_led`.
+
 ## 0.20.0 — 2026-10-02
 
 ### Fixed
