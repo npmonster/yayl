@@ -1061,6 +1061,29 @@ test "validation is bounded in bytes as well as in nodes" {
     try testing.expectError(error.LimitExceeded, outer.validateLimited(allocator, node, "$", .{ .max_bytes = 50_000 }));
 }
 
+test "running out of the byte budget at any point leaks nothing" {
+    // Paths and violation details are charged as they are made; whichever
+    // charge runs out, what was made for it is freed. Every budget from
+    // nothing to enough is tried.
+    const allocator = testing.allocator;
+    var doc = try document_mod.Document.parse(allocator, "[[a, b], [c, ok], [d]]\n");
+    defer doc.deinit();
+    const ok = Schema.strEnum(&.{"ok"});
+    const inner = Schema.seq(&ok);
+    const outer = Schema.seq(&inner);
+    var finished = false;
+    for (0..2000) |max_bytes| {
+        const got = outer.validateLimited(allocator, doc.root.?, "$", .{ .max_bytes = max_bytes }) catch |err| {
+            try testing.expectEqual(error.LimitExceeded, err);
+            continue;
+        };
+        freeViolations(allocator, got);
+        finished = true;
+        break;
+    }
+    try testing.expect(finished);
+}
+
 test "a tag is checked against the node's kind, and `!` resolves by kind" {
     const allocator = testing.allocator;
 

@@ -3521,6 +3521,8 @@ test "a document whose root is null is still a document" {
         .{ .input = "# head\na: 1\n", .want = "---\n# head\n" },
         .{ .input = "a: 1\n# tail\n", .want = "---\n\n# tail\n" },
         .{ .input = "a: 1\r\n", .want = "---\r\n\r\n" },
+        // A lone CR as the body's only break, at its very end.
+        .{ .input = "a: 1\r", .want = "---\r\r" },
         .{ .input = "\u{FEFF}a: 1\n", .want = "\u{FEFF}---\n\n" },
         // A marker already there is kept, and none is added.
         .{ .input = "--- &x\na: 1\n", .want = "--- \n" },

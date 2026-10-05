@@ -654,7 +654,10 @@ pub const Emitter = struct {
             // old root came back as if nothing had been done.
             stop = doc.body_end;
         }
-        if (stop < doc.region_end) {
+        // An empty tail too: a root written where an empty document had
+        // none ends the region, and the file's final line break still
+        // has to be written (`---` set to `x` lost it).
+        if (stop <= doc.region_end) {
             // Deleted-entry tombstones of the root container can reach
             // into the tail (when the last surviving entry is new).
             const before = self.out.items.len;
@@ -678,10 +681,11 @@ pub const Emitter = struct {
                 try self.write(src[stop..doc.region_end]);
             }
             // If everything remaining was deleted, the file's final
-            // newline is still structural: keep the output terminated.
+            // newline is still structural: keep the output terminated,
+            // with the source's own break (a CR-only file too).
             if (self.out.items.len == before and self.out.items.len > 0 and
-                self.out.items[self.out.items.len - 1] != '\n' and
-                src.len > 0 and src[src.len - 1] == '\n')
+                !ctype.isBreak(self.out.items[self.out.items.len - 1]) and
+                src.len > 0 and ctype.isBreak(src[src.len - 1]))
             {
                 try self.write(self.defaultTerminator());
             }
