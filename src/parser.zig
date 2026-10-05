@@ -69,6 +69,9 @@ pub const Parser = struct {
     /// D directives and T tags cost D x T (64,000 directives: 5 s).
     handle_index: std.StringHashMapUnmanaged(usize) = .empty,
     version_directive: ?VersionDirective = null,
+    /// Set while the block mapping entry being parsed has no key: the
+    /// line its `:` is on. See `parseBlockMappingValue`.
+    bare_value_line: ?usize = null,
     /// Transient allocations owned by the parser (resolved tags, directive
     /// snapshots handed to events). Valid until `deinit`.
     temp_bytes: std.ArrayList([]u8) = .empty,
@@ -631,6 +634,7 @@ pub const Parser = struct {
         if (tok.data == .value) {
             // Missing (empty) key.
             self.state = .block_mapping_value;
+            self.bare_value_line = tok.start.line;
             return self.processEmptyScalar(tok.start);
         }
         if (tok.data == .block_end) {
@@ -644,9 +648,22 @@ pub const Parser = struct {
 
     fn parseBlockMappingValue(self: *Parser) !Event {
         var tok = try self.peekToken();
+        const bare_line = self.bare_value_line;
+        self.bare_value_line = null;
         if (tok.data == .value) {
             self.scanner.skipToken();
             tok = try self.peekToken();
+            // An entry with no key is an implicit one, and an implicit
+            // entry's block collection value starts on a line of its own
+            // (spec 8.2.2): `: - a` is refused as `k: - a` is. Only an
+            // explicit entry's `:` may hold a compact sequence or mapping.
+            // PORT NOTE: libfyaml accepts these.
+            if (bare_line) |line| if (tok.start.line == line) switch (tok.data) {
+                .block_sequence_start, .block_mapping_start, .block_entry, .key => {
+                    return self.fail(tok.start, "a mapping value with no key cannot start a block collection on its line", .{});
+                },
+                else => {},
+            };
             if (tok.data != .key and tok.data != .value and tok.data != .block_end) {
                 try self.pushState(.block_mapping_key);
                 return self.parseNode(true, true);
@@ -1004,4 +1021,32 @@ test "%TAG handles and prefixes are validated" {
     try drainEvents(allocator, "%TAG ! tag:x\n---\nx\n");
     try drainEvents(allocator, "%TAG !! tag:x\n---\nx\n");
     try drainEvents(allocator, "%TAG !e! tag:example.com,2000:\n---\nx\n");
+}
+
+/// The outcome of parsing `input` to the end: null when it parses.
+fn parseOutcome(allocator: std.mem.Allocator, input: []const u8) !?anyerror {
+    var p = try Parser.init(allocator, null, input);
+    defer p.deinit();
+    while (true) {
+        const ev = p.nextEvent() catch |err| return @as(?anyerror, err);
+        if (ev == null) return null;
+    }
+}
+
+test "a value with no key holds no compact collection on its line" {
+    // `:` opening an entry with no key is an implicit entry, whose value
+    // starts on a line of its own when it is a block collection (spec
+    // 8.2.2 `c-l-block-map-implicit-value`): `k: - a` is refused, and so
+    // must `: - a` be. Only an explicit entry's `:` (after `? key`) may
+    // hold a compact sequence or mapping on its line (YAML reference
+    // parser; libfyaml accepts these).
+    const allocator = testing.allocator;
+    for ([_][]const u8{ ": - a\n", ": k: v\n", ": ? a\n", "a: 1\n: - a\n", "- : - a\n", "x:\n  : - a\n" }) |input| {
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(input)});
+        try testing.expectEqual(@as(?anyerror, error.InvalidSyntax), try parseOutcome(allocator, input));
+    }
+    for ([_][]const u8{ "? x\n: - a\n", "? x\n: k: v\n", "? x\n? y\n: - a\n", ": [a]\n", ": |\n  x\n", ":\n  - a\n", ": a\n", "- ? x\n  : - a\n" }) |input| {
+        errdefer std.debug.print("{f}\n", .{std.zig.fmtString(input)});
+        try testing.expectEqual(@as(?anyerror, null), try parseOutcome(allocator, input));
+    }
 }
