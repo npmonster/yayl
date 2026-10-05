@@ -106,15 +106,26 @@ Guidance for AI agents (and humans) continuing the conversion of **libfyaml**
 
 The pinned yaml-test-suite corpus is green: all 397 records pass, the
 46 unnamed sub-cases included, with no skips. That covers explicit keys,
-tab strictness (a tab may separate, never indent: column-0 tabs, tabs
-after `-`/`?`/`:` ahead of a nested block construct, and tabs ahead of
-a quoted or flow continuation line's block column are rejected, as
-libfyaml rejects them), flow/quoted continuation indentation bounds,
-`\<TAB>` escapes, and block scalar folding/indentation indicators.
-`make verify` and `make roundtrip` keep it honest (stale-skip guards).
-Where libfyaml is looser than the spec (a plain continuation indented
-by a tab, `?\tk` over `: v`), the scanner follows the spec and says so
-in a PORT NOTE.
+tabs, flow/quoted continuation indentation bounds, `\<TAB>` escapes, and
+block scalar folding/indentation indicators. `make verify` and `make
+roundtrip` keep it honest (stale-skip guards).
+
+Tabs follow the spec's grammar: a tab may separate, never indent. It is
+refused before a block indicator or a key in a line's leading blanks,
+before anything a block's column must be reached by spaces, between `- `
+or `? ` and a compact mapping, and in the indentation of a blank line
+inside a multi-line scalar. It is accepted before flow and scalar
+content after the indentation (DK95), before a block scalar header, and
+at a root block scalar's column 0. The suite does not cover all of
+that, so it was checked against the YAML 1.2 reference parser
+(github.com/yaml/yaml-reference-parser, the spec's grammar run as a
+program; it agrees with every suite verdict but ZYU8-2) over ~30,000
+generated tab-heavy documents. libfyaml is looser on some of these and
+stricter on others; each place says so in a PORT NOTE. The reference
+parser has its own bugs (an empty block scalar under a one-space root,
+block content read at column 0 under a deeper entry): where it
+disagrees with both libfyaml and libyaml, read the spec before trusting
+it.
 
 ### Parser status
 
