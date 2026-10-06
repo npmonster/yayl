@@ -1,6 +1,6 @@
 # yayl
 
-A YAML parser, document model, and emitter for Zig. Parse a config, change one value, write it back, and every byte you didn't touch comes out exactly as it went in: comments, blank lines, quoting, key order, indentation.
+A YAML parser, document model, and emitter for Zig. Parse a config, change one value, and keep its comments, blank lines, quoting, key order and indentation. Untouched documents round-trip byte for byte. After edits, tabs in adjacent blank lines and comment indentation become spaces for libyaml compatibility; comment text stays exact.
 
 Most YAML libraries parse into a plain map and drop everything else, so writing the file back reformats it and your comments are gone. yayl keeps the source layout in the tree and re-emits from it.
 
@@ -26,7 +26,9 @@ It has since grown its own editing API, value runtime, schema layer, and file I/
 
 ## Requirements
 
-Zig 0.16.x is supported; `build.zig.zon` sets 0.16.0 as the minimum, and CI pins 0.16.0 exactly.
+Zig 0.16.0 is the tested compiler. Project commands select that version from PATH or an existing zvm installation; set `ZIG=/absolute/path/to/zig` to select it explicitly. Other compiler versions require separate validation.
+
+The full development gate also needs a C compiler, Python 3, pkg-config and libyaml headers (`brew install libyaml pkg-config` on macOS; `apt-get install libyaml-dev pkg-config` on Debian/Ubuntu). These are development dependencies; the library itself is pure Zig.
 
 ## Install
 
@@ -220,7 +222,7 @@ The feature set is complete and gated. 1.0 waits on real-world use: run your wor
 Deliberate for v1:
 
 - Input has to fit in memory. Byte-faithful re-emission works by slicing the original bytes, so a document keeps a copy of its whole source; chunked input would trade that guarantee away rather than merely complicate it. The parser streams *events* (pull-based), and that layer is chunk-ready. See the note in `src/file.zig`.
-- Modified subtrees normalize their internal layout when they re-emit. Replacing a value keeps the layout of a multi-line flow collection, mapping or sequence alike. Adding or removing a flow entry still collapses the collection to one line. Untouched bytes are always exact.
+- Modified subtrees normalize their internal layout when they re-emit. Replacing a value keeps the layout of a multi-line flow collection, mapping or sequence alike. Adding or removing a flow entry still collapses the collection to one line. Untouched documents are exact. Edits normalize leading tabs only in adjacent blank/comment lines for libyaml compatibility.
 - Subtrees the emitter owns — brand-new ones, and moved ones — get block layout at the file's own indent width, but not the original's internal detail: a moved subtree keeps its structure and values, not the comments and blank lines that were inside it.
 - No parse cache. A `Document` is mutable, so a cache would have to hand out deep clones, which is not clearly cheaper than re-parsing. See the note in `src/file.zig`.
 - Emission buffers the whole output; there is no writer-based sink. This is not an oversight to be tidied up later: byte-faithful emission needs random access to what it has already written — it inserts separators and newlines behind the cursor — so a forward-only writer cannot express it. `doc.write` and `yaml.writeAll` return an owned slice, and `yaml.file.writeFile` puts it on disk atomically.
@@ -231,20 +233,22 @@ Deliberate for v1:
 ## Development
 
 ```sh
-make verify        # every gate below except differential
+make verify        # all correctness gates below
 make conformance   # yaml-test-suite corpus
 make roundtrip     # emit(parse(x)) == x over corpus + fixtures
 make preservation  # an edit changes only the lines it should (fixtures + corpus)
 make randedit      # random edit sequences written and read back (RANDEDIT_ARGS="seed iterations steps")
 make consume       # build a package against the packaged library (.paths check)
 make differential  # event-stream parity vs libfyaml (needs a C compiler)
-make emission-oracle  # libfyaml parses everything yayl emits (report-only; needs a C compiler)
+make emission-oracle  # libfyaml parses everything yayl emits (blocking in CI)
+make libyaml-compat   # edited output and scalar values checked with libyaml
+make mutation-smoke   # 16 selected regression mutations, bounded and isolated
 make examples      # compile-checked example programs (zig-out/bin)
 zig build bench    # throughput CLI (scripts/bench-corpus.sh: fixtures + corpus)
 zig build fuzz     # deterministic long-run fuzz harness (smoke runs in `test`)
 ```
 
-The gates, in both Debug and ReleaseSafe:
+Unit tests run in Debug and ReleaseSafe; the corpus and independent-parser gates run in Debug. All correctness jobs block CI. Benchmarks remain informational.
 
 | Gate | Result |
 | --- | --- |
@@ -253,8 +257,12 @@ The gates, in both Debug and ReleaseSafe:
 | edit preservation | all 303 valid corpus cases under edits (298 documents, 5 empty), plus every fixture position |
 | event-tree parity vs libfyaml | 269/269 compared, zero mismatches |
 | emission oracle (libfyaml parses what we emit) | 816 documents across three emission paths, zero findings |
-| randomized edit differential | 95,100 runs a seed (317 inputs x 5 variants x 60), each up to 4 edit steps written and read back, zero findings |
+| randomized edit differential | CI seed 1: 31,700 runs (317 inputs x 5 variants x 20), up to 4 edit steps per run |
+| libyaml edited-output compatibility | 960 streams via write/writeAll: five scalar styles, LF/CRLF/CR, BOM/no BOM, collections, aliases and adjacent blank/comment lines |
+| targeted mutation regressions | 16 named mutations; baseline must pass, mutation must compile and fail its selected test |
 | allocation-failure injection | zero leaks |
+
+Mutation results apply to the tested cases. A survivor is unobserved to differ, not proven equivalent. The targeted gate records exit status, memory use, source hashes and logs in `zig-out/mutation-smoke/`; compile failures, timeouts and memory limits fail the gate separately.
 
 ## License
 

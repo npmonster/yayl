@@ -1,14 +1,20 @@
 # yayl — Yet Another YAML Library (native Zig conversion of libfyaml)
 #
-# Thin convenience wrapper around `zig build`; requires Zig >= 0.16
+# Thin convenience wrapper around `zig build`; uses the pinned Zig version
 # (see build.zig.zon). Run `make help` for the target list.
 
-ZIG ?= zig
+ifndef ZIG
+ZIG := $(shell sh scripts/zig-path.sh)
+endif
+ifeq ($(strip $(ZIG)),)
+$(error Zig 0.16.0 is required; set ZIG to its executable path)
+endif
+export ZIG
 
 .DEFAULT_GOAL := help
 .MAIN: help
 
-.PHONY: help all build check test test-release examples fmt fmt-write docs corpus libfyaml conformance roundtrip preservation randedit differential emission-oracle consume verify clean
+.PHONY: help all build check test test-release examples fmt fmt-write docs corpus libfyaml conformance roundtrip preservation randedit differential emission-oracle consume libyaml-compat mutation-smoke merge-differential verify clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' Makefile
@@ -53,13 +59,15 @@ conformance: corpus ## Run the pinned YAML Test Suite corpus through yayl
 roundtrip: corpus ## Byte-faithful round trip over the corpus and tests/fixtures
 	$(ZIG) build roundtrip --summary all
 
+# The sweep checks exact edit boundaries, including authorized leading-tab
+# replacements beside edited values; semantic-only cases are reported.
 preservation: ## Edit-preservation sweeps over fixtures and corpus (edits change only what they should)
 	$(ZIG) build preservation --summary all
 
 # Random edit sequences, each written and read back; RANDEDIT_ARGS is
-# `seed iterations steps` (the default is a smoke; a release review runs
-# ~60 iterations a seed over several seeds).
-RANDEDIT_ARGS ?= 1 2 4
+# `seed iterations steps` (the default matches CI; release reviews run
+# additional seeds).
+RANDEDIT_ARGS ?= 1 20 4
 randedit: corpus ## Randomized edit differential: random edits written and read back (RANDEDIT_ARGS="seed iterations steps")
 	$(ZIG) build randedit -- $(RANDEDIT_ARGS)
 
@@ -82,11 +90,13 @@ merge-differential: libfyaml ## Compare yayl vs libfyaml RESOLVED merge-key valu
 consume: ## Build a throwaway package against the packaged library (catches .paths omissions)
 	sh scripts/consumer-smoke.sh
 
-# NOTE: the sweep asserts line-level non-interference on every edit
-# position in every fixture, plus weak invariants (re-parse, entry gone,
-# sentinel present) and semantic value-tree equality on the skip
-# categories — a skip is never silent.
-verify: fmt check test test-release examples conformance roundtrip preservation consume ## Quality gate minus differential: fmt, compile, tests (Debug + ReleaseSafe), examples, corpus, round trip, edit preservation, packaged-consumer smoke
+libyaml-compat: ## Check edited documents with independent libyaml (needs libyaml and pkg-config)
+	sh scripts/libyaml-compat.sh
+
+mutation-smoke: ## Recheck 16 selected mutations in isolated source copies (needs Python 3)
+	python3 scripts/mutation-smoke.py
+
+verify: fmt check test test-release examples conformance roundtrip preservation consume differential merge-differential emission-oracle libyaml-compat randedit mutation-smoke ## All correctness gates, including independent parsers, random edits and targeted mutations
 
 clean: ## Remove build artifacts (zig-out/) and the incremental cache
 	rm -rf zig-cache .zig-cache-global zig-out

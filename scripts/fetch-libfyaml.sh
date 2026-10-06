@@ -8,7 +8,8 @@
 # in the package (see `.paths` in build.zig.zon).
 set -eu
 
-PINNED_REV="04e0b58135c2e1a9264e1c4b915a6c8e750aa923"
+. "$(dirname "$0")/libfyaml-build.sh"
+PINNED_REV="$LIBFYAML_REV"
 DEST="vendor/libfyaml"
 
 if [ -d "$DEST/src/lib" ]; then

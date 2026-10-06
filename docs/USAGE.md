@@ -273,7 +273,7 @@ use the sibling entries' indentation.
 
 A block scalar (`|`, `>`) that an edit writes reads every following
 line with its own indentation, up to the next content line, so it is
-placed with those lines in mind, and they are left as they are:
+placed with those lines in mind:
 
 - It sits deeper than the comment lines after it, or they would be
   read as part of its value.
@@ -283,6 +283,11 @@ placed with those lines in mind, and they are left as they are:
   and the line is the author's to keep or remove.
 - A tab in the leading blanks of such a line cannot be indentation, so
   no block scalar is written there: the value is written quoted instead.
+  After an edit, tabs in adjacent blank lines and in leading whitespace
+  before comments become one space each. libyaml rejects those tabs after
+  quoted/flow values despite their being valid separation in YAML 1.2.
+  Comment text, line endings, and unrelated gaps stay exact. A document
+  written without edits remains byte-identical.
 - A comment on the old value's line moves to the block's header line.
 
 One case is not a plain line removal. When the deleted entry is the
