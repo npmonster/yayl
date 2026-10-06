@@ -5,6 +5,8 @@ series; APIs may still move, and anything that does is listed here.
 
 ## Unreleased
 
+## 0.20.2 — 2026-10-07
+
 ### Fixed
 
 - Edited values followed by tab-containing blank/comment indentation now
@@ -19,6 +21,8 @@ series; APIs may still move, and anything that does is listed here.
 ### Verification
 
 - Emission-oracle and randomized-edit CI jobs now fail the build on findings.
+- Core verification runs before dependent CI jobs, and benchmarks wait until
+  required checks finish, reducing contention for hosted runners.
 - Added a blocking libyaml edited-output gate and a bounded mutation gate
   for 16 named regression and allocation-cleanup cases. Baselines must run
   and pass; mutants must compile and fail their selected test. Compile
