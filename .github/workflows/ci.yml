@@ -11,9 +11,11 @@ on:
   pull_request:
 
 jobs:
+  # Acquire the core runner before scheduling dependent checks. The timeout
+  # bounds execution; it does not guarantee hosted-runner queue availability.
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
 
@@ -106,6 +108,7 @@ jobs:
   # conversation, not a red X.
   bench:
     name: Benchmarks (report only)
+    needs: quality-gates
     runs-on: ubuntu-latest
     timeout-minutes: 15
     continue-on-error: true
@@ -128,6 +131,7 @@ jobs:
   # shares its author's spec misreadings. Any finding fails CI.
   emission-oracle:
     name: Emission oracle
+    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -153,6 +157,7 @@ jobs:
   # seed, so a red run reproduces with the same command. Findings fail CI.
   randedit:
     name: Randomized edit differential
+    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -170,6 +175,7 @@ jobs:
 
   libyaml-compat:
     name: Edited output vs libyaml
+    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -184,6 +190,7 @@ jobs:
 
   mutation-smoke:
     name: Targeted mutation regressions
+    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -211,6 +218,7 @@ jobs:
   # so this also works on pull requests from forks.
   consume:
     name: Consume as a dependency
+    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
