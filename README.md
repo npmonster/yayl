@@ -35,10 +35,10 @@ The full development gate also needs a C compiler, Python 3, pkg-config and liby
 Add the package, pinned to a release:
 
 ```sh
-zig fetch --save git+https://github.com/npmonster/yayl#v0.20.1
+zig fetch --save git+https://github.com/npmonster/yayl#v0.20.2
 ```
 
-That records the resolved commit and a content hash in your `build.zig.zon`, so your build stays reproducible even if the tag later moves or disappears. Leave off `#v0.20.1` and you pin whatever `main` happens to be at that moment, which is rarely what you want.
+That records the resolved commit and a content hash in your `build.zig.zon`, so your build stays reproducible even if the tag later moves or disappears. Leave off `#v0.20.2` and you pin whatever `main` happens to be at that moment, which is rarely what you want.
 
 Wire the module into your `build.zig`:
 
